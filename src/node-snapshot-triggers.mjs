@@ -43,11 +43,12 @@ export async function transactNodeMutationAndRefreshTargets({
 export async function rebuildAfterStartup({
   hasBaseCatalog = () => existsSync(MERGED_CATALOG_PATH),
   rebuild,
+  ...rebuildOptions
 } = {}) {
   if (!hasBaseCatalog()) return undefined;
   if (typeof rebuild !== "function") {
     const { rebuildNodeSnapshots } = await import("./catalog-rebuild.mjs");
-    return rebuildNodeSnapshots("service-startup");
+    return rebuildNodeSnapshots("service-startup", rebuildOptions);
   }
   return rebuild("service-startup");
 }
@@ -60,6 +61,7 @@ export async function rebuildAfterRegistryUpdate({
   models,
   invalidate,
   rebuild,
+  ...transactionOptions
 } = {}) {
   const changed = Array.isArray(models) ? models : [];
   if (typeof invalidate !== "function") {
@@ -67,10 +69,15 @@ export async function rebuildAfterRegistryUpdate({
       import("./protocol-proof.mjs"),
       import("./catalog-rebuild.mjs"),
     ]);
+    const { transaction: injectedTransaction, ...generationOptions } = transactionOptions;
     // Proof removal and generation switch are one registry transaction. Do
     // not publish an invalidation generation and immediately publish again.
     return invalidateProtocolProofsForModels(changed, {
-      transaction: (input) => transactNodeStateMutation({ ...input, reason: "registry-update" }),
+      ...generationOptions,
+      transaction: (input) => (injectedTransaction || transactNodeStateMutation)({
+        ...input,
+        reason: "registry-update",
+      }),
     });
   } else {
     await invalidate(changed);
@@ -87,7 +94,7 @@ export async function rebuildAfterRegistryUpdate({
  * credentials, account ids, mtimes and token fingerprints never leave the
  * session module. Changes racing an active build request one later build.
  */
-export function createNativeSessionSnapshotObserver({ rebuild } = {}) {
+export function createNativeSessionSnapshotObserver({ rebuild, refreshTargets } = {}) {
   if (typeof rebuild !== "function") throw new Error("A native-session observer requires rebuild().");
   let desired;
   let published;
@@ -103,6 +110,7 @@ export function createNativeSessionSnapshotObserver({ rebuild } = {}) {
       try {
         await rebuild("native-session-usability");
         published = target;
+        if (typeof refreshTargets === "function") await refreshTargets();
       } catch (error) {
         // This is deliberately non-sensitive: callers can retry the same
         // usability state and no credential-derived detail leaves the module.

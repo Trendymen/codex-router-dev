@@ -199,6 +199,110 @@ test("an incomplete legacy artifact set fails closed before any bootstrap pointe
   }
 });
 
+test("a legacy merged-only installation bootstraps deterministic empty companion snapshots", () => {
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), "catalog-generation-merged-only-"));
+  const generationsDir = path.join(stateDir, "catalog-generations");
+  const legacyPaths = Object.fromEntries(artifactNames.map((name) => [name, path.join(stateDir, name)]));
+  const old = artifacts("legacy-merged-only");
+  const oldMergedBytes = Buffer.from(`${JSON.stringify(old["merged-models.json"], null, 2)}\n`);
+  const expectedBootstrap = {
+    "merged-models.json": oldMergedBytes,
+    "routed-models.json": Buffer.from('{\n  "models": []\n}\n'),
+    "node-routes.json": Buffer.from('{\n  "version": 1,\n  "routes": []\n}\n'),
+    "control-models.json": Buffer.from('{\n  "version": 1,\n  "models": []\n}\n'),
+    "swift-models.json": Buffer.from('{\n  "version": 1,\n  "models": []\n}\n'),
+    "browser-models.json": Buffer.from('{\n  "version": 1,\n  "models": []\n}\n'),
+  };
+  const base = testOperations();
+  let oldView;
+  let currentRenames = 0;
+  try {
+    writeFileSync(legacyPaths["merged-models.json"], oldMergedBytes, { mode: 0o640 });
+    const operations = {
+      ...base,
+      rename(source, target) {
+        if (path.basename(target) === "current" && ++currentRenames === 2) {
+          oldView = readCurrent(generationsDir);
+          for (const name of artifactNames) assert.deepEqual(readFileSync(legacyPaths[name]), expectedBootstrap[name]);
+        }
+        return base.rename(source, target);
+      },
+    };
+    publishCatalogGeneration({
+      files: artifacts("merged-only-new"), generationsDir, legacyPaths, operations,
+    });
+    assert.equal(currentRenames, 2);
+    assert.deepEqual(oldView, expectedBootstrap);
+    const bootstrap = readdirSync(generationsDir).find((name) => name.startsWith("bootstrap-"));
+    assert.ok(bootstrap);
+    if (process.platform !== "win32") {
+      for (const name of artifactNames) {
+        assert.equal(statSync(path.join(generationsDir, bootstrap, name)).mode & 0o777, 0o600);
+      }
+    }
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("bootstrap pointer rename failure removes its temporary pointer", () => {
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), "catalog-generation-bootstrap-pointer-residue-"));
+  const generationsDir = path.join(stateDir, "catalog-generations");
+  const legacyPaths = Object.fromEntries(artifactNames.map((name) => [name, path.join(stateDir, name)]));
+  const oldMergedBytes = Buffer.from(`${JSON.stringify(artifacts("bootstrap-pointer-old")["merged-models.json"], null, 2)}\n`);
+  const base = testOperations();
+  try {
+    writeFileSync(legacyPaths["merged-models.json"], oldMergedBytes, { mode: 0o640 });
+    assert.throws(() => publishCatalogGeneration({
+      files: artifacts("bootstrap-pointer-new"),
+      generationsDir,
+      legacyPaths,
+      operations: {
+        ...base,
+        rename(source, target) {
+          if (path.basename(target) === "current") throw new Error("injected bootstrap pointer rename failure");
+          return base.rename(source, target);
+        },
+      },
+    }), /injected bootstrap pointer rename failure/);
+    assert.deepEqual(readFileSync(legacyPaths["merged-models.json"]), oldMergedBytes);
+    assert.throws(() => lstatSync(path.join(generationsDir, "current")), /ENOENT/);
+    assert.equal(readdirSync(generationsDir).some((name) => name.startsWith(".bootstrap-current-")), false);
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("stable topology rename failure removes its catalog-next temporary link", () => {
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), "catalog-generation-stable-residue-"));
+  const generationsDir = path.join(stateDir, "catalog-generations");
+  const legacyPaths = Object.fromEntries(artifactNames.map((name) => [name, path.join(stateDir, name)]));
+  const base = testOperations();
+  try {
+    publishCatalogGeneration({ files: artifacts("stable-old"), generationsDir, legacyPaths: {}, operations: base });
+    for (const name of artifactNames) {
+      writeFileSync(legacyPaths[name], Buffer.from(`${JSON.stringify(artifacts("stable-regular")[name], null, 2)}\n`));
+    }
+    assert.throws(() => publishCatalogGeneration({
+      files: artifacts("stable-new"),
+      generationsDir,
+      legacyPaths,
+      operations: {
+        ...base,
+        rename(source, target) {
+          if (target.includes(".json") && source.includes(".catalog-next-")) {
+            throw new Error("injected stable topology rename failure");
+          }
+          return base.rename(source, target);
+        },
+      },
+    }), /injected stable topology rename failure/);
+    assert.equal(readdirSync(stateDir).some((name) => name.includes(".catalog-next-")), false);
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
 test("first publication bootstraps a complete old generation before switching current to new", () => {
   const stateDir = mkdtempSync(path.join(os.tmpdir(), "catalog-generation-bootstrap-"));
   const generationsDir = path.join(stateDir, "catalog-generations");
@@ -421,6 +525,60 @@ test("bootstrap migration fault matrix restores legacy topology after every obse
             `${operation} #${ordinal} left bootstrap staging behind`,
           );
         }
+      } finally {
+        rmSync(stateDir, { recursive: true, force: true });
+      }
+    }
+  }
+});
+
+function mergedOnlyLegacyFixture(stateDir) {
+  const generationsDir = path.join(stateDir, "catalog-generations");
+  const legacyPaths = Object.fromEntries(artifactNames.map((name) => [name, path.join(stateDir, name)]));
+  const merged = Buffer.from(`${JSON.stringify(artifacts("merged-only-matrix-old")["merged-models.json"], null, 2)}\n`);
+  writeFileSync(legacyPaths["merged-models.json"], merged, { mode: 0o640 });
+  return { generationsDir, legacyPaths, merged, mode: statSync(legacyPaths["merged-models.json"]).mode & 0o777 };
+}
+
+test("merged-only bootstrap fault matrix preserves its legacy view at every authority ordinal", () => {
+  const probeDir = mkdtempSync(path.join(os.tmpdir(), "catalog-generation-merged-only-probe-"));
+  let counts;
+  try {
+    const fixture = mergedOnlyLegacyFixture(probeDir);
+    counts = {};
+    publishCatalogGeneration({
+      files: artifacts("merged-only-matrix-probe"),
+      generationsDir: fixture.generationsDir,
+      legacyPaths: fixture.legacyPaths,
+      operations: countedOperations(testOperations(), counts),
+    });
+  } finally {
+    rmSync(probeDir, { recursive: true, force: true });
+  }
+
+  for (const [operation, total] of Object.entries(counts)) {
+    for (let ordinal = 1; ordinal <= total; ordinal += 1) {
+      const stateDir = mkdtempSync(path.join(os.tmpdir(), "catalog-generation-merged-only-matrix-"));
+      try {
+        const fixture = mergedOnlyLegacyFixture(stateDir);
+        assert.throws(() => publishCatalogGeneration({
+          files: artifacts(`merged-only-${operation}-${ordinal}`),
+          generationsDir: fixture.generationsDir,
+          legacyPaths: fixture.legacyPaths,
+          operations: countedOperations(testOperations(), {}, { operation, ordinal }),
+        }), new RegExp(`injected ${operation} #${ordinal}`));
+        assert.throws(() => lstatSync(path.join(fixture.generationsDir, "current")), /ENOENT/);
+        assert.deepEqual(readFileSync(fixture.legacyPaths["merged-models.json"]), fixture.merged);
+        if (process.platform !== "win32") {
+          assert.equal(statSync(fixture.legacyPaths["merged-models.json"]).mode & 0o777, fixture.mode);
+        }
+        for (const name of artifactNames.slice(1)) assert.equal(existsSync(fixture.legacyPaths[name]), false);
+        if (existsSync(fixture.generationsDir)) {
+          assert.equal(readdirSync(fixture.generationsDir).some((name) => (
+            name.startsWith("bootstrap-") || name.startsWith(".staging-") || name.startsWith(".bootstrap-current-")
+          )), false, `${operation} #${ordinal} left bootstrap residue behind`);
+        }
+        assert.equal(readdirSync(stateDir).some((name) => name.includes(".catalog-next-")), false);
       } finally {
         rmSync(stateDir, { recursive: true, force: true });
       }

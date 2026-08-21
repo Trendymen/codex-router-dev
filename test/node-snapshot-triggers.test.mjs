@@ -13,8 +13,63 @@ const {
   rebuildAfterStartup,
   transactNodeMutationAndRefreshTargets,
 } = await import("../src/node-snapshot-triggers.mjs");
+const {
+  BROWSER_MODELS_PATH,
+  CATALOG_GENERATIONS_DIR,
+  CONTROL_MODELS_PATH,
+  MERGED_CATALOG_PATH,
+  NODE_ROUTES_PATH,
+  PROTOCOL_PROOFS_PATH,
+  ROUTED_CATALOG_PATH,
+  SWIFT_MODELS_PATH,
+} = await import("../src/paths.mjs");
+const { readProtocolProof } = await import("../src/protocol-proof.mjs");
+const { publishCatalogGeneration } = await import("../src/catalog-generation.mjs");
 
 after(() => rmSync(transactionStateDir, { recursive: true, force: true }));
+
+const generationPaths = Object.freeze({
+  "merged-models.json": MERGED_CATALOG_PATH,
+  "routed-models.json": ROUTED_CATALOG_PATH,
+  "node-routes.json": NODE_ROUTES_PATH,
+  "control-models.json": CONTROL_MODELS_PATH,
+  "swift-models.json": SWIFT_MODELS_PATH,
+  "browser-models.json": BROWSER_MODELS_PATH,
+});
+
+function generationArtifacts(label) {
+  const catalog = {
+    models: [{
+      slug: `router/${label}`,
+      base_instructions: `instructions ${label}`,
+      model_messages: { instructions_template: `template ${label}` },
+      supports_parallel_tool_calls: false,
+    }],
+  };
+  const models = { version: 1, models: [] };
+  return {
+    "merged-models.json": catalog,
+    "routed-models.json": catalog,
+    "node-routes.json": { version: 1, routes: [] },
+    "control-models.json": models,
+    "swift-models.json": models,
+    "browser-models.json": models,
+  };
+}
+
+function seedPublishedGeneration(label) {
+  rmSync(CATALOG_GENERATIONS_DIR, { recursive: true, force: true });
+  for (const target of Object.values(generationPaths)) rmSync(target, { force: true });
+  publishCatalogGeneration({ files: generationArtifacts(label) });
+  return Object.fromEntries(Object.entries(generationPaths).map(([name, target]) => [name, readFileSync(target)]));
+}
+
+function assertPublishedGeneration(snapshot) {
+  for (const [name, target] of Object.entries(generationPaths)) {
+    assert.deepEqual(readFileSync(target), snapshot[name], `${name} stable export changed`);
+    assert.deepEqual(readFileSync(path.join(CATALOG_GENERATIONS_DIR, "current", name)), snapshot[name], `${name} current export changed`);
+  }
+}
 
 test("startup rebuild waits for a base catalog instead of failing a cold service", async () => {
   const calls = [];
@@ -32,6 +87,23 @@ test("startup rebuild waits for a base catalog instead of failing a cold service
   assert.deepEqual(calls, ["service-startup"]);
 });
 
+test("startup forwards its real rebuild seam and leaves external refresh outside a failed publish", async () => {
+  const calls = [];
+  const oldGeneration = seedPublishedGeneration("startup-failure-old");
+  await assert.rejects(
+    rebuildAfterStartup({
+      hasBaseCatalog: () => true,
+      buildFiles: async ({ reason }) => {
+        calls.push(["build", reason]);
+        throw new Error("injected startup generation failure");
+      },
+    }),
+    /injected startup generation failure/,
+  );
+  assert.deepEqual(calls, [["build", "service-startup"]]);
+  assertPublishedGeneration(oldGeneration);
+});
+
 test("registry completion invalidates stale proofs before one unified rebuild", async () => {
   const calls = [];
   await rebuildAfterRegistryUpdate({
@@ -43,6 +115,56 @@ test("registry completion invalidates stale proofs before one unified rebuild", 
     ["invalidate", ["a", "b"]],
     ["rebuild", "registry-update"],
   ]);
+});
+
+test("registry completion composes proof invalidation with the same failed generation transaction", async () => {
+  const oldGeneration = seedPublishedGeneration("registry-failure-old");
+  const stale = {
+    slug: "registry/stale",
+    provider: "old-provider",
+    upstreamModel: "old-model",
+    transport: "openai-responses",
+    toolDialect: "responses-functions",
+    requestProfile: "old-profile",
+    verdict: "passing",
+    fingerprint: "old-fingerprint",
+    verifierVersion: 1,
+    measuredFinalReasoningShape: "raw-content",
+    verifiedAt: "2026-08-22T00:00:00.000Z",
+  };
+  writeFileSync(PROTOCOL_PROOFS_PATH, JSON.stringify({
+    version: 1, revision: 1, revisions: { [stale.slug]: 1 }, proofs: { [stale.slug]: stale },
+  }));
+  await assert.rejects(
+    rebuildAfterRegistryUpdate({
+      models: [{ ...stale, effectiveTransport: stale.transport }],
+      buildFiles: async () => {
+        assert.equal(readProtocolProof(stale.slug), null, "invalidation must be visible inside the generation transaction");
+        throw new Error("injected registry generation failure");
+      },
+    }),
+    /injected registry generation failure/,
+  );
+  assert.deepEqual(readProtocolProof(stale.slug), stale);
+  assertPublishedGeneration(oldGeneration);
+});
+
+test("native-session observer refreshes targets only after a successful retry", async () => {
+  const calls = [];
+  let attempts = 0;
+  const observer = createNativeSessionSnapshotObserver({
+    rebuild: async () => {
+      attempts += 1;
+      calls.push(`build:${attempts}`);
+      if (attempts === 1) throw new Error("injected native generation failure");
+    },
+    refreshTargets: async () => calls.push(`refresh:${attempts}`),
+  });
+  await observer.observe({ usable: false });
+  await assert.rejects(observer.observe({ usable: true }), /injected native generation failure/);
+  assert.deepEqual(calls, ["build:1"]);
+  await observer.observe({ usable: true });
+  assert.deepEqual(calls, ["build:1", "build:2", "refresh:2"]);
 });
 
 test("target picker refresh runs only after the router state and generation commit", async () => {

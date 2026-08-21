@@ -170,13 +170,14 @@ export function observeNativeSessionUsability(usable, {
       // publication lock or turn that normal state into an asynchronous retry.
       if (!existsSync(MERGED_CATALOG_PATH)) return undefined;
       const { rebuildNodeSnapshots } = await import("./catalog-rebuild.mjs");
-      const publication = await rebuildNodeSnapshots(reason);
-      // DSH/Gemini documents are outside the Router transaction; refresh only
-      // after the generation pointer has switched, and never rerun Codex's old
-      // standalone catalog writer.
+      return rebuildNodeSnapshots(reason);
+    },
+    // DSH/Gemini documents are outside the Router transaction; refresh only
+    // after the generation pointer has switched, and never rerun Codex's old
+    // standalone catalog writer.
+    refreshTargets: async () => {
       const { refreshTargetPickerIfInstalled } = await import("./target-integration.mjs");
-      refreshTargetPickerIfInstalled({ rebuildCodex: false });
-      return publication;
+      return refreshTargetPickerIfInstalled({ rebuildCodex: false });
     },
   })),
 } = {}) {

@@ -210,7 +210,16 @@ function installStableLegacyTopology(operations, entries, snapshots) {
     // Rename replaces a stable link atomically on the macOS authority path.
     // On Windows an existing entry is intentionally refused rather than
     // unlinking it and opening a missing/mixed reader window.
-    operations.rename(next, target);
+    try {
+      operations.rename(next, target);
+    } catch (error) {
+      try {
+        if (isPresent(operations, next)) operations.unlink(next);
+      } catch (cleanupError) {
+        throw new AggregateError([error, cleanupError], "Stable catalog topology rename failed and cleanup was incomplete.");
+      }
+      throw error;
+    }
     operations.fsyncDirectory(path.dirname(target));
   }
 }
@@ -220,20 +229,62 @@ function legacyEntries(legacyPaths) {
   return CATALOG_GENERATION_FILES.map((name) => [name, path.join(STATE_DIR, name)]);
 }
 
-function bootstrapLegacyGeneration(operations, entries, snapshots, generationsDir, currentDir, state) {
+function bootstrapEmptyArtifact(name) {
+  if (name === "routed-models.json") return { models: [] };
+  if (name === "node-routes.json") return { version: 1, routes: [] };
+  return { version: 1, models: [] };
+}
+
+function validateLegacyBootstrapArtifact(name, contents) {
+  let value;
+  try {
+    value = JSON.parse(Buffer.from(contents).toString("utf8"));
+  } catch (error) {
+    throw new Error(`Cannot bootstrap catalog generations: legacy ${name} is invalid JSON.`, { cause: error });
+  }
+  if (name === "merged-models.json") return validateCatalogSchema(value, MERGED_CATALOG_SCHEMA);
+  if (name === "routed-models.json") {
+    validateCatalogSchema(value, CATALOG_0147_SCHEMA);
+    return validateCatalogSchema(value, CATALOG_0149_SCHEMA);
+  }
+  const routes = name === "node-routes.json" ? "routes" : "models";
+  if (!value || typeof value !== "object" || Array.isArray(value) || value.version !== 1 || !Array.isArray(value[routes])) {
+    throw new Error(`Cannot bootstrap catalog generations: legacy ${name} has an invalid safe snapshot shape.`);
+  }
+  return value;
+}
+
+function legacyBootstrapContents(entries, snapshots) {
   if (
     entries.length !== CATALOG_GENERATION_FILES.length
     || CATALOG_GENERATION_FILES.some((name) => !entries.some(([entry]) => entry === name))
-    || snapshots.some((snapshot) => !snapshot.present || snapshot.preserve)
+    || snapshots.some((snapshot) => snapshot.preserve)
   ) {
     throw new Error("Cannot bootstrap catalog generations from an incomplete legacy artifact set.");
   }
+  const byName = new Map(entries.map(([name, target]) => [name, snapshots.find((snapshot) => snapshot.path === target)]));
+  const merged = byName.get("merged-models.json");
+  const companionNames = CATALOG_GENERATION_FILES.filter((name) => name !== "merged-models.json");
+  const complete = snapshots.every((snapshot) => snapshot.present);
+  const mergedOnly = merged?.present === true && companionNames.every((name) => byName.get(name)?.present === false);
+  if (!complete && !mergedOnly) {
+    throw new Error("Cannot bootstrap catalog generations from an incomplete legacy artifact set.");
+  }
+  return new Map(CATALOG_GENERATION_FILES.map((name) => {
+    const snapshot = byName.get(name);
+    const contents = snapshot.present ? snapshot.contents : jsonBytes(bootstrapEmptyArtifact(name));
+    validateLegacyBootstrapArtifact(name, contents);
+    return [name, contents];
+  }));
+}
+
+function bootstrapLegacyGeneration(operations, entries, snapshots, generationsDir, currentDir, state) {
+  const contentsByName = legacyBootstrapContents(entries, snapshots);
   const { generation: bootstrap } = state;
   const { staging, final, pointer } = state;
   operations.mkdir(staging, { mode: 0o700 });
-  for (const [name, target] of entries) {
-    const snapshot = snapshots.find((entry) => entry.path === target);
-    const contents = snapshot.contents;
+  for (const [name] of entries) {
+    const contents = contentsByName.get(name);
     const output = path.join(staging, name);
     operations.writeFile(output, contents, { mode: 0o600 });
     operations.chmod(output, 0o600);
@@ -423,6 +474,9 @@ export function publishCatalogGeneration({
       if (isPresent(operations, staging)) operations.remove(staging, { recursive: true, force: true });
       if (isPresent(operations, final) && active !== generation) operations.remove(final, { recursive: true, force: true });
       if (bootstrapState) {
+        if (isPresent(operations, bootstrapState.pointer)) {
+          operations.remove(bootstrapState.pointer, { recursive: true, force: true });
+        }
         if (isPresent(operations, bootstrapState.staging)) {
           operations.remove(bootstrapState.staging, { recursive: true, force: true });
         }
