@@ -1,5 +1,11 @@
 import assert from "node:assert/strict";
-import { test } from "node:test";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { after, test } from "node:test";
+
+const transactionStateDir = mkdtempSync(path.join(os.tmpdir(), "node-trigger-rollback-"));
+process.env.MODEL_ROUTER_STATE_DIR = transactionStateDir;
 
 const {
   createNativeSessionSnapshotObserver,
@@ -7,6 +13,8 @@ const {
   rebuildAfterStartup,
   transactNodeMutationAndRefreshTargets,
 } = await import("../src/node-snapshot-triggers.mjs");
+
+after(() => rmSync(transactionStateDir, { recursive: true, force: true }));
 
 test("startup rebuild waits for a base catalog instead of failing a cold service", async () => {
   const calls = [];
@@ -127,3 +135,31 @@ test("native-session publication failure leaves the same usable state retryable"
   assert.equal(attempts, 2);
   assert.deepEqual(observer.snapshot(), { usable: true, desiredUsable: true });
 });
+
+for (const reason of [
+  "credential:set:deepseek",
+  "provider-selection:enable:deepseek",
+  "model-visibility:deepseek/deepseek-v4-flash:hide",
+  "canary:deepseek/deepseek-v4-flash:on",
+  "native-session-usability",
+  "service-startup",
+  "registry-update",
+]) {
+  test(`${reason} generation failure restores Router state before any external refresh`, async () => {
+    const state = path.join(transactionStateDir, `${reason.replaceAll(/[^a-z0-9]/gi, "-")}.json`);
+    writeFileSync(state, "old\n");
+    const refreshes = [];
+    await assert.rejects(
+      transactNodeMutationAndRefreshTargets({
+        files: [state],
+        reason,
+        mutate: () => writeFileSync(state, "new\n"),
+        buildFiles: async () => { throw new Error(`injected ${reason} generation failure`); },
+        refreshTargets: () => refreshes.push(reason),
+      }),
+      /injected .* generation failure/,
+    );
+    assert.equal(readFileSync(state, "utf8"), "old\n");
+    assert.deepEqual(refreshes, []);
+  });
+}

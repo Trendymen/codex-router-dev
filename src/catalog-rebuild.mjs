@@ -19,6 +19,16 @@ import { MERGED_CATALOG_PATH, NATIVE_CATALOG_PATH, ROUTED_CATALOG_PATH } from ".
 let activeRebuild;
 let queuedRebuild;
 
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
 function readJson(target, label) {
   try {
     return JSON.parse(readFileSync(target, "utf8"));
@@ -88,7 +98,10 @@ export async function buildNodeSnapshotFiles() {
   let nativeModels;
   if (existsSync(NATIVE_CATALOG_PATH)) {
     const native = readJson(NATIVE_CATALOG_PATH, "native catalog");
-    nativeModels = Array.isArray(native.models) ? native.models : [];
+    if (!Array.isArray(native.models) || native.models.length === 0) {
+      throw new Error("Cannot rebuild Node snapshots: native catalog has no models.");
+    }
+    nativeModels = native.models;
   } else {
     const priorRouted = existsSync(ROUTED_CATALOG_PATH)
       ? readJson(ROUTED_CATALOG_PATH, "prior routed catalog")
@@ -96,9 +109,11 @@ export async function buildNodeSnapshotFiles() {
     const routedSlugs = new Set((priorRouted.models || []).map((model) => String(model?.slug || "")));
     nativeModels = previous.models.filter((model) => !routedSlugs.has(String(model?.slug)));
   }
-  nativeModels = nativeModels.map((model) => hiddenModels.has(String(model?.slug))
-    ? { ...model, visibility: "hide" }
-    : model);
+  nativeModels = nativeModels.map((model) => ({
+    ...model,
+    supports_parallel_tool_calls: model?.supports_parallel_tool_calls === true,
+    ...(hiddenModels.has(String(model?.slug)) ? { visibility: "hide" } : {}),
+  }));
   // A legacy generation can lack an authoritative native capture. Keep its
   // template only for shaping; do not carry it into the merged result.
   const routed = buildRoutedCatalog({
@@ -171,26 +186,46 @@ export async function rebuildNodeSnapshots(reason, {
   if (alreadyLocked) return rebuild();
   // One shared rebuild drains a concurrent burst, then performs at most one
   // follow-up pass for changes observed while its files were being built.
-  queuedRebuild = { reason, buildFiles, publish, catalogLock };
-  if (activeRebuild) return activeRebuild;
+  const waiter = deferred();
+  const request = { reason, buildFiles, publish, catalogLock, waiters: [waiter] };
+  if (activeRebuild) {
+    // The latest trigger supplies the next build inputs, while every caller
+    // that arrived during the active pass receives that follow-up's result.
+    if (queuedRebuild) {
+      queuedRebuild.reason = reason;
+      queuedRebuild.buildFiles = buildFiles;
+      queuedRebuild.publish = publish;
+      queuedRebuild.catalogLock = catalogLock;
+      queuedRebuild.waiters.push(waiter);
+    } else {
+      queuedRebuild = request;
+    }
+    return waiter.promise;
+  }
   activeRebuild = (async () => {
-    let result;
+    let next = request;
     try {
-      do {
-        const next = queuedRebuild;
+      while (next) {
+        try {
+          const result = await next.catalogLock(async () => {
+            const files = await next.buildFiles({ reason: next.reason });
+            const publication = await next.publish(files, { reason: next.reason });
+            return Object.freeze({ reason: next.reason, files, publication });
+          });
+          for (const pending of next.waiters) pending.resolve(result);
+        } catch (error) {
+          for (const pending of next.waiters) pending.reject(error);
+        }
+        next = queuedRebuild;
         queuedRebuild = undefined;
-        result = await next.catalogLock(async () => {
-          const files = await next.buildFiles({ reason: next.reason });
-          const publication = await next.publish(files, { reason: next.reason });
-          return Object.freeze({ reason: next.reason, files, publication });
-        });
-      } while (queuedRebuild);
-      return result;
+      }
     } finally {
       activeRebuild = undefined;
     }
   })();
-  return activeRebuild;
+  // `activeRebuild` deliberately absorbs per-request failures after delivering
+  // them to their callers, so a dirty follow-up always drains.
+  return waiter.promise;
 }
 
 /**

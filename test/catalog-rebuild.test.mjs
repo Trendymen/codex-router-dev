@@ -15,6 +15,7 @@ const {
   publishCatalogGeneration,
 } = await import("../src/catalog-generation.mjs");
 const {
+  buildNodeSnapshotFiles,
   rebuildNodeSnapshots,
   transactNodeStateMutation,
 } = await import("../src/catalog-rebuild.mjs");
@@ -124,6 +125,47 @@ test("default Node snapshot rebuild republishes one complete generation from the
   for (const name of Object.keys(artifacts("unused"))) {
     assert.ok(readFileSync(path.join(stateDir, name)).byteLength > 0, name);
   }
+});
+
+test("an empty native capture fails closed without replacing the current generation", async () => {
+  publishCatalogGeneration({ files: artifacts("old-native"), operations: testOperations() });
+  const previous = readFileSync(path.join(stateDir, "merged-models.json"));
+  writeFileSync(path.join(stateDir, "native-models.json"), "{\"models\":[]}\n");
+
+  await assert.rejects(buildNodeSnapshotFiles(), /native catalog has no models/);
+  assert.deepEqual(readFileSync(path.join(stateDir, "merged-models.json")), previous);
+});
+
+test("a queued rebuild runs after an active rebuild fails and returns its own result", async () => {
+  let failActive;
+  const activeStarted = new Promise((resolve) => { failActive = resolve; });
+  let enteredActive;
+  const entered = new Promise((resolve) => { enteredActive = resolve; });
+  const calls = [];
+  const first = rebuildNodeSnapshots("active", {
+    catalogLock: async (operation) => operation(),
+    buildFiles: async () => {
+      calls.push("active");
+      enteredActive();
+      await activeStarted;
+      throw new Error("active generation failure");
+    },
+    publish: async () => undefined,
+  });
+  await entered;
+  const second = rebuildNodeSnapshots("queued", {
+    catalogLock: async (operation) => operation(),
+    buildFiles: async () => {
+      calls.push("queued");
+      return artifacts("queued");
+    },
+    publish: async () => ({ generation: "queued" }),
+  });
+  failActive();
+
+  await assert.rejects(first, /active generation failure/);
+  assert.equal((await second).reason, "queued");
+  assert.deepEqual(calls, ["active", "queued"]);
 });
 
 test("concurrent verification records for distinct slugs preserve both proofs", async () => {

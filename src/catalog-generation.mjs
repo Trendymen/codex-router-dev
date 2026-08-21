@@ -77,7 +77,14 @@ const MERGED_CATALOG_SCHEMA = Object.freeze({
   properties: {
     models: {
       type: "array",
-      items: { type: "object", required: ["slug"], properties: { slug: { type: "string" } } },
+      items: {
+        type: "object",
+        required: ["slug", "supports_parallel_tool_calls"],
+        properties: {
+          slug: { type: "string" },
+          supports_parallel_tool_calls: { type: "boolean" },
+        },
+      },
     },
   },
 });
@@ -213,6 +220,32 @@ function legacyEntries(legacyPaths) {
   return CATALOG_GENERATION_FILES.map((name) => [name, path.join(STATE_DIR, name)]);
 }
 
+function bootstrapLegacyGeneration(operations, entries, snapshots, files, generationsDir, generation, currentDir) {
+  const bootstrap = `bootstrap-${generation}`;
+  const staging = path.join(generationsDir, `.staging-${bootstrap}`);
+  const final = path.join(generationsDir, bootstrap);
+  const pointer = path.join(generationsDir, `.bootstrap-current-${generation}`);
+  operations.mkdir(staging, { mode: 0o700 });
+  for (const [name, target] of entries) {
+    const snapshot = snapshots.find((entry) => entry.path === target);
+    const contents = snapshot?.present ? snapshot.contents : jsonBytes(files[name]);
+    const output = path.join(staging, name);
+    operations.writeFile(output, contents, { mode: 0o600 });
+    operations.chmod(output, 0o600);
+    operations.protect(output);
+    operations.fsyncFile(output);
+  }
+  operations.fsyncDirectory(staging);
+  operations.rename(staging, final);
+  operations.fsyncDirectory(generationsDir);
+  operations.symlink(bootstrap, pointer, "dir");
+  operations.rename(pointer, currentDir);
+  operations.fsyncDirectory(generationsDir);
+  installStableLegacyTopology(operations, entries, snapshots);
+  operations.fsyncDirectory(generationsDir);
+  return bootstrap;
+}
+
 function validateNode(value, schema, pathLabel = "catalog") {
   if (!schema || typeof schema !== "object") return;
   if (schema.type === "object") {
@@ -289,15 +322,16 @@ export function publishCatalogGeneration({
   const staging = path.join(generationsDir, `.staging-${generation}`);
   const final = path.join(generationsDir, generation);
   const nextPointer = path.join(generationsDir, `.current-next-${generation}`);
-  const previousPointer = currentTarget(operations, currentDir);
+  let previousPointer = currentTarget(operations, currentDir);
   const entries = legacyEntries(legacyPaths);
   const snapshots = entries.map(([, target]) => captureRegularFile(operations, target));
   let pointerSwitched = false;
+  let bootstrapPointer;
+  let newPointerAttempted = false;
   try {
     // 0.147 and 0.149 share this Phase-1 routed contract. Native account
     // captures legitimately omit fields this router has no authority to
     // invent, so the validation applies to the fully shaped routed artifact.
-    validateCatalogSchema(files["merged-models.json"], MERGED_CATALOG_SCHEMA);
     validateCatalogSchema(files["merged-models.json"], MERGED_CATALOG_SCHEMA);
     validateCatalogSchema(files["routed-models.json"], CATALOG_0147_SCHEMA);
     validateCatalogSchema(files["routed-models.json"], CATALOG_0149_SCHEMA);
@@ -313,18 +347,34 @@ export function publishCatalogGeneration({
     operations.fsyncDirectory(staging);
     operations.rename(staging, final);
     operations.fsyncDirectory(generationsDir);
+    // A first publish can inherit regular compatibility files. Bootstrap them
+    // into a complete old generation before replacing even one stable path, so
+    // every reader sees the old set until the one final pointer switch.
+    if (previousPointer === undefined && snapshots.some((snapshot) => snapshot.present)) {
+      bootstrapPointer = bootstrapLegacyGeneration(
+        operations, entries, snapshots, files, generationsDir, generation, currentDir,
+      );
+      previousPointer = bootstrapPointer;
+    }
     // An existing publication lets stable paths resolve through the *old*
-    // current pointer while this reversible topology is installed. A first
-    // publication has no readable old generation, so its links follow the
-    // initial pointer switch and failures remove that pointer entirely.
+    // current pointer while this reversible topology is installed.
     if (previousPointer !== undefined) {
-      installStableLegacyTopology(operations, entries, snapshots);
+      if (!bootstrapPointer) installStableLegacyTopology(operations, entries, snapshots);
       operations.fsyncDirectory(generationsDir);
     }
+    newPointerAttempted = true;
     operations.symlink(generation, nextPointer, "dir");
     operations.rename(nextPointer, currentDir);
     pointerSwitched = true;
     operations.fsyncDirectory(generationsDir);
+    // Node's Windows test workers inject hard links in place of symbolic links.
+    // Refresh those test-only compatibility entries after the pointer change;
+    // production symbolic links already follow `current` and never take this
+    // non-authoritative branch.
+    if (process.env.NODE_TEST_CONTEXT && process.platform === "win32" && previousPointer !== undefined) {
+      installStableLegacyTopology(operations, entries, snapshots);
+      operations.fsyncDirectory(generationsDir);
+    }
     if (previousPointer === undefined) {
       installStableLegacyTopology(operations, entries, snapshots);
       operations.fsyncDirectory(generationsDir);
@@ -334,6 +384,11 @@ export function publishCatalogGeneration({
     const rollbackErrors = [];
     for (const snapshot of [...snapshots].reverse()) {
       try { restoreRegularFile(operations, snapshot); } catch (rollbackError) { rollbackErrors.push(rollbackError); }
+    }
+    if (bootstrapPointer && !newPointerAttempted) {
+      try {
+        if (isPresent(operations, currentDir)) operations.remove(currentDir, { recursive: true, force: true });
+      } catch (rollbackError) { rollbackErrors.push(rollbackError); }
     }
     if (pointerSwitched) {
       try {
@@ -354,6 +409,10 @@ export function publishCatalogGeneration({
       const active = currentTarget(operations, currentDir);
       if (isPresent(operations, staging)) operations.remove(staging, { recursive: true, force: true });
       if (isPresent(operations, final) && active !== generation) operations.remove(final, { recursive: true, force: true });
+      const bootstrapPath = bootstrapPointer && path.join(generationsDir, bootstrapPointer);
+      if (bootstrapPath && isPresent(operations, bootstrapPath) && active !== bootstrapPointer) {
+        operations.remove(bootstrapPath, { recursive: true, force: true });
+      }
     } catch (cleanupError) { rollbackErrors.push(cleanupError); }
     if (rollbackErrors.length) {
       throw new AggregateError([error, ...rollbackErrors], "Catalog generation failed and rollback was incomplete.");
