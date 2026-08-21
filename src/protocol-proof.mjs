@@ -31,11 +31,36 @@ export function registryFingerprint(model, verifierVersion) {
   })).digest("base64url");
 }
 
+function objectRecord(value) {
+  return value && typeof value === "object" && !Array.isArray(value);
+}
+
+function validProtocolProof(record, slug = record?.slug) {
+  return (
+    objectRecord(record) &&
+    typeof record.slug === "string" &&
+    record.slug.length > 0 &&
+    record.slug === slug &&
+    record.verdict === "passing" &&
+    typeof record.fingerprint === "string" &&
+    record.fingerprint.length > 0 &&
+    Number.isInteger(record.verifierVersion) &&
+    record.verifierVersion > 0 &&
+    typeof record.verifiedAt === "string" &&
+    record.verifiedAt.length > 0
+  );
+}
+
 function readProtocolProofs() {
   if (!existsSync(PROTOCOL_PROOFS_PATH)) return {};
   try {
     const parsed = JSON.parse(readFileSync(PROTOCOL_PROOFS_PATH, "utf8"));
-    if (parsed?.version !== 1 || !parsed.proofs || typeof parsed.proofs !== "object") {
+    if (
+      !objectRecord(parsed) ||
+      parsed.version !== 1 ||
+      !objectRecord(parsed.proofs) ||
+      !Object.entries(parsed.proofs).every(([slug, proof]) => validProtocolProof(proof, slug))
+    ) {
       return {};
     }
     return parsed.proofs;
@@ -51,11 +76,10 @@ export function readProtocolProof(slug) {
 }
 
 export function writePassingProtocolProof(record) {
-  if (!record || record.verdict !== "passing") {
-    throw new Error("Protocol proof writes require a passing verdict.");
+  if (!validProtocolProof(record)) {
+    throw new Error("Protocol proof writes require a complete passing record.");
   }
-  const slug = String(record.slug || "");
-  if (!slug) throw new Error("Protocol proof writes require a model slug.");
+  const slug = record.slug;
   const proofs = readProtocolProofs();
   writePrivateJson(
     PROTOCOL_PROOFS_PATH,

@@ -7,8 +7,17 @@ function readExperimentalModels() {
   if (!existsSync(EXPERIMENTAL_MODELS_PATH)) return new Set();
   try {
     const parsed = JSON.parse(readFileSync(EXPERIMENTAL_MODELS_PATH, "utf8"));
-    if (parsed?.version !== 1 || !Array.isArray(parsed.models)) return new Set();
-    return new Set(parsed.models.filter((slug) => typeof slug === "string"));
+    if (
+      !parsed ||
+      typeof parsed !== "object" ||
+      Array.isArray(parsed) ||
+      parsed.version !== 1 ||
+      !Array.isArray(parsed.models) ||
+      !parsed.models.every((slug) => typeof slug === "string" && slug.length > 0)
+    ) {
+      return new Set();
+    }
+    return new Set(parsed.models);
   } catch {
     return new Set();
   }

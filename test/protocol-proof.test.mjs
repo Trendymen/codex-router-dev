@@ -72,6 +72,16 @@ test("a corrupt canary file fails closed", () => {
   assert.equal(experimentalModelEnabled("qwen-plan/qwen3.7-max"), true);
 });
 
+test("a canary file with any invalid model entry fails closed as a whole", () => {
+  writeFileSync(
+    EXPERIMENTAL_MODELS_PATH,
+    JSON.stringify({ version: 1, models: [passingProof.slug, 17] }),
+    { mode: 0o600 },
+  );
+
+  assert.equal(experimentalModelEnabled(passingProof.slug), false);
+});
+
 test("registry fingerprint covers only the canonical model contract", () => {
   const model = {
     ignored: "not part of the contract",
@@ -101,6 +111,69 @@ test("failed verification never replaces a passing proof", () => {
     () => writePassingProtocolProof({ ...passingProof, verdict: "failed" }),
     /passing/,
   );
+  assert.deepEqual(readProtocolProof(passingProof.slug), passingProof);
+});
+
+test("any invalid proof record makes the whole readable state empty", () => {
+  const invalidRecords = [
+    Object.fromEntries(Object.entries(passingProof).filter(([key]) => key !== "fingerprint")),
+    Object.fromEntries(Object.entries(passingProof).filter(([key]) => key !== "verifierVersion")),
+    { ...passingProof, fingerprint: "" },
+    { ...passingProof, verifierVersion: "1" },
+  ];
+
+  for (const invalid of invalidRecords) {
+    writeFileSync(
+      PROTOCOL_PROOFS_PATH,
+      JSON.stringify({ version: 1, proofs: { [passingProof.slug]: invalid } }),
+      { mode: 0o600 },
+    );
+    assert.equal(readProtocolProof(passingProof.slug), null);
+  }
+});
+
+test("an invalid sibling or mismatched proof key invalidates every proof", () => {
+  const siblingSlug = "qwen-plan/qwen3.7-plus";
+  const invalidSiblings = [
+    { ...passingProof, slug: siblingSlug, fingerprint: "" },
+    { ...passingProof, slug: "qwen-plan/different" },
+  ];
+
+  for (const sibling of invalidSiblings) {
+    writeFileSync(
+      PROTOCOL_PROOFS_PATH,
+      JSON.stringify({
+        version: 1,
+        proofs: { [passingProof.slug]: passingProof, [siblingSlug]: sibling },
+      }),
+      { mode: 0o600 },
+    );
+    assert.equal(readProtocolProof(passingProof.slug), null);
+  }
+});
+
+test("array-shaped proof state is discarded before the next passing write", () => {
+  writeFileSync(
+    PROTOCOL_PROOFS_PATH,
+    JSON.stringify({ version: 1, proofs: [passingProof] }),
+    { mode: 0o600 },
+  );
+
+  writePassingProtocolProof(passingProof);
+
+  assert.deepEqual(
+    JSON.parse(readFileSync(PROTOCOL_PROOFS_PATH, "utf8")),
+    { version: 1, proofs: { [passingProof.slug]: passingProof } },
+  );
+});
+
+test("proof writer rejects records missing any required field", () => {
+  writePassingProtocolProof(passingProof);
+  for (const field of ["slug", "fingerprint", "verifierVersion", "verifiedAt"]) {
+    const incomplete = { ...passingProof };
+    delete incomplete[field];
+    assert.throws(() => writePassingProtocolProof(incomplete), /require/);
+  }
   assert.deepEqual(readProtocolProof(passingProof.slug), passingProof);
 });
 
