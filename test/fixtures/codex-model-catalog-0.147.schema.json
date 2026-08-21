@@ -9,16 +9,14 @@
       "type": "array",
       "items": {
         "type": "object",
-        "required": ["slug", "base_instructions", "model_messages", "supports_parallel_tool_calls"],
+        "required": ["slug", "model_messages"],
         "properties": {
           "slug": { "type": "string" },
-          "base_instructions": { "type": "string" },
           "model_messages": {
             "type": "object",
             "required": ["instructions_template"],
             "properties": { "instructions_template": { "type": "string" } }
           },
-          "supports_parallel_tool_calls": { "type": "boolean" }
         }
       }
     }

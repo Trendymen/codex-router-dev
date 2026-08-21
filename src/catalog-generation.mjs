@@ -30,7 +30,7 @@ export const CATALOG_GENERATION_FILES = Object.freeze([
   "browser-models.json",
 ]);
 
-const ROUTED_CATALOG_SCHEMA = Object.freeze({
+const CATALOG_0147_SCHEMA = Object.freeze({
   type: "object",
   required: ["models"],
   properties: {
@@ -38,15 +38,32 @@ const ROUTED_CATALOG_SCHEMA = Object.freeze({
       type: "array",
       items: {
         type: "object",
-        required: ["slug", "base_instructions", "model_messages", "supports_parallel_tool_calls"],
+        required: ["slug", "model_messages"],
         properties: {
           slug: { type: "string" },
-          base_instructions: { type: "string" },
           model_messages: {
             type: "object",
             required: ["instructions_template"],
             properties: { instructions_template: { type: "string" } },
           },
+        },
+      },
+    },
+  },
+});
+
+const CATALOG_0149_SCHEMA = Object.freeze({
+  ...CATALOG_0147_SCHEMA,
+  properties: {
+    ...CATALOG_0147_SCHEMA.properties,
+    models: {
+      ...CATALOG_0147_SCHEMA.properties.models,
+      items: {
+        ...CATALOG_0147_SCHEMA.properties.models.items,
+        required: ["slug", "base_instructions", "model_messages", "supports_parallel_tool_calls"],
+        properties: {
+          ...CATALOG_0147_SCHEMA.properties.models.items.properties,
+          base_instructions: { type: "string" },
           supports_parallel_tool_calls: { type: "boolean" },
         },
       },
@@ -238,7 +255,8 @@ export function buildRoutedCatalog({ nativeModels = [], routedModels = [] } = {}
     return next;
   }).sort((left, right) => Number(left.priority ?? 999) - Number(right.priority ?? 999)
     || left.slug.localeCompare(right.slug));
-  return validateCatalogSchema({ models }, ROUTED_CATALOG_SCHEMA);
+  validateCatalogSchema({ models }, CATALOG_0147_SCHEMA);
+  return validateCatalogSchema({ models }, CATALOG_0149_SCHEMA);
 }
 
 /**
@@ -268,7 +286,13 @@ export function publishCatalogGeneration({
     // 0.147 and 0.149 share this Phase-1 routed contract. Native account
     // captures legitimately omit fields this router has no authority to
     // invent, so the validation applies to the fully shaped routed artifact.
-    validateCatalogSchema(files["routed-models.json"], ROUTED_CATALOG_SCHEMA);
+    for (const [name, catalog] of Object.entries({
+      "merged-models.json": files["merged-models.json"],
+      "routed-models.json": files["routed-models.json"],
+    })) {
+      validateCatalogSchema(catalog, CATALOG_0147_SCHEMA);
+      validateCatalogSchema(catalog, CATALOG_0149_SCHEMA);
+    }
     operations.mkdir(generationsDir, { recursive: true, mode: 0o700 });
     operations.mkdir(staging, { mode: 0o700 });
     for (const name of CATALOG_GENERATION_FILES) {
