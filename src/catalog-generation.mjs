@@ -71,6 +71,12 @@ const CATALOG_0149_SCHEMA = Object.freeze({
   },
 });
 
+const MERGED_CATALOG_SCHEMA = Object.freeze({
+  type: "object",
+  required: ["models"],
+  properties: { models: { type: "array", items: { type: "object", required: ["slug"], properties: { slug: { type: "string" } } } },
+});
+
 function jsonBytes(value) {
   return Buffer.isBuffer(value)
     ? value
@@ -286,13 +292,10 @@ export function publishCatalogGeneration({
     // 0.147 and 0.149 share this Phase-1 routed contract. Native account
     // captures legitimately omit fields this router has no authority to
     // invent, so the validation applies to the fully shaped routed artifact.
-    for (const [name, catalog] of Object.entries({
-      "merged-models.json": files["merged-models.json"],
-      "routed-models.json": files["routed-models.json"],
-    })) {
-      validateCatalogSchema(catalog, CATALOG_0147_SCHEMA);
-      validateCatalogSchema(catalog, CATALOG_0149_SCHEMA);
-    }
+    validateCatalogSchema(files["merged-models.json"], MERGED_CATALOG_SCHEMA);
+    validateCatalogSchema(files["merged-models.json"], MERGED_CATALOG_SCHEMA);
+    validateCatalogSchema(files["routed-models.json"], CATALOG_0147_SCHEMA);
+    validateCatalogSchema(files["routed-models.json"], CATALOG_0149_SCHEMA);
     operations.mkdir(generationsDir, { recursive: true, mode: 0o700 });
     operations.mkdir(staging, { mode: 0o700 });
     for (const name of CATALOG_GENERATION_FILES) {
