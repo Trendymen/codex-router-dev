@@ -28,6 +28,7 @@
 - `src/protocol-proof.mjs`: fingerprint registry profiles and read/write/revoke exact-slug proof records.
 - `src/experimental-models.mjs`: protected exact-slug canary state.
 - `src/catalog-rebuild.mjs`: coalesce triggers and publish route/catalog/control snapshots under one lock.
+- `src/catalog-generation.mjs`: build immutable snapshot generations and atomically switch one `current` pointer.
 - `src/cc-switch-snippet.mjs`: pure aggregate TOML rendering.
 - `src/standalone-search-doctor.mjs`: read-only feature-gate status and snippet.
 - `test/fixtures/node-route-matrix.json`: independent Appendix B oracle.
@@ -234,6 +235,9 @@ git commit -m "feat: define node model route contract"
 - Modify: `src/protocol-proof.mjs`
 - Create: `src/protocol-proof-verifier.mjs`
 - Modify: `src/control.mjs`
+- Modify: `src/protocol-proof.mjs`
+- Modify: `src/protocol-proof-verifier.mjs`
+- Modify: `src/experimental-models.mjs`
 - Modify: `bin/model-router`
 - Test: `test/protocol-proof.test.mjs`
 - Create: `test/protocol-proof-verifier.test.mjs`
@@ -306,10 +310,19 @@ git commit -m "feat: add quota-gated protocol proofs"
 **Files:**
 - Modify: `src/paths.mjs`
 - Create: `src/catalog-rebuild.mjs`
+- Create: `src/catalog-generation.mjs`
 - Modify: `src/catalog.mjs`
 - Modify: `src/catalog-publication-lock.mjs`
 - Modify: `src/model-overlay-publication.mjs`
 - Modify: `src/routed-client-models.mjs`
+- Modify: `src/provider-onboarding.mjs`
+- Modify: `src/provider-selection.mjs`
+- Modify: `src/model-picker-state.mjs`
+- Modify: `src/codex-native-session.mjs`
+- Modify: `src/target-integration.mjs`
+- Modify: `src/start.mjs`
+- Modify: `src/update.mjs`
+- Modify: `src/control.mjs`
 - Create: `test/fixtures/codex-model-catalog-0.147.schema.json`
 - Create: `test/fixtures/codex-model-catalog-0.149.schema.json`
 - Test: `test/catalog.test.mjs`
@@ -320,7 +333,8 @@ git commit -m "feat: add quota-gated protocol proofs"
 - Consumes: `nodeRoutableModels(state)` from Task 2.
 - Produces: `rebuildNodeSnapshots(reason) -> Promise<SnapshotBuildResult>`.
 - Produces: `buildRoutedCatalog({nativeModels, routedModels}) -> CodexCatalog`.
-- Writes: `merged-models.json`, `routed-models.json`, and route/control/UI snapshots under one lock.
+- Produces: `transactNodeStateMutation({files, mutate, reason}) -> Promise<SnapshotBuildResult>`.
+- Writes: one immutable generation containing `merged-models.json`, `routed-models.json`, and route/control/UI snapshots; fixed paths resolve through one atomically switched `current` generation pointer.
 
 - [ ] **Step 1: Write failing catalog independence and atomicity tests**
 
@@ -333,7 +347,7 @@ for (const activeProvider of ["openai", "codex-router", "deepseek"]) {
 }
 ```
 
-Assert every model has boolean `supports_parallel_tool_calls`, full instructions/messages survive, both 0.147 and 0.149 fixtures parse, experimental defaults are absent, failed validation preserves old bytes, files are `0600`, and concurrent triggers coalesce once.
+Assert every model has boolean `supports_parallel_tool_calls`, full instructions/messages survive, both 0.147 and 0.149 fixtures parse, experimental defaults are absent, failed validation preserves old bytes, generation targets are `0600`, and concurrent triggers coalesce once.
 
 - [ ] **Step 2: Run catalog tests to verify RED**
 
@@ -356,11 +370,19 @@ export function buildRoutedCatalog({nativeModels, routedModels}) {
 
 Do not inspect live `config.toml` or CC Switch state. Preserve canonical provider-prefixed slugs and omit `show_raw_agent_reasoning`.
 
-- [ ] **Step 4: Implement locked, validated, atomic publication**
+- [ ] **Step 4: Implement one-pointer generation publication**
 
-Build all outputs in memory, validate both catalog schemas, write sibling temp files mode `0600`, `fsync` each file and parent directory, then rename. On any error, remove temps and retain every previous output byte-for-byte.
+Build all outputs in memory, validate both catalog schemas, write every output mode `0600` into a new immutable generation directory, `fsync` every file and directory, then atomically replace one `current` symlink. Fixed catalog paths resolve through `current`, so every reader observes one generation. On any error before pointer replacement, delete only the new generation; on pointer replacement failure, retain the previous pointer. Migrate existing regular catalog files to stable symlinks under a byte/mode snapshot with rollback.
 
-- [ ] **Step 5: Re-run catalog tests to verify GREEN**
+Inject failures at every write, file `fsync`, directory `fsync`, symlink creation, and pointer rename boundary. Assert both catalogs plus route/control/UI readers resolve either the complete old generation or the complete new generation, never a mixed set.
+
+- [ ] **Step 5: Wire every Appendix E rebuild trigger**
+
+Implement `transactNodeStateMutation()` as the only state-plus-generation commit path: snapshot touched protected files, run `mutate`, build the complete generation, atomically switch `current`, then return success; any mutation or generation failure restores the touched files and leaves the old pointer active. Route credential set/remove through `provider-onboarding.mjs`; provider selection through `provider-selection.mjs`; visibility/canary through `model-picker-state.mjs`, `experimental-models.mjs`, and `control.mjs`; proof create/reverify/revoke/fingerprint invalidation through `protocol-proof.mjs` and `protocol-proof-verifier.mjs`; native-session usability transitions through `codex-native-session.mjs`; startup/update completion through `start.mjs` and `update.mjs`.
+
+Change `verifyProtocolProof()` to pass its candidate record to `transactNodeStateMutation()` instead of directly writing it; revoke and fingerprint invalidation use the same transaction. Add non-live fixture-dispatcher tests that prove passing verification, reverify, revoke, and fingerprint invalidation switch proof state, route table, both catalogs, control snapshot, and both UI snapshots together; injected rebuild failure preserves the prior proof and generation. Add one equivalent test per canary, credential, provider, visibility, native-session, startup, and registry-update trigger.
+
+- [ ] **Step 6: Re-run catalog tests to verify GREEN**
 
 ```bash
 node --test test/catalog.test.mjs test/catalog-publication-lock.test.mjs test/refresh-catalog.test.mjs
@@ -368,10 +390,10 @@ node --test test/catalog.test.mjs test/catalog-publication-lock.test.mjs test/re
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit deterministic publication**
+- [ ] **Step 7: Commit deterministic publication**
 
 ```bash
-git add src/paths.mjs src/catalog-rebuild.mjs src/catalog.mjs src/catalog-publication-lock.mjs src/model-overlay-publication.mjs src/routed-client-models.mjs test/fixtures/codex-model-catalog-0.147.schema.json test/fixtures/codex-model-catalog-0.149.schema.json test/catalog.test.mjs test/catalog-publication-lock.test.mjs test/refresh-catalog.test.mjs
+git add src/paths.mjs src/catalog-rebuild.mjs src/catalog-generation.mjs src/catalog.mjs src/catalog-publication-lock.mjs src/model-overlay-publication.mjs src/routed-client-models.mjs src/provider-onboarding.mjs src/provider-selection.mjs src/model-picker-state.mjs src/codex-native-session.mjs src/target-integration.mjs src/start.mjs src/update.mjs src/control.mjs src/protocol-proof.mjs src/protocol-proof-verifier.mjs src/experimental-models.mjs test/fixtures/codex-model-catalog-0.147.schema.json test/fixtures/codex-model-catalog-0.149.schema.json test/catalog.test.mjs test/catalog-publication-lock.test.mjs test/refresh-catalog.test.mjs test/protocol-proof.test.mjs test/protocol-proof-verifier.test.mjs
 git commit -m "feat: publish deterministic routed catalog"
 ```
 
@@ -388,22 +410,23 @@ git commit -m "feat: publish deterministic routed catalog"
 - Test: `test/doctor-routing-mode.test.mjs`
 
 **Interfaces:**
-- Produces: `renderAggregateSnippet({routedCatalogPath, redactedBaseUrl}) -> string`.
+- Produces: `renderAggregateSnippet({routedCatalogPath, callerBaseUrl}) -> string` for caller-authenticated local CLI/Swift/browser responses only.
+- Produces: `aggregateSnippetStatus({routedCatalogPath, redactedBaseUrl}) -> object` for logs, doctor, snapshots, and support bundles.
 - Produces: `standaloneSearchStatus(codexConfig) -> {ok, missing, snippet}`.
 - Commands are read-only and never mutate Codex or CC Switch configuration.
 
 - [ ] **Step 1: Write failing deterministic-render and no-write tests**
 
 ```js
-test("aggregate snippet is deterministic and references routed catalog", () => {
+test("authenticated aggregate snippet is deterministic and usable", () => {
   const first = renderAggregateSnippet(fixture);
   assert.equal(first, renderAggregateSnippet(fixture));
   assert.match(first, /routed-models\.json/);
-  assert.doesNotMatch(first, /_codex-router\/[^/]+\/v1/);
+  assert.match(first, /_codex-router\/[^/]+\/v1/);
 });
 ```
 
-Assert the search status requires `web_search = "live"`, `suppress_unstable_features_warning = true`, and `[features].standalone_web_search = true`; missing fields produce the exact copyable snippet without writing files.
+Assert the protected snippet is returned only by caller-authenticated CLI output or authenticated Swift/browser sessions and never enters logs, doctor rows, snapshots, telemetry, exceptions, or support bundles. Status surfaces receive only `aggregateSnippetStatus()` with the redacted URL. The search status requires `web_search = "live"`, `suppress_unstable_features_warning = true`, and `[features].standalone_web_search = true`; missing fields produce the exact copyable snippet without writing files.
 
 - [ ] **Step 2: Run focused tests to verify RED**
 
@@ -424,7 +447,7 @@ standalone_web_search = true
 `;
 ```
 
-Render the aggregate provider with `model_catalog_json` pointing to `ROUTED_CATALOG_PATH` and `supports_standalone_web_search = true`. Accept only a redacted base URL in status output.
+Render the protected aggregate provider with the real local caller capability URL, `model_catalog_json` pointing to `ROUTED_CATALOG_PATH`, and `supports_standalone_web_search = true`. Accept only a redacted base URL in status/log/snapshot/support output and add decoy capability leakage tests across those surfaces.
 
 - [ ] **Step 4: Add mutation guards**
 
