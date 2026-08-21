@@ -47,6 +47,10 @@ const passingProof = Object.freeze({
   verifiedAt: "2026-08-21T12:00:00.000Z",
 });
 
+const directTransaction = async ({ mutate }) => mutate();
+const writeProof = (record) => writePassingProtocolProof(record, { transaction: directTransaction });
+const revokeProof = (slug) => revokeProtocolProof(slug, { transaction: directTransaction });
+
 function mode(target) {
   return statSync(target).mode & 0o777;
 }
@@ -68,21 +72,21 @@ after(() => {
   rmSync(scratch, { recursive: true, force: true });
 });
 
-test("canary defaults off and is exact-slug scoped", () => {
+test("canary defaults off and is exact-slug scoped", async () => {
   assert.equal(experimentalModelEnabled("qwen-plan/qwen3.7-max"), false);
-  setExperimentalModel("qwen-plan/qwen3.7-max", true);
+  await setExperimentalModel("qwen-plan/qwen3.7-max", true, { transaction: directTransaction });
   assert.equal(experimentalModelEnabled("qwen-plan/qwen3.7-max"), true);
   assert.equal(experimentalModelEnabled("qwen-plan/qwen3.7-plus"), false);
 
   assertPrivateFile(EXPERIMENTAL_MODELS_PATH);
-  setExperimentalModel("qwen-plan/qwen3.7-max", false);
+  await setExperimentalModel("qwen-plan/qwen3.7-max", false, { transaction: directTransaction });
   assert.equal(experimentalModelEnabled("qwen-plan/qwen3.7-max"), false);
 });
 
-test("a corrupt canary file fails closed", () => {
+test("a corrupt canary file fails closed", async () => {
   writeFileSync(EXPERIMENTAL_MODELS_PATH, "not json", { mode: 0o600 });
   assert.equal(experimentalModelEnabled("qwen-plan/qwen3.7-max"), false);
-  setExperimentalModel("qwen-plan/qwen3.7-max", true);
+  await setExperimentalModel("qwen-plan/qwen3.7-max", true, { transaction: directTransaction });
   assert.equal(experimentalModelEnabled("qwen-plan/qwen3.7-max"), true);
 });
 
@@ -119,10 +123,10 @@ test("registry fingerprint covers only the canonical model contract", () => {
   assert.notEqual(registryFingerprint(model, 4), registryFingerprint(model, 3));
 });
 
-test("failed verification never replaces a passing proof", () => {
-  writePassingProtocolProof(passingProof);
-  assert.throws(
-    () => writePassingProtocolProof({ ...passingProof, verdict: "failed" }),
+test("failed verification never replaces a passing proof", async () => {
+  await writeProof(passingProof);
+  await assert.rejects(
+    () => writeProof({ ...passingProof, verdict: "failed" }),
     /passing/,
   );
   assert.deepEqual(readProtocolProof(passingProof.slug), passingProof);
@@ -166,23 +170,28 @@ test("an invalid sibling or mismatched proof key invalidates every proof", () =>
   }
 });
 
-test("array-shaped proof state is discarded before the next passing write", () => {
+test("array-shaped proof state is discarded before the next passing write", async () => {
   writeFileSync(
     PROTOCOL_PROOFS_PATH,
     JSON.stringify({ version: 1, proofs: [passingProof] }),
     { mode: 0o600 },
   );
 
-  writePassingProtocolProof(passingProof);
+  await writeProof(passingProof);
 
   assert.deepEqual(
     JSON.parse(readFileSync(PROTOCOL_PROOFS_PATH, "utf8")),
-    { version: 1, proofs: { [passingProof.slug]: passingProof } },
+    {
+      version: 1,
+      revision: 1,
+      revisions: { [passingProof.slug]: 1 },
+      proofs: { [passingProof.slug]: passingProof },
+    },
   );
 });
 
-test("proof writer rejects records missing any required field", () => {
-  writePassingProtocolProof(passingProof);
+test("proof writer rejects records missing any required field", async () => {
+  await writeProof(passingProof);
   for (const field of [
     "slug",
     "provider",
@@ -197,39 +206,39 @@ test("proof writer rejects records missing any required field", () => {
   ]) {
     const incomplete = { ...passingProof };
     delete incomplete[field];
-    assert.throws(() => writePassingProtocolProof(incomplete), /require/);
+    await assert.rejects(() => writeProof(incomplete), /require/);
   }
   assert.deepEqual(readProtocolProof(passingProof.slug), passingProof);
 });
 
-test("proof state fails closed when corrupt and revoke is exact-slug scoped", () => {
+test("proof state fails closed when corrupt and revoke is exact-slug scoped", async () => {
   writeFileSync(PROTOCOL_PROOFS_PATH, "not json", { mode: 0o600 });
   assert.equal(readProtocolProof(passingProof.slug), null);
 
   const other = { ...passingProof, slug: "qwen-plan/qwen3.7-plus" };
-  writePassingProtocolProof(passingProof);
-  writePassingProtocolProof(other);
-  revokeProtocolProof(passingProof.slug);
+  await writeProof(passingProof);
+  await writeProof(other);
+  await revokeProof(passingProof.slug);
 
   assert.equal(readProtocolProof(passingProof.slug), null);
   assert.deepEqual(readProtocolProof(other.slug), other);
 });
 
-test("proof writes are owner-only atomic replacements", () => {
-  writePassingProtocolProof(passingProof);
+test("proof writes are owner-only atomic replacements", async () => {
+  await writeProof(passingProof);
   assertPrivateFile(PROTOCOL_PROOFS_PATH);
 
   const replacement = { ...passingProof, verifiedAt: "2026-08-21T12:01:00.000Z" };
   if (process.platform === "win32") {
     // Windows refuses a replace while a reader keeps the target open, so it
     // cannot exercise the POSIX open-descriptor atomicity check below.
-    writePassingProtocolProof(replacement);
+    await writeProof(replacement);
     assert.deepEqual(readProtocolProof(passingProof.slug), replacement);
     assertPrivateFile(PROTOCOL_PROOFS_PATH);
   } else {
     const oldDescriptor = openSync(PROTOCOL_PROOFS_PATH, "r");
     try {
-      writePassingProtocolProof(replacement);
+      await writeProof(replacement);
       assert.deepEqual(readProtocolProof(passingProof.slug), replacement);
       assert.match(readFileSync(oldDescriptor, "utf8"), /12:00:00\.000Z/);
     } finally {
@@ -242,14 +251,14 @@ test("proof writes are owner-only atomic replacements", () => {
   );
 });
 
-test("isolated state never writes through CODEX_HOME", () => {
+test("isolated state never writes through CODEX_HOME", async () => {
   const marker = path.join(codexHome, "operator-state");
   writeFileSync(marker, "untouched");
 
   assert.equal(EXPERIMENTAL_MODELS_PATH, path.join(stateDir, "experimental-models.json"));
   assert.equal(PROTOCOL_PROOFS_PATH, path.join(stateDir, "protocol-proofs.json"));
-  setExperimentalModel(passingProof.slug, true);
-  writePassingProtocolProof(passingProof);
+  await setExperimentalModel(passingProof.slug, true, { transaction: directTransaction });
+  await writeProof(passingProof);
 
   assert.equal(readFileSync(marker, "utf8"), "untouched");
   assert.deepEqual(readdirSync(codexHome), ["operator-state"]);

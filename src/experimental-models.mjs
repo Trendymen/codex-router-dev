@@ -3,6 +3,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { writePrivateJson } from "./file-security.mjs";
 import { MODEL_BY_SLUG } from "./model-registry.mjs";
 import { EXPERIMENTAL_MODELS_PATH } from "./paths.mjs";
+import { transactNodeStateMutation } from "./catalog-rebuild.mjs";
 
 function readExperimentalModels() {
   if (!existsSync(EXPERIMENTAL_MODELS_PATH)) return new Set();
@@ -38,14 +39,22 @@ export function experimentalModelForSlug(slug) {
   throw error;
 }
 
-export function setExperimentalModel(slug, enabled) {
-  const models = readExperimentalModels();
+export async function setExperimentalModel(slug, enabled, options = {}) {
   const key = String(slug);
-  if (enabled === true) models.add(key);
-  else models.delete(key);
-  writePrivateJson(
-    EXPERIMENTAL_MODELS_PATH,
-    { version: 1, models: [...models].sort() },
-    { directoryMode: 0o700 },
-  );
+  const { transaction = transactNodeStateMutation, ...transactionOptions } = options;
+  return transaction({
+    files: [EXPERIMENTAL_MODELS_PATH],
+    reason: `experimental-model:${enabled === true ? "enable" : "disable"}:${key}`,
+    mutate: () => {
+      const models = readExperimentalModels();
+      if (enabled === true) models.add(key);
+      else models.delete(key);
+      writePrivateJson(
+        EXPERIMENTAL_MODELS_PATH,
+        { version: 1, models: [...models].sort() },
+        { directoryMode: 0o700 },
+      );
+    },
+    ...transactionOptions,
+  });
 }

@@ -2248,7 +2248,7 @@ async function handleProtocolProof(action, slug, flags) {
     throw new Error("Usage: control protocol-proof status|verify|revoke <model-slug> [--yes]");
   }
   if (command === "revoke") {
-    revokeProtocolProof(slug);
+    await revokeProtocolProof(slug);
     process.stdout.write(`${JSON.stringify({ slug, proof: null })}\n`);
     return;
   }

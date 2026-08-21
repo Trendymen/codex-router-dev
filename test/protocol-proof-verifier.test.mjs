@@ -35,6 +35,7 @@ function verifierOptions(overrides = {}) {
     confirmed: true,
     clock: () => new Date("2026-08-22T01:02:03.000Z"),
     dispatchProtocolProbe: async () => passingEvidence(),
+    transactionOptions: { transaction: async ({ mutate }) => mutate() },
     ...overrides,
   };
 }

@@ -1,5 +1,9 @@
 import { experimentalModelForSlug } from "./experimental-models.mjs";
-import { registryFingerprint, writePassingProtocolProof } from "./protocol-proof.mjs";
+import {
+  protocolProofRevision,
+  registryFingerprint,
+  writePassingProtocolProof,
+} from "./protocol-proof.mjs";
 
 export const PROTOCOL_PROOF_VERIFIER_VERSION = 1;
 
@@ -58,6 +62,11 @@ export async function verifyProtocolProof(slug, options = {}) {
   if (options.confirmed !== true) throw publicError("quota_confirmation_required", 409);
 
   const model = experimentalModelForSlug(slug);
+  // The probe intentionally runs before the commit lock so it never holds a
+  // shared state transaction while quota work is in flight. Guard its later
+  // candidate commit with this revision: an operator revoke during the probe
+  // wins instead of being silently resurrected by stale evidence.
+  const expectedRevision = protocolProofRevision(model.slug);
   const dispatchProtocolProbe = options.dispatchProtocolProbe ?? unavailableDispatcher;
   const evidence = await dispatchProtocolProbe(model, {
     retry: false,
@@ -71,6 +80,9 @@ export async function verifyProtocolProof(slug, options = {}) {
     throw publicError("protocol_proof_verification_failed", 422);
   }
   const record = recordFor(model, evidence, options.clock);
-  writePassingProtocolProof(record);
+  await writePassingProtocolProof(record, {
+    expectedRevision,
+    ...(options.transactionOptions || {}),
+  });
   return record;
 }
