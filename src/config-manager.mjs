@@ -46,6 +46,7 @@ import {
   loopback,
 } from "./paths.mjs";
 import { scanTomlDocument } from "./toml-structure.mjs";
+import { signedProviderBlockIsOwned as sharedSignedProviderBlockIsOwned, signedProviderStateIsOwned as sharedSignedProviderStateIsOwned } from "./signed-provider-ownership.mjs";
 
 const managedRouterBaseUrls = new Set([
   loopback(PORTS.router, "/v1"),
@@ -648,6 +649,8 @@ function signedManagedRange(contents) {
 }
 
 function signedProviderBlockIsOwned(contents, state) {
+  return sharedSignedProviderBlockIsOwned(contents, state);
+  /* legacy implementation retained below for reference
   if (state.version === 2) {
     const range = signedManagedRange(contents);
     if (!range) return false;
@@ -677,7 +680,7 @@ function signedProviderBlockIsOwned(contents, state) {
     slotIndex + 1 === range.start &&
     providerRanges.length === 1 &&
     providerRanges[0].start === range.start + 1
-  );
+  ); */
 }
 
 function restoreSignedProviderTable(contents, state) {
@@ -735,6 +738,14 @@ function managedSignedProviderContents(contents, managedProvider, managedBaseUrl
 
 function signedProviderStateIsOwned(contents, state) {
   const { rootLines } = splitRoot(contents);
+  return sharedSignedProviderStateIsOwned(contents, state, {
+    activeProvider: rootValue(rootLines, "model_provider") || "openai",
+    baseUrl: rootValue(rootLines, "openai_base_url"),
+    isManagedRouterBaseUrl,
+    signedProviderId,
+  });
+  /* legacy implementation retained below for reference
+  const { rootLines } = splitRoot(contents);
   const activeProvider = rootValue(rootLines, "model_provider") || "openai";
   if (activeProvider !== state.managedProvider) return false;
   if (state.version === 1) return activeProvider === signedProviderId;
@@ -744,7 +755,7 @@ function signedProviderStateIsOwned(contents, state) {
       (state.version !== 3 || signedProviderBlockIsOwned(contents, state))
     );
   }
-  return signedProviderBlockIsOwned(contents, state);
+  return signedProviderBlockIsOwned(contents, state); */
 }
 
 function readProviderModeState() {

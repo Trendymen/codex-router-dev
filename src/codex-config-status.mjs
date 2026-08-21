@@ -12,12 +12,10 @@ import {
   loopback,
 } from "./paths.mjs";
 import { scanTomlDocument } from "./toml-structure.mjs";
+import { signedProviderStateIsOwned } from "./signed-provider-ownership.mjs";
 
 const routerProviderId = "codex-router";
 const signedProviderId = "codex-router-signed";
-const signedProviderStartMarker = "# BEGIN codex-router-signed-provider-managed";
-const signedProviderEndMarker = "# END codex-router-signed-provider-managed";
-const signedProviderSlotPrefix = "# codex-router-signed-provider-tree-slot";
 const managedRouterBaseUrls = new Set([
   loopback(PORTS.router, "/v1"),
   loopback(LEGACY_PORTS.router, "/v1"),
@@ -94,46 +92,6 @@ function readSignedProviderModeState() {
   }
 }
 
-function exactManagedBlock(contents, state) {
-  const lines = contents.split("\n");
-  const starts = lines.filter((line) => line.trim() === signedProviderStartMarker);
-  const ends = lines.filter((line) => line.trim() === signedProviderEndMarker);
-  if (starts.length !== 1 || ends.length !== 1) return false;
-  const headerId = /^[A-Za-z0-9_-]+$/.test(state.managedProvider)
-    ? state.managedProvider
-    : JSON.stringify(state.managedProvider);
-  const expected = [
-    signedProviderStartMarker,
-    `[model_providers.${headerId}]`,
-    'name = "Codex Router (with ChatGPT)"',
-    `base_url = ${JSON.stringify(state.managedBaseUrl)}`,
-    'wire_api = "responses"',
-    "requires_openai_auth = true",
-  ];
-  const start = lines.findIndex((line) => line.trim() === signedProviderStartMarker);
-  const end = lines.findIndex((line) => line.trim() === signedProviderEndMarker);
-  const actual = lines.slice(start, end + 1);
-  const hasExpectedPrefix = expected.every((line, index) => actual[index] === line);
-  return hasExpectedPrefix && actual.at(-1) === signedProviderEndMarker;
-}
-
-function signedProviderStateIsOwned(contents, state, document) {
-  const activeProvider = rootValue(document, "model_provider") || "openai";
-  if (activeProvider !== state.managedProvider) return false;
-  if (state.version === 1) return activeProvider === signedProviderId;
-  if (!exactManagedBlock(contents, state)) return false;
-  if (state.mode === "root-openai") {
-    return isManagedRouterBaseUrl(rootValue(document, "openai_base_url"));
-  }
-  if (state.version === 3) {
-    const expected = Math.max(1, state.previousProviderSections.length);
-    const slots = contents.split("\n").filter((line) => line.startsWith(`${signedProviderSlotPrefix} `));
-    return slots.length === expected && slots.every((line, index) =>
-      line === `${signedProviderSlotPrefix} ${state.ownershipId} ${index}`,
-    );
-  }
-  return true;
-}
 
 // Shared, read-only snapshot used both by config-manager status and doctor.
 // It performs no config mutation and never invokes a config-manager subprocess.
@@ -145,7 +103,12 @@ export function readCodexConfigStatus(contents) {
   const providerState = readProviderModeState();
   const signedState = readSignedProviderModeState();
   const signedActive = signedState
-    ? signedProviderStateIsOwned(contents, signedState, document)
+    ? signedProviderStateIsOwned(contents, signedState, {
+      activeProvider,
+      baseUrl,
+      isManagedRouterBaseUrl,
+      signedProviderId,
+    })
     : false;
   return {
     mode: isManagedRouterBaseUrl(baseUrl) && catalog === MERGED_CATALOG_PATH ? "router" : "native",

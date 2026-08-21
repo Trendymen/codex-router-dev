@@ -192,6 +192,7 @@ test("read-only snippet, status, and doctor calls leave the fully isolated home 
   const secret = "runtime-guard-caller-capability-decoy-with-sufficient-length";
   const ccSwitchDatabase = path.join(home, ".cc-switch", "cc-switch.db");
   mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+  mkdirSync(path.join(isolated, "tmp"), { recursive: true, mode: 0o700 });
   mkdirSync(path.dirname(ccSwitchDatabase), { recursive: true, mode: 0o700 });
   writeFileSync(path.join(codexHome, "config.toml"), `web_search = "live"
 suppress_unstable_features_warning = true
@@ -208,6 +209,9 @@ standalone_web_search = true
     USERPROFILE: home,
     APPDATA: path.join(home, "AppData", "Roaming"),
     LOCALAPPDATA: path.join(home, "AppData", "Local"),
+    TMP: path.join(isolated, "tmp"),
+    TEMP: path.join(isolated, "tmp"),
+    TMPDIR: path.join(isolated, "tmp"),
     CODEX_HOME: codexHome,
     CODEX_ROUTER_STATE_DIR: stateDir,
     MODEL_ROUTER_STATE_DIR: stateDir,
