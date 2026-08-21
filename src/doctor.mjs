@@ -2,7 +2,8 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 
-import { validCallerSecret } from "./caller-auth.mjs";
+import { callerBaseUrl, redactCallerUrl, validCallerSecret } from "./caller-auth.mjs";
+import { aggregateSnippetStatus } from "./cc-switch-snippet.mjs";
 import { codexAuthStatus, findCodexBinary, runCodex } from "./codex-binary.mjs";
 import { commandOnPath, spawnableCommand } from "./spawnable-command.mjs";
 import { routedCodexAgentStatus } from "./codex-agent-catalog.mjs";
@@ -34,9 +35,11 @@ import {
   LITELLM_CONFIG_PATH,
   MERGED_CATALOG_PATH,
   PORTS,
+  ROUTED_CATALOG_PATH,
   SOURCE_ROOT,
   TARGET,
 } from "./paths.mjs";
+import { standaloneSearchStatus } from "./standalone-search-doctor.mjs";
 import { CODEX_APP_TOOLS } from "./codex-app-tools.mjs";
 import {
   skillPackStatus,
@@ -714,6 +717,37 @@ add(
         : `mode ${callerSecretMode.toString(8)}`,
   "Run ./bin/doctor --fix; this capability is generated locally and is not a provider key.",
 );
+
+// This is diagnostic metadata only: the actual aggregate TOML includes a
+// local caller capability and is deliberately restricted to `control catalog
+// render-snippet`. Doctor, logs, snapshots, and support bundles see this
+// redacted status object instead.
+const aggregateStatus = aggregateSnippetStatus({
+  routedCatalogPath: ROUTED_CATALOG_PATH,
+  redactedBaseUrl: callerSecretValid
+    ? redactCallerUrl(callerBaseUrl(PORTS.router, readFileSync(CALLER_SECRET_PATH, "utf8").trim()))
+    : "unavailable",
+});
+add(
+  callerSecretValid ? "ok" : "fail",
+  "CC Switch aggregate profile",
+  `${aggregateStatus.modelCatalogJson}; ${aggregateStatus.baseUrl}; standalone web search supported`,
+  "Run ./bin/doctor --fix to regenerate the local caller capability before rendering the snippet.",
+);
+
+if (codexTarget) {
+  const search = standaloneSearchStatus(
+    existsSync(CONFIG_PATH) ? readFileSync(CONFIG_PATH, "utf8") : "",
+  );
+  add(
+    search.ok ? "ok" : "warn",
+    "Standalone web search",
+    search.ok
+      ? "web_search is live and the standalone search feature gate is enabled"
+      : `missing ${search.missing.join(", ")}`,
+    search.ok ? undefined : search.snippet,
+  );
+}
 
 // Tool-result retention is the one place this router keeps model-visible
 // *content* on disk rather than counts and bytes, and it has no eviction and no

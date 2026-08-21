@@ -14,6 +14,8 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
+import { SEARCH_CONFIG_SNIPPET } from "../src/standalone-search-doctor.mjs";
+
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const callerSecret = "doctor-routing-caller-capability-with-sufficient-length";
 
@@ -234,3 +236,59 @@ test(
     }
   },
 );
+
+test("doctor read-only reports every missing standalone search gate with a copyable snippet", () => {
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), "codex-router-search-doctor-"));
+  const stateDir = path.join(codexHome, "router-state");
+  const configPath = path.join(codexHome, "config.toml");
+  const ccSwitchDatabase = path.join(codexHome, ".cc-switch", "cc-switch.db");
+  mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+  writeFileSync(
+    configPath,
+    `web_search = "live"
+
+[features]
+standalone_web_search = false
+`,
+    { mode: 0o600 },
+  );
+  mkdirSync(path.dirname(ccSwitchDatabase), { recursive: true, mode: 0o700 });
+  writeFileSync(ccSwitchDatabase, "do-not-touch", { mode: 0o600 });
+  writeFileSync(path.join(stateDir, "caller-secret"), `${callerSecret}\n`, { mode: 0o600 });
+  writeFileSync(
+    path.join(stateDir, "internal-secret"),
+    "doctor-internal-service-key-with-sufficient-length\n",
+    { mode: 0o600 },
+  );
+  const env = {
+    ...process.env,
+    CODEX_BIN: writeCodexStub(codexHome),
+    CODEX_HOME: codexHome,
+    CODEX_ROUTER_PORT: "46194",
+    CODEX_ROUTER_STATE_DIR: stateDir,
+    MODEL_ROUTER_STATE_DIR: stateDir,
+    MODEL_ROUTER_TARGET: "codex",
+  };
+
+  try {
+    const result = child("doctor.mjs", ["--json"], env);
+    const report = JSON.parse(result.stdout);
+    const byName = new Map(report.checks.map((check) => [check.name, check]));
+    assert.doesNotMatch(result.stdout, new RegExp(callerSecret));
+    assert.deepEqual(byName.get("Standalone web search"), {
+      status: "warn",
+      name: "Standalone web search",
+      detail: "missing suppress_unstable_features_warning, features.standalone_web_search",
+      fix: SEARCH_CONFIG_SNIPPET,
+    });
+    assert.equal(readFileSync(configPath, "utf8"), `web_search = "live"
+
+[features]
+standalone_web_search = false
+`);
+    assert.equal(readFileSync(ccSwitchDatabase, "utf8"), "do-not-touch");
+    assert.match(byName.get("CC Switch aggregate profile").detail, /\[REDACTED\]/);
+  } finally {
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});

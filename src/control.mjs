@@ -800,6 +800,46 @@ async function updateAndVerifyCodex() {
   process.stdout.write(`${JSON.stringify(runCodexMaintenance())}\n`);
 }
 
+// CC Switch owns its profile database. These two read-only commands only
+// report the aggregate profile's stable catalog metadata or render TOML for a
+// local caller that can already read the Router capability file.
+async function handleCatalog(action) {
+  const {
+    CALLER_SECRET_PATH,
+    CONFIG_PATH,
+    PORTS,
+    ROUTED_CATALOG_PATH,
+  } = await import("./paths.mjs");
+  const { callerBaseUrl, redactCallerUrl } = await import("./caller-auth.mjs");
+  const {
+    aggregateSnippetStatus,
+    renderAggregateSnippet,
+  } = await import("./cc-switch-snippet.mjs");
+  const { standaloneSearchStatus } = await import("./standalone-search-doctor.mjs");
+  const secret = readFileSync(CALLER_SECRET_PATH, "utf8").trim();
+  const baseUrl = callerBaseUrl(PORTS.router, secret);
+
+  if (action === "render-snippet") {
+    process.stdout.write(renderAggregateSnippet({
+      routedCatalogPath: ROUTED_CATALOG_PATH,
+      callerBaseUrl: baseUrl,
+    }));
+    return;
+  }
+  if (action === "status") {
+    const config = existsSync(CONFIG_PATH) ? readFileSync(CONFIG_PATH, "utf8") : "";
+    process.stdout.write(`${JSON.stringify({
+      aggregate: aggregateSnippetStatus({
+        routedCatalogPath: ROUTED_CATALOG_PATH,
+        redactedBaseUrl: redactCallerUrl(baseUrl),
+      }),
+      standaloneSearch: standaloneSearchStatus(config),
+    })}\n`);
+    return;
+  }
+  throw new Error("Usage: control catalog status|render-snippet");
+}
+
 function runDoctor(args) {
   const json = args.includes("--json");
   const result = spawnSync(
@@ -2320,6 +2360,8 @@ if (args.includes("--probe")) {
   await handlePresence(args[1], args[2]);
 } else if (args[0] === "protocol-proof") {
   await handleProtocolProof(args[1], args[2], args.slice(3));
+} else if (args[0] === "catalog") {
+  await handleCatalog(args[1]);
 } else if (args[0] === "maintenance") {
   await updateAndVerifyCodex();
 } else if (args[0] === "doctor") {
