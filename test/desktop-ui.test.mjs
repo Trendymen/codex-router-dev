@@ -21,6 +21,16 @@ import {
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 import { availableLanguages, getLanguage, setLanguage, t, translationKeys } from "../apps/desktop/ui/i18n.mjs";
 
+function withLanguage(language, callback) {
+  const previous = getLanguage();
+  setLanguage(language);
+  try {
+    return callback();
+  } finally {
+    setLanguage(previous);
+  }
+}
+
 test("desktop usage series fills missing local calendar days", () => {
   const series = dailySeries(
     [
@@ -42,75 +52,81 @@ test("desktop usage series fills missing local calendar days", () => {
 });
 
 test("quota windows use one weekly label and a distinct five-hour label", () => {
-  assert.deepEqual(quotaWindow({ label: "Weekly requests" }), {
-    key: "weekly",
-    label: "Weekly limit",
-  });
-  assert.deepEqual(quotaWindow({ windowDurationMins: 300 }), {
-    key: "five-hour",
-    label: "5-hour limit",
+  withLanguage("en", () => {
+    assert.deepEqual(quotaWindow({ label: "Weekly requests" }), {
+      key: "weekly",
+      label: "Weekly limit",
+    });
+    assert.deepEqual(quotaWindow({ windowDurationMins: 300 }), {
+      key: "five-hour",
+      label: "5-hour limit",
+    });
   });
 });
 
 test("monthly quota windows keep their own label instead of being dropped", () => {
-  assert.deepEqual(quotaWindow({ label: "Monthly limit" }), {
-    key: "monthly",
-    label: "Monthly limit",
-  });
-  assert.deepEqual(quotaWindow({ label: "Monthly subscription" }), {
-    key: "monthly",
-    label: "Monthly limit",
-  });
-  assert.deepEqual(quotaWindow({ windowDurationMins: 43_200 }), {
-    key: "monthly",
-    label: "Monthly limit",
+  withLanguage("en", () => {
+    assert.deepEqual(quotaWindow({ label: "Monthly limit" }), {
+      key: "monthly",
+      label: "Monthly limit",
+    });
+    assert.deepEqual(quotaWindow({ label: "Monthly subscription" }), {
+      key: "monthly",
+      label: "Monthly limit",
+    });
+    assert.deepEqual(quotaWindow({ windowDurationMins: 43_200 }), {
+      key: "monthly",
+      label: "Monthly limit",
+    });
   });
 });
 
 test("quota cards omit unconfigured providers and de-duplicate synonymous windows", () => {
-  const cards = buildQuotaCards({
-    providerSetup: {
-      providers: [
-        { id: "kimi-oauth", configured: true },
-        { id: "grok-api", configured: false },
-      ],
-    },
-    providerUsage: {
-      providers: [
-        {
-          id: "kimi-oauth",
-          displayName: "Kimi OAuth",
-          account: {
-            metrics: [
-              { kind: "quota", label: "Weekly requests", usedPercent: 48 },
-              { kind: "quota", label: "Week", usedPercent: 48 },
-              { kind: "quota", label: "5 hour", usedPercent: 3 },
-            ],
+  withLanguage("en", () => {
+    const cards = buildQuotaCards({
+      providerSetup: {
+        providers: [
+          { id: "kimi-oauth", configured: true },
+          { id: "grok-api", configured: false },
+        ],
+      },
+      providerUsage: {
+        providers: [
+          {
+            id: "kimi-oauth",
+            displayName: "Kimi OAuth",
+            account: {
+              metrics: [
+                { kind: "quota", label: "Weekly requests", usedPercent: 48 },
+                { kind: "quota", label: "Week", usedPercent: 48 },
+                { kind: "quota", label: "5 hour", usedPercent: 3 },
+              ],
+            },
           },
-        },
-        {
-          id: "grok-api",
-          displayName: "Grok API",
-          account: { metrics: [{ kind: "quota", label: "Weekly", usedPercent: 20 }] },
-        },
-      ],
-    },
-  });
+          {
+            id: "grok-api",
+            displayName: "Grok API",
+            account: { metrics: [{ kind: "quota", label: "Weekly", usedPercent: 20 }] },
+          },
+        ],
+      },
+    });
 
-  assert.deepEqual(
-    cards.map(({ providerId, label }) => ({ providerId, label })),
-    [
-      { providerId: "kimi-oauth", label: "Weekly limit" },
-      { providerId: "kimi-oauth", label: "5-hour limit" },
-    ],
-  );
-  assert.deepEqual(
-    cards.map(({ usedPercent, remainingPercent }) => ({ usedPercent, remainingPercent })),
-    [
-      { usedPercent: 48, remainingPercent: 52 },
-      { usedPercent: 3, remainingPercent: 97 },
-    ],
-  );
+    assert.deepEqual(
+      cards.map(({ providerId, label }) => ({ providerId, label })),
+      [
+        { providerId: "kimi-oauth", label: "Weekly limit" },
+        { providerId: "kimi-oauth", label: "5-hour limit" },
+      ],
+    );
+    assert.deepEqual(
+      cards.map(({ usedPercent, remainingPercent }) => ({ usedPercent, remainingPercent })),
+      [
+        { usedPercent: 48, remainingPercent: 52 },
+        { usedPercent: 3, remainingPercent: 97 },
+      ],
+    );
+  });
 });
 
 test("quota remaining percentage prefers provider data and derives from usage", () => {

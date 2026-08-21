@@ -15,6 +15,8 @@ import os from "node:os";
 import path from "node:path";
 import test, { after, beforeEach } from "node:test";
 
+import { privateFileIsProtected } from "../src/file-security.mjs";
+
 const scratch = mkdtempSync(path.join(os.tmpdir(), "protocol-proof-"));
 const stateDir = path.join(scratch, "state");
 const codexHome = path.join(scratch, "codex-home");
@@ -43,6 +45,12 @@ function mode(target) {
   return statSync(target).mode & 0o777;
 }
 
+function assertPrivateFile(target) {
+  assert.equal(privateFileIsProtected(target), true);
+  // Windows protects private files with ACLs, not POSIX mode bits.
+  if (process.platform !== "win32") assert.equal(mode(target), 0o600);
+}
+
 beforeEach(() => {
   rmSync(stateDir, { recursive: true, force: true });
   rmSync(codexHome, { recursive: true, force: true });
@@ -60,7 +68,7 @@ test("canary defaults off and is exact-slug scoped", () => {
   assert.equal(experimentalModelEnabled("qwen-plan/qwen3.7-max"), true);
   assert.equal(experimentalModelEnabled("qwen-plan/qwen3.7-plus"), false);
 
-  assert.equal(mode(EXPERIMENTAL_MODELS_PATH), 0o600);
+  assertPrivateFile(EXPERIMENTAL_MODELS_PATH);
   setExperimentalModel("qwen-plan/qwen3.7-max", false);
   assert.equal(experimentalModelEnabled("qwen-plan/qwen3.7-max"), false);
 });
@@ -192,16 +200,24 @@ test("proof state fails closed when corrupt and revoke is exact-slug scoped", ()
 
 test("proof writes are owner-only atomic replacements", () => {
   writePassingProtocolProof(passingProof);
-  assert.equal(mode(PROTOCOL_PROOFS_PATH), 0o600);
+  assertPrivateFile(PROTOCOL_PROOFS_PATH);
 
-  const oldDescriptor = openSync(PROTOCOL_PROOFS_PATH, "r");
   const replacement = { ...passingProof, verifiedAt: "2026-08-21T12:01:00.000Z" };
-  try {
+  if (process.platform === "win32") {
+    // Windows refuses a replace while a reader keeps the target open, so it
+    // cannot exercise the POSIX open-descriptor atomicity check below.
     writePassingProtocolProof(replacement);
     assert.deepEqual(readProtocolProof(passingProof.slug), replacement);
-    assert.match(readFileSync(oldDescriptor, "utf8"), /12:00:00\.000Z/);
-  } finally {
-    closeSync(oldDescriptor);
+    assertPrivateFile(PROTOCOL_PROOFS_PATH);
+  } else {
+    const oldDescriptor = openSync(PROTOCOL_PROOFS_PATH, "r");
+    try {
+      writePassingProtocolProof(replacement);
+      assert.deepEqual(readProtocolProof(passingProof.slug), replacement);
+      assert.match(readFileSync(oldDescriptor, "utf8"), /12:00:00\.000Z/);
+    } finally {
+      closeSync(oldDescriptor);
+    }
   }
   assert.equal(
     readdirSync(stateDir).some((entry) => entry.startsWith("protocol-proofs.json.tmp.")),
