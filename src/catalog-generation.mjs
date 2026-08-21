@@ -220,15 +220,20 @@ function legacyEntries(legacyPaths) {
   return CATALOG_GENERATION_FILES.map((name) => [name, path.join(STATE_DIR, name)]);
 }
 
-function bootstrapLegacyGeneration(operations, entries, snapshots, files, generationsDir, generation, currentDir) {
-  const bootstrap = `bootstrap-${generation}`;
-  const staging = path.join(generationsDir, `.staging-${bootstrap}`);
-  const final = path.join(generationsDir, bootstrap);
-  const pointer = path.join(generationsDir, `.bootstrap-current-${generation}`);
+function bootstrapLegacyGeneration(operations, entries, snapshots, generationsDir, currentDir, state) {
+  if (
+    entries.length !== CATALOG_GENERATION_FILES.length
+    || CATALOG_GENERATION_FILES.some((name) => !entries.some(([entry]) => entry === name))
+    || snapshots.some((snapshot) => !snapshot.present || snapshot.preserve)
+  ) {
+    throw new Error("Cannot bootstrap catalog generations from an incomplete legacy artifact set.");
+  }
+  const { generation: bootstrap } = state;
+  const { staging, final, pointer } = state;
   operations.mkdir(staging, { mode: 0o700 });
   for (const [name, target] of entries) {
     const snapshot = snapshots.find((entry) => entry.path === target);
-    const contents = snapshot?.present ? snapshot.contents : jsonBytes(files[name]);
+    const contents = snapshot.contents;
     const output = path.join(staging, name);
     operations.writeFile(output, contents, { mode: 0o600 });
     operations.chmod(output, 0o600);
@@ -240,10 +245,10 @@ function bootstrapLegacyGeneration(operations, entries, snapshots, files, genera
   operations.fsyncDirectory(generationsDir);
   operations.symlink(bootstrap, pointer, "dir");
   operations.rename(pointer, currentDir);
+  state.pointerSwitched = true;
   operations.fsyncDirectory(generationsDir);
   installStableLegacyTopology(operations, entries, snapshots);
   operations.fsyncDirectory(generationsDir);
-  return bootstrap;
 }
 
 function validateNode(value, schema, pathLabel = "catalog") {
@@ -326,8 +331,18 @@ export function publishCatalogGeneration({
   const entries = legacyEntries(legacyPaths);
   const snapshots = entries.map(([, target]) => captureRegularFile(operations, target));
   let pointerSwitched = false;
-  let bootstrapPointer;
-  let newPointerAttempted = false;
+  const bootstrapState = previousPointer === undefined && snapshots.some((snapshot) => snapshot.present)
+    ? (() => {
+      const bootstrap = `bootstrap-${generation}`;
+      return {
+        generation: bootstrap,
+        staging: path.join(generationsDir, `.staging-${bootstrap}`),
+        final: path.join(generationsDir, bootstrap),
+        pointer: path.join(generationsDir, `.bootstrap-current-${bootstrap}`),
+        pointerSwitched: false,
+      };
+    })()
+    : undefined;
   try {
     // 0.147 and 0.149 share this Phase-1 routed contract. Native account
     // captures legitimately omit fields this router has no authority to
@@ -350,19 +365,16 @@ export function publishCatalogGeneration({
     // A first publish can inherit regular compatibility files. Bootstrap them
     // into a complete old generation before replacing even one stable path, so
     // every reader sees the old set until the one final pointer switch.
-    if (previousPointer === undefined && snapshots.some((snapshot) => snapshot.present)) {
-      bootstrapPointer = bootstrapLegacyGeneration(
-        operations, entries, snapshots, files, generationsDir, generation, currentDir,
-      );
-      previousPointer = bootstrapPointer;
+    if (bootstrapState) {
+      bootstrapLegacyGeneration(operations, entries, snapshots, generationsDir, currentDir, bootstrapState);
+      previousPointer = bootstrapState.generation;
     }
     // An existing publication lets stable paths resolve through the *old*
     // current pointer while this reversible topology is installed.
     if (previousPointer !== undefined) {
-      if (!bootstrapPointer) installStableLegacyTopology(operations, entries, snapshots);
+      if (!bootstrapState) installStableLegacyTopology(operations, entries, snapshots);
       operations.fsyncDirectory(generationsDir);
     }
-    newPointerAttempted = true;
     operations.symlink(generation, nextPointer, "dir");
     operations.rename(nextPointer, currentDir);
     pointerSwitched = true;
@@ -385,12 +397,13 @@ export function publishCatalogGeneration({
     for (const snapshot of [...snapshots].reverse()) {
       try { restoreRegularFile(operations, snapshot); } catch (rollbackError) { rollbackErrors.push(rollbackError); }
     }
-    if (bootstrapPointer && !newPointerAttempted) {
+    const bootstrapRollback = bootstrapState?.pointerSwitched === true;
+    if (bootstrapRollback) {
       try {
         if (isPresent(operations, currentDir)) operations.remove(currentDir, { recursive: true, force: true });
       } catch (rollbackError) { rollbackErrors.push(rollbackError); }
     }
-    if (pointerSwitched) {
+    if (pointerSwitched && !bootstrapRollback) {
       try {
         if (previousPointer === undefined) {
           // A first publication has no prior generation to restore. Its
@@ -409,9 +422,13 @@ export function publishCatalogGeneration({
       const active = currentTarget(operations, currentDir);
       if (isPresent(operations, staging)) operations.remove(staging, { recursive: true, force: true });
       if (isPresent(operations, final) && active !== generation) operations.remove(final, { recursive: true, force: true });
-      const bootstrapPath = bootstrapPointer && path.join(generationsDir, bootstrapPointer);
-      if (bootstrapPath && isPresent(operations, bootstrapPath) && active !== bootstrapPointer) {
-        operations.remove(bootstrapPath, { recursive: true, force: true });
+      if (bootstrapState) {
+        if (isPresent(operations, bootstrapState.staging)) {
+          operations.remove(bootstrapState.staging, { recursive: true, force: true });
+        }
+        if (isPresent(operations, bootstrapState.final)) {
+          operations.remove(bootstrapState.final, { recursive: true, force: true });
+        }
       }
     } catch (cleanupError) { rollbackErrors.push(cleanupError); }
     if (rollbackErrors.length) {

@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import {
+  existsSync,
   lstatSync,
   linkSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -171,7 +173,7 @@ for (const boundary of ["write", "file-fsync", "directory-fsync", "symlink", "po
   });
 }
 
-test("regular legacy catalog paths migrate to generation links and restore byte and mode snapshots on failure", () => {
+test("an incomplete legacy artifact set fails closed before any bootstrap pointer", () => {
   const stateDir = mkdtempSync(path.join(os.tmpdir(), "catalog-generation-migration-"));
   const generationsDir = path.join(stateDir, "catalog-generations");
   const legacyPath = path.join(stateDir, "merged-models.json");
@@ -184,22 +186,14 @@ test("regular legacy catalog paths migrate to generation links and restore byte 
         files: artifacts("new"),
         generationsDir,
         legacyPaths: { "merged-models.json": legacyPath },
-        operations: failingOperations("pointer-rename", testOperations()),
+        operations: testOperations(),
       }),
-      /injected pointer rename failure/,
+      /incomplete legacy artifact set/,
     );
     assert.equal(lstatSync(legacyPath).isFile(), true);
     assert.deepEqual(readFileSync(legacyPath), original);
     assert.equal(statSync(legacyPath).mode & 0o777, originalMode);
-
-    publishCatalogGeneration({
-      files: artifacts("new"),
-      generationsDir,
-      legacyPaths: { "merged-models.json": legacyPath },
-      operations: testOperations(),
-    });
-    assert.equal(process.platform === "win32" ? lstatSync(legacyPath).isFile() : lstatSync(legacyPath).isSymbolicLink(), true);
-    assert.deepEqual(readFileSync(legacyPath), readCurrent(generationsDir)["merged-models.json"]);
+    assert.throws(() => lstatSync(path.join(generationsDir, "current")), /ENOENT/);
   } finally {
     rmSync(stateDir, { recursive: true, force: true });
   }
@@ -245,10 +239,14 @@ test("first publication bootstraps a complete old generation before switching cu
 test("a first-generation bootstrap-pointer failure restores the regular file", () => {
   const stateDir = mkdtempSync(path.join(os.tmpdir(), "catalog-generation-first-migration-"));
   const generationsDir = path.join(stateDir, "catalog-generations");
-  const legacyPath = path.join(stateDir, "merged-models.json");
-  const original = Buffer.from("{\"legacy\":true}\n");
+  const legacyPaths = Object.fromEntries(artifactNames.map((name) => [name, path.join(stateDir, name)]));
+  const old = artifacts("bootstrap-failure-old");
+  const oldBytes = Object.fromEntries(artifactNames.map((name) => [
+    name,
+    Buffer.from(`${JSON.stringify(old[name], null, 2)}\n`),
+  ]));
   try {
-    writeFileSync(legacyPath, original, { mode: 0o640 });
+    for (const name of artifactNames) writeFileSync(legacyPaths[name], oldBytes[name], { mode: 0o640 });
     const base = testOperations();
     let symlinkCalls = 0;
     const operations = {
@@ -263,13 +261,16 @@ test("a first-generation bootstrap-pointer failure restores the regular file", (
       () => publishCatalogGeneration({
         files: artifacts("new"),
         generationsDir,
-        legacyPaths: { "merged-models.json": legacyPath },
+        legacyPaths,
         operations,
       }),
       /injected bootstrap pointer failure/,
     );
     assert.throws(() => lstatSync(path.join(generationsDir, "current")), /ENOENT/);
-    assert.deepEqual(readFileSync(legacyPath), original);
+    for (const name of artifactNames) {
+      assert.deepEqual(readFileSync(legacyPaths[name]), oldBytes[name]);
+      if (process.platform !== "win32") assert.equal(statSync(legacyPaths[name]).mode & 0o777, 0o640);
+    }
   } finally {
     rmSync(stateDir, { recursive: true, force: true });
   }
@@ -307,7 +308,7 @@ function countedOperations(base, counts, fail = undefined) {
   };
 }
 
-test("every publication operation ordinal preserves one complete old reader view", () => {
+test("ordinary symlink-topology update fault matrix preserves one complete old reader view", () => {
   const probeDir = mkdtempSync(path.join(os.tmpdir(), "catalog-generation-matrix-probe-"));
   let counts;
   try {
@@ -324,9 +325,11 @@ test("every publication operation ordinal preserves one complete old reader view
   }
   assert.equal(counts.writeFile, 6);
   assert.equal(counts.fsyncFile, 6);
-  assert.ok(counts.fsyncDirectory >= 4, "syncs staging, generation root, stable parents, and pointer parent");
-  assert.ok(counts.symlink >= 7, "covers six stable links plus the current pointer");
-  assert.ok(counts.rename >= 8, "covers staging, six stable migrations, and the current pointer");
+  // The injected authority seam records the actual platform operation graph;
+  // only file writes and file fsyncs have an invariant cardinality here.
+  assert.ok(counts.fsyncDirectory > 0);
+  assert.ok(counts.symlink > 0);
+  assert.ok(counts.rename > 0);
 
   for (const [operation, total] of Object.entries(counts)) {
     for (let ordinal = 1; ordinal <= total; ordinal += 1) {
@@ -353,6 +356,70 @@ test("every publication operation ordinal preserves one complete old reader view
         );
         for (const name of artifactNames) {
           assert.equal(statSync(path.join(fixture.generationsDir, "current", name)).mode & 0o777, oldModes[name]);
+        }
+      } finally {
+        rmSync(stateDir, { recursive: true, force: true });
+      }
+    }
+  }
+});
+
+function bootstrapLegacyFixture(stateDir) {
+  const generationsDir = path.join(stateDir, "catalog-generations");
+  const legacyPaths = Object.fromEntries(artifactNames.map((name) => [name, path.join(stateDir, name)]));
+  const old = artifacts("bootstrap-matrix-old");
+  const stable = Object.fromEntries(artifactNames.map((name) => [
+    name,
+    Buffer.from(`${JSON.stringify(old[name], null, 2)}\n`),
+  ]));
+  for (const name of artifactNames) writeFileSync(legacyPaths[name], stable[name], { mode: 0o600 });
+  return { generationsDir, legacyPaths, stable };
+}
+
+test("bootstrap migration fault matrix restores legacy topology after every observed ordinal", () => {
+  const probeDir = mkdtempSync(path.join(os.tmpdir(), "catalog-generation-bootstrap-probe-"));
+  let counts;
+  try {
+    const fixture = bootstrapLegacyFixture(probeDir);
+    counts = {};
+    publishCatalogGeneration({
+      files: artifacts("bootstrap-matrix-probe"),
+      generationsDir: fixture.generationsDir,
+      legacyPaths: fixture.legacyPaths,
+      operations: countedOperations(testOperations(), counts),
+    });
+  } finally {
+    rmSync(probeDir, { recursive: true, force: true });
+  }
+  assert.ok(counts.writeFile >= 12, "new and bootstrap generations each write six artifacts");
+  assert.ok(counts.fsyncFile >= 12);
+
+  for (const [operation, total] of Object.entries(counts)) {
+    for (let ordinal = 1; ordinal <= total; ordinal += 1) {
+      const stateDir = mkdtempSync(path.join(os.tmpdir(), "catalog-generation-bootstrap-matrix-"));
+      try {
+        const fixture = bootstrapLegacyFixture(stateDir);
+        assert.throws(
+          () => publishCatalogGeneration({
+            files: artifacts(`bootstrap-${operation}-${ordinal}`),
+            generationsDir: fixture.generationsDir,
+            legacyPaths: fixture.legacyPaths,
+            operations: countedOperations(testOperations(), {}, { operation, ordinal }),
+          }),
+          new RegExp(`injected ${operation} #${ordinal}`),
+        );
+        assert.throws(() => lstatSync(path.join(fixture.generationsDir, "current")), /ENOENT/);
+        assert.deepEqual(
+          Object.fromEntries(artifactNames.map((name) => [name, readFileSync(fixture.legacyPaths[name])])),
+          fixture.stable,
+        );
+        if (existsSync(fixture.generationsDir)) {
+          const leftovers = readdirSync(fixture.generationsDir);
+          assert.equal(
+            leftovers.some((name) => name.startsWith("bootstrap-") || name.startsWith(".staging-")),
+            false,
+            `${operation} #${ordinal} left bootstrap staging behind`,
+          );
         }
       } finally {
         rmSync(stateDir, { recursive: true, force: true });

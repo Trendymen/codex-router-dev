@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test, { after } from "node:test";
@@ -9,8 +9,13 @@ process.env.MODEL_ROUTER_STATE_DIR = stateDir;
 
 const {
   readProviderSelection,
+  setProviderEnabledAndRebuild,
   writeProviderSelectionAndRebuild,
 } = await import("../src/provider-selection.mjs");
+const {
+  experimentalModelEnabled,
+  setExperimentalModel,
+} = await import("../src/experimental-models.mjs");
 const {
   removeApiCredentialAndRebuild,
   saveApiCredentialAndRebuild,
@@ -19,6 +24,7 @@ const {
   readHiddenModels,
   setModelVisibleAndRebuild,
 } = await import("../src/model-picker-state.mjs");
+const { EXPERIMENTAL_MODELS_PATH, PROVIDER_SELECTION_PATH } = await import("../src/paths.mjs");
 
 after(() => rmSync(stateDir, { recursive: true, force: true }));
 
@@ -69,4 +75,48 @@ test("visibility commits the picker state and unified generation before target r
   assert.deepEqual([...readHiddenModels()], ["deepseek/deepseek-v4-flash"]);
   assert.equal(calls[0].reason, "model-visibility:deepseek/deepseek-v4-flash:hide");
   assert.deepEqual(calls.slice(1), ["refresh"]);
+});
+
+function bytesOrMissing(file) {
+  return existsSync(file) ? readFileSync(file) : undefined;
+}
+
+function failingGeneration(reason) {
+  return {
+    buildFiles: async () => { throw new Error(`injected ${reason} generation failure`); },
+    refreshTargets: () => { throw new Error("external refresh must not run"); },
+  };
+}
+
+test("production credential, provider, visibility, and canary wrappers restore state on generation failure", async () => {
+  const beforeSelection = bytesOrMissing(PROVIDER_SELECTION_PATH);
+  const beforeCanary = bytesOrMissing(EXPERIMENTAL_MODELS_PATH);
+  const beforeHidden = [...readHiddenModels()];
+  const credentialPath = path.join(stateDir, "deepseek-api-key.secret");
+  const beforeCredential = bytesOrMissing(credentialPath);
+
+  await assert.rejects(
+    saveApiCredentialAndRebuild("deepseek", "test-only-failure-key", failingGeneration("credential:set:deepseek")),
+    /credential:set:deepseek generation failure/,
+  );
+  assert.deepEqual(bytesOrMissing(credentialPath), beforeCredential);
+
+  await assert.rejects(
+    setProviderEnabledAndRebuild("deepseek", false, failingGeneration("provider-selection:disable:deepseek")),
+    /provider-selection:disable:deepseek generation failure/,
+  );
+  assert.deepEqual(bytesOrMissing(PROVIDER_SELECTION_PATH), beforeSelection);
+
+  await assert.rejects(
+    setModelVisibleAndRebuild("deepseek/deepseek-v4-flash", false, failingGeneration("model-visibility:deepseek/deepseek-v4-flash:hide")),
+    /model-visibility:deepseek\/deepseek-v4-flash:hide generation failure/,
+  );
+  assert.deepEqual([...readHiddenModels()], beforeHidden);
+
+  await assert.rejects(
+    setExperimentalModel("deepseek/deepseek-v4-flash", true, failingGeneration("experimental-model:enable:deepseek/deepseek-v4-flash")),
+    /experimental-model:enable:deepseek\/deepseek-v4-flash generation failure/,
+  );
+  assert.equal(experimentalModelEnabled("deepseek/deepseek-v4-flash"), false);
+  assert.deepEqual(bytesOrMissing(EXPERIMENTAL_MODELS_PATH), beforeCanary);
 });
