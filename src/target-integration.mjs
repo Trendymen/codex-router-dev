@@ -105,9 +105,9 @@ function codexIntegrationInstalled() {
   }
 }
 
-export function refreshTargetPickerIfInstalled() {
+export function refreshTargetPickerIfInstalled({ rebuildCodex = true } = {}) {
   let refreshed = false;
-  if (existsSync(NATIVE_CATALOG_PATH)) {
+  if (rebuildCodex && existsSync(NATIVE_CATALOG_PATH)) {
     run("catalog.mjs");
     refreshed = true;
   }

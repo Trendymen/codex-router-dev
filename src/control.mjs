@@ -443,7 +443,12 @@ async function runSet(provider, desired) {
   // target-aware CLI invocations can each publish a stale provider selection
   // even though the target files themselves are private and atomic.
   const selected = requestedControlTargets();
-  await withModelOverlayLock(() => setProviderSelectionForTargets(provider, desired, selected));
+  const { transactNodeMutationAndRefreshTargets } = await import("./node-snapshot-triggers.mjs");
+  await transactNodeMutationAndRefreshTargets({
+    files: [PROVIDER_SELECTION_PATH],
+    reason: `provider-selection:${provider}:${desired}`,
+    mutate: () => setProviderSelectionForTargets(provider, desired, selected),
+  });
   process.stderr.write(
     `Set ${provider} ${desired} for: ${selected.join(", ")}. Run \`bin/control apply\` to make it live.\n`,
   );
@@ -452,9 +457,7 @@ async function runSet(provider, desired) {
 
 function refreshActiveTarget(target) {
   const command =
-    target === "codex"
-      ? [process.execPath, [path.join(REPO_ROOT, "src", "catalog.mjs")]]
-      : target === "dsh"
+    target === "dsh"
         ? [process.execPath, [path.join(REPO_ROOT, "src", "dsh-config-manager.mjs"), "install"]]
         : target === "gemini"
           ? [process.execPath, [path.join(REPO_ROOT, "src", "gemini-config-manager.mjs"), "install"]]
@@ -524,12 +527,14 @@ async function runSetApply(provider, desired) {
   const selected = requestedControlTargets();
   const activate = args.includes("--activate");
   let publication;
-  await transactModelOverlayMutation({
+  const { transactNodeMutationAndRefreshTargets } = await import("./node-snapshot-triggers.mjs");
+  await transactNodeMutationAndRefreshTargets({
     files: [PROVIDER_SELECTION_PATH],
+    reason: `provider-selection:${provider}:${desired}`,
     mutate: () => setProviderSelectionForTargets(provider, desired, selected),
     // Selection belongs to the shared router plane. Republish every installed
     // client even when the initiating UI named only its own target.
-    applyPublication: async () => {
+    refreshTargets: async () => {
       publication = await applyProviderSelectionForTargets(TARGETS, { activate });
       return publication;
     },
@@ -580,35 +585,22 @@ async function readSecretFromStdin() {
 }
 
 async function saveProviderCredential(providerId) {
-  const { providerOnboardingSnapshot, saveApiCredential } = await import("./provider-onboarding.mjs");
+  const { providerOnboardingSnapshot, saveApiCredentialAndRebuild } = await import("./provider-onboarding.mjs");
   const value = await readSecretFromStdin();
   // The control-center sends this command before it refreshes its provider
   // snapshot. Keep credential persistence, selection, and target publication
   // together so a concurrent remove cannot create an enabled credentialless
   // provider between the child processes.
-  await withModelOverlayLock(async () => {
-    saveApiCredential(providerId, value);
-    const { enableProvider } = await import("./provider-selection.mjs");
-    enableProvider(providerId);
-    const { refreshTargetPickerIfInstalled } = await import("./target-integration.mjs");
-    refreshTargetPickerIfInstalled();
-  });
+  await saveApiCredentialAndRebuild(providerId, value);
   process.stdout.write(`${JSON.stringify(providerOnboardingSnapshot())}\n`);
 }
 
 async function deleteProviderCredential(providerId) {
-  const { providerOnboardingSnapshot, removeApiCredential } = await import("./provider-onboarding.mjs");
+  const { providerOnboardingSnapshot, removeApiCredentialAndRebuild } = await import("./provider-onboarding.mjs");
   // Removing a managed credential also withdraws its provider selection. Keep
   // that low-level write under the same cross-process lock as the picker and
   // local-model mutations; status reads remain outside the lock.
-  let removal;
-  await withModelOverlayLock(async () => {
-    removal = removeApiCredential(providerId);
-    if (removal.removedFiles) {
-      const { refreshTargetPickerIfInstalled } = await import("./target-integration.mjs");
-      refreshTargetPickerIfInstalled();
-    }
-  });
+  const { removal } = await removeApiCredentialAndRebuild(providerId);
   process.stdout.write(
     `${JSON.stringify({ ...providerOnboardingSnapshot(), removal })}\n`,
   );
@@ -2007,9 +1999,9 @@ async function handleLocalModels(action, value, ...rest) {
 async function handlePicker(action, value, flag) {
   const {
     modelPickerSnapshot,
-    setAllModelsVisible,
-    setModelVisible,
-    setModelsVisible,
+    setAllModelsVisibleAndRebuild,
+    setModelVisibleAndRebuild,
+    setModelsVisibleAndRebuild,
   } = await import("./model-picker-state.mjs");
   if (action === "status") {
     process.stdout.write(`${JSON.stringify(modelPickerSnapshot())}\n`);
@@ -2024,7 +2016,7 @@ async function handlePicker(action, value, flag) {
     const slugs = Array.isArray(parsed.models)
       ? parsed.models.map((model) => String(model.slug))
       : [];
-    setAllModelsVisible(slugs, flag === "show");
+    await setAllModelsVisibleAndRebuild(slugs, flag === "show");
   } else if (action === "set") {
     if (!["show", "hide"].includes(flag)) {
       throw new Error("Usage: control picker set <model-slug> <show|hide>");
@@ -2032,7 +2024,7 @@ async function handlePicker(action, value, flag) {
     if (!(await knownModelSlug(value))) {
       throw new Error(`Unknown model slug: ${value}`);
     }
-    setModelVisible(value, flag === "show");
+    await setModelVisibleAndRebuild(value, flag === "show");
   } else if (action === "provider") {
     if (!["show", "hide"].includes(flag)) {
       throw new Error("Usage: control picker provider <provider-id> <show|hide>");
@@ -2063,14 +2055,13 @@ async function handlePicker(action, value, flag) {
     if (slugs.length === 0) {
       throw new Error(`No enabled models found for provider: ${value}`);
     }
-    setModelsVisible(slugs, flag === "show");
+    await setModelsVisibleAndRebuild(slugs, flag === "show");
   } else {
     throw new Error(
       "Usage: control picker status|all <show|hide>|set <model-slug> <show|hide>|" +
         "provider <provider-id> <show|hide>",
     );
   }
-  refreshModelSettingsCatalog();
   process.stdout.write(`${JSON.stringify(modelPickerSnapshot())}\n`);
 }
 

@@ -25,6 +25,7 @@ import { venvRuntimeProblem } from "./venv-runtime.mjs";
 import { dependencyRepairHint } from "./dependency-repair.mjs";
 import { clearServiceProcessState, writeServiceProcessState } from "./service-process.mjs";
 import { environmentProxyOptedIn } from "./proxy-environment.mjs";
+import { rebuildAfterStartup } from "./node-snapshot-triggers.mjs";
 
 const dependencyFix = dependencyRepairHint();
 
@@ -229,6 +230,10 @@ const FRONTEND = { script: "router.mjs", service: "codex-router", label: "Codex 
 for (const signal of ["SIGINT", "SIGTERM"]) process.on(signal, stopChildren);
 
 async function main() {
+  // A normal install already has a base native/merged catalog. A first cold
+  // start may not, and rebuilding from a missing template would turn that into
+  // a startup loop, so the trigger deliberately waits for the base artifact.
+  await rebuildAfterStartup();
   // These forwarders use separate ports and do not depend on one another.
   // Start all of them before waiting so a cold service does not pay their
   // startup times one after another.

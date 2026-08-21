@@ -4,6 +4,14 @@ import { existsSync, readFileSync } from "node:fs";
 import { writePrivateJson } from "./file-security.mjs";
 import { PROTOCOL_PROOFS_PATH } from "./paths.mjs";
 import { transactNodeStateMutation } from "./catalog-rebuild.mjs";
+import { transactNodeMutationAndRefreshTargets } from "./node-snapshot-triggers.mjs";
+
+function proofRefreshTargets() {
+  return async () => {
+    const { refreshTargetPickerIfInstalled } = await import("./target-integration.mjs");
+    return refreshTargetPickerIfInstalled({ rebuildCodex: false });
+  };
+}
 
 function canonicalValue(value) {
   if (Array.isArray(value)) return value.map(canonicalValue);
@@ -123,8 +131,9 @@ export async function writePassingProtocolProof(record, options = {}) {
   if (!validProtocolProof(record)) {
     throw new Error("Protocol proof writes require a complete passing record.");
   }
-  const { expectedRevision, transaction = transactNodeStateMutation, ...transactionOptions } = options;
-  return transaction({
+  const { expectedRevision, transaction = transactNodeStateMutation, refreshTargets, ...transactionOptions } = options;
+  return transactNodeMutationAndRefreshTargets({
+    transaction,
     files: [PROTOCOL_PROOFS_PATH],
     reason: `protocol-proof:verify:${record.slug}`,
     mutate: () => {
@@ -142,13 +151,15 @@ export async function writePassingProtocolProof(record, options = {}) {
       );
     },
     ...transactionOptions,
+    refreshTargets: refreshTargets || proofRefreshTargets(),
   });
 }
 
 export async function revokeProtocolProof(slug, options = {}) {
   const key = String(slug);
-  const { transaction = transactNodeStateMutation, ...transactionOptions } = options;
-  return transaction({
+  const { transaction = transactNodeStateMutation, refreshTargets, ...transactionOptions } = options;
+  return transactNodeMutationAndRefreshTargets({
+    transaction,
     files: [PROTOCOL_PROOFS_PATH],
     reason: `protocol-proof:revoke:${key}`,
     mutate: () => {
@@ -165,6 +176,7 @@ export async function revokeProtocolProof(slug, options = {}) {
       );
     },
     ...transactionOptions,
+    refreshTargets: refreshTargets || proofRefreshTargets(),
   });
 }
 
@@ -182,8 +194,9 @@ function recordMatchesModel(record, model) {
 export async function invalidateProtocolProofForModel(model, options = {}) {
   const slug = String(model?.slug || "");
   if (!slug) throw new Error("Protocol proof invalidation requires a model slug.");
-  const { transaction = transactNodeStateMutation, ...transactionOptions } = options;
-  return transaction({
+  const { transaction = transactNodeStateMutation, refreshTargets, ...transactionOptions } = options;
+  return transactNodeMutationAndRefreshTargets({
+    transaction,
     files: [PROTOCOL_PROOFS_PATH],
     reason: `protocol-proof:invalidate:${slug}`,
     mutate: () => {
@@ -199,5 +212,40 @@ export async function invalidateProtocolProofForModel(model, options = {}) {
       );
     },
     ...transactionOptions,
+    refreshTargets: refreshTargets || proofRefreshTargets(),
+  });
+}
+
+/**
+ * Registry/update completion invalidates a whole registry snapshot under one
+ * transaction. Read-time contract resolution stays read-only; only this
+ * explicit completion path persists stale-proof withdrawal.
+ */
+export async function invalidateProtocolProofsForModels(models, options = {}) {
+  const bySlug = new Map(
+    (Array.isArray(models) ? models : [])
+      .filter((model) => String(model?.slug || ""))
+      .map((model) => [String(model.slug), model]),
+  );
+  const { transaction = transactNodeStateMutation, refreshTargets, ...transactionOptions } = options;
+  return transactNodeMutationAndRefreshTargets({
+    transaction,
+    files: [PROTOCOL_PROOFS_PATH],
+    reason: "protocol-proof:invalidate-registry",
+    mutate: () => {
+      const state = readProtocolProofState();
+      const stale = [...bySlug.entries()]
+        .filter(([slug, model]) => state.proofs[slug] && !recordMatchesModel(state.proofs[slug], model));
+      if (stale.length === 0) return;
+      const proofs = { ...state.proofs };
+      const revisions = { ...state.revisions };
+      for (const [slug] of stale) {
+        delete proofs[slug];
+        revisions[slug] = (revisions[slug] ?? 0) + 1;
+      }
+      writeProtocolProofState(proofs, state.revision + 1, revisions);
+    },
+    ...transactionOptions,
+    refreshTargets: refreshTargets || proofRefreshTargets(),
   });
 }

@@ -12,6 +12,7 @@ import {
   installationNeedsRefresh,
   localModificationsMessage,
   parseArguments,
+  rebuildNodeSnapshotsAfterUpdate,
   resolveCommand,
   trayRefreshRequired,
 } from "../src/update.mjs";
@@ -26,6 +27,19 @@ test("checkout updates preserve the codex target on every platform", () => {
   const posixCodex = currentCheckoutInstaller("darwin", "codex");
   assert.match(posixCodex.command, /bin[\\/]install$/);
   assert.deepEqual(posixCodex.args, []);
+});
+
+test("a completed update invokes the non-live registry snapshot trigger", () => {
+  const calls = [];
+  rebuildNodeSnapshotsAfterUpdate({
+    run: (command, args, options) => {
+      calls.push({ command, args, options });
+      return { status: 0, stderr: "" };
+    },
+  });
+  assert.equal(calls.length, 1);
+  assert.equal(path.basename(calls[0].args[0]), "node-snapshot-triggers.mjs");
+  assert.deepEqual(calls[0].args.slice(1), ["registry-update"]);
 });
 
 test("a bare invocation updates and an explicit check stays read-only", () => {

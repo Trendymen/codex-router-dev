@@ -15,12 +15,14 @@ import { MODELS, PROVIDERS, providerNeedsNoKey } from "./model-registry.mjs";
 import { kimiOAuthStatus } from "./oauth-status.mjs";
 import {
   apiProvider,
+  credentialPaths,
   credentialLabel,
   credentialStatus,
   removeProviderCredential,
   writeProviderCredential,
 } from "./provider-credentials.mjs";
-import { disableProvider } from "./provider-selection.mjs";
+import { disableProvider, enableProvider } from "./provider-selection.mjs";
+import { transactNodeMutationAndRefreshTargets } from "./node-snapshot-triggers.mjs";
 import {
   npmGlobalBinary,
   npmInstallGlobal,
@@ -252,6 +254,45 @@ export function removeApiCredential(providerId) {
     stillConfigured: remaining.configured === true,
     remainingSource: remaining.configured ? remaining.source : undefined,
   };
+}
+
+export async function saveApiCredentialAndRebuild(providerId, value, options = {}) {
+  const provider = apiProvider(providerId);
+  const refreshTargets = options.refreshTargets || (async () => {
+    const { refreshTargetPickerIfInstalled } = await import("./target-integration.mjs");
+    return refreshTargetPickerIfInstalled({ rebuildCodex: false });
+  });
+  let target;
+  const publication = await transactNodeMutationAndRefreshTargets({
+    ...options,
+    files: [...credentialPaths(provider), (await import("./paths.mjs")).PROVIDER_SELECTION_PATH],
+    reason: `credential:set:${provider.id}`,
+    mutate: () => {
+      target = writeProviderCredential(provider, value);
+      enableProvider(provider.id);
+    },
+    refreshTargets,
+  });
+  return { target, publication };
+}
+
+export async function removeApiCredentialAndRebuild(providerId, options = {}) {
+  const provider = apiProvider(providerId);
+  const refreshTargets = options.refreshTargets || (async () => {
+    const { refreshTargetPickerIfInstalled } = await import("./target-integration.mjs");
+    return refreshTargetPickerIfInstalled({ rebuildCodex: false });
+  });
+  let removal;
+  const publication = await transactNodeMutationAndRefreshTargets({
+    ...options,
+    files: [...credentialPaths(provider), (await import("./paths.mjs")).PROVIDER_SELECTION_PATH],
+    reason: `credential:remove:${provider.id}`,
+    mutate: () => {
+      removal = removeApiCredential(provider.id);
+    },
+    refreshTargets,
+  });
+  return { removal, publication };
 }
 
 // Catalog-only providers (gemini-api, openrouter, groq, ...) ship no

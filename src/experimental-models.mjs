@@ -4,6 +4,7 @@ import { writePrivateJson } from "./file-security.mjs";
 import { MODEL_BY_SLUG } from "./model-registry.mjs";
 import { EXPERIMENTAL_MODELS_PATH } from "./paths.mjs";
 import { transactNodeStateMutation } from "./catalog-rebuild.mjs";
+import { transactNodeMutationAndRefreshTargets } from "./node-snapshot-triggers.mjs";
 
 function readExperimentalModels() {
   if (!existsSync(EXPERIMENTAL_MODELS_PATH)) return new Set();
@@ -41,8 +42,9 @@ export function experimentalModelForSlug(slug) {
 
 export async function setExperimentalModel(slug, enabled, options = {}) {
   const key = String(slug);
-  const { transaction = transactNodeStateMutation, ...transactionOptions } = options;
-  return transaction({
+  const { transaction = transactNodeStateMutation, refreshTargets, ...transactionOptions } = options;
+  return transactNodeMutationAndRefreshTargets({
+    transaction,
     files: [EXPERIMENTAL_MODELS_PATH],
     reason: `experimental-model:${enabled === true ? "enable" : "disable"}:${key}`,
     mutate: () => {
@@ -56,5 +58,9 @@ export async function setExperimentalModel(slug, enabled, options = {}) {
       );
     },
     ...transactionOptions,
+    refreshTargets: refreshTargets || (async () => {
+      const { refreshTargetPickerIfInstalled } = await import("./target-integration.mjs");
+      return refreshTargetPickerIfInstalled({ rebuildCodex: false });
+    }),
   });
 }

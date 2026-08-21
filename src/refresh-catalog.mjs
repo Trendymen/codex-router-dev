@@ -52,6 +52,10 @@ export function refreshCatalog({ run = nodeRunner } = {}) {
       restoreTransport(run, signed);
       restoreNeeded = false;
     }
+    // Catalog capture established the base merged/native template. Completing
+    // refresh now invalidates stale contract proofs and republishes one unified
+    // Node generation; the trigger itself makes no provider request.
+    checked(run, "node-snapshot-triggers.mjs", ["registry-update"]);
   } catch (error) {
     if (restoreNeeded) {
       try {

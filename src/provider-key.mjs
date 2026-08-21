@@ -6,11 +6,12 @@ import {
   credentialLabel,
   credentialStatus,
   primaryCredentialPath,
-  writeProviderCredential,
 } from "./provider-credentials.mjs";
-import { providerNeedsCuration, removeApiCredential } from "./provider-onboarding.mjs";
-import { enableProvider } from "./provider-selection.mjs";
-import { withModelOverlayLock } from "./model-overlay-lock.mjs";
+import {
+  providerNeedsCuration,
+  removeApiCredentialAndRebuild,
+  saveApiCredentialAndRebuild,
+} from "./provider-onboarding.mjs";
 import { secretEntryFeedback, secretEntryProblem } from "./secret-entry.mjs";
 import {
   refreshTargetPickerIfInstalled,
@@ -239,14 +240,12 @@ if (command === "status") {
   const value = promptForKey(provider.credential.prompt || `${provider.displayName} API key`);
   let target;
   let refreshed;
-  await withModelOverlayLock(async () => {
-    // Keep the credential write and the provider selection in one cross-process
-    // critical section. A concurrent remove must not delete the key between
-    // these operations and leave an enabled credentialless provider behind.
-    target = writeProviderCredential(provider, value);
-    enableProvider(provider.id);
-    refreshed = refreshTargetPickerIfInstalled();
-  });
+  ({ target } = await saveApiCredentialAndRebuild(provider.id, value, {
+    refreshTargets: () => {
+      refreshed = refreshTargetPickerIfInstalled({ rebuildCodex: false });
+      return refreshed;
+    },
+  }));
   process.stdout.write(
     `${provider.displayName} ${credentialNoun} saved to protected local storage at ${target}. The provider is enabled.${
       refreshed ? ` ${targetRestartHint()}` : ""
@@ -261,14 +260,12 @@ if (command === "status") {
 } else {
   let removal;
   let refreshed;
-  await withModelOverlayLock(async () => {
-    // Deletion and withdrawal are intentionally one plain lock scope. There
-    // is no rollback of credential files, so a publication failure leaves the
-    // coherent result (credential gone, provider disabled) rather than a
-    // selection restored next to a deleted secret.
-    removal = removeApiCredential(provider.id);
-    refreshed = removal.removedFiles ? refreshTargetPickerIfInstalled() : false;
-  });
+  ({ removal } = await removeApiCredentialAndRebuild(provider.id, {
+    refreshTargets: () => {
+      refreshed = refreshTargetPickerIfInstalled({ rebuildCodex: false });
+      return refreshed;
+    },
+  }));
   process.stdout.write(
     removal.removedFiles
       ? `Removed ${removal.removedFiles} managed ${provider.displayName} ${credentialNoun} file${removal.removedFiles === 1 ? "" : "s"} and disabled the provider.${

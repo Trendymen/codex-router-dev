@@ -434,15 +434,17 @@ test("toggle rejects an unknown provider", () => {
   assert.throws(() => probeSet("codex", ["deepseek"], "not-a-provider", "on"));
 });
 
-test("set-apply keeps provider mutation, publication, and rollback in one transaction", () => {
+test("set-apply delegates provider mutation to the Router state-and-generation transaction", () => {
   const source = readFileSync(path.join(root, "src", "control.mjs"), "utf8");
   const atomic = source.match(
     /async function runSetApply[\s\S]*?\r?\n}\r?\n\r?\nasync function printAccountUsage/,
   )?.[0];
   assert.ok(atomic, "atomic set/apply helper should be readable");
-  assert.match(atomic, /transactModelOverlayMutation\(\{/);
+  assert.match(atomic, /transactNodeMutationAndRefreshTargets\(\{/);
   assert.match(atomic, /files: \[PROVIDER_SELECTION_PATH\]/);
   assert.match(atomic, /mutate: \(\) => setProviderSelectionForTargets/);
+  assert.match(atomic, /reason: `provider-selection:\$\{provider\}:\$\{desired\}`/);
+  assert.match(atomic, /refreshTargets: async \(\) =>/);
   assert.match(atomic, /applyProviderSelectionForTargets\(TARGETS, \{ activate \}\)/);
   assert.match(atomic, /const activate = args\.includes\("--activate"\)/);
   assert.match(source, /args\[0\] === "set-apply"[\s\S]{0,260}runSetApply\(args\[1\], args\[2\]\)/);

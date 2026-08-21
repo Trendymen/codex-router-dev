@@ -9,6 +9,7 @@ import {
 import path from "node:path";
 
 import { protectPrivateFile } from "./file-security.mjs";
+import { transactNodeMutationAndRefreshTargets } from "./node-snapshot-triggers.mjs";
 import { STATE_DIR } from "./paths.mjs";
 
 export const MODEL_PICKER_STATE_PATH =
@@ -96,6 +97,35 @@ export function setAllModelsVisible(slugs, visible) {
     hidden: visible ? new Set() : new Set(known),
     seeded: new Set([...seeded, ...known]),
   });
+}
+
+async function transactPickerMutation(reason, mutate, options = {}) {
+  const refreshTargets = options.refreshTargets || (async () => {
+    const { refreshTargetPickerIfInstalled } = await import("./target-integration.mjs");
+    return refreshTargetPickerIfInstalled({ rebuildCodex: false });
+  });
+  return transactNodeMutationAndRefreshTargets({
+    ...options,
+    files: [MODEL_PICKER_STATE_PATH],
+    reason,
+    mutate,
+    refreshTargets,
+  });
+}
+
+export async function setModelVisibleAndRebuild(slug, visible, options = {}) {
+  return transactPickerMutation(`model-visibility:${String(slug)}:${visible ? "show" : "hide"}`,
+    () => setModelVisible(slug, visible), options);
+}
+
+export async function setModelsVisibleAndRebuild(slugs, visible, options = {}) {
+  return transactPickerMutation(`model-visibility:models:${visible ? "show" : "hide"}`,
+    () => setModelsVisible(slugs, visible), options);
+}
+
+export async function setAllModelsVisibleAndRebuild(slugs, visible, options = {}) {
+  return transactPickerMutation(`model-visibility:all:${visible ? "show" : "hide"}`,
+    () => setAllModelsVisible(slugs, visible), options);
 }
 
 // Applies a shipped default to models the operator has never decided, and only

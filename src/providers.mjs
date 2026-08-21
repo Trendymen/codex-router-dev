@@ -9,9 +9,8 @@ import { credentialStatus } from "./provider-credentials.mjs";
 import { providerNeedsCuration } from "./provider-onboarding.mjs";
 import {
   canonicalProviderId,
-  disableProvider,
-  enableProvider,
   readProviderSelection,
+  setProviderEnabledAndRebuild,
 } from "./provider-selection.mjs";
 import {
   refreshTargetPickerIfInstalled,
@@ -19,7 +18,6 @@ import {
   targetPickerName,
   targetRestartHint,
 } from "./target-integration.mjs";
-import { withModelOverlayLock } from "./model-overlay-lock.mjs";
 
 // One entry per OAuth vendor keeps adding a provider a registry-plus-map
 // change instead of another branch in a nested conditional.
@@ -81,13 +79,12 @@ async function main() {
       : keySetup;
     throw new Error(`${provider.displayName} is not configured; ${setup} first.`);
   }
-  let providers;
-  let refreshed;
-  await withModelOverlayLock(async () => {
-    providers = command === "enable"
-      ? enableProvider(providerId)
-      : disableProvider(providerId);
-    refreshed = refreshTargetPickerIfInstalled();
+  let refreshed = false;
+  const { providers } = await setProviderEnabledAndRebuild(providerId, command === "enable", {
+    refreshTargets: () => {
+      refreshed = refreshTargetPickerIfInstalled({ rebuildCodex: false });
+      return refreshed;
+    },
   });
   // "shown in the model picker" is false for a catalog-only provider with no
   // curated models: enabling it changes nothing the user can see. Say what

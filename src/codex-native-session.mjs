@@ -2,7 +2,8 @@ import { existsSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 
 import { discoveryDisabled } from "./discovery-mode.mjs";
-import { CODEX_HOME } from "./paths.mjs";
+import { createNativeSessionSnapshotObserver } from "./node-snapshot-triggers.mjs";
+import { CODEX_HOME, MERGED_CATALOG_PATH } from "./paths.mjs";
 
 // The ChatGPT session the local Codex install already holds.
 //
@@ -153,7 +154,37 @@ export function nativeSessionHeaders() {
 }
 
 export function nativeSessionAvailable() {
-  return Boolean(nativeSessionHeaders());
+  const usable = Boolean(nativeSessionHeaders());
+  observeNativeSessionUsability(usable);
+  return usable;
+}
+
+// Keep just the usable bit in memory. In particular, this does not retain a
+// token, account id, file contents, or a credential-derived fingerprint.
+let nodeSnapshotObserver;
+
+export function observeNativeSessionUsability(usable, {
+  observer = nodeSnapshotObserver || (nodeSnapshotObserver = createNativeSessionSnapshotObserver({
+    rebuild: async (reason) => {
+      // A first cold start has no native template yet. Do not contend on the
+      // publication lock or turn that normal state into an asynchronous retry.
+      if (!existsSync(MERGED_CATALOG_PATH)) return undefined;
+      const { rebuildNodeSnapshots } = await import("./catalog-rebuild.mjs");
+      const publication = await rebuildNodeSnapshots(reason);
+      // DSH/Gemini documents are outside the Router transaction; refresh only
+      // after the generation pointer has switched, and never rerun Codex's old
+      // standalone catalog writer.
+      const { refreshTargetPickerIfInstalled } = await import("./target-integration.mjs");
+      refreshTargetPickerIfInstalled({ rebuildCodex: false });
+      return publication;
+    },
+  })),
+} = {}) {
+  // A route lookup must not wait on a filesystem publication. The observer
+  // serializes the generation work and makes a later transition request one
+  // follow-up rebuild at most.
+  void observer.observe({ usable: usable === true }).catch(() => {});
+  return observer.snapshot();
 }
 
 /**

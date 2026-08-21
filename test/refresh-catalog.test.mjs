@@ -39,6 +39,7 @@ test("refresh orchestration restores signed routing and republishes the routed c
     ["config-manager.mjs", ["enable"]],
     ["config-manager.mjs", ["signed-enable"]],
     ["catalog.mjs", []],
+    ["node-snapshot-triggers.mjs", ["registry-update"]],
   ]);
   assert.equal(result.catalogOutput, '{"models":1}\n');
 });
@@ -68,5 +69,6 @@ test("ordinary routed refresh also republishes external models after restore", (
     ["catalog.mjs", ["--refresh-native"]],
     ["config-manager.mjs", ["enable"]],
     ["catalog.mjs", []],
+    ["node-snapshot-triggers.mjs", ["registry-update"]],
   ]);
 });

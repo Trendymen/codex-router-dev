@@ -17,6 +17,7 @@ import { targetCli } from "./target-integration.mjs";
 import { kimiOAuthStatus } from "./oauth-status.mjs";
 import { grokOAuthStatus } from "./grok-oauth-status.mjs";
 import { credentialStatus } from "./provider-credentials.mjs";
+import { transactNodeMutationAndRefreshTargets } from "./node-snapshot-triggers.mjs";
 
 const RETIRED_PROVIDER_ALIASES = new Map([["chatgpt-oauth", "grok-oauth"]]);
 
@@ -218,6 +219,39 @@ export function disableProvider(providerId) {
     : defaultProviderIds();
   return writeProviderSelection(
     current.filter((id) => canonicalProviderId(id) !== target),
+  );
+}
+
+/** Commit provider selection and its route/catalog generation together. */
+export async function writeProviderSelectionAndRebuild(values, options = {}) {
+  let providers;
+  const refreshTargets = options.refreshTargets || (async () => {
+    const { refreshTargetPickerIfInstalled } = await import("./target-integration.mjs");
+    return refreshTargetPickerIfInstalled({ rebuildCodex: false });
+  });
+  return transactNodeMutationAndRefreshTargets({
+    ...options,
+    files: [PROVIDER_SELECTION_PATH],
+    reason: "provider-selection",
+    mutate: () => {
+      providers = writeProviderSelection(values);
+    },
+    refreshTargets,
+  }).then((publication) => ({ providers, publication }));
+}
+
+export async function setProviderEnabledAndRebuild(providerId, enabled, options = {}) {
+  const current = existsSync(PROVIDER_SELECTION_PATH)
+    ? readProviderSelection()
+    : defaultProviderIds();
+  return writeProviderSelectionAndRebuild(
+    enabled
+      ? [...current, providerId]
+      : current.filter((id) => canonicalProviderId(id) !== canonicalProviderId(providerId)),
+    {
+      ...options,
+      reason: `provider-selection:${enabled ? "enable" : "disable"}:${canonicalProviderId(providerId)}`,
+    },
   );
 }
 

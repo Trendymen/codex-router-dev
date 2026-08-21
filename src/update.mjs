@@ -199,6 +199,26 @@ export function installationNeedsRefresh(manifest, revision) {
   return manifest?.current?.commit !== revision;
 }
 
+/** Complete update publication after the installer has rebuilt the base catalog. */
+export function rebuildNodeSnapshotsAfterUpdate({ run = spawnSync } = {}) {
+  const result = run(
+    process.execPath,
+    [path.join(SOURCE_ROOT, "src", "node-snapshot-triggers.mjs"), "registry-update"],
+    {
+      cwd: SOURCE_ROOT,
+      env: process.env,
+      encoding: "utf8",
+      stdio: "inherit",
+      windowsHide: true,
+    },
+  );
+  if (result?.error) throw result.error;
+  if (result?.status !== 0) {
+    throw new Error(String(result?.stderr || "Node snapshot rebuild after update failed.").trim());
+  }
+  return true;
+}
+
 export function updateCheckout({ force = false } = {}) {
   const status = checkForUpdate();
   if (!status.updateAvailable) {
@@ -206,6 +226,7 @@ export function updateCheckout({ force = false } = {}) {
       return { ...status, updated: false, reinstalled: false };
     }
     installCurrentCheckout();
+    rebuildNodeSnapshotsAfterUpdate();
     refreshTrayCompanion();
     return { ...status, updated: false, reinstalled: true };
   }
@@ -222,6 +243,7 @@ export function updateCheckout({ force = false } = {}) {
   git(["merge", "--ff-only", status.available], { inherit: true });
   try {
     installCurrentCheckout();
+    rebuildNodeSnapshotsAfterUpdate();
     refreshTrayCompanion();
   } catch (error) {
     try {
