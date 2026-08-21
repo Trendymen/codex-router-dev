@@ -258,6 +258,29 @@ test("native-session publication failure leaves the same usable state retryable"
   assert.deepEqual(observer.snapshot(), { usable: true, desiredUsable: true });
 });
 
+test("native-session observer retries a failed external refresh without publishing its state early", async () => {
+  const calls = [];
+  let refreshAttempts = 0;
+  const observer = createNativeSessionSnapshotObserver({
+    rebuild: async () => calls.push("rebuild"),
+    refreshTargets: async () => {
+      refreshAttempts += 1;
+      calls.push(`refresh:${refreshAttempts}`);
+      if (refreshAttempts === 1) throw new Error("injected refresh failure carrying secret-like text");
+    },
+  });
+
+  await observer.observe({ usable: false });
+  await assert.rejects(observer.observe({ usable: true }), /injected refresh failure/);
+  assert.deepEqual(calls, ["rebuild", "refresh:1"]);
+  assert.deepEqual(observer.snapshot(), { usable: false, desiredUsable: true });
+  assert.doesNotMatch(JSON.stringify(observer.snapshot()), /secret|error|failure/i);
+
+  await observer.observe({ usable: true });
+  assert.deepEqual(calls, ["rebuild", "refresh:1", "refresh:2"]);
+  assert.deepEqual(observer.snapshot(), { usable: true, desiredUsable: true });
+});
+
 for (const reason of [
   "credential:set:deepseek",
   "provider-selection:enable:deepseek",

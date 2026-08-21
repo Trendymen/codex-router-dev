@@ -97,6 +97,7 @@ export async function rebuildAfterRegistryUpdate({
 export function createNativeSessionSnapshotObserver({ rebuild, refreshTargets } = {}) {
   if (typeof rebuild !== "function") throw new Error("A native-session observer requires rebuild().");
   let desired;
+  let generationPublished;
   let published;
   let initialized = false;
   let running;
@@ -105,12 +106,19 @@ export function createNativeSessionSnapshotObserver({ rebuild, refreshTargets } 
 
   const run = async () => {
     do {
+      const rebuildPending = pending;
       pending = false;
       const target = desired;
       try {
-        await rebuild("native-session-usability");
+        if (generationPublished !== target || rebuildPending) {
+          await rebuild("native-session-usability");
+          generationPublished = target;
+        }
+        if (published !== target && typeof refreshTargets === "function") await refreshTargets();
+        // A usable state is published only when Router generation and every
+        // installed external picker have both accepted it. If refresh fails,
+        // retain the committed generation and retry only that external step.
         published = target;
-        if (typeof refreshTargets === "function") await refreshTargets();
       } catch (error) {
         // This is deliberately non-sensitive: callers can retry the same
         // usability state and no credential-derived detail leaves the module.
@@ -126,6 +134,7 @@ export function createNativeSessionSnapshotObserver({ rebuild, refreshTargets } 
       if (!initialized) {
         initialized = true;
         desired = usable;
+        generationPublished = usable;
         published = usable;
         return current;
       }

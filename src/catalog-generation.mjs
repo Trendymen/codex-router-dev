@@ -89,6 +89,12 @@ const MERGED_CATALOG_SCHEMA = Object.freeze({
   },
 });
 
+// Pre-generation merged catalogs were consumed by the 0.147 client contract.
+// Keep that historical validation separate from the stricter artifact written
+// by this version, so bootstrapping preserves old bytes rather than rewriting
+// them to satisfy a schema they never claimed to implement.
+const LEGACY_MERGED_CATALOG_SCHEMA = CATALOG_0147_SCHEMA;
+
 function jsonBytes(value) {
   return Buffer.isBuffer(value)
     ? value
@@ -242,7 +248,7 @@ function validateLegacyBootstrapArtifact(name, contents) {
   } catch (error) {
     throw new Error(`Cannot bootstrap catalog generations: legacy ${name} is invalid JSON.`, { cause: error });
   }
-  if (name === "merged-models.json") return validateCatalogSchema(value, MERGED_CATALOG_SCHEMA);
+  if (name === "merged-models.json") return validateCatalogSchema(value, LEGACY_MERGED_CATALOG_SCHEMA);
   if (name === "routed-models.json") {
     validateCatalogSchema(value, CATALOG_0147_SCHEMA);
     return validateCatalogSchema(value, CATALOG_0149_SCHEMA);

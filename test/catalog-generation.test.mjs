@@ -49,6 +49,13 @@ function artifacts(label) {
   };
 }
 
+function legacy0147MergedOnlyFixture(label) {
+  const legacy = artifacts(label)["merged-models.json"];
+  delete legacy.models[0].base_instructions;
+  delete legacy.models[0].supports_parallel_tool_calls;
+  return legacy;
+}
+
 function readCurrent(generationsDir) {
   return Object.fromEntries(artifactNames.map((name) => [
     name,
@@ -203,8 +210,7 @@ test("a legacy merged-only installation bootstraps deterministic empty companion
   const stateDir = mkdtempSync(path.join(os.tmpdir(), "catalog-generation-merged-only-"));
   const generationsDir = path.join(stateDir, "catalog-generations");
   const legacyPaths = Object.fromEntries(artifactNames.map((name) => [name, path.join(stateDir, name)]));
-  const old = artifacts("legacy-merged-only");
-  const oldMergedBytes = Buffer.from(`${JSON.stringify(old["merged-models.json"], null, 2)}\n`);
+  const oldMergedBytes = Buffer.from(`${JSON.stringify(legacy0147MergedOnlyFixture("legacy-merged-only"), null, 2)}\n`);
   const expectedBootstrap = {
     "merged-models.json": oldMergedBytes,
     "routed-models.json": Buffer.from('{\n  "models": []\n}\n'),
@@ -535,7 +541,7 @@ test("bootstrap migration fault matrix restores legacy topology after every obse
 function mergedOnlyLegacyFixture(stateDir) {
   const generationsDir = path.join(stateDir, "catalog-generations");
   const legacyPaths = Object.fromEntries(artifactNames.map((name) => [name, path.join(stateDir, name)]));
-  const merged = Buffer.from(`${JSON.stringify(artifacts("merged-only-matrix-old")["merged-models.json"], null, 2)}\n`);
+  const merged = Buffer.from(`${JSON.stringify(legacy0147MergedOnlyFixture("merged-only-matrix-old"), null, 2)}\n`);
   writeFileSync(legacyPaths["merged-models.json"], merged, { mode: 0o640 });
   return { generationsDir, legacyPaths, merged, mode: statSync(legacyPaths["merged-models.json"]).mode & 0o777 };
 }
