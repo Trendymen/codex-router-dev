@@ -2234,6 +2234,36 @@ async function handlePresence(action, value) {
   process.stdout.write(`${JSON.stringify(setPresenceMode(value))}\n`);
 }
 
+async function handleProtocolProof(action, slug, flags) {
+  const { protocolProofSnapshot, readProtocolProof, revokeProtocolProof } = await import(
+    "./protocol-proof.mjs"
+  );
+  const command = action || "status";
+  if (command === "status") {
+    const proof = slug ? readProtocolProof(slug) : undefined;
+    process.stdout.write(`${JSON.stringify(slug ? { slug, proof } : { proofs: protocolProofSnapshot() })}\n`);
+    return;
+  }
+  if (!slug) {
+    throw new Error("Usage: control protocol-proof status|verify|revoke <model-slug> [--yes]");
+  }
+  if (command === "revoke") {
+    revokeProtocolProof(slug);
+    process.stdout.write(`${JSON.stringify({ slug, proof: null })}\n`);
+    return;
+  }
+  if (command === "verify") {
+    if (!flags.includes("--yes")) {
+      process.stderr.write("Protocol verification can consume provider quota. Re-run with --yes to confirm.\n");
+      return;
+    }
+    const { verifyProtocolProof } = await import("./protocol-proof-verifier.mjs");
+    process.stdout.write(`${JSON.stringify(await verifyProtocolProof(slug, { confirmed: true }))}\n`);
+    return;
+  }
+  throw new Error("Usage: control protocol-proof status|verify|revoke <model-slug> [--yes]");
+}
+
 // --- dispatch ---------------------------------------------------------------
 
 if (args.includes("--probe")) {
@@ -2297,6 +2327,8 @@ if (args.includes("--probe")) {
   await handleHarness(args[1]);
 } else if (args[0] === "presence") {
   await handlePresence(args[1], args[2]);
+} else if (args[0] === "protocol-proof") {
+  await handleProtocolProof(args[1], args[2], args.slice(3));
 } else if (args[0] === "maintenance") {
   await updateAndVerifyCodex();
 } else if (args[0] === "doctor") {

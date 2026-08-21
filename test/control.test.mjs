@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -287,6 +287,32 @@ test("control exposes subagent and picker settings without credentials", () => {
       ),
     );
     assert.deepEqual(picker.hidden, []);
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("protocol-proof verify warns without --yes and makes no proof request", () => {
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), "control-protocol-proof-"));
+  try {
+    const result = spawnSync(
+      process.execPath,
+      [path.join(root, "src", "control.mjs"), "protocol-proof", "verify", "qwen-plan/qwen3.7-max"],
+      {
+        cwd: root,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          MODEL_ROUTER_TARGET: "codex",
+          MODEL_ROUTER_STATE_DIR: stateDir,
+          CODEX_HOME: path.join(stateDir, "codex-home"),
+        },
+      },
+    );
+    assert.equal(result.status, 0);
+    assert.equal(result.stdout, "");
+    assert.match(result.stderr, /can consume provider quota.*--yes/i);
+    assert.equal(existsSync(path.join(stateDir, "protocol-proofs.json")), false);
   } finally {
     rmSync(stateDir, { recursive: true, force: true });
   }

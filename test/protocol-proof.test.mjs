@@ -35,9 +35,15 @@ const {
 
 const passingProof = Object.freeze({
   slug: "qwen-plan/qwen3.7-max",
+  provider: "qwen-plan",
+  upstreamModel: "qwen3.7-max",
+  transport: "openai-responses",
+  toolDialect: "responses-functions",
+  requestProfile: "qwen-plan",
   verdict: "passing",
   fingerprint: "registry-fingerprint",
   verifierVersion: 1,
+  measuredFinalReasoningShape: "raw-content",
   verifiedAt: "2026-08-21T12:00:00.000Z",
 });
 
@@ -177,7 +183,18 @@ test("array-shaped proof state is discarded before the next passing write", () =
 
 test("proof writer rejects records missing any required field", () => {
   writePassingProtocolProof(passingProof);
-  for (const field of ["slug", "fingerprint", "verifierVersion", "verifiedAt"]) {
+  for (const field of [
+    "slug",
+    "provider",
+    "upstreamModel",
+    "transport",
+    "toolDialect",
+    "requestProfile",
+    "fingerprint",
+    "verifierVersion",
+    "measuredFinalReasoningShape",
+    "verifiedAt",
+  ]) {
     const incomplete = { ...passingProof };
     delete incomplete[field];
     assert.throws(() => writePassingProtocolProof(incomplete), /require/);

@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 
 import { writePrivateJson } from "./file-security.mjs";
+import { MODEL_BY_SLUG } from "./model-registry.mjs";
 import { EXPERIMENTAL_MODELS_PATH } from "./paths.mjs";
 
 function readExperimentalModels() {
@@ -25,6 +26,16 @@ function readExperimentalModels() {
 
 export function experimentalModelEnabled(slug) {
   return readExperimentalModels().has(String(slug));
+}
+
+export function experimentalModelForSlug(slug) {
+  const key = String(slug);
+  const model = MODEL_BY_SLUG.get(key);
+  if (model?.rolloutState === "experimental") return model;
+  const error = new Error(`Unknown experimental model slug: ${key}`);
+  error.code = "unknown_experimental_model";
+  error.status = 404;
+  throw error;
 }
 
 export function setExperimentalModel(slug, enabled) {

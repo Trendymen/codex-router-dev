@@ -18,7 +18,7 @@ command writes, not which router it talks to.
 
 Commands:
   setup, install, doctor, status, provider-key, providers, enable, disable,
-  multi-agent, media, panel, uninstall, smoke-test, start, stop, update,
+  multi-agent, media, panel, protocol-proof, uninstall, smoke-test, start, stop, update,
   rollback, shim, subagent-preset (dsh only)
 
 Examples:
@@ -62,10 +62,13 @@ case "$target" in
 esac
 
 case "$command" in
-  setup|install|doctor|status|provider-key|providers|enable|disable|multi-agent|media|panel|uninstall|smoke-test|start|stop|update|rollback|subagent-preset|shim) ;;
+  setup|install|doctor|status|provider-key|providers|enable|disable|multi-agent|media|panel|protocol-proof|uninstall|smoke-test|start|stop|update|rollback|subagent-preset|shim) ;;
   *) echo "Unknown command: $command" >&2; usage >&2; exit 2 ;;
 esac
 
 MODEL_ROUTER_TARGET=$target
 export MODEL_ROUTER_TARGET
+if [ "$command" = "protocol-proof" ]; then
+  exec node "$repo_dir/src/control.mjs" protocol-proof "$@"
+fi
 exec "$repo_dir/bin/$command" "$@"

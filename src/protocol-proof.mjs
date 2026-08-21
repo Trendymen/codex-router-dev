@@ -41,11 +41,25 @@ function validProtocolProof(record, slug = record?.slug) {
     typeof record.slug === "string" &&
     record.slug.length > 0 &&
     record.slug === slug &&
+    typeof record.provider === "string" &&
+    record.provider.length > 0 &&
+    typeof record.upstreamModel === "string" &&
+    record.upstreamModel.length > 0 &&
+    typeof record.transport === "string" &&
+    record.transport.length > 0 &&
+    typeof record.toolDialect === "string" &&
+    record.toolDialect.length > 0 &&
+    typeof record.requestProfile === "string" &&
+    record.requestProfile.length > 0 &&
     record.verdict === "passing" &&
     typeof record.fingerprint === "string" &&
     record.fingerprint.length > 0 &&
     Number.isInteger(record.verifierVersion) &&
     record.verifierVersion > 0 &&
+    typeof record.measuredFinalReasoningShape === "string" &&
+    ["provider-summary", "raw-content", "hybrid-summary", "anthropic-thinking"].includes(
+      record.measuredFinalReasoningShape,
+    ) &&
     typeof record.verifiedAt === "string" &&
     record.verifiedAt.length > 0
   );
@@ -73,6 +87,14 @@ export function readProtocolProof(slug) {
   const key = String(slug);
   const proof = readProtocolProofs()[key];
   return proof?.slug === key && proof.verdict === "passing" ? proof : null;
+}
+
+export function protocolProofSnapshot() {
+  return Object.freeze(
+    Object.values(readProtocolProofs())
+      .filter((proof) => proof.verdict === "passing")
+      .sort((left, right) => left.slug.localeCompare(right.slug)),
+  );
 }
 
 export function writePassingProtocolProof(record) {
