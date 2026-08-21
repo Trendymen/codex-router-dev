@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test, { after, beforeEach } from "node:test";
@@ -54,7 +54,25 @@ function artifacts(label) {
 function rebuildOptions(label) {
   return {
     buildFiles: async () => artifacts(label),
-    publish: (files) => publishCatalogGeneration({ files, legacyPaths: {} }),
+    publish: (files) => publishCatalogGeneration({ files, legacyPaths: {}, operations: testOperations() }),
+  };
+}
+
+function testOperations() {
+  const base = createCatalogGenerationFileSystem();
+  if (process.platform !== "win32") return base;
+  // Test-only privilege-free adapter; production Windows fails closed rather
+  // than publishing through junction/hard-link replacement.
+  return {
+    ...base,
+    symlink(source, target, type) {
+      if (type === "dir") return symlinkSync(path.resolve(path.dirname(target), source), target, "junction");
+      return linkSync(path.resolve(path.dirname(target), source), target);
+    },
+    rename(source, target) {
+      if (existsSync(target)) rmSync(target, { recursive: true, force: true });
+      return renameSync(source, target);
+    },
   };
 }
 
@@ -96,9 +114,11 @@ test("transaction serializes concurrent protected RMW mutations without dropping
 });
 
 test("default Node snapshot rebuild republishes one complete generation from the current catalog", async () => {
-  publishCatalogGeneration({ files: artifacts("native-template") });
+  publishCatalogGeneration({ files: artifacts("native-template"), operations: testOperations() });
 
-  const result = await rebuildNodeSnapshots("test-default-rebuild");
+  const result = await rebuildNodeSnapshots("test-default-rebuild", {
+    publish: (files) => publishCatalogGeneration({ files, operations: testOperations() }),
+  });
 
   assert.equal(result.reason, "test-default-rebuild");
   for (const name of Object.keys(artifacts("unused"))) {

@@ -14,7 +14,10 @@ import { buildRoutedCatalog, publishCatalogGeneration } from "./catalog-generati
 import { withCatalogPublicationLock } from "./catalog-publication-lock.mjs";
 import { protectPrivateFile } from "./file-security.mjs";
 import { withModelOverlayLock } from "./model-overlay-lock.mjs";
-import { MERGED_CATALOG_PATH } from "./paths.mjs";
+import { MERGED_CATALOG_PATH, NATIVE_CATALOG_PATH, ROUTED_CATALOG_PATH } from "./paths.mjs";
+
+let activeRebuild;
+let queuedRebuild;
 
 function readJson(target, label) {
   try {
@@ -64,9 +67,8 @@ function route(model) {
  * template and the current Node contract. No active provider profile is read.
  */
 export async function buildNodeSnapshotFiles() {
-  const [{ MODEL_BY_SLUG }, { nodeRoutableModels }, { configuredProviderIds }, { readHiddenModels }] =
+  const [{ nodeRoutableModels }, { configuredProviderIds }, { readHiddenModels }] =
     await Promise.all([
-      import("./model-registry.mjs"),
       import("./model-contract.mjs"),
       import("./provider-selection.mjs"),
       import("./model-picker-state.mjs"),
@@ -75,16 +77,37 @@ export async function buildNodeSnapshotFiles() {
   if (!Array.isArray(previous.models) || previous.models.length === 0) {
     throw new Error("Cannot rebuild Node snapshots: merged catalog has no native template.");
   }
+  const hiddenModels = readHiddenModels();
   const nodeModels = nodeRoutableModels({
     enabledProviders: new Set(configuredProviderIds()),
-    hiddenModels: readHiddenModels(),
+    hiddenModels,
   });
-  const nodeSlugs = new Set(MODEL_BY_SLUG.keys());
-  const nativeModels = previous.models.filter((model) => !nodeSlugs.has(String(model?.slug)));
-  const routed = buildRoutedCatalog({ nativeModels, routedModels: nodeModels });
+  // Prefer the native capture; when it is unavailable subtract the previous
+  // routed artifact, never today's registry. A deleted routed slug must not
+  // become a fossilized native entry in the next merged catalog.
+  let nativeModels;
+  if (existsSync(NATIVE_CATALOG_PATH)) {
+    const native = readJson(NATIVE_CATALOG_PATH, "native catalog");
+    nativeModels = Array.isArray(native.models) ? native.models : [];
+  } else {
+    const priorRouted = existsSync(ROUTED_CATALOG_PATH)
+      ? readJson(ROUTED_CATALOG_PATH, "prior routed catalog")
+      : { models: [] };
+    const routedSlugs = new Set((priorRouted.models || []).map((model) => String(model?.slug || "")));
+    nativeModels = previous.models.filter((model) => !routedSlugs.has(String(model?.slug)));
+  }
+  nativeModels = nativeModels.map((model) => hiddenModels.has(String(model?.slug))
+    ? { ...model, visibility: "hide" }
+    : model);
+  // A legacy generation can lack an authoritative native capture. Keep its
+  // template only for shaping; do not carry it into the merged result.
+  const routed = buildRoutedCatalog({
+    nativeModels: nativeModels.length ? nativeModels : previous.models,
+    routedModels: nodeModels,
+  });
   const merged = {
     models: [
-      ...previous.models.filter((model) => !nodeSlugs.has(String(model?.slug))),
+      ...nativeModels,
       ...routed.models,
     ],
   };
@@ -145,7 +168,29 @@ export async function rebuildNodeSnapshots(reason, {
     const publication = await publish(files, { reason });
     return Object.freeze({ reason, files, publication });
   };
-  return alreadyLocked ? rebuild() : catalogLock(rebuild);
+  if (alreadyLocked) return rebuild();
+  // One shared rebuild drains a concurrent burst, then performs at most one
+  // follow-up pass for changes observed while its files were being built.
+  queuedRebuild = { reason, buildFiles, publish, catalogLock };
+  if (activeRebuild) return activeRebuild;
+  activeRebuild = (async () => {
+    let result;
+    try {
+      do {
+        const next = queuedRebuild;
+        queuedRebuild = undefined;
+        result = await next.catalogLock(async () => {
+          const files = await next.buildFiles({ reason: next.reason });
+          const publication = await next.publish(files, { reason: next.reason });
+          return Object.freeze({ reason: next.reason, files, publication });
+        });
+      } while (queuedRebuild);
+      return result;
+    } finally {
+      activeRebuild = undefined;
+    }
+  })();
+  return activeRebuild;
 }
 
 /**

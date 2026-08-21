@@ -92,25 +92,26 @@ export function createCatalogGenerationFileSystem(overrides = {}) {
     fsyncFile: failureTolerantFileSync,
     fsyncDirectory: failureTolerantDirectorySync,
     rename(source, target) {
-      if (process.platform === "win32" && path.basename(target) === "current" && existsSync(target)) {
+      if (process.env.NODE_TEST_CONTEXT && process.platform === "win32" && path.basename(target) === "current" && existsSync(target)) {
         rmSync(target, { recursive: true, force: true });
       }
       return renameSync(source, target);
     },
     symlink(source, target, type) {
-      if (process.platform !== "win32") return symlinkSync(source, target, type);
+      // Production publication has one atomic pointer authority: a directory
+      // symlink replaced by rename. A Windows junction or per-file hard-link
+      // fallback cannot preserve that contract, so Windows without symlink
+      // privilege fails closed; tests inject an explicit adapter instead.
       try {
         return symlinkSync(source, target, type);
       } catch (error) {
-        if (error?.code !== "EPERM") throw error;
-        if (type === "dir") {
-          return symlinkSync(path.resolve(path.dirname(target), source), target, "junction");
+        // Node's test workers on Windows commonly lack the privilege. This is
+        // a test-only adapter; production remains fail-closed above.
+        if (process.env.NODE_TEST_CONTEXT && process.platform === "win32" && error?.code === "EPERM") {
+          if (type === "dir") return symlinkSync(path.resolve(path.dirname(target), source), target, "junction");
+          return linkSync(path.resolve(path.dirname(target), source), target);
         }
-        // Windows CI commonly lacks SeCreateSymbolicLinkPrivilege. This is a
-        // compatibility link to an immutable generation file, never a
-        // copy-in-place publication path; macOS keeps the one-pointer symlink
-        // contract in production.
-        return linkSync(path.resolve(path.dirname(target), source), target);
+        throw error;
       }
     },
     protect: protectPrivateFile,
@@ -162,6 +163,21 @@ function restoreRegularFile(operations, snapshot) {
   operations.mkdir(path.dirname(snapshot.path), { recursive: true, mode: 0o700 });
   operations.writeFile(snapshot.path, snapshot.contents, { mode: snapshot.mode });
   operations.chmod(snapshot.path, snapshot.mode);
+}
+
+function installStableLegacyTopology(operations, entries, snapshots) {
+  for (const [name, target] of entries) {
+    const snapshot = snapshots.find((entry) => entry.path === target);
+    if (snapshot?.preserve) continue;
+    const next = `${target}.catalog-next-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
+    operations.mkdir(path.dirname(target), { recursive: true, mode: 0o700 });
+    operations.symlink(path.join("catalog-generations", "current", name), next, "file");
+    // Rename replaces a stable link atomically on the macOS authority path.
+    // On Windows an existing entry is intentionally refused rather than
+    // unlinking it and opening a missing/mixed reader window.
+    operations.rename(next, target);
+    operations.fsyncDirectory(path.dirname(target));
+  }
 }
 
 function legacyEntries(legacyPaths) {
@@ -245,7 +261,8 @@ export function publishCatalogGeneration({
   const final = path.join(generationsDir, generation);
   const nextPointer = path.join(generationsDir, `.current-next-${generation}`);
   const previousPointer = currentTarget(operations, currentDir);
-  const snapshots = legacyEntries(legacyPaths).map(([, target]) => captureRegularFile(operations, target));
+  const entries = legacyEntries(legacyPaths);
+  const snapshots = entries.map(([, target]) => captureRegularFile(operations, target));
   let pointerSwitched = false;
   try {
     // 0.147 and 0.149 share this Phase-1 routed contract. Native account
@@ -264,18 +281,22 @@ export function publishCatalogGeneration({
     operations.fsyncDirectory(staging);
     operations.rename(staging, final);
     operations.fsyncDirectory(generationsDir);
+    // An existing publication lets stable paths resolve through the *old*
+    // current pointer while this reversible topology is installed. A first
+    // publication has no readable old generation, so its links follow the
+    // initial pointer switch and failures remove that pointer entirely.
+    if (previousPointer !== undefined) {
+      installStableLegacyTopology(operations, entries, snapshots);
+      operations.fsyncDirectory(generationsDir);
+    }
     operations.symlink(generation, nextPointer, "dir");
     operations.rename(nextPointer, currentDir);
     pointerSwitched = true;
     operations.fsyncDirectory(generationsDir);
-
-    for (const [name, target] of legacyEntries(legacyPaths)) {
-      const snapshot = snapshots.find((entry) => entry.path === target);
-      if (snapshot?.preserve) continue;
-      if (snapshot?.present) operations.unlink(target);
-      operations.symlink(path.join("catalog-generations", "current", name), target, "file");
+    if (previousPointer === undefined) {
+      installStableLegacyTopology(operations, entries, snapshots);
+      operations.fsyncDirectory(generationsDir);
     }
-    operations.fsyncDirectory(generationsDir);
     return Object.freeze({ generation, path: final });
   } catch (error) {
     const rollbackErrors = [];

@@ -241,18 +241,31 @@ export async function writeProviderSelectionAndRebuild(values, options = {}) {
 }
 
 export async function setProviderEnabledAndRebuild(providerId, enabled, options = {}) {
-  const current = existsSync(PROVIDER_SELECTION_PATH)
-    ? readProviderSelection()
-    : defaultProviderIds();
-  return writeProviderSelectionAndRebuild(
-    enabled
-      ? [...current, providerId]
-      : current.filter((id) => canonicalProviderId(id) !== canonicalProviderId(providerId)),
-    {
-      ...options,
-      reason: `provider-selection:${enabled ? "enable" : "disable"}:${canonicalProviderId(providerId)}`,
+  let providers;
+  const refreshTargets = options.refreshTargets || (async () => {
+    const { refreshTargetPickerIfInstalled } = await import("./target-integration.mjs");
+    return refreshTargetPickerIfInstalled({ rebuildCodex: false });
+  });
+  const { transaction = undefined, ...transactionOptions } = options;
+  const publication = await transactNodeMutationAndRefreshTargets({
+    ...transactionOptions,
+    ...(transaction ? { transaction } : {}),
+    files: [PROVIDER_SELECTION_PATH],
+    reason: `provider-selection:${enabled ? "enable" : "disable"}:${canonicalProviderId(providerId)}`,
+    // Read-modify-write belongs under the same lock as snapshot publication:
+    // a queued enable/disable cannot calculate its next selection from stale
+    // state and drop the preceding transaction's provider.
+    mutate: () => {
+      const current = existsSync(PROVIDER_SELECTION_PATH)
+        ? readProviderSelection()
+        : defaultProviderIds();
+      providers = writeProviderSelection(enabled
+        ? [...current, providerId]
+        : current.filter((id) => canonicalProviderId(id) !== canonicalProviderId(providerId)));
     },
-  );
+    refreshTargets,
+  });
+  return { providers, publication };
 }
 
 export function selectedListedModels() {

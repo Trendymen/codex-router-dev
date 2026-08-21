@@ -109,5 +109,21 @@ test("native session observer rebuilds only on usable transitions and coalesces 
   await Promise.all([first, second, third]);
 
   assert.deepEqual(calls, ["native-session-usability", "native-session-usability"]);
-  assert.deepEqual(observer.snapshot(), { usable: true });
+  assert.deepEqual(observer.snapshot(), { usable: true, desiredUsable: true });
+});
+
+test("native-session publication failure leaves the same usable state retryable", async () => {
+  let attempts = 0;
+  const observer = createNativeSessionSnapshotObserver({
+    rebuild: async () => {
+      attempts += 1;
+      if (attempts === 1) throw new Error("injected rebuild failure");
+    },
+  });
+  await observer.observe({ usable: false });
+  await assert.rejects(observer.observe({ usable: true }), /injected rebuild failure/);
+  assert.deepEqual(observer.snapshot(), { usable: false, desiredUsable: true });
+  await observer.observe({ usable: true });
+  assert.equal(attempts, 2);
+  assert.deepEqual(observer.snapshot(), { usable: true, desiredUsable: true });
 });

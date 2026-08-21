@@ -63,8 +63,15 @@ export async function rebuildAfterRegistryUpdate({
 } = {}) {
   const changed = Array.isArray(models) ? models : [];
   if (typeof invalidate !== "function") {
-    const { invalidateProtocolProofsForModels } = await import("./protocol-proof.mjs");
-    await invalidateProtocolProofsForModels(changed);
+    const [{ invalidateProtocolProofsForModels }, { transactNodeStateMutation }] = await Promise.all([
+      import("./protocol-proof.mjs"),
+      import("./catalog-rebuild.mjs"),
+    ]);
+    // Proof removal and generation switch are one registry transaction. Do
+    // not publish an invalidation generation and immediately publish again.
+    return invalidateProtocolProofsForModels(changed, {
+      transaction: (input) => transactNodeStateMutation({ ...input, reason: "registry-update" }),
+    });
   } else {
     await invalidate(changed);
   }
@@ -82,7 +89,8 @@ export async function rebuildAfterRegistryUpdate({
  */
 export function createNativeSessionSnapshotObserver({ rebuild } = {}) {
   if (typeof rebuild !== "function") throw new Error("A native-session observer requires rebuild().");
-  let known;
+  let desired;
+  let published;
   let initialized = false;
   let running;
   let pending = false;
@@ -91,8 +99,17 @@ export function createNativeSessionSnapshotObserver({ rebuild } = {}) {
   const run = async () => {
     do {
       pending = false;
-      await rebuild("native-session-usability");
-    } while (pending);
+      const target = desired;
+      try {
+        await rebuild("native-session-usability");
+        published = target;
+      } catch (error) {
+        // This is deliberately non-sensitive: callers can retry the same
+        // usability state and no credential-derived detail leaves the module.
+        pending = false;
+        throw error;
+      }
+    } while (pending || desired !== published);
   };
 
   return Object.freeze({
@@ -100,11 +117,13 @@ export function createNativeSessionSnapshotObserver({ rebuild } = {}) {
       const usable = status?.usable === true;
       if (!initialized) {
         initialized = true;
-        known = usable;
+        desired = usable;
+        published = usable;
         return current;
       }
-      if (known === usable) return current;
-      known = usable;
+      if (desired === usable && desired === published) return current;
+      if (running && desired === usable) return current;
+      desired = usable;
       if (running) {
         pending = true;
         return current;
@@ -116,7 +135,7 @@ export function createNativeSessionSnapshotObserver({ rebuild } = {}) {
       return current;
     },
     snapshot() {
-      return Object.freeze({ usable: known === true });
+      return Object.freeze({ usable: published === true, desiredUsable: desired === true });
     },
   });
 }
