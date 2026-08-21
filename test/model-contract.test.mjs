@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test, { after } from "node:test";
@@ -10,6 +10,40 @@ const codexHome = path.join(scratch, "codex-home");
 process.env.MODEL_ROUTER_USER_MODELS = path.join(scratch, "user-models.json");
 process.env.MODEL_ROUTER_STATE_DIR = stateDir;
 process.env.CODEX_HOME = codexHome;
+
+const FUTURE_NODE_SLUG = "deepseek/future-node-model";
+writeFileSync(
+  process.env.MODEL_ROUTER_USER_MODELS,
+  JSON.stringify({
+    version: 1,
+    models: [
+      {
+        slug: FUTURE_NODE_SLUG,
+        gatewayModel: "deepseek-future-node-model",
+        upstreamModel: "future-node-model",
+        provider: "deepseek",
+        credentialOwner: "deepseek",
+        effectiveTransport: "openai-responses",
+        toolDialect: "responses-functions",
+        reasoningDisplayMode: "summary-compat",
+        declaredFinalReasoningShape: "raw-content",
+        rolloutState: "stable",
+        purpose: "primary",
+        listed: true,
+        displayName: "Future Node Model",
+        description: "Valid user overlay model outside the normative Appendix B matrix.",
+        priority: 999,
+        defaultEffort: "high",
+        reasoningLevels: [{ effort: "high", description: "Deep reasoning" }],
+        contextWindow: 131072,
+        autoCompact: 110000,
+        inputModalities: ["text"],
+        requestProfile: "deepseek-thinking",
+        compHash: "deepseek-future-node-model-user-v1",
+      },
+    ],
+  }),
+);
 
 const oracle = (await import("./fixtures/node-route-matrix.json", { with: { type: "json" } })).default;
 const { MODEL_BY_SLUG, MODELS } = await import("../src/model-registry.mjs");
@@ -88,6 +122,15 @@ test("Node routing contains every Appendix B row and no legacy registry model", 
   );
   assert.equal(
     routed.some((model) => model.slug === "deepseek/deepseek-chat"),
+    false,
+  );
+});
+
+test("valid Node metadata outside Appendix B never becomes routable", () => {
+  assert.ok(MODEL_BY_SLUG.has(FUTURE_NODE_SLUG));
+  assert.equal(
+    nodeRoutableModels({ enabledProviders: new Set(["deepseek"]) })
+      .some((model) => model.slug === FUTURE_NODE_SLUG),
     false,
   );
 });

@@ -40,6 +40,24 @@ const NODE_FIELDS = Object.freeze([
 
 const VERIFIED_FINAL_SHAPES = new Set(FINAL_SHAPES.filter((shape) => shape !== "unverified"));
 
+// Appendix B is the closed Node-only routing boundary. Registry metadata is
+// validated independently, but it is not provenance: user overlays and future
+// fragments may carry the same valid fields without becoming supported routes.
+const NORMATIVE_NODE_SLUGS = new Set([
+  "deepseek/deepseek-v4-flash",
+  "deepseek/deepseek-v4-pro",
+  "qwen-plan/qwen3.8-max",
+  "qwen-plan/deepseek-v4-flash-0731",
+  "qwen-plan/qwen3.8-max-preview",
+  "qwen-plan/qwen3.7-max",
+  "qwen-plan/qwen3.7-plus",
+  "qwen-plan/qwen3.6-flash",
+  "qwen-plan/deepseek-v4-pro",
+  "qwen-plan/deepseek-v4-pro-0813",
+  "qwen-plan/glm-5.2",
+  "qwen-plan-responses/glm-5.2",
+]);
+
 function objectRecord(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
@@ -209,7 +227,7 @@ export function resolveNodeModel(model, state = {}) {
 export function nodeRoutableModels(state = {}) {
   return Object.freeze(
     MODELS
-      .filter(isNodeModel)
+      .filter((model) => NORMATIVE_NODE_SLUGS.has(model.slug) && isNodeModel(model))
       .map((model) => resolveNodeModel(model, state))
       .filter((model) => model.routable),
   );
