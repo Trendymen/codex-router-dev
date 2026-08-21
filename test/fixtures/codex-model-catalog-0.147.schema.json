@@ -16,7 +16,7 @@
             "type": "object",
             "required": ["instructions_template"],
             "properties": { "instructions_template": { "type": "string" } }
-          },
+          }
         }
       }
     }
