@@ -96,7 +96,17 @@ export const NATIVE_CATALOG_SOURCE_PATH = path.join(
   STATE_DIR,
   "native-catalog-source.json",
 );
+export const CATALOG_GENERATIONS_DIR = path.join(STATE_DIR, "catalog-generations");
+export const CATALOG_CURRENT_DIR = path.join(CATALOG_GENERATIONS_DIR, "current");
+// Keep public paths stable for already-managed config.toml documents. The
+// generation publisher migrates each one to a link through `current`, so the
+// one atomic pointer switch remains the only per-generation visibility change.
 export const MERGED_CATALOG_PATH = path.join(STATE_DIR, "merged-models.json");
+export const ROUTED_CATALOG_PATH = path.join(STATE_DIR, "routed-models.json");
+export const NODE_ROUTES_PATH = path.join(STATE_DIR, "node-routes.json");
+export const CONTROL_MODELS_PATH = path.join(STATE_DIR, "control-models.json");
+export const SWIFT_MODELS_PATH = path.join(STATE_DIR, "swift-models.json");
+export const BROWSER_MODELS_PATH = path.join(STATE_DIR, "browser-models.json");
 // What the last dsh publish actually wrote. The settings document is the
 // user's and is hot-reloaded by anything else that edits it, so drift is
 // detected against this snapshot rather than by re-deriving what "should" be

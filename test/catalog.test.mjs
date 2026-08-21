@@ -24,6 +24,7 @@ import {
   routedCatalogConfigured,
   routedModel,
 } from "../src/catalog.mjs";
+import { buildRoutedCatalog } from "../src/catalog-generation.mjs";
 
 const template = {
   slug: "gpt-5.5",
@@ -57,6 +58,18 @@ const grok = {
   compHash: "grok-oauth-grok-4-5-v1",
   multiAgentVersion: "v2",
 };
+
+test("routed catalog is profile-independent and carries an explicit parallel-tool boolean", () => {
+  const catalog = buildRoutedCatalog({
+    nativeModels: [template],
+    routedModels: [{ ...grok, provider: "deepseek", upstreamModel: "deepseek-chat", supportsParallelToolCalls: false }],
+  });
+  assert.equal(catalog.models[0].slug, "grok-oauth/grok-4.5");
+  assert.equal(catalog.models[0].supports_parallel_tool_calls, false);
+  assert.equal(typeof catalog.models[0].base_instructions, "string");
+  assert.equal(typeof catalog.models[0].model_messages.instructions_template, "string");
+  assert.equal("show_raw_agent_reasoning" in catalog.models[0], false);
+});
 
 test("routed catalog is exposed only when the active provider reaches the router", () => {
   // An absent base URL is the first-install case: setup has not written the

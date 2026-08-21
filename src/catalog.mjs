@@ -48,6 +48,8 @@ import {
 } from "./native-catalog-source.mjs";
 import { discoveryDisabled } from "./discovery-mode.mjs";
 import { withCatalogPublicationLock } from "./catalog-publication-lock.mjs";
+import { buildRoutedCatalog, publishCatalogGeneration } from "./catalog-generation.mjs";
+import { nodeRoutableModels } from "./model-contract.mjs";
 
 const refresh = process.argv.includes("--refresh-native");
 
@@ -916,20 +918,52 @@ function main() {
         aliases: {},
       };
   const snapshots = new Map(
-    [MERGED_CATALOG_PATH, NATIVE_ALIAS_PATH, ANNOUNCED_MODELS_PATH]
+    [NATIVE_ALIAS_PATH, ANNOUNCED_MODELS_PATH]
       .map((target) => [target, fileSnapshot(target)]),
   );
   let routedAgents;
   try {
     atomicJson(NATIVE_ALIAS_PATH, { version: 1, aliases });
     writeAnnouncedAt(announcedAt);
-    atomicJson(MERGED_CATALOG_PATH, {
-      models: merged.map((model) =>
-        hiddenModels.has(String(model.slug))
-          ? { ...model, visibility: "hide" }
-          : model,
-      ),
+    // The Node contract, not the active CC Switch profile, is the source for
+    // every routed artifact. The same resolved set feeds route dispatch and
+    // the three future UI consumers so they cannot drift between rebuilds.
+    const nodeModels = nodeRoutableModels({
+      enabledProviders: new Set(configuredProviderIds()),
+      hiddenModels,
     });
+    const safeModel = (model) => ({
+      slug: model.slug, provider: model.provider, upstreamModel: model.upstreamModel,
+      effectiveTransport: model.effectiveTransport, toolDialect: model.toolDialect,
+      reasoningDisplayMode: model.reasoningDisplayMode,
+      declaredFinalReasoningShape: model.declaredFinalReasoningShape,
+      effectiveFinalReasoningShape: model.effectiveFinalReasoningShape,
+      rolloutState: model.rolloutState, purpose: model.purpose, routable: model.routable,
+      listed: model.listed, visible: model.visible,
+      ...(model.publicError ? { publicError: model.publicError } : {}),
+    });
+    const ui = { version: 1, models: nodeModels.map(safeModel) };
+    const routes = { version: 1, routes: nodeModels.map((model) => ({
+      slug: model.slug, provider: model.provider, upstreamModel: model.upstreamModel,
+      effectiveTransport: model.effectiveTransport, toolDialect: model.toolDialect,
+      requestProfile: model.requestProfile, reasoningDisplayMode: model.reasoningDisplayMode,
+      effectiveFinalReasoningShape: model.effectiveFinalReasoningShape, purpose: model.purpose,
+    })) };
+    const visibleMerged = {
+      models: merged.map((model) => ({
+        ...model,
+        supports_parallel_tool_calls: model.supports_parallel_tool_calls === true,
+        ...(hiddenModels.has(String(model.slug)) ? { visibility: "hide" } : {}),
+      })),
+    };
+    publishCatalogGeneration({ files: {
+      "merged-models.json": visibleMerged,
+      "routed-models.json": buildRoutedCatalog({ nativeModels: native.models, routedModels: nodeModels }),
+      "node-routes.json": routes,
+      "control-models.json": ui,
+      "swift-models.json": ui,
+      "browser-models.json": ui,
+    } });
     if (process.env.MODEL_ROUTER_TEST_FAIL_AFTER_CATALOG_WRITE === "1") {
       throw new Error("Forced failure after model catalog publication.");
     }
