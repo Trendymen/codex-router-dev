@@ -14,6 +14,86 @@ function fail(message) {
   throw new Error(`Invalid provider registry ${REGISTRY_PATH}: ${message}`);
 }
 
+const NODE_TRANSPORTS = new Set([
+  "native-openai",
+  "openai-responses",
+  "anthropic-messages",
+]);
+const NODE_TOOL_DIALECTS = new Set(["responses-native", "responses-functions"]);
+const NODE_REASONING_DISPLAY_MODES = new Set(["summary-compat", "raw-preserve"]);
+const NODE_FINAL_SHAPES = new Set([
+  "provider-summary",
+  "raw-content",
+  "hybrid-summary",
+  "anthropic-thinking",
+  "unverified",
+]);
+const NODE_ROLLOUT_STATES = new Set(["stable", "experimental"]);
+const NODE_PURPOSES = new Set(["primary", "compatibility"]);
+const NODE_FIELDS = [
+  "effectiveTransport",
+  "toolDialect",
+  "reasoningDisplayMode",
+  "declaredFinalReasoningShape",
+  "rolloutState",
+  "purpose",
+];
+
+// This compatibility slug deliberately keeps the qwen-plan model provider so
+// it reuses the existing credential owner without introducing a second key
+// namespace. The route slug remains distinct because it selects Responses
+// rather than the listed Anthropic Messages profile.
+const NODE_SLUG_NAMESPACES = Object.freeze({
+  "qwen-plan-responses/glm-5.2": "qwen-plan-responses",
+});
+
+function nodeModelProblem(model) {
+  const hasMetadata = NODE_FIELDS.some((field) => model[field] !== undefined);
+  if (!hasMetadata) return undefined;
+  for (const field of NODE_FIELDS) {
+    if (typeof model[field] !== "string" || !model[field]) {
+      return `Node model ${model.slug || "<unknown>"} requires ${field}`;
+    }
+  }
+  if (!NODE_TRANSPORTS.has(model.effectiveTransport)) {
+    return `Node model ${model.slug} has an unsupported effectiveTransport`;
+  }
+  if (!NODE_TOOL_DIALECTS.has(model.toolDialect)) {
+    return `Node model ${model.slug} has an unsupported toolDialect`;
+  }
+  if (!NODE_REASONING_DISPLAY_MODES.has(model.reasoningDisplayMode)) {
+    return `Node model ${model.slug} has an unsupported reasoningDisplayMode`;
+  }
+  if (!NODE_FINAL_SHAPES.has(model.declaredFinalReasoningShape)) {
+    return `Node model ${model.slug} has an unsupported declaredFinalReasoningShape`;
+  }
+  if (!NODE_ROLLOUT_STATES.has(model.rolloutState)) {
+    return `Node model ${model.slug} has an unsupported rolloutState`;
+  }
+  if (!NODE_PURPOSES.has(model.purpose)) {
+    return `Node model ${model.slug} has an unsupported purpose`;
+  }
+  if (
+    model.declaredFinalReasoningShape === "unverified" &&
+    model.rolloutState !== "experimental"
+  ) {
+    return `Node model ${model.slug} may use unverified final reasoning only when experimental`;
+  }
+  if (model.purpose === "compatibility" && model.rolloutState !== "experimental") {
+    return `Node model ${model.slug} compatibility purpose must be experimental`;
+  }
+  if (typeof model.listed !== "boolean") {
+    return `Node model ${model.slug} requires a boolean listed field`;
+  }
+  if (
+    model.credentialOwner !== undefined &&
+    (typeof model.credentialOwner !== "string" || !model.credentialOwner)
+  ) {
+    return `Node model ${model.slug} has an invalid credentialOwner`;
+  }
+  return undefined;
+}
+
 // Remote providers that intentionally accept anonymous traffic are a much
 // narrower class than local `keyless` providers. Keep the allowlist here so a
 // future registry entry cannot turn an arbitrary HTTPS endpoint into a
@@ -475,7 +555,8 @@ function modelProblem(model, providers, slugs, gatewayModels) {
   if (!provider) {
     return `model ${model.slug} references unknown provider ${model.provider}`;
   }
-  if (!model.slug.startsWith(`${model.provider}/`)) {
+  const namespaceProvider = NODE_SLUG_NAMESPACES[model.slug] || model.provider;
+  if (!model.slug.startsWith(`${namespaceProvider}/`)) {
     return `model ${model.slug} must be namespaced under ${model.provider}/`;
   }
   if (provider.authMode === "anonymous" && !anonymousModelAllowed(provider, model.upstreamModel)) {
@@ -495,6 +576,8 @@ function modelProblem(model, providers, slugs, gatewayModels) {
   if (model.requestProfile !== undefined && typeof model.requestProfile !== "string") {
     return `model ${model.slug} has an invalid requestProfile`;
   }
+  const nodeProblem = nodeModelProblem(model);
+  if (nodeProblem) return nodeProblem;
   if (
     model.requiresTrailingUserTurn !== undefined &&
     typeof model.requiresTrailingUserTurn !== "boolean"

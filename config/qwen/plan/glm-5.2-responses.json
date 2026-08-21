@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "models": [
+    {
+      "slug": "qwen-plan-responses/glm-5.2",
+      "gatewayModel": "qwen-plan-responses-glm-5-2",
+      "upstreamModel": "glm-5.2",
+      "provider": "qwen-plan",
+      "credentialOwner": "qwen-plan",
+      "listed": false,
+      "effectiveTransport": "openai-responses",
+      "toolDialect": "responses-functions",
+      "reasoningDisplayMode": "summary-compat",
+      "declaredFinalReasoningShape": "unverified",
+      "rolloutState": "experimental",
+      "purpose": "compatibility",
+      "requestProfile": "qwen-plan"
+    }
+  ]
+}

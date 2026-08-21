@@ -1152,3 +1152,33 @@ test("opencode's DeepSeek models never receive a forced tool_choice", () => {
     assert.equal(MODEL_BY_SLUG.get(slug).requestProfile, undefined, slug);
   }
 });
+
+test("Node route metadata is explicit and the GLM Responses alias reuses Qwen credentials", () => {
+  const nodeSlugs = [
+    "deepseek/deepseek-v4-flash",
+    "deepseek/deepseek-v4-pro",
+    "qwen-plan/qwen3.8-max",
+    "qwen-plan/deepseek-v4-flash-0731",
+    "qwen-plan/qwen3.8-max-preview",
+    "qwen-plan/qwen3.7-max",
+    "qwen-plan/qwen3.7-plus",
+    "qwen-plan/qwen3.6-flash",
+    "qwen-plan/deepseek-v4-pro",
+    "qwen-plan/deepseek-v4-pro-0813",
+    "qwen-plan/glm-5.2",
+    "qwen-plan-responses/glm-5.2",
+  ];
+  for (const slug of nodeSlugs) {
+    assert.equal(typeof MODEL_BY_SLUG.get(slug)?.effectiveTransport, "string", slug);
+    assert.equal(typeof MODEL_BY_SLUG.get(slug)?.toolDialect, "string", slug);
+    assert.equal(typeof MODEL_BY_SLUG.get(slug)?.declaredFinalReasoningShape, "string", slug);
+    assert.equal(typeof MODEL_BY_SLUG.get(slug)?.rolloutState, "string", slug);
+    assert.equal(typeof MODEL_BY_SLUG.get(slug)?.purpose, "string", slug);
+  }
+  const alias = MODEL_BY_SLUG.get("qwen-plan-responses/glm-5.2");
+  assert.equal(alias.provider, "qwen-plan");
+  assert.equal(alias.listed, false);
+  assert.equal(alias.purpose, "compatibility");
+  assert.equal(alias.requestProfile, "qwen-plan");
+  assert.equal(alias.credentialOwner, "qwen-plan");
+});
