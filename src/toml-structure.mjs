@@ -166,6 +166,8 @@ function assignmentAtLine(line, lineNumber) {
   const key = tomlDottedKey(line.slice(0, equals).trim());
   if (!key) ambiguousToml(lineNumber, "an assignment key cannot be decoded safely");
   const rawValue = line.slice(equals + 1).trimStart();
+  const boolean = rawValue.match(/^(true|false)(?:\s*(?:#.*)?)?$/);
+  if (boolean) return { key, kind: "boolean", value: boolean[1] === "true" };
   const quoteCharacter = rawValue[0];
   if (quoteCharacter !== '"' && quoteCharacter !== "'") {
     return { key, kind: "other" };
@@ -296,6 +298,38 @@ function samePath(left, right) {
   return left.length === right.length && left.every((part, index) => part === right[index]);
 }
 
+function pathKey(path) {
+  return path.join("\u0000");
+}
+
+// Consumers that need a trustworthy configuration decision, rather than only
+// a table boundary, opt into this stricter pass. Duplicate declarations and
+// multiline values have too much ambiguity for a security-sensitive status
+// check to guess at their meaning.
+export function assertUnambiguousTomlDocument(document) {
+  const tables = new Set();
+  for (const header of document.headers) {
+    const key = pathKey(header.path);
+    if (tables.has(key)) {
+      throw new Error(`Refusing duplicate TOML table ${header.path.join(".")}.`);
+    }
+    tables.add(key);
+  }
+  const assignments = new Set();
+  for (const assignment of document.assignments) {
+    if (assignment.kind === "multiline-string") {
+      throw new Error(`Refusing multiline TOML assignment at line ${assignment.index + 1}.`);
+    }
+    const key = pathKey([...assignment.tablePath, ...assignment.key]);
+    if (assignments.has(key)) {
+      throw new Error(
+        `Refusing duplicate TOML assignments for ${[...assignment.tablePath, ...assignment.key].join(".")}.`,
+      );
+    }
+    assignments.add(key);
+  }
+}
+
 export function tomlStringValue(document, tablePath, key) {
   const matches = document.assignments.filter(
     (assignment) =>
@@ -309,6 +343,23 @@ export function tomlStringValue(document, tablePath, key) {
   if (matches.length === 0) return undefined;
   if (matches[0].kind !== "string") {
     throw new Error(`${[...tablePath, key].join(".")} must be a single-line TOML string.`);
+  }
+  return matches[0].value;
+}
+
+export function tomlBooleanValue(document, tablePath, key) {
+  const matches = document.assignments.filter(
+    (assignment) =>
+      samePath(assignment.tablePath, tablePath) &&
+      assignment.key.length === 1 &&
+      assignment.key[0] === key,
+  );
+  if (matches.length > 1) {
+    throw new Error(`Refusing duplicate TOML assignments for ${[...tablePath, key].join(".")}.`);
+  }
+  if (matches.length === 0) return undefined;
+  if (matches[0].kind !== "boolean") {
+    throw new Error(`${[...tablePath, key].join(".")} must be a TOML boolean.`);
   }
   return matches[0].value;
 }

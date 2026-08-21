@@ -804,25 +804,27 @@ async function updateAndVerifyCodex() {
 // report the aggregate profile's stable catalog metadata or render TOML for a
 // local caller that can already read the Router capability file.
 async function handleCatalog(action) {
+  if (action !== "status" && action !== "render-snippet") {
+    throw new Error("Usage: control catalog status|render-snippet");
+  }
   const {
-    CALLER_SECRET_PATH,
     CONFIG_PATH,
     PORTS,
     ROUTED_CATALOG_PATH,
   } = await import("./paths.mjs");
-  const { callerBaseUrl, redactCallerUrl } = await import("./caller-auth.mjs");
   const {
     aggregateSnippetStatus,
     renderAggregateSnippet,
   } = await import("./cc-switch-snippet.mjs");
   const { standaloneSearchStatus } = await import("./standalone-search-doctor.mjs");
-  const secret = readFileSync(CALLER_SECRET_PATH, "utf8").trim();
-  const baseUrl = callerBaseUrl(PORTS.router, secret);
 
   if (action === "render-snippet") {
+    const { CALLER_SECRET_PATH } = await import("./paths.mjs");
+    const { callerBaseUrl } = await import("./caller-auth.mjs");
+    const secret = readFileSync(CALLER_SECRET_PATH, "utf8").trim();
     process.stdout.write(renderAggregateSnippet({
       routedCatalogPath: ROUTED_CATALOG_PATH,
-      callerBaseUrl: baseUrl,
+      callerBaseUrl: callerBaseUrl(PORTS.router, secret),
     }));
     return;
   }
@@ -831,13 +833,12 @@ async function handleCatalog(action) {
     process.stdout.write(`${JSON.stringify({
       aggregate: aggregateSnippetStatus({
         routedCatalogPath: ROUTED_CATALOG_PATH,
-        redactedBaseUrl: redactCallerUrl(baseUrl),
+        redactedBaseUrl: "unavailable",
       }),
       standaloneSearch: standaloneSearchStatus(config),
     })}\n`);
     return;
   }
-  throw new Error("Usage: control catalog status|render-snippet");
 }
 
 function runDoctor(args) {

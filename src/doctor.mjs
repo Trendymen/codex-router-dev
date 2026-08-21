@@ -744,7 +744,7 @@ if (codexTarget) {
     "Standalone web search",
     search.ok
       ? "web_search is live and the standalone search feature gate is enabled"
-      : `missing ${search.missing.join(", ")}`,
+      : search.invalid || `missing ${search.missing.join(", ")}`,
     search.ok ? undefined : search.snippet,
   );
 }
@@ -996,50 +996,26 @@ if (TARGET === "gemini") {
       "Inspect $DSH_HOME/settings.yaml, then run ./bin/model-router dsh enable.",
     );
   }
-} else try {
-  const config = childJson("config-manager.mjs", ["status"]);
+} else {
+  // CC Switch and the user own Codex configuration. A diagnostic must not
+  // invoke the config manager even for its old status-only helper: that would
+  // make a supposedly read-only CC Switch check depend on a configuration
+  // control path.
   add(
-    config.mode === "router" ? "ok" : "fail",
+    existsSync(CONFIG_PATH) ? "ok" : "fail",
     "Codex routing config",
-    config.mode,
-    "Run ./bin/enable or ./bin/doctor --fix.",
+    existsSync(CONFIG_PATH) ? "user-owned configuration present" : "missing",
+    "Start Codex once to create its configuration.",
   );
-  const providerModeOk = config.login_free
-    ? config.login_free_managed
-    : !config.provider_mode_state_present;
   add(
-    providerModeOk ? "ok" : "fail",
+    "ok",
     "Codex login mode",
-    config.login_free
-      ? config.login_free_managed
-        ? "external providers; OpenAI login not required"
-        : "unmanaged custom provider"
-      : config.provider_mode_state_present
-        ? "stale provider-mode restore state"
-        : "OpenAI login available",
-    "Use the tray toggle to switch modes, or run ./bin/doctor --fix.",
+    "user-owned; not inspected by the read-only doctor",
   );
-  const signedModeOk = config.signed_routing
-    ? config.signed_routing_managed
-    : !config.signed_provider_state_present;
   add(
-    signedModeOk ? "ok" : "fail",
+    "ok",
     "Signed router coexistence",
-    config.signed_routing
-      ? config.signed_routing_managed
-        ? "active; native GPT and external models share the authenticated router"
-        : "active without managed restore state"
-      : config.signed_provider_state_present
-        ? `ownership drift; active provider is ${config.model_provider}`
-        : `off; active provider is ${config.model_provider}`,
-    "Use the tray toggle to restore the previous provider table before changing configuration managers.",
-  );
-} catch (error) {
-  add(
-    "fail",
-    "Codex routing config",
-    error instanceof Error ? error.message : String(error),
-    "Inspect ~/.codex/config.toml, then run ./bin/doctor --fix.",
+    "user-owned; not inspected by the read-only doctor",
   );
 }
 

@@ -29,6 +29,61 @@ standalone_web_search = true # required for routed search
   assert.deepEqual(status.missing, []);
 });
 
+test("standalone search honors decoded quoted root and features table keys", () => {
+  const status = standaloneSearchStatus(`"web_search" = "live"
+"suppress_unstable_features_warning" = true
+
+["features"]
+"standalone_web_search" = true
+`);
+
+  assert.equal(status.ok, true);
+  assert.deepEqual(status.missing, []);
+});
+
+test("standalone search fails closed on duplicate or multiline TOML structures", () => {
+  const invalidDocuments = [
+    `web_search = "live"
+web_search = "live"
+suppress_unstable_features_warning = true
+
+[features]
+standalone_web_search = true
+`,
+    `notes = """
+web_search = "live"
+suppress_unstable_features_warning = true
+[features]
+standalone_web_search = true
+"""
+`,
+    `web_search = "live"
+suppress_unstable_features_warning = true
+
+[features]
+standalone_web_search = true
+
+[features]
+`,
+  ];
+
+  for (const document of invalidDocuments) {
+    const status = standaloneSearchStatus(document);
+    assert.equal(status.ok, false);
+    assert.match(status.invalid || "", /duplicate|multiline/i);
+  }
+});
+
+test("standalone search requires the explicit features table instead of a dotted root key", () => {
+  const status = standaloneSearchStatus(`web_search = "live"
+suppress_unstable_features_warning = true
+features.standalone_web_search = true
+`);
+
+  assert.equal(status.ok, false);
+  assert.deepEqual(status.missing, ["features.standalone_web_search"]);
+});
+
 test("missing standalone search gates return the exact copyable snippet", () => {
   const status = standaloneSearchStatus(`web_search = "live"
 

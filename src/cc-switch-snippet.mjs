@@ -5,6 +5,11 @@ function requiredString(value, name) {
   return value;
 }
 
+function canonicalRedactedCallerBaseUrl(value) {
+  const match = /^http:\/\/127\.0\.0\.1:([1-9]\d{0,4})\/_codex-router\/\[REDACTED\]\/v1$/.exec(value);
+  return Boolean(match && Number(match[1]) <= 65_535);
+}
+
 // This is deliberately a renderer, not an integration manager. CC Switch owns
 // its database and profile selection; the Router only gives an authenticated
 // local caller the TOML it may choose to paste into an aggregate profile.
@@ -30,8 +35,8 @@ supports_standalone_web_search = true
 // support-bundle disclosure too easy.
 export function aggregateSnippetStatus({ routedCatalogPath, redactedBaseUrl }) {
   const baseUrl = requiredString(redactedBaseUrl, "redactedBaseUrl");
-  if (baseUrl !== "unavailable" && !baseUrl.includes("[REDACTED]")) {
-    throw new TypeError("redactedBaseUrl must not contain a caller capability.");
+  if (baseUrl !== "unavailable" && !canonicalRedactedCallerBaseUrl(baseUrl)) {
+    throw new TypeError("redactedBaseUrl must be the canonical redacted caller URL or unavailable.");
   }
   return {
     modelCatalogJson: requiredString(routedCatalogPath, "routedCatalogPath"),

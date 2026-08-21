@@ -1,6 +1,15 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  mkdtempSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  readlinkSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -17,6 +26,41 @@ const redactedCapability =
   "http://127.0.0.1:46192/_codex-router/[REDACTED]/v1";
 const routedCatalogPath = "/private/router-state/routed-models.json";
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const runtimeGuard = path.join(root, "test", "fixtures", "task5-runtime-guards.cjs");
+const guardMarker = "__TASK5_RUNTIME_GUARDS__";
+
+function snapshotTree(directory, relative = "") {
+  const target = path.join(directory, relative);
+  return readdirSync(target, { withFileTypes: true })
+    .sort((left, right) => left.name.localeCompare(right.name))
+    .flatMap((entry) => {
+      const next = path.join(relative, entry.name);
+      const full = path.join(directory, next);
+      const mode = statSync(full).mode & 0o777;
+      if (entry.isDirectory()) return [{ type: "directory", path: next, mode }, ...snapshotTree(directory, next)];
+      if (entry.isSymbolicLink()) return [{ type: "symlink", path: next, mode, target: readlinkSync(full) }];
+      return [{ type: "file", path: next, mode, bytes: readFileSync(full).toString("base64") }];
+    });
+}
+
+function guardEvents(stderr) {
+  return stderr
+    .split(/\r?\n/)
+    .filter((line) => line.startsWith(guardMarker))
+    .flatMap((line) => JSON.parse(line.slice(guardMarker.length)));
+}
+
+function writeCodexStub(directory) {
+  const target = path.join(directory, process.platform === "win32" ? "codex-test.cmd" : "codex-test");
+  writeFileSync(
+    target,
+    process.platform === "win32"
+      ? "@echo off\r\nif \"%1\"==\"--version\" (echo codex-cli 99.0.0& exit /b 0)\r\nif \"%1\"==\"login\" exit /b 0\r\nif \"%1\"==\"debug\" (echo {\"models\":[]}& exit /b 0)\r\nexit /b 1\r\n"
+      : "#!/bin/sh\ncase \"$1\" in\n  --version) echo 'codex-cli 99.0.0' ;;\n  login) exit 0 ;;\n  debug) printf '%s\\n' '{\"models\":[]}' ;;\n  *) exit 1 ;;\nesac\n",
+    { mode: 0o755 },
+  );
+  return target;
+}
 
 test("authenticated aggregate snippet is deterministic and usable", () => {
   const fixture = { routedCatalogPath, callerBaseUrl: capability };
@@ -49,8 +93,44 @@ test("aggregate status is redacted and contains no protected snippet", () => {
 test("aggregate status rejects an unredacted caller capability", () => {
   assert.throws(
     () => aggregateSnippetStatus({ routedCatalogPath, redactedBaseUrl: capability }),
-    /redactedBaseUrl must not contain a caller capability/,
+    /canonical redacted caller URL/,
   );
+});
+
+test("aggregate status accepts only the exact canonical redacted caller URL", () => {
+  const rejected = [
+    `${redactedCapability}?next=/elsewhere`,
+    `${redactedCapability} trailing-text`,
+    `http://user@127.0.0.1:46192/_codex-router/[REDACTED]/v1`,
+    `http://127.0.0.1:46192/_codex-router/${capability.split("/")[4]}/v1 [REDACTED]`,
+    `http://127.0.0.1:46192/_codex-router/[REDACTED]/v1#fragment`,
+    "http://127.0.0.1/_codex-router/[REDACTED]/v1",
+    "https://127.0.0.1:46192/_codex-router/[REDACTED]/v1",
+  ];
+
+  for (const redactedBaseUrl of rejected) {
+    assert.throws(
+      () => aggregateSnippetStatus({ routedCatalogPath, redactedBaseUrl }),
+      /canonical redacted caller URL/,
+      redactedBaseUrl,
+    );
+  }
+  assert.equal(
+    aggregateSnippetStatus({ routedCatalogPath, redactedBaseUrl: "unavailable" }).baseUrl,
+    "unavailable",
+  );
+});
+
+test("rejected aggregate status errors do not echo the supplied capability", () => {
+  const mixedCapability = `${capability} [REDACTED]`;
+  let error;
+  try {
+    aggregateSnippetStatus({ routedCatalogPath, redactedBaseUrl: mixedCapability });
+  } catch (caught) {
+    error = caught;
+  }
+  assert.ok(error instanceof Error);
+  assert.doesNotMatch(error.message, /caller-capability-decoy-with-sufficient-length/);
 });
 
 test("pure snippet and status surfaces do not carry filesystem or configuration writers", async () => {
@@ -87,7 +167,7 @@ test("catalog status is redacted while the local render command alone returns th
     });
     assert.equal(status.status, 0, status.stderr);
     assert.doesNotMatch(status.stdout, new RegExp(secret));
-    assert.match(status.stdout, /\[REDACTED\]/);
+    assert.equal(JSON.parse(status.stdout).aggregate.baseUrl, "unavailable");
     assert.equal(readFileSync(decoyDatabase, "utf8"), "do-not-touch");
 
     const rendered = spawnSync(process.execPath, ["src/control.mjs", "catalog", "render-snippet"], {
@@ -101,5 +181,110 @@ test("catalog status is redacted while the local render command alone returns th
     assert.equal(readFileSync(decoyDatabase, "utf8"), "do-not-touch");
   } finally {
     rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test("read-only snippet, status, and doctor calls leave the fully isolated home untouched", () => {
+  const isolated = mkdtempSync(path.join(os.tmpdir(), "codex-router-runtime-guard-"));
+  const home = path.join(isolated, "home");
+  const codexHome = path.join(isolated, "codex");
+  const stateDir = path.join(codexHome, "router-state");
+  const secret = "runtime-guard-caller-capability-decoy-with-sufficient-length";
+  const ccSwitchDatabase = path.join(home, ".cc-switch", "cc-switch.db");
+  mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+  mkdirSync(path.dirname(ccSwitchDatabase), { recursive: true, mode: 0o700 });
+  writeFileSync(path.join(codexHome, "config.toml"), `web_search = "live"
+suppress_unstable_features_warning = true
+
+[features]
+standalone_web_search = true
+`, { mode: 0o600 });
+  writeFileSync(path.join(stateDir, "caller-secret"), `${secret}\n`, { mode: 0o600 });
+  writeFileSync(path.join(stateDir, "internal-secret"), "runtime-guard-internal-key-with-sufficient-length\n", { mode: 0o600 });
+  writeFileSync(ccSwitchDatabase, "do-not-touch", { mode: 0o600 });
+  const env = {
+    ...process.env,
+    HOME: home,
+    USERPROFILE: home,
+    APPDATA: path.join(home, "AppData", "Roaming"),
+    LOCALAPPDATA: path.join(home, "AppData", "Local"),
+    CODEX_HOME: codexHome,
+    CODEX_ROUTER_STATE_DIR: stateDir,
+    MODEL_ROUTER_STATE_DIR: stateDir,
+    CODEX_ROUTER_PORT: "46192",
+    CODEX_BIN: writeCodexStub(isolated),
+    CODEX_ROUTER_SERVICE_PLATFORM: "darwin",
+    NODE_OPTIONS: `${process.env.NODE_OPTIONS || ""} --require=${runtimeGuard}`.trim(),
+  };
+
+  try {
+    const before = snapshotTree(isolated);
+    for (const args of [
+      ["src/control.mjs", "catalog", "status"],
+      ["src/control.mjs", "catalog", "render-snippet"],
+      ["src/doctor.mjs", "--json"],
+    ]) {
+      const result = spawnSync(process.execPath, args, { cwd: root, env, encoding: "utf8" });
+      if (args[2] === "render-snippet") {
+        assert.match(result.stdout, new RegExp(secret));
+        assert.doesNotMatch(result.stderr, new RegExp(secret));
+      } else {
+        assert.doesNotMatch(`${result.stderr}\n${result.stdout}`, new RegExp(secret));
+      }
+      assert.deepEqual(guardEvents(result.stderr), []);
+      assert.deepEqual(snapshotTree(isolated), before, args.join(" "));
+    }
+  } finally {
+    rmSync(isolated, { recursive: true, force: true });
+  }
+});
+
+test("only the explicit local catalog command references protected snippet rendering", () => {
+  const sourceFiles = readdirSync(path.join(root, "src"))
+    .filter((name) => name.endsWith(".mjs"))
+    .filter((name) => readFileSync(path.join(root, "src", name), "utf8").includes("renderAggregateSnippet"));
+
+  assert.deepEqual(sourceFiles.sort(), ["cc-switch-snippet.mjs", "control.mjs"]);
+});
+
+test("aggregate status never leaks a decoy caller capability into a support bundle or log tail", () => {
+  const isolated = mkdtempSync(path.join(os.tmpdir(), "codex-router-support-redaction-"));
+  const codexHome = path.join(isolated, "codex");
+  const stateDir = path.join(codexHome, "router-state");
+  const secret = "support-bundle-caller-capability-decoy-with-sufficient-length";
+  const capabilityUrl = `http://127.0.0.1:46195/_codex-router/${secret}/v1`;
+  const output = path.join(isolated, "support.json");
+  mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+  writeFileSync(path.join(codexHome, "config.toml"), "", { mode: 0o600 });
+  writeFileSync(path.join(stateDir, "caller-secret"), `${secret}\n`, { mode: 0o600 });
+  writeFileSync(path.join(stateDir, "internal-secret"), "support-internal-key-with-sufficient-length\n", { mode: 0o600 });
+  writeFileSync(path.join(stateDir, "router.log"), `base_url=${capabilityUrl}\n`, { mode: 0o600 });
+  const env = {
+    ...process.env,
+    HOME: path.join(isolated, "home"),
+    USERPROFILE: path.join(isolated, "home"),
+    APPDATA: path.join(isolated, "home", "AppData", "Roaming"),
+    LOCALAPPDATA: path.join(isolated, "home", "AppData", "Local"),
+    CODEX_HOME: codexHome,
+    CODEX_ROUTER_STATE_DIR: stateDir,
+    MODEL_ROUTER_STATE_DIR: stateDir,
+    CODEX_ROUTER_PORT: "46195",
+    CODEX_BIN: writeCodexStub(isolated),
+    CODEX_ROUTER_SERVICE_PLATFORM: "darwin",
+  };
+
+  try {
+    const result = spawnSync(
+      process.execPath,
+      ["src/support-bundle.mjs", "--include-logs", "--output", output],
+      { cwd: root, env, encoding: "utf8" },
+    );
+    assert.equal(result.status, 0, result.stderr);
+    const surfaces = `${result.stdout}\n${result.stderr}\n${readFileSync(output, "utf8")}`;
+    assert.doesNotMatch(surfaces, new RegExp(secret));
+    assert.doesNotMatch(surfaces, /model_provider = "custom"/);
+    assert.match(readFileSync(output, "utf8"), /\[REDACTED\]/);
+  } finally {
+    rmSync(isolated, { recursive: true, force: true });
   }
 });
