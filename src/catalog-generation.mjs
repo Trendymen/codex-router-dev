@@ -74,7 +74,12 @@ const CATALOG_0149_SCHEMA = Object.freeze({
 const MERGED_CATALOG_SCHEMA = Object.freeze({
   type: "object",
   required: ["models"],
-  properties: { models: { type: "array", items: { type: "object", required: ["slug"], properties: { slug: { type: "string" } } } },
+  properties: {
+    models: {
+      type: "array",
+      items: { type: "object", required: ["slug"], properties: { slug: { type: "string" } } },
+    },
+  },
 });
 
 function jsonBytes(value) {
