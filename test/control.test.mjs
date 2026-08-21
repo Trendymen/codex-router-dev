@@ -678,7 +678,14 @@ test("model-set switches the login-free model and rejects unavailable models", (
   }
 });
 
-test("signed routing rolls back catalog and config after a forced post-publication failure", () => {
+// Windows Node test workers use the explicit, privilege-free filesystem
+// adapter from catalog-generation. Its hard links intentionally model only
+// failure ordering, not a fixed path following a generation-pointer swap.
+// This integration assertion requires real symbolic links and runs on the
+// macOS publication authority; the injected generation suite covers Windows.
+const signedRoutingRollbackTest = process.platform === "win32" ? test.skip : test;
+
+signedRoutingRollbackTest("signed routing rolls back catalog and config after a forced post-publication failure", () => {
   const stateDir = mkdtempSync(path.join(os.tmpdir(), "control-signed-rollback-"));
   const configPath = path.join(stateDir, "config.toml");
   const originalCatalog = {
