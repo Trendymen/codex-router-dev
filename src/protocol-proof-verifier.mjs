@@ -33,7 +33,6 @@ function verifiedAt(clock) {
 }
 
 function recordFor(model, evidence, clock) {
-  const verdict = evidence?.verdict === "passing" ? "passing" : "failed";
   return Object.freeze({
     slug: model.slug,
     provider: model.provider,
@@ -41,7 +40,7 @@ function recordFor(model, evidence, clock) {
     transport: model.effectiveTransport,
     toolDialect: model.toolDialect,
     requestProfile: model.requestProfile,
-    verdict,
+    verdict: "passing",
     fingerprint: registryFingerprint(model, PROTOCOL_PROOF_VERIFIER_VERSION),
     verifierVersion: PROTOCOL_PROOF_VERIFIER_VERSION,
     measuredFinalReasoningShape: evidence?.measuredFinalReasoningShape ?? "unverified",
@@ -65,9 +64,13 @@ export async function verifyProtocolProof(slug, options = {}) {
     failover: false,
     checks: CHECKS,
   });
-  const record = recordFor(model, evidence, options.clock);
-  if (record.verdict === "passing" && VERIFIED_FINAL_SHAPES.has(record.measuredFinalReasoningShape)) {
-    writePassingProtocolProof(record);
+  if (
+    evidence?.verdict !== "passing" ||
+    !VERIFIED_FINAL_SHAPES.has(evidence.measuredFinalReasoningShape)
+  ) {
+    throw publicError("protocol_proof_verification_failed", 422);
   }
+  const record = recordFor(model, evidence, options.clock);
+  writePassingProtocolProof(record);
   return record;
 }

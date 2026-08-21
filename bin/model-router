@@ -66,6 +66,11 @@ case "$command" in
   *) echo "Unknown command: $command" >&2; usage >&2; exit 2 ;;
 esac
 
+if [ "$command" = "protocol-proof" ] && [ "$target" != "codex" ]; then
+  echo "protocol-proof is only supported for the codex target." >&2
+  exit 2
+fi
+
 MODEL_ROUTER_TARGET=$target
 export MODEL_ROUTER_TARGET
 if [ "$command" = "protocol-proof" ]; then

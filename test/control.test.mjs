@@ -318,6 +318,37 @@ test("protocol-proof verify warns without --yes and makes no proof request", () 
   }
 });
 
+test("model-router restricts protocol-proof to codex and Phase 1 --yes fails closed", () => {
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), "control-protocol-proof-cli-"));
+  const env = {
+    ...process.env,
+    MODEL_ROUTER_STATE_DIR: stateDir,
+    CODEX_HOME: path.join(stateDir, "codex-home"),
+  };
+  try {
+    for (const target of ["dsh", "gemini"]) {
+      const rejected = spawnSync(
+        "sh",
+        [path.join(root, "bin", "model-router"), target, "protocol-proof", "status"],
+        { cwd: root, encoding: "utf8", env },
+      );
+      assert.notEqual(rejected.status, 0, target);
+      assert.match(rejected.stderr, /only supported for the codex target/i, target);
+    }
+
+    const phaseOne = spawnSync(
+      "sh",
+      [path.join(root, "bin", "model-router"), "codex", "protocol-proof", "verify", "qwen-plan/qwen3.7-max", "--yes"],
+      { cwd: root, encoding: "utf8", env },
+    );
+    assert.notEqual(phaseOne.status, 0);
+    assert.match(phaseOne.stderr, /protocol_probe_not_implemented/);
+    assert.equal(existsSync(path.join(stateDir, "protocol-proofs.json")), false);
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
 test("control toggles tool-result aging without a router restart", () => {
   const stateDir = mkdtempSync(path.join(os.tmpdir(), "control-tool-result-aging-"));
   const env = {

@@ -1,6 +1,7 @@
 import { experimentalModelEnabled } from "./experimental-models.mjs";
 import { MODELS } from "./model-registry.mjs";
 import { readProtocolProof, registryFingerprint } from "./protocol-proof.mjs";
+import { PROTOCOL_PROOF_VERIFIER_VERSION } from "./protocol-proof-verifier.mjs";
 
 export const TRANSPORTS = Object.freeze([
   "native-openai",
@@ -184,7 +185,7 @@ export function proofMatchesModel(proof, model) {
   if (proofField(proof, "transport", "effectiveTransport") !== model.effectiveTransport) return false;
   if (proof.toolDialect !== model.toolDialect) return false;
   if (proof.requestProfile !== model.requestProfile) return false;
-  if (!Number.isInteger(proof.verifierVersion) || proof.verifierVersion < 1) return false;
+  if (proof.verifierVersion !== PROTOCOL_PROOF_VERIFIER_VERSION) return false;
   const fingerprint = proof.fingerprint ?? proof.registryFingerprint;
   if (typeof fingerprint !== "string" || !fingerprint) return false;
   if (fingerprint !== registryFingerprint(model, proof.verifierVersion)) return false;
