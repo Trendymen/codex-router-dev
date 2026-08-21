@@ -109,7 +109,10 @@ test("both versioned Codex schemas reject incomplete routed entries", () => {
       "utf8",
     ));
     assert.doesNotThrow(() => validateCatalogSchema(artifacts("schema")["routed-models.json"], schema));
-    assert.throws(() => validateCatalogSchema({ models: [{ slug: "missing-contract" }] }, schema), /model_messages/);
+    assert.throws(
+      () => validateCatalogSchema({ models: [{ slug: "missing-contract" }] }, schema),
+      version === "0.147" ? /model_messages/ : /base_instructions/,
+    );
   }
 });
 
