@@ -168,9 +168,10 @@ export function observeNativeSessionUsability(usable, {
     rebuild: async (reason) => {
       // A first cold start has no native template yet. Do not contend on the
       // publication lock or turn that normal state into an asynchronous retry.
-      if (!existsSync(MERGED_CATALOG_PATH)) return undefined;
+      if (!existsSync(MERGED_CATALOG_PATH)) return Object.freeze({ committed: false });
       const { rebuildNodeSnapshots } = await import("./catalog-rebuild.mjs");
-      return rebuildNodeSnapshots(reason);
+      await rebuildNodeSnapshots(reason);
+      return Object.freeze({ committed: true });
     },
     // DSH/Gemini documents are outside the Router transaction; refresh only
     // after the generation pointer has switched, and never rerun Codex's old

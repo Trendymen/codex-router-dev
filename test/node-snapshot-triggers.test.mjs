@@ -281,6 +281,70 @@ test("native-session observer retries a failed external refresh without publishi
   assert.deepEqual(observer.snapshot(), { usable: true, desiredUsable: true });
 });
 
+test("native-session observer defers a cold rebuild without advancing publication", async () => {
+  const calls = [];
+  let baseAvailable = false;
+  const observer = createNativeSessionSnapshotObserver({
+    rebuild: async () => {
+      calls.push(`rebuild:${baseAvailable}`);
+      return { committed: baseAvailable };
+    },
+    refreshTargets: async () => calls.push("refresh"),
+  });
+
+  await observer.observe({ usable: false });
+  await observer.observe({ usable: true });
+  assert.deepEqual(calls, ["rebuild:false"]);
+  assert.deepEqual(observer.snapshot(), { usable: false, desiredUsable: true });
+
+  baseAvailable = true;
+  await observer.observe({ usable: true });
+  assert.deepEqual(calls, ["rebuild:false", "rebuild:true", "refresh"]);
+  assert.deepEqual(observer.snapshot(), { usable: true, desiredUsable: true });
+});
+
+test("native-session observer converges to a reversal that races a failed target refresh", async () => {
+  const calls = [];
+  let releaseRefresh;
+  const refreshStarted = new Promise((resolve) => { releaseRefresh = resolve; });
+  let continueRefresh;
+  const refreshGate = new Promise((resolve) => { continueRefresh = resolve; });
+  let refreshes = 0;
+  let rebuilds = 0;
+  const observer = createNativeSessionSnapshotObserver({
+    rebuild: async () => {
+      rebuilds += 1;
+      calls.push(`rebuild:${rebuilds}`);
+      return { committed: true };
+    },
+    refreshTargets: async () => {
+      refreshes += 1;
+      calls.push(`refresh:${refreshes}`);
+      if (refreshes === 1) {
+        releaseRefresh();
+        await refreshGate;
+        throw new Error("injected target refresh failure carrying secret-like text");
+      }
+    },
+  });
+
+  await observer.observe({ usable: false });
+  const enabling = observer.observe({ usable: true });
+  const enablingFailure = enabling.catch((error) => assert.match(String(error?.message), /injected target refresh failure/));
+  await refreshStarted;
+  const disabling = observer.observe({ usable: false });
+  const disablingFailure = disabling.catch((error) => assert.match(String(error?.message), /injected target refresh failure/));
+  continueRefresh();
+  await enablingFailure;
+  await disablingFailure;
+  assert.deepEqual(observer.snapshot(), { usable: false, desiredUsable: false });
+  assert.doesNotMatch(JSON.stringify(observer.snapshot()), /secret|error|failure/i);
+
+  await observer.observe({ usable: false });
+  assert.deepEqual(calls, ["rebuild:1", "refresh:1", "rebuild:2", "refresh:2"]);
+  assert.deepEqual(observer.snapshot(), { usable: false, desiredUsable: false });
+});
+
 for (const reason of [
   "credential:set:deepseek",
   "provider-selection:enable:deepseek",

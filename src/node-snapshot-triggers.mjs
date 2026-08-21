@@ -102,6 +102,7 @@ export function createNativeSessionSnapshotObserver({ rebuild, refreshTargets } 
   let initialized = false;
   let running;
   let pending = false;
+  let targetRefreshPending = false;
   let current;
 
   const run = async () => {
@@ -111,10 +112,20 @@ export function createNativeSessionSnapshotObserver({ rebuild, refreshTargets } 
       const target = desired;
       try {
         if (generationPublished !== target || rebuildPending) {
-          await rebuild("native-session-usability");
+          const result = await rebuild("native-session-usability");
+          if (result?.committed === false) {
+            // A cold service has no merged base to publish yet. This is a
+            // deliberate defer, not a generation commit or target refresh.
+            pending ||= desired !== target;
+            return;
+          }
           generationPublished = target;
+          targetRefreshPending = true;
         }
-        if (published !== target && typeof refreshTargets === "function") await refreshTargets();
+        if ((published !== target || targetRefreshPending) && typeof refreshTargets === "function") {
+          await refreshTargets();
+        }
+        targetRefreshPending = false;
         // A usable state is published only when Router generation and every
         // installed external picker have both accepted it. If refresh fails,
         // retain the committed generation and retry only that external step.
@@ -122,7 +133,10 @@ export function createNativeSessionSnapshotObserver({ rebuild, refreshTargets } 
       } catch (error) {
         // This is deliberately non-sensitive: callers can retry the same
         // usability state and no credential-derived detail leaves the module.
-        pending = false;
+        // Keep a state reversal that raced the failed refresh. Its next
+        // observation must rebuild from the current desired state instead of
+        // returning the previous rejected promise as if it were published.
+        pending ||= desired !== target;
         throw error;
       }
     } while (pending || desired !== published);
@@ -138,7 +152,12 @@ export function createNativeSessionSnapshotObserver({ rebuild, refreshTargets } 
         published = usable;
         return current;
       }
-      if (desired === usable && desired === published) return current;
+      if (
+        desired === usable
+        && desired === published
+        && generationPublished === usable
+        && !targetRefreshPending
+      ) return current;
       if (running && desired === usable) return current;
       desired = usable;
       if (running) {
