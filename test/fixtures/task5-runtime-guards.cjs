@@ -6,52 +6,68 @@ const events = [];
 const marker = "__TASK5_RUNTIME_GUARDS__";
 
 function pathValue(value) {
-  return typeof value === "string" ? value.replaceAll("\\", "/") : "";
+  if (typeof value === "string") return value.replaceAll("\\", "/");
+  if (Buffer.isBuffer(value)) return value.toString("utf8").replaceAll("\\", "/");
+  return "";
 }
 
-function record(kind, value) {
-  const target = pathValue(value);
-  events.push({
-    kind,
-    ...(target.includes("/.cc-switch/") ? { ccSwitchAccess: true } : {}),
-  });
+function isCcSwitchPath(value) {
+  return pathValue(value).includes("/.cc-switch/");
+}
+
+function record(kind, value, extra = {}) {
+  const event = { kind, ...extra };
+  if (isCcSwitchPath(value)) event.ccSwitchAccess = true;
+  events.push(event);
+  return event;
+}
+
+function blockCcSwitch(kind, value) {
+  if (!isCcSwitchPath(value)) return false;
+  record(kind, value, { blocked: true });
+  throw new Error("CC Switch database access is blocked by the Task 5 runtime guard.");
+}
+
+function wrapFs(name, { mutation = false } = {}) {
+  const original = fs[name];
+  if (typeof original !== "function") return;
+  fs[name] = function guardedFsOperation(...args) {
+    if (blockCcSwitch(`fs.${name}`, args[0])) return undefined;
+    if (mutation) record(`fs.${name}`, args[0]);
+    return original.apply(this, args);
+  };
 }
 
 for (const name of [
-  "appendFile",
-  "appendFileSync",
-  "chmod",
-  "chmodSync",
-  "copyFile",
-  "copyFileSync",
-  "mkdir",
-  "mkdirSync",
-  "rename",
-  "renameSync",
-  "rm",
-  "rmSync",
-  "truncate",
-  "truncateSync",
-  "unlink",
-  "unlinkSync",
-  "writeFile",
-  "writeFileSync",
-]) {
-  const original = fs[name];
-  if (typeof original !== "function") continue;
-  fs[name] = function guardedFsOperation(...args) {
-    record(`fs.${name}`, args[0]);
+  "access", "accessSync", "existsSync", "lstat", "lstatSync", "open", "openSync",
+  "opendir", "opendirSync", "readFile", "readFileSync", "readdir", "readdirSync",
+  "readlink", "readlinkSync", "realpath", "realpathSync", "stat", "statSync",
+  "statfs", "statfsSync", "watch", "watchFile", "unwatchFile", "createReadStream", "createWriteStream",
+]) wrapFs(name);
+
+for (const name of [
+  "appendFile", "appendFileSync", "chmod", "chmodSync", "copyFile", "copyFileSync",
+  "chown", "chownSync", "cp", "cpSync", "lchown", "lchownSync", "link", "linkSync",
+  "lutimes", "lutimesSync", "mkdir", "mkdirSync", "rename", "renameSync", "rm", "rmSync",
+  "symlink", "symlinkSync", "truncate", "truncateSync", "unlink", "unlinkSync", "utimes", "utimesSync",
+  "writeFile", "writeFileSync",
+]) wrapFs(name, { mutation: true });
+
+function wrapPromise(name, { mutation = false } = {}) {
+  const original = fs.promises[name];
+  if (typeof original !== "function") return;
+  fs.promises[name] = async function guardedPromiseOperation(...args) {
+    if (blockCcSwitch(`fs.promises.${name}`, args[0])) return undefined;
+    if (mutation) record(`fs.promises.${name}`, args[0]);
     return original.apply(this, args);
   };
 }
 
-for (const name of ["writeFile", "appendFile", "mkdir", "rename", "rm", "unlink", "chmod", "copyFile"]) {
-  const original = fs.promises[name];
-  if (typeof original !== "function") continue;
-  fs.promises[name] = async function guardedPromiseOperation(...args) {
-    record(`fs.promises.${name}`, args[0]);
-    return original.apply(this, args);
-  };
+for (const name of ["access", "lstat", "open", "opendir", "readFile", "readdir", "readlink", "realpath", "stat", "statfs", "watch"]) {
+  wrapPromise(name);
+}
+for (const name of ["appendFile", "chmod", "chown", "copyFile", "cp", "lchown", "link", "lutimes", "mkdir", "rename", "rm", "symlink", "truncate", "unlink", "utimes", "writeFile"]) {
+  wrapPromise(name, { mutation: true });
 }
 
 for (const name of ["execFile", "execFileSync", "spawn", "spawnSync", "fork"]) {

@@ -234,6 +234,28 @@ standalone_web_search = true
       assert.deepEqual(guardEvents(result.stderr), []);
       assert.deepEqual(snapshotTree(isolated), before, args.join(" "));
     }
+
+    const ccSwitchOperations = [
+      "readFileSync",
+      "statSync",
+      "openSync",
+      "createWriteStream",
+      "promises.open",
+    ];
+    for (const operation of ccSwitchOperations) {
+      const script = `const fs = require("node:fs"); const target = process.argv[1]; const op = process.argv[2]; if (op === "readFileSync") fs.readFileSync(target); else if (op === "statSync") fs.statSync(target); else if (op === "openSync") fs.openSync(target, "w"); else if (op === "createWriteStream") fs.createWriteStream(target); else fs.promises.open(target, "w");`;
+      const result = spawnSync(process.execPath, ["-e", script, ccSwitchDatabase, operation], {
+        cwd: root,
+        env,
+        encoding: "utf8",
+      });
+      assert.notEqual(result.status, 0, operation);
+      assert.ok(
+        guardEvents(result.stderr).some((event) => event.ccSwitchAccess && event.blocked),
+        operation,
+      );
+      assert.deepEqual(snapshotTree(isolated), before, operation);
+    }
   } finally {
     rmSync(isolated, { recursive: true, force: true });
   }
@@ -245,6 +267,15 @@ test("only the explicit local catalog command references protected snippet rende
     .filter((name) => readFileSync(path.join(root, "src", name), "utf8").includes("renderAggregateSnippet"));
 
   assert.deepEqual(sourceFiles.sort(), ["cc-switch-snippet.mjs", "control.mjs"]);
+});
+
+test("production source has no SQLite or CC Switch database adapter", () => {
+  const forbidden = /(?:better-sqlite3|node:sqlite|from\s+["']sqlite|cc-switch\.db|\.cc-switch[\\/])/i;
+  const offenders = readdirSync(path.join(root, "src"))
+    .filter((name) => name.endsWith(".mjs"))
+    .filter((name) => forbidden.test(readFileSync(path.join(root, "src", name), "utf8")));
+
+  assert.deepEqual(offenders, []);
 });
 
 test("aggregate status never leaks a decoy caller capability into a support bundle or log tail", () => {

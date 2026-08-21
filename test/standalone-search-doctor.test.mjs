@@ -65,6 +65,13 @@ standalone_web_search = true
 
 [features]
 `,
+    `web_search = "live"
+suppress_unstable_features_warning = true
+features.standalone_web_search = true
+
+[features]
+standalone_web_search = true
+`,
   ];
 
   for (const document of invalidDocuments) {
@@ -74,14 +81,27 @@ standalone_web_search = true
   }
 });
 
-test("standalone search requires the explicit features table instead of a dotted root key", () => {
+test("standalone search treats a dotted features key as the same configuration path", () => {
   const status = standaloneSearchStatus(`web_search = "live"
 suppress_unstable_features_warning = true
 features.standalone_web_search = true
 `);
 
+  assert.equal(status.ok, true);
+  assert.deepEqual(status.missing, []);
+});
+
+test("standalone search fails closed on an unrecognized active TOML line", () => {
+  const status = standaloneSearchStatus(`web_search = "live"
+suppress_unstable_features_warning = true
+
+[features]
+standalone_web_search = true
+this is not TOML
+`);
+
   assert.equal(status.ok, false);
-  assert.deepEqual(status.missing, ["features.standalone_web_search"]);
+  assert.match(status.invalid || "", /unrecognized active TOML content/i);
 });
 
 test("missing standalone search gates return the exact copyable snippet", () => {

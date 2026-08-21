@@ -15,6 +15,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { findCodexBinary, spawnableCommand } from "./codex-binary.mjs";
+import { readCodexConfigStatus } from "./codex-config-status.mjs";
 
 import {
   assertCallerSecret,
@@ -940,35 +941,7 @@ function clean(contents) {
 }
 
 function snapshot(contents) {
-  const { rootLines } = splitRoot(contents);
-  const baseUrl = rootValue(rootLines, "openai_base_url");
-  const catalog = rootValue(rootLines, "model_catalog_json");
-  const activeProvider = rootValue(rootLines, "model_provider") || "openai";
-  const signedState = readSignedProviderModeState();
-  const signedActive = signedState
-    ? signedProviderStateIsOwned(contents, signedState)
-    : false;
-  return {
-    mode:
-      isManagedRouterBaseUrl(baseUrl) && catalog === MERGED_CATALOG_PATH
-        ? "router"
-        : "native",
-    model: rootValue(rootLines, "model") || null,
-    model_provider: activeProvider,
-    login_free: rootValue(rootLines, "model_provider") === routerProviderId,
-    login_free_managed:
-      rootValue(rootLines, "model_provider") === routerProviderId &&
-      existsSync(CODEX_PROVIDER_MODE_PATH),
-    provider_mode_state_present: existsSync(CODEX_PROVIDER_MODE_PATH),
-    signed_routing: Boolean(signedActive),
-    signed_routing_managed: Boolean(
-      signedActive && privateFileIsProtected(SIGNED_PROVIDER_MODE_PATH),
-    ),
-    signed_provider_state_present: existsSync(SIGNED_PROVIDER_MODE_PATH),
-    openai_base_url: baseUrl ? redactCallerUrl(baseUrl) : null,
-    model_catalog_json: catalog || null,
-    config_protected: privateFileIsProtected(CONFIG_PATH),
-  };
+  return readCodexConfigStatus(contents);
 }
 
 function enabledContents(contents) {

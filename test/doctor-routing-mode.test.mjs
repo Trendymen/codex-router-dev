@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import {
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -288,6 +289,67 @@ standalone_web_search = false
 `);
     assert.equal(readFileSync(ccSwitchDatabase, "utf8"), "do-not-touch");
     assert.match(byName.get("CC Switch aggregate profile").detail, /\[REDACTED\]/);
+  } finally {
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test("doctor preserves routing-mode failures without invoking config-manager", () => {
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), "codex-router-doctor-mode-failures-"));
+  const stateDir = path.join(codexHome, "router-state");
+  const configPath = path.join(codexHome, "config.toml");
+  mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+  writeFileSync(path.join(stateDir, "caller-secret"), `${callerSecret}\n`, { mode: 0o600 });
+  writeFileSync(
+    path.join(stateDir, "internal-secret"),
+    "doctor-internal-service-key-with-sufficient-length\n",
+    { mode: 0o600 },
+  );
+  const env = {
+    ...process.env,
+    CODEX_BIN: writeCodexStub(codexHome),
+    CODEX_HOME: codexHome,
+    CODEX_ROUTER_PORT: "46195",
+    CODEX_ROUTER_STATE_DIR: stateDir,
+    MODEL_ROUTER_STATE_DIR: stateDir,
+    MODEL_ROUTER_TARGET: "codex",
+  };
+  const cases = [
+    {
+      config: 'model_provider = "openai"\n',
+      expected: ["Codex routing config", "native"],
+    },
+    {
+      config: 'model_provider = "codex-router"\n',
+      expected: ["Codex login mode", "unmanaged custom provider"],
+    },
+    {
+      config: 'model_provider = "openai"\n',
+      state: ["codex-provider-mode.json", { version: 1, previousPresent: false, previousModelPresent: false }],
+      expected: ["Codex login mode", "stale provider-mode restore state"],
+    },
+    {
+      config: 'model_provider = "openai"\n',
+      state: ["signed-provider-mode.json", { version: 1, managedProvider: "codex-router-signed", previousPresent: false }],
+      expected: ["Signed router coexistence", "ownership drift; active provider is openai"],
+    },
+  ];
+
+  try {
+    for (const scenario of cases) {
+      writeFileSync(configPath, scenario.config, { mode: 0o600 });
+      for (const name of ["codex-provider-mode.json", "signed-provider-mode.json"]) {
+        const target = path.join(stateDir, name);
+        if (existsSync(target)) unlinkSync(target);
+      }
+      if (scenario.state) {
+        writeFileSync(path.join(stateDir, scenario.state[0]), `${JSON.stringify(scenario.state[1])}\n`, { mode: 0o600 });
+      }
+      const result = child("doctor.mjs", ["--json"], env);
+      const checks = new Map(JSON.parse(result.stdout).checks.map((check) => [check.name, check]));
+      assert.equal(checks.get(scenario.expected[0]).status, "fail");
+      assert.equal(checks.get(scenario.expected[0]).detail, scenario.expected[1]);
+    }
   } finally {
     rmSync(codexHome, { recursive: true, force: true });
   }

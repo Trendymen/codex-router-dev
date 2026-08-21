@@ -228,6 +228,8 @@ export function scanTomlDocument(contents) {
       const assignment = assignmentAtLine(line, lineNumber);
       if (assignment) {
         assignments.push({ index: lineIndex, tablePath: [...tablePath], ...assignment });
+      } else if (line.trim() && !line.trimStart().startsWith("#")) {
+        ambiguousToml(lineNumber, "unrecognized active TOML content");
       }
     }
 
@@ -331,11 +333,10 @@ export function assertUnambiguousTomlDocument(document) {
 }
 
 export function tomlStringValue(document, tablePath, key) {
+  const requestedPath = [...tablePath, key];
   const matches = document.assignments.filter(
     (assignment) =>
-      samePath(assignment.tablePath, tablePath) &&
-      assignment.key.length === 1 &&
-      assignment.key[0] === key,
+      samePath([...assignment.tablePath, ...assignment.key], requestedPath),
   );
   if (matches.length > 1) {
     throw new Error(`Refusing duplicate TOML assignments for ${[...tablePath, key].join(".")}.`);
@@ -348,11 +349,10 @@ export function tomlStringValue(document, tablePath, key) {
 }
 
 export function tomlBooleanValue(document, tablePath, key) {
+  const requestedPath = [...tablePath, key];
   const matches = document.assignments.filter(
     (assignment) =>
-      samePath(assignment.tablePath, tablePath) &&
-      assignment.key.length === 1 &&
-      assignment.key[0] === key,
+      samePath([...assignment.tablePath, ...assignment.key], requestedPath),
   );
   if (matches.length > 1) {
     throw new Error(`Refusing duplicate TOML assignments for ${[...tablePath, key].join(".")}.`);

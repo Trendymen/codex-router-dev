@@ -5,6 +5,7 @@ import path from "node:path";
 import { callerBaseUrl, redactCallerUrl, validCallerSecret } from "./caller-auth.mjs";
 import { aggregateSnippetStatus } from "./cc-switch-snippet.mjs";
 import { codexAuthStatus, findCodexBinary, runCodex } from "./codex-binary.mjs";
+import { readCodexConfigStatus } from "./codex-config-status.mjs";
 import { commandOnPath, spawnableCommand } from "./spawnable-command.mjs";
 import { routedCodexAgentStatus } from "./codex-agent-catalog.mjs";
 import { privateFileIsProtected } from "./file-security.mjs";
@@ -997,26 +998,52 @@ if (TARGET === "gemini") {
     );
   }
 } else {
-  // CC Switch and the user own Codex configuration. A diagnostic must not
-  // invoke the config manager even for its old status-only helper: that would
-  // make a supposedly read-only CC Switch check depend on a configuration
-  // control path.
-  add(
-    existsSync(CONFIG_PATH) ? "ok" : "fail",
-    "Codex routing config",
-    existsSync(CONFIG_PATH) ? "user-owned configuration present" : "missing",
-    "Start Codex once to create its configuration.",
-  );
-  add(
-    "ok",
-    "Codex login mode",
-    "user-owned; not inspected by the read-only doctor",
-  );
-  add(
-    "ok",
-    "Signed router coexistence",
-    "user-owned; not inspected by the read-only doctor",
-  );
+  try {
+    const config = readCodexConfigStatus(existsSync(CONFIG_PATH) ? readFileSync(CONFIG_PATH, "utf8") : "");
+    add(
+      config.mode === "router" ? "ok" : "fail",
+      "Codex routing config",
+      config.mode,
+      "Run ./bin/enable or ./bin/doctor --fix.",
+    );
+    const providerModeOk = config.login_free
+      ? config.login_free_managed
+      : !config.provider_mode_state_present;
+    add(
+      providerModeOk ? "ok" : "fail",
+      "Codex login mode",
+      config.login_free
+        ? config.login_free_managed
+          ? "external providers; OpenAI login not required"
+          : "unmanaged custom provider"
+        : config.provider_mode_state_present
+          ? "stale provider-mode restore state"
+          : "OpenAI login available",
+      "Use the tray toggle to switch modes, or run ./bin/doctor --fix.",
+    );
+    const signedModeOk = config.signed_routing
+      ? config.signed_routing_managed
+      : !config.signed_provider_state_present;
+    add(
+      signedModeOk ? "ok" : "fail",
+      "Signed router coexistence",
+      config.signed_routing
+        ? config.signed_routing_managed
+          ? "active; native GPT and external models share the authenticated router"
+          : "active without managed restore state"
+        : config.signed_provider_state_present
+          ? `ownership drift; active provider is ${config.model_provider}`
+          : `off; active provider is ${config.model_provider}`,
+      "Use the tray toggle to restore the previous provider table before changing configuration managers.",
+    );
+  } catch (error) {
+    add(
+      "fail",
+      "Codex routing config",
+      error instanceof Error ? error.message : String(error),
+      "Inspect ~/.codex/config.toml, then run ./bin/doctor --fix.",
+    );
+  }
 }
 
 const legacy = detectLegacyInstallations();
