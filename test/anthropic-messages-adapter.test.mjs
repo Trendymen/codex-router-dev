@@ -40,6 +40,45 @@ async function collect(transform, chunks) {
   return Buffer.concat(out).toString("utf8");
 }
 
+function eventsFrom(output) {
+  return output.split("\n\n")
+    .filter(Boolean)
+    .map((part) => part.split(/\r\n|\n|\r/).find((line) => line.startsWith("data:")))
+    .filter((line) => line && line.slice(5).trim() !== "[DONE]")
+    .map((line) => JSON.parse(line.slice(5).trim()));
+}
+
+async function summarize(transform, chunks) {
+  const summary = { completed: 0, incomplete: 0, failed: 0, done: 0, bytes: 0 };
+  transform.on("data", (chunk) => {
+    const text = Buffer.from(chunk).toString("utf8");
+    summary.bytes += Buffer.byteLength(text);
+    summary.completed += (text.match(/event: response\.completed/g) || []).length;
+    summary.incomplete += (text.match(/event: response\.incomplete/g) || []).length;
+    summary.failed += (text.match(/event: response\.failed|data: \{"type":"response\.failed"/g) || []).length;
+    summary.done += (text.match(/data: \[DONE\]/g) || []).length;
+  });
+  await new Promise((resolve, reject) => {
+    transform.on("end", resolve);
+    transform.on("error", reject);
+    for (const chunk of chunks) transform.write(chunk);
+    transform.end();
+  });
+  return summary;
+}
+
+function request(overrides = {}, requestContext = {}) {
+  return buildAnthropicMessagesRequest({ model: MODEL, payload: payload(overrides), credential: "k", internalKey: KEY, requestContext });
+}
+
+function simpleCompletion(id = "msg_limits") {
+  return [
+    frame("message_start", { type: "message_start", message: { id, model: "glm-5.2" } }),
+    frame("message_delta", { type: "message_delta", delta: { stop_reason: "end_turn" } }),
+    frame("message_stop", { type: "message_stop" }),
+  ].join("");
+}
+
 test("builds canonical GLM Messages request with full base path", () => {
   const built = buildAnthropicMessagesRequest({ model: MODEL, payload: payload(), credential: { value: "provider-secret" }, internalKey: KEY });
   assert.equal(built.url.href, `${MODEL.baseUrl}/messages`);
@@ -145,8 +184,12 @@ test("converts text, thinking signature, tool input, usage and one terminal even
   assert.ok(events.some((e) => e.type === "response.output_text.delta" && e.delta === "answer"));
   const terminal = events.find((e) => e.type === "response.completed");
   assert.equal(terminal.response.status, "completed");
-  assert.equal(terminal.response.usage.input_tokens, 10);
-  assert.deepEqual(terminal.response.usage.input_tokens_details, { cached_tokens: 3 });
+  assert.deepEqual(terminal.response.usage, {
+    input_tokens: 10,
+    input_tokens_details: { cached_tokens: 3 },
+    output_tokens: 8,
+    cache_creation_input_tokens: 2,
+  });
   assert.equal(output.endsWith("data: [DONE]\n\n"), true);
 });
 
@@ -330,5 +373,283 @@ test("rejects new blocks after a stop reason and closes max-token items as incom
   assert.equal(events.at(-1).type, "response.failed");
   assert.equal(events.at(-1).response.output[0].status, "incomplete");
   assert.ok(events.some((event) => event.type === "response.output_text.done"));
-  assert.deepEqual(events.at(-1).response.incomplete_details, undefined);
+  assert.deepEqual(events.at(-1).response.incomplete_details, null);
+});
+
+test("reasoning and output-limit matrix uses every exact budget, default, cap, and invalid branch", () => {
+  const cases = [
+    [undefined, undefined, { type: "enabled", budget_tokens: 32768 }, 131072],
+    [{}, undefined, { type: "enabled", budget_tokens: 32768 }, 131072],
+    [{ effort: "off" }, 1, undefined, 1],
+    [{ effort: "none" }, 131072, undefined, 131072],
+    [{ effort: "minimal" }, 2048, { type: "enabled", budget_tokens: 1024 }, 2048],
+    [{ effort: "low" }, 3072, { type: "enabled", budget_tokens: 2048 }, 3072],
+    [{ effort: "medium" }, 5120, { type: "enabled", budget_tokens: 4096 }, 5120],
+    [{ effort: "high" }, 9216, { type: "enabled", budget_tokens: 8192 }, 9216],
+    [{ effort: "xhigh" }, 17408, { type: "enabled", budget_tokens: 16384 }, 17408],
+    [{ effort: "max" }, 33792, { type: "enabled", budget_tokens: 32768 }, 33792],
+    [{ effort: "max" }, 131072, { type: "enabled", budget_tokens: 32768 }, 131072],
+  ];
+  for (const [reasoning, limit, thinking, maxTokens] of cases) {
+    const overrides = { reasoning, max_output_tokens: limit };
+    const built = request(overrides);
+    assert.deepEqual(built.json.thinking, thinking);
+    assert.equal(built.json.max_tokens, maxTokens);
+  }
+  const cross = [
+    [undefined, 33792],
+    [{}, 33792],
+    [{ effort: "off" }, 1],
+    [{ effort: "none" }, 1],
+    [{ effort: "minimal" }, 2048],
+    [{ effort: "low" }, 3072],
+    [{ effort: "medium" }, 5120],
+    [{ effort: "high" }, 9216],
+    [{ effort: "xhigh" }, 17408],
+    [{ effort: "max" }, 33792],
+  ];
+  for (const [reasoning, explicit] of cross) {
+    assert.equal(request({ reasoning, max_output_tokens: undefined }).json.max_tokens, 131072);
+    assert.equal(request({ reasoning, max_output_tokens: 131072 }).json.max_tokens, 131072);
+    assert.equal(request({ reasoning, max_output_tokens: explicit }).json.max_tokens, explicit);
+  }
+  const failures = [
+    [null, undefined, "invalid_reasoning_config"],
+    ["high", undefined, "invalid_reasoning_config"],
+    [[], undefined, "invalid_reasoning_config"],
+    [{ effort: "ultra" }, undefined, "unsupported_reasoning_effort"],
+    [{ effort: "minimal" }, null, "invalid_output_limit"],
+    [{ effort: "minimal" }, 1.5, "invalid_output_limit"],
+    [{ effort: "minimal" }, 0, "invalid_output_limit"],
+    [{ effort: "minimal" }, -1, "invalid_output_limit"],
+    [{ effort: "minimal" }, 2047, "thinking_budget_exceeds_output_limit"],
+    [{ effort: "off" }, 131073, "output_limit_exceeds_provider_cap"],
+  ];
+  for (const [reasoning, limit, code] of failures) {
+    assert.throws(() => request({ reasoning, max_output_tokens: limit }), (error) => error.code === code);
+  }
+  for (const reasoning of [null, "high", [], { effort: "ultra" }]) {
+    const code = reasoning && typeof reasoning === "object" && !Array.isArray(reasoning) ? "unsupported_reasoning_effort" : "invalid_reasoning_config";
+    for (const limit of [undefined, 131072, 33792]) assert.throws(() => request({ reasoning, max_output_tokens: limit }), (error) => error.code === code);
+  }
+});
+
+test("parallel settings and every tool choice have exact Anthropic shapes", () => {
+  const tools = payload().tools;
+  const cases = [
+    [undefined, undefined, { type: "auto" }],
+    [undefined, true, { type: "auto" }],
+    [undefined, false, { type: "auto", disable_parallel_tool_use: true }],
+    ["auto", false, { type: "auto", disable_parallel_tool_use: true }],
+    ["required", false, { type: "any", disable_parallel_tool_use: true }],
+    [{ type: "function", name: "lookup" }, false, { type: "tool", name: "lookup", disable_parallel_tool_use: true }],
+  ];
+  for (const [toolChoice, parallel, expected] of cases) {
+    const built = request({ tools, tool_choice: toolChoice, parallel_tool_calls: parallel, reasoning: { effort: "off" }, max_output_tokens: 131072 });
+    assert.deepEqual(built.json.tool_choice, expected);
+  }
+  const none = request({ tools, tool_choice: "none", parallel_tool_calls: false, reasoning: { effort: "off" }, max_output_tokens: 131072 });
+  assert.equal(none.json.tools, undefined);
+  assert.equal(none.json.tool_choice, undefined);
+
+  const mixedTools = [
+    ...tools,
+    { type: "custom", name: "freeform" },
+    { type: "namespace", name: "files", tools: [{ type: "function", name: "read", parameters: { type: "object", properties: {} } }] },
+  ];
+  for (const choice of [{ type: "custom", name: "freeform" }, { type: "function", namespace: "files", name: "read" }]) {
+    const built = request({ tools: mixedTools, tool_choice: choice, parallel_tool_calls: false, reasoning: { effort: "off" }, max_output_tokens: 131072 });
+    assert.equal(built.json.tool_choice.type, "tool");
+    assert.equal(built.json.tool_choice.disable_parallel_tool_use, true);
+    assert.ok(built.json.tools.some((tool) => tool.name === built.json.tool_choice.name));
+  }
+});
+
+test("continuation provenance crosses every bound field and distinguishes foreign from invalid and unknown", () => {
+  const summary = ["bound thought"];
+  const responseId = "msg_bound";
+  const itemId = reasoningItemId(responseId, 2);
+  const basePayload = { v: 1, provider: MODEL.provider, model: MODEL.upstreamModel, transport: "anthropic-messages", responseId, itemId, textSha256: reasoningTextHash(summary), signature: "sig" };
+  const build = (encrypted_content, block = {}, provenance = { [itemId]: { responseId, outputIndex: 2 } }, model = MODEL) => buildAnthropicMessagesRequest({
+    model,
+    payload: payload({ input: [{ role: "assistant", content: [{ type: "reasoning", id: itemId, summary, encrypted_content, ...block }] }] }),
+    credential: "k", internalKey: KEY, requestContext: { provenance },
+  });
+  assert.deepEqual(build(sealReasoningEnvelope(basePayload, KEY)).json.messages[0].content, [{ type: "thinking", thinking: summary[0], signature: "sig" }]);
+  for (const mutation of [
+    { provider: "other" }, { model: "glm-foreign" }, { transport: "openai-responses" },
+  ]) {
+    assert.deepEqual(build(sealReasoningEnvelope({ ...basePayload, ...mutation }, KEY)).json.messages[0].content, []);
+  }
+  for (const mutation of [
+    { responseId: "msg_other" }, { itemId: "rsn_other" }, { textSha256: reasoningTextHash(["other"]) },
+  ]) {
+    assert.throws(() => build(sealReasoningEnvelope({ ...basePayload, ...mutation }, KEY)), (error) => error.code === "thinking_signature_invalid");
+  }
+  assert.throws(() => build("cr.reasoning.v2.invalid.invalid"), (error) => error.code === "thinking_signature_invalid");
+  assert.throws(() => build(undefined), (error) => error.code === "thinking_provenance_unknown");
+  assert.throws(() => build("untagged"), (error) => error.code === "thinking_signature_invalid" || error.code === "thinking_provenance_unknown");
+  assert.throws(() => build(sealReasoningEnvelope({ ...basePayload, signature: null }, KEY)), (error) => error.code === "thinking_signature_missing");
+});
+
+test("failed and incomplete terminals deep-equal Appendix I with no private provider fields", async () => {
+  const upstream = { status: 200, headers: new Headers({ "content-type": "text/event-stream" }) };
+  const malformed = adaptAnthropicMessages({ model: MODEL, upstream, requestContext: { internalKey: KEY, responseId: "resp_safe" } }).transforms[0];
+  const failedOutput = await collect(malformed, [Buffer.from("data: {provider_secret}\n\n")]);
+  const failed = eventsFrom(failedOutput).at(-1);
+  assert.deepEqual(failed, {
+    type: "response.failed",
+    sequence_number: 1,
+    response: {
+      id: "resp_safe",
+      object: "response",
+      created_at: 0,
+      model: MODEL.slug,
+      output: [],
+      usage: null,
+      status: "failed",
+      error: { code: "reasoning_protocol_error", message: "Invalid upstream reasoning sequence." },
+      incomplete_details: null,
+    },
+  });
+  assert.doesNotMatch(JSON.stringify(failed), /provider_secret|provider_response_malformed|"details":|"param":/);
+  assert.equal((failedOutput.match(/data: \[DONE\]/g) || []).length, 1);
+
+  const incompleteTransform = adaptAnthropicMessages({ model: MODEL, upstream, requestContext: { internalKey: KEY } }).transforms[0];
+  const incompleteOutput = await collect(incompleteTransform, [Buffer.from([
+    frame("message_start", { type: "message_start", message: { id: "msg_incomplete", model: "private-provider-model", created_at: 7, usage: { input_tokens: 4, output_tokens: 2, cache_read_input_tokens: 1 } } }),
+    frame("message_delta", { type: "message_delta", delta: { stop_reason: "max_tokens" } }),
+    frame("message_stop", { type: "message_stop" }),
+  ].join(""))]);
+  assert.deepEqual(eventsFrom(incompleteOutput).at(-1), {
+    type: "response.incomplete",
+    sequence_number: 2,
+    response: {
+      id: "msg_incomplete",
+      object: "response",
+      created_at: 7,
+      model: MODEL.slug,
+      output: [],
+      usage: { input_tokens: 4, output_tokens: 2, input_tokens_details: { cached_tokens: 1 } },
+      status: "incomplete",
+      error: null,
+      incomplete_details: { reason: "max_output_tokens" },
+    },
+  });
+  assert.doesNotMatch(incompleteOutput, /private-provider-model/);
+});
+
+test("a paused consumer accepts sixty thousand small frames totaling twelve MiB in order", async () => {
+  const upstream = { status: 200, headers: new Headers({ "content-type": "text/event-stream" }) };
+  const transform = adaptAnthropicMessages({ model: MODEL, upstream, requestContext: { internalKey: KEY } }).transforms[0];
+  const count = 60_000;
+  const targetBytes = 12 * 1024 * 1024;
+  const frames = [
+    frame("message_start", { type: "message_start", message: { id: "msg_many_frames", model: "glm-5.2" } }),
+    frame("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text" } }),
+    ...Array.from({ length: count }, () => frame("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "x" } })),
+    frame("content_block_stop", { type: "content_block_stop", index: 0 }),
+    frame("message_delta", { type: "message_delta", delta: { stop_reason: "end_turn" } }),
+    frame("message_stop", { type: "message_stop" }),
+  ];
+  let source = Buffer.from(frames.join(""));
+  const remainder = targetBytes - source.length;
+  if (remainder > 0) source = Buffer.concat([Buffer.from(`:${"x".repeat(remainder - 3)}\n\n`), source]);
+  assert.equal(source.length, targetBytes);
+  transform.pause();
+  const done = summarize(transform, [source]);
+  transform.resume();
+  const result = await done;
+  assert.deepEqual({ ...result, bytes: 0 }, { completed: 1, incomplete: 0, failed: 0, done: 1, bytes: 0 });
+  assert.ok(result.bytes > 0);
+});
+
+test("frame, body, work, and tool-argument limits accept the exact boundary and reject the first extra byte or event", async () => {
+  const upstream = { status: 200, headers: new Headers({ "content-type": "text/event-stream" }) };
+  const run = (source) => summarize(adaptAnthropicMessages({ model: MODEL, upstream, requestContext: { internalKey: KEY } }).transforms[0], [Buffer.isBuffer(source) ? source : Buffer.from(source)]);
+  const runPaused = async (source) => {
+    const transform = adaptAnthropicMessages({ model: MODEL, upstream, requestContext: { internalKey: KEY } }).transforms[0];
+    transform.pause();
+    const result = summarize(transform, [Buffer.isBuffer(source) ? source : Buffer.from(source)]);
+    transform.resume();
+    return result;
+  };
+
+  const exactFrame = Buffer.from(`:${"x".repeat(8 * 1024 * 1024 - 1)}\n\n${simpleCompletion("msg_frame_exact")}`);
+  assert.deepEqual({ ...(await run(exactFrame)), bytes: 0 }, { completed: 1, incomplete: 0, failed: 0, done: 1, bytes: 0 });
+  const extraFrame = Buffer.from(`:${"x".repeat(8 * 1024 * 1024)}\n\n${simpleCompletion("msg_frame_extra")}`);
+  assert.deepEqual({ ...(await run(extraFrame)), bytes: 0 }, { completed: 0, incomplete: 0, failed: 1, done: 1, bytes: 0 });
+
+  const bodyTail = Buffer.from(simpleCompletion("msg_body_exact"));
+  const comment = (size) => Buffer.from(`:${"x".repeat(size - 3)}\n\n`);
+  const first = comment(6 * 1024 * 1024);
+  const second = comment(6 * 1024 * 1024);
+  const third = comment(16 * 1024 * 1024 - first.length - second.length - bodyTail.length);
+  const exactBody = Buffer.concat([first, second, third, bodyTail]);
+  assert.equal(exactBody.length, 16 * 1024 * 1024);
+  assert.deepEqual({ ...(await run(exactBody)), bytes: 0 }, { completed: 1, incomplete: 0, failed: 0, done: 1, bytes: 0 });
+  assert.deepEqual({ ...(await run(Buffer.concat([Buffer.from("x"), exactBody]))), bytes: 0 }, { completed: 0, incomplete: 0, failed: 1, done: 1, bytes: 0 });
+
+  const workSource = (deltaCount, id) => [
+    frame("message_start", { type: "message_start", message: { id, model: "glm-5.2" } }),
+    frame("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text" } }),
+    ...Array.from({ length: deltaCount }, () => frame("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "" } })),
+    frame("content_block_stop", { type: "content_block_stop", index: 0 }),
+    frame("message_delta", { type: "message_delta", delta: { stop_reason: "end_turn" } }),
+    frame("message_stop", { type: "message_stop" }),
+  ].join("");
+  assert.deepEqual({ ...(await run(workSource(65_531, "msg_work_exact"))), bytes: 0 }, { completed: 1, incomplete: 0, failed: 0, done: 1, bytes: 0 });
+  assert.deepEqual({ ...(await run(workSource(65_532, "msg_work_extra"))), bytes: 0 }, { completed: 0, incomplete: 0, failed: 1, done: 1, bytes: 0 });
+
+  const argumentsOfSize = (size) => `{"value":"${"a".repeat(size - 12)}"}`;
+  const argsSource = (size, id) => {
+    const args = argumentsOfSize(size);
+    const pieces = [];
+    for (let offset = 0; offset < args.length; offset += 512 * 1024) pieces.push(args.slice(offset, offset + 512 * 1024));
+    return [
+      frame("message_start", { type: "message_start", message: { id, model: "glm-5.2" } }),
+      frame("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "tool_use", id: "call_limit", name: "lookup", input: {} } }),
+      ...pieces.map((partial_json) => frame("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json } })),
+      frame("content_block_stop", { type: "content_block_stop", index: 0 }),
+      frame("message_delta", { type: "message_delta", delta: { stop_reason: "tool_use" } }),
+      frame("message_stop", { type: "message_stop" }),
+    ].join("");
+  };
+  assert.deepEqual({ ...(await runPaused(argsSource(8 * 1024 * 1024, "msg_args_exact"))), bytes: 0 }, { completed: 1, incomplete: 0, failed: 0, done: 1, bytes: 0 });
+  assert.deepEqual({ ...(await run(argsSource(8 * 1024 * 1024 + 1, "msg_args_extra"))), bytes: 0 }, { completed: 0, incomplete: 0, failed: 1, done: 1, bytes: 0 });
+});
+
+test("EOF, unknown blocks, malformed tool JSON, non-2xx headers, and post-terminal input preserve public boundaries", async () => {
+  const upstream = { status: 200, headers: new Headers({ "content-type": "text/event-stream" }) };
+  const run = (source, context = { internalKey: KEY }) => collect(adaptAnthropicMessages({ model: MODEL, upstream, requestContext: context }).transforms[0], [Buffer.from(source)]);
+  const truncated = eventsFrom(await run(frame("message_start", { type: "message_start", message: { id: "msg_eof", model: "glm-5.2" } }))).at(-1);
+  assert.deepEqual(truncated.response.error, { code: "upstream_stream_truncated", message: "Upstream stream ended early." });
+  assert.throws(() => request({ input: [{ role: "user", content: [{ type: "unknown" }] }] }), (error) => error.code === "unsupported_anthropic_block");
+  const unknown = eventsFrom(await run(frame("message_start", { type: "message_start", message: { id: "msg_unknown", model: "glm-5.2" } }) + frame("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "unknown", private: "provider-secret" } }))).at(-1);
+  assert.deepEqual(unknown.response.error, { code: "unsupported_anthropic_block", message: "Unsupported Messages response block." });
+  assert.doesNotMatch(JSON.stringify(unknown), /provider-secret/);
+  const badArgs = eventsFrom(await run([
+    frame("message_start", { type: "message_start", message: { id: "msg_bad_args", model: "glm-5.2" } }),
+    frame("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "tool_use", id: "call_bad", name: "lookup", input: {} } }),
+    frame("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: "{private-provider-json" } }),
+    frame("content_block_stop", { type: "content_block_stop", index: 0 }),
+  ].join(""))).at(-1);
+  assert.deepEqual(badArgs.response.error, { code: "tool_mapping_error", message: "Invalid tool mapping." });
+  assert.doesNotMatch(JSON.stringify(badArgs), /private-provider-json|invalid_tool_arguments/);
+
+  for (const status of [400, 429, 500, 503]) {
+    const non2xx = { status, headers: new Headers({ "x-request-id": `req-${status}`, "retry-after": "5", "x-secret": "hidden" }), body: { marker: status } };
+    const adapted = adaptAnthropicMessages({ model: MODEL, upstream: non2xx });
+    assert.equal(adapted.upstream, non2xx);
+    assert.deepEqual(adapted.transforms, []);
+    assert.equal(adapted.upstream.headers.get("x-request-id"), `req-${status}`);
+  }
+
+  const observed = [];
+  const terminalSource = simpleCompletion("msg_post_terminal") + frame("error", { type: "error", error: { type: "private-provider-error", message: "secret" } });
+  const terminalOutput = await run(terminalSource, { internalKey: KEY, observeReasoningProtocol: (value) => observed.push(value) });
+  assert.equal(eventsFrom(terminalOutput).filter((event) => event.type === "response.completed").length, 1);
+  assert.equal(eventsFrom(terminalOutput).filter((event) => event.type === "response.failed").length, 0);
+  assert.deepEqual(observed, [{ code: "event_after_terminal" }]);
+  assert.doesNotMatch(terminalOutput, /private-provider-error|secret/);
 });
