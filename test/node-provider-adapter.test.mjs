@@ -16,6 +16,7 @@ import {
   restoreOpenAIResponsesEvent,
 } from "../src/openai-responses-adapter.mjs";
 import { providerEndpoint } from "../src/provider-endpoint.mjs";
+import { createForcedDispatchDeadline } from "../src/forced-dispatch-deadline.mjs";
 import { openPort } from "./port-pool.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -98,6 +99,24 @@ test("provider endpoints append /responses without discarding provider base path
   for (const leaf of ["https://evil.example/responses", "//evil.example/responses", "responses?x=1", "responses#x", "a\\b", "../responses", "./responses"]) {
     assert.throws(() => providerEndpoint("https://api.deepseek.com/v1", leaf), TypeError, leaf);
   }
+});
+
+test("injected dispatch deadline admits 30000 and aborts once at 30001 without waiting", () => {
+  let callback;
+  let delay;
+  let cancels = 0;
+  const controller = new AbortController();
+  const deadline = createForcedDispatchDeadline({
+    controller,
+    onTimeout: () => { cancels += 1; },
+    timers: { setTimeout(fn, value) { callback = fn; delay = value; return 1; }, clearTimeout() {} },
+  });
+  assert.equal(delay, 30_001);
+  assert.equal(controller.signal.aborted, false);
+  callback(); callback();
+  assert.equal(controller.signal.aborted, true);
+  assert.equal(deadline.fired, true);
+  assert.equal(cancels, 1);
 });
 
 test("DeepSeek Responses preserves nested reasoning and never emits chat-only thinking fields", () => {

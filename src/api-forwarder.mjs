@@ -54,6 +54,7 @@ import { failedResponseEvent, formatTerminalFrames, routerError, ERROR_DEFINITIO
 import { ToolDialectError } from "./tool-dialect.mjs";
 import { createForcedToolBuffer } from "./tool-dialect.mjs";
 import { ReasoningProtocolError } from "./reasoning-summary-compat.mjs";
+import { createForcedDispatchDeadline } from "./forced-dispatch-deadline.mjs";
 
 installStableFetchTransport();
 
@@ -1020,14 +1021,13 @@ async function handleRequest(request, response) {
   // never sends headers or a body. Abort the dispatch controller exactly once;
   // the shared forced coordinator remains sealed by the same signal.
   const forcedDeadline = forcedBuffer
-    ? setTimeout(() => {
+    ? createForcedDispatchDeadline({ controller, onTimeout: () => {
         // Preserve the timeout cause across fetch's generic AbortError so the
         // public boundary can distinguish a caller disconnect from 30s expiry.
         response._codexRouterForcedTimeout = true;
         controller.abort();
-      }, 30_001)
+      } })
     : undefined;
-  forcedDeadline?.unref?.();
   // Command Code's documented API is an entitlement, not a credential: the
   // same key that runs its CLI is refused by /provider/v1 on the plans most of
   // its customers buy. The CLI's own route serves those plans, so an account
@@ -1185,7 +1185,7 @@ async function handleRequest(request, response) {
   try {
     await pipeResponse(upstream, response, undefined, transforms.length ? transforms : undefined);
   } finally {
-    if (forcedDeadline) clearTimeout(forcedDeadline);
+    forcedDeadline?.clear();
   }
   recordUpstreamLimits(normalized, upstream);
   if (!QUIET) {
