@@ -173,7 +173,7 @@ function generatedToolId(responseId, outputIndex) { return `fc_${createHash("sha
 
 class AnthropicStreamTransform extends Transform {
   #buffer = Buffer.alloc(0); #queue = []; #queueBytes = 0; #backpressured = false; #pendingTransform; #pendingFlush;
-  #frameScanOffset = 0; #pendingBoundary;
+  #frameScanOffset = 0; #pendingBoundary; #settleScheduled = false;
   #state = { id: undefined, model: "", created: undefined, messageStarted: false, blockProviderIndexes: new Set(), nextOutputIndex: 0, items: new Map(), usage: undefined, stopReason: undefined, messageStopped: false, terminal: false, sequence: 0, work: 0, bodyBytes: 0, textBytes: 0, argsBytes: 0, signatureBytes: 0 };
   #model; #requestContext; #key; #toolBuild; #abortListener; #abortCalled = false;
   constructor(model, requestContext) { super(); this.#model = model; this.#requestContext = requestContext; this.#key = requestContext.internalKey; this.#toolBuild = requestContext.toolBuild; if (requestContext.signal) { this.#abortListener = () => { if (this.#state.terminal) return; this.#callAbort(); this.destroy(new AnthropicMessagesAdapterError("request_aborted")); }; if (requestContext.signal.aborted) this.#abortListener(); else requestContext.signal.addEventListener("abort", this.#abortListener, { once: true }); } }
@@ -197,7 +197,18 @@ class AnthropicStreamTransform extends Transform {
   }
   #processBuffered() { let boundary; while ((boundary = this.#locateBoundary())) { if (this.#backpressured) return; const frame = this.#buffer.subarray(0, boundary.index); this.#buffer = this.#buffer.subarray(boundary.index + boundary.length); this.#pendingBoundary = undefined; this.#frameScanOffset = 0; this.#consume(frame); } }
   #drain() { while (!this.#backpressured && this.#queue.length) { const chunk = this.#queue.shift(); this.#queueBytes -= chunk.length; if (!this.push(chunk)) this.#backpressured = true; } }
-  #settle() { if (!this.#backpressured && !this.#queue.length) { const transform = this.#pendingTransform; this.#pendingTransform = undefined; transform?.(); const flush = this.#pendingFlush; this.#pendingFlush = undefined; flush?.(); } }
+  #settle() {
+    if (this.#settleScheduled || this.#backpressured || this.#queue.length || (!this.#pendingTransform && !this.#pendingFlush)) return;
+    this.#settleScheduled = true;
+    queueMicrotask(() => {
+      this.#settleScheduled = false;
+      if (this.#backpressured || this.#queue.length) return;
+      const callback = this.#pendingTransform || this.#pendingFlush;
+      if (this.#pendingTransform) this.#pendingTransform = undefined;
+      else this.#pendingFlush = undefined;
+      callback?.();
+    });
+  }
   #enqueue(chunk, terminal = false) {
     if (!this.#backpressured && !this.#queue.length) {
       if (!this.push(chunk)) this.#backpressured = true;

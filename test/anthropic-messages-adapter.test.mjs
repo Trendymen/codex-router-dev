@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { Readable } from "node:stream";
+import { Readable, Writable } from "node:stream";
+import { pipeline } from "node:stream/promises";
 
 import { buildAnthropicMessagesRequest, adaptAnthropicMessages, AnthropicMessagesAdapterError } from "../src/anthropic-messages-adapter.mjs";
 import { sealReasoningEnvelope, reasoningTextHash, reasoningItemId } from "../src/reasoning-envelope.mjs";
@@ -77,6 +78,101 @@ function simpleCompletion(id = "msg_limits") {
     frame("message_delta", { type: "message_delta", delta: { stop_reason: "end_turn" } }),
     frame("message_stop", { type: "message_stop" }),
   ].join("");
+}
+
+function multiChunkTextCompletion(id) {
+  const deltas = Array.from({ length: 80 }, (_, index) => `${String(index).padStart(2, "0")}${"x".repeat(49_998)}`);
+  const chunks = deltas.map((text) => frame("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text } }));
+  chunks[0] = [
+    frame("message_start", { type: "message_start", message: { id, model: "glm-5.2" } }),
+    frame("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text" } }),
+    chunks[0],
+  ].join("");
+  chunks[chunks.length - 1] += [
+    frame("content_block_stop", { type: "content_block_stop", index: 0 }),
+    frame("message_delta", { type: "message_delta", delta: { stop_reason: "end_turn" } }),
+    frame("message_stop", { type: "message_stop" }),
+  ].join("");
+  return { deltas, chunks: chunks.map((chunk) => Buffer.from(chunk)) };
+}
+
+function instrumentDemandCallbacks(transform) {
+  const stats = { readWakeups: 0, transformCallbacks: [], flushCallbacks: [] };
+  const read = transform._read;
+  transform._read = function instrumentedRead(size) {
+    stats.readWakeups += 1;
+    return read.call(this, size);
+  };
+  const transformChunk = transform._transform;
+  transform._transform = function instrumentedTransform(chunk, encoding, callback) {
+    const index = stats.transformCallbacks.length;
+    stats.transformCallbacks.push(0);
+    return transformChunk.call(this, chunk, encoding, (...args) => {
+      stats.transformCallbacks[index] += 1;
+      callback(...args);
+    });
+  };
+  const flush = transform._flush;
+  transform._flush = function instrumentedFlush(callback) {
+    const index = stats.flushCallbacks.length;
+    stats.flushCallbacks.push(0);
+    return flush.call(this, (...args) => {
+      stats.flushCallbacks[index] += 1;
+      callback(...args);
+    });
+  };
+  return stats;
+}
+
+async function runMultiChunkBackpressure({ delayedAttach = false } = {}) {
+  const upstream = { status: 200, headers: new Headers({ "content-type": "text/event-stream" }) };
+  const transform = adaptAnthropicMessages({ model: MODEL, upstream, requestContext: { internalKey: KEY } }).transforms[0];
+  const stats = instrumentDemandCallbacks(transform);
+  const { chunks, deltas } = multiChunkTextCompletion(delayedAttach ? "msg_delayed_attach" : "msg_connected_slow");
+  const source = Readable.from(chunks);
+  const output = [];
+  let writes = 0;
+  const sink = new Writable({
+    highWaterMark: 16 * 1024,
+    write(chunk, _encoding, callback) {
+      output.push(Buffer.from(chunk));
+      writes += 1;
+      if (writes === 1) setTimeout(callback, 30);
+      else callback();
+    },
+  });
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 5_000);
+  try {
+    if (delayedAttach) {
+      source.pipe(transform);
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      await pipeline(transform, sink, { signal: controller.signal });
+    } else {
+      await pipeline(source, transform, sink, { signal: controller.signal });
+    }
+  } finally {
+    clearTimeout(timeout);
+  }
+  return { chunks, deltas, output: Buffer.concat(output).toString("utf8"), stats };
+}
+
+function assertMultiChunkBackpressure(result) {
+  const events = eventsFrom(result.output);
+  const outputDeltas = events.filter((event) => event.type === "response.output_text.delta");
+  const textBytes = result.deltas.reduce((total, delta) => total + Buffer.byteLength(delta), 0);
+  assert.equal(textBytes, 4_000_000);
+  assert.ok(textBytes < 4 * 1024 * 1024);
+  assert.deepEqual(outputDeltas.map((event) => event.delta), result.deltas);
+  assert.deepEqual(events.map((event) => event.sequence_number), Array.from({ length: events.length }, (_, index) => index + 1));
+  assert.equal(events.filter((event) => ["response.completed", "response.incomplete", "response.failed"].includes(event.type)).length, 1);
+  assert.equal(events.filter((event) => event.type === "response.completed").length, 1);
+  assert.equal((result.output.match(/data: \[DONE\]/g) || []).length, 1);
+  assert.equal(result.stats.transformCallbacks.length, result.chunks.length);
+  assert.ok(result.stats.transformCallbacks.every((count) => count === 1));
+  assert.deepEqual(result.stats.flushCallbacks, [1]);
+  assert.ok(result.stats.readWakeups > 0);
+  assert.ok(result.stats.readWakeups <= events.length + result.chunks.length);
 }
 
 test("builds canonical GLM Messages request with full base path", () => {
@@ -562,6 +658,14 @@ test("a paused consumer accepts sixty thousand small frames totaling twelve MiB 
   const result = await done;
   assert.deepEqual({ ...result, bytes: 0 }, { completed: 1, incomplete: 0, failed: 0, done: 1, bytes: 0 });
   assert.ok(result.bytes > 0);
+});
+
+test("an already-connected 16 KiB consumer resumes all eighty upstream chunks after its first delayed write", async () => {
+  assertMultiChunkBackpressure(await runMultiChunkBackpressure());
+});
+
+test("a consumer attached after upstream backpressure resumes all eighty upstream chunks", async () => {
+  assertMultiChunkBackpressure(await runMultiChunkBackpressure({ delayedAttach: true }));
 });
 
 test("frame, body, work, and tool-argument limits accept the exact boundary and reject the first extra byte or event", async () => {
