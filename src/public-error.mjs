@@ -58,24 +58,31 @@ function safeSnapshot(value, seen = new WeakSet()) {
   if (value === null || typeof value === "string" || typeof value === "boolean") return value;
   if (typeof value === "number") return Number.isFinite(value) ? value : undefined;
   if (!value || typeof value !== "object" || seen.has(value)) return undefined;
-  const prototype = Object.getPrototypeOf(value);
-  if (prototype !== Object.prototype && prototype !== null && !Array.isArray(value)) return undefined;
-  seen.add(value);
-  if (Array.isArray(value)) {
-    const copy = [];
-    for (const entry of value) {
-      const snapshot = safeSnapshot(entry, seen);
-      if (snapshot !== undefined) copy.push(snapshot);
+  try {
+    const isArray = Array.isArray(value);
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null && !isArray) return undefined;
+    seen.add(value);
+    if (isArray) {
+      const length = ownDataValue(value, "length");
+      if (!Number.isSafeInteger(length) || length < 0) return undefined;
+      const copy = [];
+      for (let index = 0; index < length; index += 1) {
+        const snapshot = safeSnapshot(ownDataValue(value, String(index)), seen);
+        if (snapshot !== undefined) copy.push(snapshot);
+      }
+      return copy;
+    }
+    const copy = {};
+    for (const key of Object.keys(value)) {
+      if (!SAFE_SNAPSHOT_KEY.test(key) || UNSAFE_SNAPSHOT_KEYS.has(key)) continue;
+      const snapshot = safeSnapshot(ownDataValue(value, key), seen);
+      if (snapshot !== undefined) Object.defineProperty(copy, key, { value: snapshot, enumerable: true });
     }
     return copy;
+  } catch {
+    return undefined;
   }
-  const copy = {};
-  for (const key of Object.keys(value)) {
-    if (!SAFE_SNAPSHOT_KEY.test(key) || UNSAFE_SNAPSHOT_KEYS.has(key)) continue;
-    const snapshot = safeSnapshot(ownDataValue(value, key), seen);
-    if (snapshot !== undefined) Object.defineProperty(copy, key, { value: snapshot, enumerable: true });
-  }
-  return copy;
 }
 
 function safeInteger(value, fallback) {
@@ -118,7 +125,7 @@ function responseContext(context) {
     created_at: safeInteger(ownDataValue(context, "createdAt"), 0),
     model: safeString(ownDataValue(context, "model"), SAFE_MODEL, "unknown"),
     output: Array.isArray(output) ? output : [],
-    usage: usage && !Array.isArray(usage) ? usage : null,
+    usage: usage && typeof usage === "object" && !Array.isArray(usage) ? usage : null,
   };
 }
 

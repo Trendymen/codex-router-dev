@@ -228,6 +228,55 @@ for (const [name, buildEvent] of [
   });
 }
 
+for (const [name, buildEvent] of [
+  ["failed", (context) => failedResponseEvent(context, routerError("upstream_stream_truncated"))],
+  ["incomplete", (context) => incompleteResponseEvent(context, "max_output_tokens")],
+]) {
+  test(`${name} terminal fails closed for array accessors, proxy reflection, and scalar usage`, () => {
+    let getterRead = false;
+    const getterArray = [];
+    Object.defineProperty(getterArray, "0", {
+      enumerable: true,
+      get() {
+        getterRead = true;
+        throw new Error(DECOYS.providerBody);
+      },
+    });
+    const prototypeTrap = new Proxy([], {
+      getPrototypeOf() {
+        throw new Error(DECOYS.prompt);
+      },
+    });
+    const ownKeysTrap = new Proxy({}, {
+      ownKeys() {
+        throw new Error(DECOYS.reasoning);
+      },
+    });
+    const contexts = [
+      { output: getterArray, usage: DECOYS.support },
+      { output: prototypeTrap, usage: null },
+      { output: [], usage: ownKeysTrap },
+    ];
+
+    for (const context of contexts) {
+      const event = buildEvent({
+        sequenceNumber: 1,
+        responseId: "resp_safe",
+        createdAt: 0,
+        model: "canonical/slug",
+        ...context,
+      });
+      const frames = formatTerminalFrames(event);
+      assert.doesNotThrow(() => JSON.parse(frames.split("\n")[0].slice(6)));
+      assert.equal((frames.match(/data: \[DONE\]/g) || []).length, 1);
+      assert.ok(frames.indexOf(`\"type\":\"response.${name}\"`) < frames.indexOf("data: [DONE]"));
+      assertNoDecoys(frames);
+    }
+    assert.equal(getterRead, false);
+    assert.equal(buildEvent({ sequenceNumber: 1, responseId: "resp_safe", createdAt: 0, model: "canonical/slug", usage: DECOYS.support }).response.usage, null);
+  });
+}
+
 test("incomplete terminal retains only the authoritative reason", () => {
   const event = incompleteResponseEvent(
     { sequenceNumber: 18, responseId: "resp_req_safe", createdAt: 0, model: "canonical/slug" },
