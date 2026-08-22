@@ -372,14 +372,26 @@ function lifecycleCallIds(event, state) {
     allowed.add(tracked.callId);
   }
   if (event.type === "response.completed") {
+    if (!state.itemCalls.size) return allowed;
+    const calls = eventFunctionCalls(event);
+    if (calls.length !== state.itemCalls.size) fail();
+    const byCallId = new Map();
+    for (const tracked of state.itemCalls.values()) {
+      if (byCallId.has(tracked.callId)) fail();
+      byCallId.set(tracked.callId, tracked);
+    }
     const terminal = [];
-    for (const call of eventFunctionCalls(event)) {
-      const tracked = typeof call.id === "string" ? state.itemCalls.get(call.id) : undefined;
-      const prior = typeof call.call_id === "string" ? state.returnedCallIds.get(call.call_id) : undefined;
-      if (!tracked) {
-        if (prior) fail();
-        continue;
-      }
+    const seenItemIds = new Set();
+    const seenCallIds = new Set();
+    for (const call of calls) {
+      if (typeof call.id !== "string" || !call.id || typeof call.call_id !== "string" || !call.call_id
+        || seenItemIds.has(call.id) || seenCallIds.has(call.call_id)) fail();
+      seenItemIds.add(call.id); seenCallIds.add(call.call_id);
+      const trackedByItem = state.itemCalls.get(call.id);
+      const trackedByCall = byCallId.get(call.call_id);
+      if (!trackedByItem || !trackedByCall || trackedByItem !== trackedByCall) fail();
+      const tracked = trackedByItem;
+      const prior = state.returnedCallIds.get(call.call_id);
       const entry = state.byEncodedName.get(call.name);
       if (!tracked.done || tracked.terminal || tracked.entry !== entry || tracked.callId !== call.call_id || tracked.finalArguments !== call.arguments || prior?.entry !== tracked.entry || prior?.itemId !== call.id) fail();
       allowed.add(tracked.callId);
@@ -458,6 +470,27 @@ function validateInvocation(invocation, state) {
   if (strictSchema && !schemaAccepts(parseArguments(invocation.arguments), strictSchema)) fail("required_tool_not_called");
 }
 
+function mergeForcedCompletedSet(calls, byItemId, byCallId, state) {
+  if (calls.length !== byItemId.size || byCallId.size !== byItemId.size) fail("required_tool_not_called");
+  const terminal = [];
+  const seenItemIds = new Set();
+  const seenCallIds = new Set();
+  for (const call of calls) {
+    if (typeof call.id !== "string" || !call.id || typeof call.call_id !== "string" || !call.call_id
+      || typeof call.name !== "string" || state.callIds.has(call.call_id)
+      || seenItemIds.has(call.id) || seenCallIds.has(call.call_id)) fail("required_tool_not_called");
+    seenItemIds.add(call.id); seenCallIds.add(call.call_id);
+    const invocationByItem = byItemId.get(call.id);
+    const invocationByCall = byCallId.get(call.call_id);
+    if (!invocationByItem || !invocationByCall || invocationByItem !== invocationByCall) fail("required_tool_not_called");
+    const entry = state.byEncodedName.get(call.name);
+    if (!invocationByItem.streamed || !invocationByItem.completed || invocationByItem.terminal
+      || invocationByItem.entry !== entry || invocationByItem.arguments !== call.arguments) fail("required_tool_not_called");
+    terminal.push(invocationByItem);
+  }
+  for (const invocation of terminal) invocation.terminal = true;
+}
+
 export function validateForcedToolResult(buffer, build) {
   const buildState = buildStateFor(build);
   if (!buildState.forcedRequirement) return;
@@ -479,7 +512,12 @@ export function validateForcedToolResult(buffer, build) {
       }
       continue;
     }
-    for (const call of eventFunctionCalls(event)) {
+    const calls = eventFunctionCalls(event);
+    if (type === "response.completed" && byItemId.size) {
+      mergeForcedCompletedSet(calls, byItemId, byCallId, buildState.state);
+      continue;
+    }
+    for (const call of calls) {
       if (typeof call.call_id !== "string" || !call.call_id || typeof call.name !== "string" || buildState.state.callIds.has(call.call_id)) fail("required_tool_not_called");
       const entry = buildState.state.byEncodedName.get(call.name);
       if (!entry) fail("required_tool_not_called");
@@ -492,9 +530,6 @@ export function validateForcedToolResult(buffer, build) {
         const invocation = byItemId.get(call.id);
         if (!invocation || invocation !== existing || invocation.entry !== entry || invocation.completed || !invocation.argumentsDone || call.arguments !== invocation.arguments) fail("required_tool_not_called");
         invocation.completed = true;
-      } else if (type === "response.completed" && existing) {
-        if (!existing.streamed || !existing.completed || existing.terminal || existing.entry !== entry || existing.itemId !== call.id || existing.arguments !== call.arguments) fail("required_tool_not_called");
-        existing.terminal = true;
       } else {
         if (existing) fail("required_tool_not_called");
         if (typeof call.arguments !== "string") fail("required_tool_not_called");

@@ -40,6 +40,32 @@ function mappedOutput(build, overrides = {}) {
   return { type: "response.completed", output: [mappedCall(build, overrides).item] };
 }
 
+function twoCallLifecycle(build, { unfinishedSecond = false } = {}) {
+  const name = build.tools[0].name;
+  const added = [
+    { type: "function_call", id: "fc_1", call_id: "call_1", name, arguments: "" },
+    { type: "function_call", id: "fc_2", call_id: "call_2", name, arguments: "" },
+  ];
+  const final = [
+    { ...added[0], arguments: '{"input":"first"}' },
+    { ...added[1], arguments: '{"input":"second"}' },
+  ];
+  const events = added.map((item) => ({ type: "response.output_item.added", item }));
+  events.push(
+    { type: "response.function_call_arguments.done", item_id: added[0].id, arguments: final[0].arguments },
+    { type: "response.output_item.done", item: final[0] },
+  );
+  if (!unfinishedSecond) events.push(
+    { type: "response.function_call_arguments.done", item_id: added[1].id, arguments: final[1].arguments },
+    { type: "response.output_item.done", item: final[1] },
+  );
+  return { events, final };
+}
+
+function completedWith(output) {
+  return { type: "response.completed", response: { output } };
+}
+
 function code(thunk) {
   assert.throws(thunk, (error) => error instanceof ToolDialectError && error.code === "tool_mapping_error");
 }
@@ -450,6 +476,74 @@ test("forced validation merges exact completed terminal calls but rejects confli
     { type: "response.completed", response: { output: [{ ...namespaceItem, arguments: '{"color":"blue"}' }] } },
   ];
   assert.doesNotThrow(() => validateForcedToolResult({ bytes: 1, elapsedMs: 1, events: namespaceEvents }, namespaced));
+});
+
+test("completed restoration requires the exact set of two streamed invocations", () => {
+  const build = encodeToolDialect({ tools: [customTool], input: [], profile: functionsProfile });
+  const { events, final } = twoCallLifecycle(build);
+  for (const event of events) restoreToolEvent(event, build.mapping);
+  const message = { type: "message", id: "msg_1", content: [] };
+  const restored = restoreToolEvent(completedWith([message, ...final]), build.mapping).response.output;
+  assert.deepEqual({ ...restored[0] }, message);
+  assert.deepEqual(restored.slice(1), [
+    { type: "custom_tool_call", id: "fc_1", call_id: "call_1", name: "computer", input: "first" },
+    { type: "custom_tool_call", id: "fc_2", call_id: "call_2", name: "computer", input: "second" },
+  ]);
+});
+
+for (const [name, completedCalls, unfinishedSecond = false] of [
+  ["omitted", (final) => [final[0]]],
+  ["extra", (final) => [...final, { ...final[0], id: "fc_3", call_id: "call_3" }]],
+  ["same item with different call", (final) => [final[0], { ...final[1], call_id: "other_call" }]],
+  ["same call with different item", (final) => [final[0], { ...final[1], id: "other_item" }]],
+  ["duplicate", (final) => [...final, { ...final[1] }]],
+  ["different declaration", (final, build) => [final[0], { ...final[1], name: build.tools[1].name }]],
+  ["unfinished", (final) => final, true],
+]) {
+  test(`completed restoration rejects ${name} streamed invocation sets`, () => {
+    const build = encodeToolDialect({ tools: [customTool, { type: "custom", name: "keyboard" }], input: [], profile: functionsProfile });
+    const { events, final } = twoCallLifecycle(build, { unfinishedSecond });
+    for (const event of events) restoreToolEvent(event, build.mapping);
+    code(() => restoreToolEvent(completedWith(completedCalls(final, build)), build.mapping));
+  });
+}
+
+test("forced validation requires the exact set of two streamed invocations", () => {
+  const build = encodeToolDialect({ tools: [customTool], toolChoice: "required", input: [], profile: functionsProfile });
+  const { events, final } = twoCallLifecycle(build);
+  const message = { type: "message", id: "msg_1", content: [] };
+  assert.doesNotThrow(() => validateForcedToolResult({
+    bytes: 1, elapsedMs: 1, events: [...events, completedWith([message, ...final])],
+  }, build));
+});
+
+for (const [name, completedCalls, unfinishedSecond = false] of [
+  ["omitted", (final) => [final[0]]],
+  ["extra", (final) => [...final, { ...final[0], id: "fc_3", call_id: "call_3" }]],
+  ["same item with different call", (final) => [final[0], { ...final[1], call_id: "other_call" }]],
+  ["same call with different item", (final) => [final[0], { ...final[1], id: "other_item" }]],
+  ["duplicate", (final) => [...final, { ...final[1] }]],
+  ["different declaration", (final, build) => [final[0], { ...final[1], name: build.tools[1].name }]],
+  ["unfinished", (final) => final, true],
+]) {
+  test(`forced validation rejects ${name} streamed invocation sets`, () => {
+    const build = encodeToolDialect({ tools: [customTool, { type: "custom", name: "keyboard" }], toolChoice: "required", input: [], profile: functionsProfile });
+    const { events, final } = twoCallLifecycle(build, { unfinishedSecond });
+    assert.throws(() => validateForcedToolResult({
+      bytes: 1, elapsedMs: 1, events: [...events, completedWith(completedCalls(final, build))],
+    }, build), /required_tool_not_called/);
+  });
+}
+
+test("standalone completed responses register tool calls without streaming state", () => {
+  const restored = encodeToolDialect({ tools: [customTool], input: [], profile: functionsProfile });
+  const { final } = twoCallLifecycle(restored);
+  assert.equal(restoreToolEvent(completedWith(final), restored.mapping).response.output.length, 2);
+
+  const forced = encodeToolDialect({ tools: [customTool], toolChoice: "required", input: [], profile: functionsProfile });
+  assert.doesNotThrow(() => validateForcedToolResult({
+    bytes: 1, elapsedMs: 1, events: [completedWith(twoCallLifecycle(forced).final)],
+  }, forced));
 });
 
 test("rejects unsafe event roots and non-array completed response output with ToolDialectError", () => {
