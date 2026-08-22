@@ -1,9 +1,24 @@
 import assert from "node:assert/strict";
-import test from "node:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import test, { after } from "node:test";
 
-const { buildRoutedRequest, dispatchRoutedRequest, dispatchProtocolProbe, protocolProbeArgv, rankRoutedCandidates, readDispatchBody } = await import("../src/provider-dispatch.mjs");
+const scratch = mkdtempSync(path.join(os.tmpdir(), "provider-dispatch-test-"));
+const priorStateDir = process.env.MODEL_ROUTER_STATE_DIR;
+const priorCooldowns = process.env.MODEL_ROUTER_PROVIDER_COOLDOWNS;
+process.env.MODEL_ROUTER_STATE_DIR = path.join(scratch, "state");
+process.env.MODEL_ROUTER_PROVIDER_COOLDOWNS = path.join(scratch, "provider-cooldowns.json");
+const { buildRoutedRequest, dispatchRoutedRequest, dispatchProtocolProbe, protocolProbeArgv, rankRoutedCandidates, readDispatchBody, parseRetryAfter } = await import("../src/provider-dispatch.mjs");
 const { clearAllProviderCooldowns } = await import("../src/model-failover.mjs");
 clearAllProviderCooldowns();
+after(() => {
+  if (priorStateDir === undefined) delete process.env.MODEL_ROUTER_STATE_DIR;
+  else process.env.MODEL_ROUTER_STATE_DIR = priorStateDir;
+  if (priorCooldowns === undefined) delete process.env.MODEL_ROUTER_PROVIDER_COOLDOWNS;
+  else process.env.MODEL_ROUTER_PROVIDER_COOLDOWNS = priorCooldowns;
+  rmSync(scratch, { recursive: true, force: true });
+});
 
 const model = {
   slug: "fixture/openai",
@@ -162,4 +177,55 @@ test("all failed failover hops return the originally selected provider error", a
   assert.equal(result.model.slug, model.slug);
   assert.equal(result.response.status, 402);
   assert.equal(await result.response.text(), "primary");
+});
+
+test("ordinary primary dispatch has no failover timer, while a timed-out candidate returns the saved original", async () => {
+  const fallback = { ...model, slug: "z-timeout-fallback/openai", provider: "z-timeout-fallback", baseUrl: "http://127.0.0.1:9998/v1" };
+  let calls = 0;
+  const built = buildRoutedRequest({ input: "same" }, model, { credential: "A" });
+  const result = await dispatchRoutedRequest(built, {
+    fetchImpl: async (_url, init) => {
+      calls += 1;
+      if (calls === 1) return new Response("primary", { status: 402 });
+      await new Promise((resolve, reject) => {
+        init.signal.addEventListener("abort", () => reject(Object.assign(new Error("timed out"), { name: "AbortError" })), { once: true });
+      });
+    },
+    failoverCandidates: [fallback],
+    credentialFor: () => "B",
+    baseUrlFor: (candidate) => candidate.baseUrl,
+    retries: 0,
+    failoverBudgetMs: 10,
+  });
+  assert.equal(calls, 2);
+  assert.equal(result.aborted, true);
+  assert.equal(result.model.slug, model.slug);
+  assert.equal(result.response.status, 402);
+});
+
+test("failover accumulates canonical provider families across hops", async () => {
+  const b = { ...model, slug: "z-family-b/model", provider: "z-family-b", baseUrl: "http://127.0.0.1:9998/v1" };
+  const a2 = { ...model, slug: "z-family-a/variant", provider: "fixture", baseUrl: "http://127.0.0.1:9997/v1" };
+  let calls = 0;
+  const built = buildRoutedRequest({ input: "same" }, model, { credential: "A" });
+  const result = await dispatchRoutedRequest(built, {
+    fetchImpl: async () => {
+      calls += 1;
+      return new Response(`fail-${calls}`, { status: 402 });
+    },
+    failoverCandidates: [b, a2],
+    credentialFor: () => "independent",
+    baseUrlFor: (candidate) => candidate.baseUrl,
+    retries: 0,
+  });
+  assert.equal(calls, 2);
+  assert.equal(result.response.status, 402);
+  assert.equal(result.model.slug, model.slug);
+});
+
+test("Retry-After accepts positive integer and future-date forms without imposing cooldown storage cap", () => {
+  assert.equal(parseRetryAfter("61"), 61);
+  assert.ok(parseRetryAfter(new Date(Date.now() + 61_000).toUTCString()) >= 60);
+  assert.equal(parseRetryAfter("0"), undefined);
+  assert.equal(parseRetryAfter("not-a-retry"), undefined);
 });

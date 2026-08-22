@@ -2297,7 +2297,7 @@ async function handleProtocolProof(action, slug, flags) {
       return;
     }
     const { verifyProtocolProof } = await import("./protocol-proof-verifier.mjs");
-    process.stdout.write(`${JSON.stringify(await verifyProtocolProof(slug, { confirmed: true }))}\n`);
+    process.stdout.write(`${JSON.stringify(await verifyProtocolProof(slug, { confirmed: true, allowLive: process.env.CODEX_ROUTER_ALLOW_LIVE_PROTOCOL_PROBE !== "0" }))}\n`);
     return;
   }
   throw new Error(usage);

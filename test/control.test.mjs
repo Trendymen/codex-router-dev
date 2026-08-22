@@ -324,6 +324,7 @@ test("model-router restricts protocol-proof to codex and Phase 1 --yes fails clo
     ...process.env,
     MODEL_ROUTER_STATE_DIR: stateDir,
     CODEX_HOME: path.join(stateDir, "codex-home"),
+    CODEX_ROUTER_ALLOW_LIVE_PROTOCOL_PROBE: "0",
   };
   try {
     for (const target of ["dsh", "gemini"]) {

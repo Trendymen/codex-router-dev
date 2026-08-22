@@ -2467,7 +2467,18 @@ async function summarizeDirect(request, payload, route, signal) {
   const bytes = await readDispatchBody(result);
   const parsed = parseDirectCompactionBody(bytes);
   const usage = tokenUsageFromPayload(parsed.payload);
-  if (!result.response.ok) return { ok: false, status: result.response.status, payload: parsed.payload, usage, input: originalInput, toolResultAging: aged.stats, route: result.model, failed: result.failures?.map((failure) => ({ route: failure.model, status: failure.status })) || [] };
+  if (!result.response.ok) return {
+    ok: false,
+    status: result.response.status,
+    payload: parsed.payload,
+    bodyText: bytes.toString("utf8"),
+    retryAfter: parseRetryAfter(result.response.headers.get("retry-after")),
+    usage,
+    input: originalInput,
+    toolResultAging: aged.stats,
+    route: result.model,
+    failed: result.failures?.map((failure) => ({ route: failure.model, status: failure.status })) || [],
+  };
   return { ok: true, summary: parsed.summary, input: originalInput, usage, toolResultAging: aged.stats, route: result.model, failed: result.failures?.map((failure) => ({ route: failure.model, status: failure.status })) || [], ...(result.hops ? { failoverFrom: route.slug } : {}) };
 }
 
@@ -2578,7 +2589,18 @@ async function handleResponses(request, response, requestUrl) {
         ? await (async () => {
             const result = await summarizeDirect(request, payload, route, controller.signal);
             const served = { route: result.route, failed: (result.failed || []).filter((entry) => entry.route !== result.route), ...(result.failoverFrom ? { failoverFrom: result.failoverFrom } : {}) };
-            if (!result.ok) return { status: result.status, usage: result.usage, toolResultAging: result.toolResultAging, payload: result.payload, ...served };
+            if (!result.ok) {
+              if (result.retryAfter !== undefined) response.setHeader("Retry-After", String(result.retryAfter));
+              const safe = translateGatewayError({
+                status: result.status,
+                bodyText: result.bodyText,
+                modelName: route.displayName || route.slug,
+                providerName: providerForModel(route)?.ownedBy || route.provider,
+                retryAfterSeconds: result.retryAfter,
+              });
+              writeJson(response, result.status, safe);
+              return { status: result.status, usage: result.usage, toolResultAging: result.toolResultAging, payload: safe, ...served };
+            }
             if (compactV2) {
               if (payload.stream === false) {
                 const item = { type: "compaction", id: `cmp_${randomUUID().replaceAll("-", "")}`, encrypted_content: encodeSummary(result.summary) };

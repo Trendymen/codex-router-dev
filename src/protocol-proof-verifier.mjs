@@ -73,6 +73,7 @@ export async function verifyProtocolProof(slug, options = {}) {
     failover: false,
     checks: CHECKS,
     ...(options.dispatchProtocolProbe ? {} : { confirmed: options.confirmed === true }),
+    ...(options.dispatchProtocolProbe || options.allowLive === undefined ? {} : { allowLive: options.allowLive === true }),
   };
   const evidence = await probe(model, probeOptions);
   if (

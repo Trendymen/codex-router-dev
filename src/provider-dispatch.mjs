@@ -3,6 +3,7 @@ import { Readable, Writable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { spawn } from "node:child_process";
 import { adaptOpenAIResponses, buildOpenAIResponsesRequest, createResponsesRelayContext } from "./openai-responses-adapter.mjs";
 import { providerEndpoint } from "./provider-endpoint.mjs";
 import { fetchWithRetry } from "./upstream-retry.mjs";
@@ -21,14 +22,36 @@ export const DIRECT_RETRY_BUDGET_MS = 5_000;
 
 export function parseRetryAfter(value) {
   const text = String(value ?? "").trim();
-  if (!/^\d+$/.test(text)) return undefined;
-  const seconds = Number(text);
-  return Number.isSafeInteger(seconds) && seconds >= 0 && seconds <= 6 * 60 * 60 ? seconds : undefined;
+  if (/^\d+$/.test(text)) {
+    const seconds = Number(text);
+    return Number.isSafeInteger(seconds) && seconds > 0 ? seconds : undefined;
+  }
+  const date = Date.parse(text);
+  if (!Number.isFinite(date)) return undefined;
+  const seconds = Math.ceil((date - Date.now()) / 1_000);
+  return Number.isSafeInteger(seconds) && seconds > 0 ? seconds : undefined;
 }
 export function protocolProbeArgv(model) {
   if (!model?.slug) throw new TypeError("protocol probe model is required");
   const script = fileURLToPath(new URL("./compatibility-test.mjs", import.meta.url));
   return Object.freeze([process.execPath, path.resolve(script), model.slug, "--live", "--yes", "--json"]);
+}
+
+export function runProtocolProbe({ argv, timeoutMs = 180_000 } = {}) {
+  if (!Array.isArray(argv) || argv.length < 3 || argv[0] !== process.execPath) throw new TypeError("invalid protocol probe argv");
+  return new Promise((resolve, reject) => {
+    const child = spawn(argv[0], argv.slice(1), { cwd: path.dirname(argv[1]), env: process.env, stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    const timer = setTimeout(() => { child.kill(); reject(Object.assign(new Error("protocol probe timed out"), { code: "protocol_probe_timeout", status: 504 })); }, timeoutMs);
+    child.once("error", (error) => { clearTimeout(timer); reject(Object.assign(new Error("protocol probe could not start"), { code: "protocol_probe_failed", status: 502, cause: error })); });
+    child.once("exit", (code) => {
+      clearTimeout(timer);
+      if (code !== 0) return reject(Object.assign(new Error("protocol probe failed"), { code: "protocol_probe_failed", status: 502 }));
+      try { resolve(JSON.parse(stdout)); } catch { reject(Object.assign(new Error("protocol probe returned invalid evidence"), { code: "protocol_probe_invalid_evidence", status: 422 })); }
+    });
+  });
 }
 
 const RESPONSES_MARKERS = new Set([
@@ -156,6 +179,7 @@ export function rankRoutedCandidates(candidates, sourceModel, payload, options =
   return (Array.isArray(candidates) ? candidates : [])
     .filter((candidate) => canFailoverTo(candidate, sourceModel, payload, options))
     .filter((candidate) => !options.usedModels?.has(candidate.slug))
+    .filter((candidate) => !options.usedProviderFamilies?.has(canonicalProviderId(candidate.provider)))
     .sort((left, right) => Number(left.priority ?? 999) - Number(right.priority ?? 999) || String(left.slug).localeCompare(String(right.slug)))
     .slice(0, options.limit ?? MAX_FAILOVER_HOPS);
 }
@@ -207,11 +231,9 @@ export async function dispatchRoutedRequest(built, options = {}) {
   if (!built?.url || !built?.body) throw new TypeError("built routed request is required");
   const fetchImpl = options.fetchImpl || fetch;
   const callerSignal = options.signal || built.context?.signal;
-  const deadlineController = new AbortController();
-  const deadlineTimer = setTimeout(() => deadlineController.abort(new Error("routed failover budget exceeded")), options.failoverBudgetMs ?? FAILOVER_BUDGET_MS);
-  const signal = callerSignal
-    ? (AbortSignal.any ? AbortSignal.any([callerSignal, deadlineController.signal]) : callerSignal)
-    : deadlineController.signal;
+  let deadlineController;
+  let deadlineTimer;
+  let signal = callerSignal;
   const startedAt = options.now ? options.now() : Date.now();
   const retryOptions = {
     retries: options.retries ?? DIRECT_RETRY_LIMIT,
@@ -230,6 +252,7 @@ export async function dispatchRoutedRequest(built, options = {}) {
   let retries = 0;
   const failures = [];
   const usedModels = new Set([currentModel.slug]);
+  const usedProviderFamilies = new Set([canonicalProviderId(currentModel.provider)]);
   let originalFailure;
   try {
    for (;;) {
@@ -267,6 +290,7 @@ export async function dispatchRoutedRequest(built, options = {}) {
       bodyText,
       retryAfterSeconds: parseRetryAfter(upstream.headers?.get?.("retry-after")),
     });
+    if (verdict.swap) recordProviderCooldown(currentModel.provider, verdict);
     if (!verdict.swap || hops >= MAX_FAILOVER_HOPS) {
       const finalFailure = hops ? originalFailure : { status: upstream.status, bodyText, headers: upstream.headers };
       return Object.freeze({
@@ -283,16 +307,29 @@ export async function dispatchRoutedRequest(built, options = {}) {
     if (elapsed >= (options.failoverBudgetMs ?? FAILOVER_BUDGET_MS)) {
       return Object.freeze({ response: new Response(originalFailure.bodyText, { status: originalFailure.status, headers: originalFailure.headers }), model: built.model, built, retries, hops, failures, elapsedMs: elapsed });
     }
-    recordProviderCooldown(currentModel.provider, verdict);
-    const candidate = candidateList(options, currentModel, built.pristinePayload)
+    const candidate = rankRoutedCandidates(
+      typeof options.failoverCandidates === "function" ? options.failoverCandidates(currentModel, built.pristinePayload) : options.failoverCandidates,
+      currentModel,
+      built.pristinePayload,
+      { ...options, usedModels, usedProviderFamilies },
+    )
       .filter((entry) => !usedModels.has(entry.slug))
       .map((entry) => ({ model: entry, credential: candidateCredential(options, entry) }))
       .find((entry) => entry.credential !== undefined);
     if (!candidate) {
       return Object.freeze({ response: new Response(originalFailure.bodyText, { status: originalFailure.status, headers: originalFailure.headers }), model: built.model, built, retries, hops, failures, elapsedMs: elapsed });
     }
+    if (!deadlineController) {
+      deadlineController = new AbortController();
+      deadlineTimer = setTimeout(() => deadlineController.abort(new Error("routed failover budget exceeded")), options.failoverBudgetMs ?? FAILOVER_BUDGET_MS);
+      signal = callerSignal
+        ? (AbortSignal.any ? AbortSignal.any([callerSignal, deadlineController.signal]) : callerSignal)
+        : deadlineController.signal;
+      retryOptions.signal = signal;
+    }
     hops += 1;
     usedModels.add(candidate.model.slug);
+    usedProviderFamilies.add(canonicalProviderId(candidate.model.provider));
     currentModel = candidate.model;
     currentBuilt = buildRoutedRequest(built.pristinePayload, candidate.model, {
       ...built.context,
@@ -302,8 +339,22 @@ export async function dispatchRoutedRequest(built, options = {}) {
       baseUrl: options.baseUrlFor?.(candidate.model) ?? candidate.model.baseUrl,
     });
    }
+  } catch (error) {
+    if (deadlineController?.signal.aborted && !callerSignal?.aborted && originalFailure) {
+      return Object.freeze({
+        response: new Response(originalFailure.bodyText, { status: originalFailure.status, headers: originalFailure.headers }),
+        model: built.model,
+        built,
+        retries,
+        hops,
+        failures,
+        elapsedMs: (options.now ? options.now() : Date.now()) - startedAt,
+        aborted: true,
+      });
+    }
+    throw error;
   } finally {
-    clearTimeout(deadlineTimer);
+    if (deadlineTimer) clearTimeout(deadlineTimer);
   }
 }
 
@@ -335,14 +386,15 @@ export async function dispatchProtocolProbe(model, options = {}, { runProbe } = 
   if (options.confirmed !== true) {
     throw Object.assign(new Error("protocol probe requires explicit quota confirmation"), { code: "quota_confirmation_required", status: 409 });
   }
-  if (!model?.slug || typeof runProbe !== "function") {
+  const runner = runProbe || (options.allowLive === false ? undefined : runProtocolProbe);
+  if (!model?.slug || typeof runner !== "function") {
     throw Object.assign(new Error("protocol probe is unavailable without an injected runner"), {
       code: "protocol_probe_not_implemented",
       status: 501,
     });
   }
   const argv = protocolProbeArgv(model);
-  const evidence = await runProbe({ argv, model, options: { retry: false, failover: false } });
+  const evidence = await runner({ argv, model, options: { retry: false, failover: false } });
   const requiredChecks = new Set(["nonstream", "stream-reasoning", "auto-tool", "continuation", "usage"]);
   const checks = Array.isArray(evidence?.checks) ? evidence.checks : [];
   if (!evidence || evidence.model !== model.slug || evidence.verdict !== "passing" || typeof evidence.measuredFinalReasoningShape !== "string" || !checks.every((check) => requiredChecks.has(check?.name)) || checks.length !== requiredChecks.size || ![...requiredChecks].every((name) => checks.some((check) => check.name === name && check.ok === true))) {

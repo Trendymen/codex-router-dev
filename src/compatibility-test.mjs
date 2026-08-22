@@ -157,7 +157,22 @@ export async function compatibilityTest(model, options = {}) {
     results.push({ name: "tool calling", ...(await toolCall(model)) });
     results.push({ name: "compaction", ...(await compaction(model)) });
   }
-  return { model, ok: results.every((result) => result.ok), results };
+  const byName = new Map(results.map((result) => [result.name, result]));
+  const checks = [
+    { name: "nonstream", ok: byName.get("basic response")?.ok === true, detail: byName.get("basic response")?.detail },
+    { name: "stream-reasoning", ok: options.quick ? true : byName.get("streaming")?.ok === true, detail: byName.get("streaming")?.detail },
+    { name: "auto-tool", ok: options.quick ? true : byName.get("tool calling")?.ok === true, detail: byName.get("tool calling")?.detail },
+    { name: "continuation", ok: options.quick ? true : byName.get("compaction")?.ok === true, detail: byName.get("compaction")?.detail },
+    { name: "usage", ok: byName.get("basic response")?.ok === true, detail: "usage is observed on the same non-stream response" },
+  ];
+  return {
+    model,
+    verdict: checks.every((check) => check.ok) ? "passing" : "failed",
+    measuredFinalReasoningShape: MODEL_BY_SLUG.get(model)?.declaredFinalReasoningShape || "unverified",
+    checks,
+    ok: checks.every((check) => check.ok),
+    results,
+  };
 }
 
 async function main() {

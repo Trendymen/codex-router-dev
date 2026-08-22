@@ -164,7 +164,7 @@ test("the Phase 1 dispatcher fails closed without a network seam", async () => {
   };
   try {
     await assert.rejects(
-      () => verifyProtocolProof(slug, { confirmed: true }),
+      () => verifyProtocolProof(slug, { confirmed: true, allowLive: false }),
       { code: "protocol_probe_not_implemented" },
     );
   } finally {
