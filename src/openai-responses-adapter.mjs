@@ -256,7 +256,8 @@ class SseFramer {
 
 class ResponsesSseToolTransform extends Transform {
   #framer; #toolBuild; #work = 0; #forced; #events; #held = []; #context;
-  #backpressured = false; #pendingCallback;
+  #backpressured = false; #pendingCallback; #resumeScheduled = false;
+  #outputQueue = []; #queuedBytes = 0;
   constructor(toolBuild, { signal, abort, limits, forcedBuffer, relayContext } = {}) {
     super(); this.#toolBuild = toolBuild;
     this.#context = relayContext;
@@ -277,17 +278,12 @@ class ResponsesSseToolTransform extends Transform {
       // reached its high-water mark.  This leaves at most the current framed
       // chunk in memory; unlike the former event array, it never retains the
       // history of an ordinary relay.
-      if (this.#backpressured) this.#pendingCallback = callback;
+      if (this.#backpressured || this.#outputQueue.length) {
+        this.#pendingCallback = callback;
+        this.#scheduleResume();
+      }
       else callback();
     } catch (error) { callback(error); }
-  }
-  _read(size) {
-    super._read(size);
-    if (!this.#backpressured) return;
-    this.#backpressured = false;
-    const callback = this.#pendingCallback;
-    this.#pendingCallback = undefined;
-    callback?.();
   }
   _flush(callback) {
     try {
@@ -302,8 +298,7 @@ class ResponsesSseToolTransform extends Transform {
       this.#held.push(chunk);
       return;
     }
-    this.#context.relayedBytes += chunk.length;
-    if (!this.push(chunk)) this.#backpressured = true;
+    this.#enqueueOutput(chunk);
   }
   #release() {
     if (!this.#forced) return;
@@ -311,9 +306,44 @@ class ResponsesSseToolTransform extends Transform {
     // at exactly 8 MiB.  Release the held fragments in source order instead of
     // concatenating them, which keeps the peak bounded and preserves framing.
     for (const chunk of this.#held.splice(0)) {
+      this.#enqueueOutput(chunk);
+    }
+  }
+  #enqueueOutput(chunk) {
+    this.#queuedBytes += chunk.length;
+    if (!Number.isSafeInteger(this.#queuedBytes) || this.#queuedBytes > MAX_SSE_FRAME_BYTES) fail("forced_tool_buffer_limit");
+    this.#outputQueue.push(chunk);
+    this.#drainOutput();
+  }
+  #drainOutput() {
+    while (!this.#backpressured && this.#outputQueue.length) {
+      const chunk = this.#outputQueue.shift();
+      this.#queuedBytes -= chunk.length;
       this.#context.relayedBytes += chunk.length;
       if (!this.push(chunk)) this.#backpressured = true;
     }
+    if (this.#backpressured || this.#outputQueue.length) this.#scheduleResume();
+  }
+  #scheduleResume() {
+    if (this.#resumeScheduled) return;
+    this.#resumeScheduled = true;
+    setImmediate(() => {
+      this.#resumeScheduled = false;
+      // The readable buffer is owned by Node. Polling it on a scheduled turn
+      // avoids the Transform `_read` re-entrancy deadlock and gives the
+      // downstream writable a chance to consume exactly one bounded frame.
+      if (this.#backpressured && this.readableLength >= this.readableHighWaterMark) {
+        this.#scheduleResume();
+        return;
+      }
+      this.#backpressured = false;
+      this.#drainOutput();
+      if (!this.#backpressured && !this.#outputQueue.length && this.#pendingCallback) {
+        const callback = this.#pendingCallback;
+        this.#pendingCallback = undefined;
+        callback();
+      }
+    });
   }
   #rewrite(raw) {
     if (++this.#work > MAX_SSE_WORK) fail("reasoning_protocol_error");

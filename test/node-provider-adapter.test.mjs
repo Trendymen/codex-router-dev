@@ -462,6 +462,22 @@ test("multiline data frames parse as one event while unchanged bytes remain exac
   assert.equal(await through(adapter.transforms, [Buffer.from(raw)]), raw);
 });
 
+test("slow consumer drains more than 500 ordinary SSE frames in exact order", async () => {
+  const frames = Array.from({ length: 600 }, (_, sequence_number) => `data: ${JSON.stringify({ type: "response.created", sequence_number, response: { id: "resp_slow", model: "deepseek-v4-flash", output: [] } })}\n\n`);
+  const adapter = adaptOpenAIResponses({
+    model: { ...deepseek, reasoningDisplayMode: "raw-preserve" },
+    upstream: new Response("", { headers: { "content-type": "text/event-stream" } }),
+  });
+  const output = [];
+  await pipeline(
+    Readable.from(frames),
+    ...adapter.transforms,
+    new Writable({ highWaterMark: 1, write(chunk, _encoding, callback) { output.push(Buffer.from(chunk)); setImmediate(callback); } }),
+  );
+  assert.equal(Buffer.concat(output).toString("utf8"), frames.join(""));
+  assert.ok(adapter.relayContext.relayedBytes < 1024 * 1024);
+});
+
 test("a relayed completed terminal prevents a second failure terminal", async () => {
   const upstream = await directServer((_request, response) => {
     response.writeHead(200, { "content-type": "text/event-stream" });
