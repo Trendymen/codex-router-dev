@@ -163,8 +163,38 @@ function failureTolerantDirectorySync(directory) {
   }
 }
 
+const WINDOWS_TRANSIENT_RENAME_CODES = new Set(["EPERM", "EBUSY"]);
+const WINDOWS_RENAME_RETRY_DELAY_MS = 10;
+const WINDOWS_RENAME_ATTEMPTS = 2;
+
+function waitForWindowsRenameRetry(milliseconds) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT)), 0, 0, milliseconds);
+}
+
+function renameWithWindowsTransientRetry(rename, source, target, platform, wait) {
+  for (let attempt = 0; attempt < WINDOWS_RENAME_ATTEMPTS; attempt += 1) {
+    try {
+      return rename(source, target);
+    } catch (error) {
+      if (
+        platform !== "win32"
+        || !WINDOWS_TRANSIENT_RENAME_CODES.has(error?.code)
+        || attempt === WINDOWS_RENAME_ATTEMPTS - 1
+      ) {
+        throw error;
+      }
+      wait(WINDOWS_RENAME_RETRY_DELAY_MS);
+    }
+  }
+}
+
 /** The generation writer's injectable filesystem boundary. */
-export function createCatalogGenerationFileSystem(overrides = {}) {
+export function createCatalogGenerationFileSystem({
+  platform = process.platform,
+  renameSystemCall = renameSync,
+  wait = waitForWindowsRenameRetry,
+  ...overrides
+} = {}) {
   return {
     mkdir: mkdirSync,
     writeFile: writeFileSync,
@@ -175,7 +205,7 @@ export function createCatalogGenerationFileSystem(overrides = {}) {
       if (process.env.NODE_TEST_CONTEXT && process.platform === "win32" && path.basename(target) === "current" && existsSync(target)) {
         rmSync(target, { recursive: true, force: true });
       }
-      return renameSync(source, target);
+      return renameWithWindowsTransientRetry(renameSystemCall, source, target, platform, wait);
     },
     symlink(source, target, type) {
       // Production publication has one atomic pointer authority: a directory

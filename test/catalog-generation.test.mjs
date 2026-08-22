@@ -125,6 +125,66 @@ function failingOperations(boundary, base = testOperations()) {
   };
 }
 
+test("Windows catalog filesystem retries one transient staging rename", () => {
+  let attempts = 0;
+  const waits = [];
+  const operations = createCatalogGenerationFileSystem({
+    platform: "win32",
+    renameSystemCall() {
+      attempts += 1;
+      if (attempts === 1) {
+        const error = new Error("transient sharing violation");
+        error.code = "EPERM";
+        throw error;
+      }
+      return "renamed";
+    },
+    wait(milliseconds) { waits.push(milliseconds); },
+  });
+
+  assert.equal(operations.rename("staging", "generation"), "renamed");
+  assert.equal(attempts, 2);
+  assert.deepEqual(waits, [10]);
+});
+
+test("Windows catalog filesystem preserves the original transient rename error after its retry bound", () => {
+  const original = new Error("transient sharing violation");
+  original.code = "EPERM";
+  let attempts = 0;
+  const waits = [];
+  const operations = createCatalogGenerationFileSystem({
+    platform: "win32",
+    renameSystemCall() {
+      attempts += 1;
+      throw original;
+    },
+    wait(milliseconds) { waits.push(milliseconds); },
+  });
+
+  assert.throws(() => operations.rename("staging", "generation"), (error) => error === original);
+  assert.equal(attempts, 2);
+  assert.deepEqual(waits, [10]);
+});
+
+test("catalog filesystem does not retry non-transient rename errors", () => {
+  const original = new Error("cross-device rename");
+  original.code = "EXDEV";
+  let attempts = 0;
+  const waits = [];
+  const operations = createCatalogGenerationFileSystem({
+    platform: "win32",
+    renameSystemCall() {
+      attempts += 1;
+      throw original;
+    },
+    wait(milliseconds) { waits.push(milliseconds); },
+  });
+
+  assert.throws(() => operations.rename("staging", "generation"), (error) => error === original);
+  assert.equal(attempts, 1);
+  assert.deepEqual(waits, []);
+});
+
 test("both versioned Codex schemas reject incomplete routed entries", () => {
   for (const version of ["0.147", "0.149"]) {
     const schema = JSON.parse(readFileSync(

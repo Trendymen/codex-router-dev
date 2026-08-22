@@ -18,8 +18,19 @@ import { fileURLToPath } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
-function serviceEnv(platform, testRoot, target = "codex") {
-  return {
+function mergeServiceEnvironment(base, fixture, platform) {
+  const environment = { ...base };
+  if (platform === "win32") {
+    const fixtureNames = new Set(Object.keys(fixture).map((name) => name.toLowerCase()));
+    for (const name of Object.keys(environment)) {
+      if (fixtureNames.has(name.toLowerCase())) delete environment[name];
+    }
+  }
+  return { ...environment, ...fixture };
+}
+
+function serviceEnv(platform, testRoot, target = "codex", fixture = {}) {
+  return mergeServiceEnvironment({
     ...process.env,
     CODEX_HOME: path.join(testRoot, "codex home"),
     CODEX_ROUTER_STATE_DIR: path.join(testRoot, "router state"),
@@ -27,7 +38,7 @@ function serviceEnv(platform, testRoot, target = "codex") {
     MODEL_ROUTER_TARGET: target,
     CODEX_ROUTER_SERVICE_PLATFORM: platform,
     XDG_CONFIG_HOME: path.join(testRoot, "xdg config"),
-  };
+  }, fixture, process.platform);
 }
 
 function serviceCommand(
@@ -46,10 +57,24 @@ function serviceCommand(
     {
       cwd: sourceRoot,
       encoding: "utf8",
-      env: { ...serviceEnv(platform, testRoot, target), ...env },
+      env: serviceEnv(platform, testRoot, target, env),
     },
   );
 }
+
+test("Windows fixture variables override host variables without case-colliding duplicates", () => {
+  const environment = mergeServiceEnvironment(
+    { HTTP_PROXY: "http://host.invalid:8080", PATH: "host-path" },
+    { http_proxy: "http://fixture.invalid:8080" },
+    "win32",
+  );
+
+  assert.equal(environment.http_proxy, "http://fixture.invalid:8080");
+  assert.equal(
+    Object.keys(environment).filter((name) => name.toLowerCase() === "http_proxy").length,
+    1,
+  );
+});
 
 function render(script, platform, testRoot, target = "codex", sourceRoot = root) {
   return serviceCommand(script, platform, testRoot, "render", target, sourceRoot);
@@ -545,7 +570,7 @@ function runWindowsService(testRoot, command, extraEnv = {}) {
       cwd: root,
       encoding: "utf8",
       timeout: 120_000,
-      env: { ...serviceEnv("win32", testRoot), ...extraEnv },
+      env: serviceEnv("win32", testRoot, "codex", extraEnv),
     },
   );
 }
