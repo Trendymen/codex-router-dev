@@ -371,6 +371,95 @@ test("strict nullable root accepts only the exact object-null union", () => {
     code(() => encodeToolDialect({ tools: [{ type: "function", name: "strict", strict: true, parameters: { type, properties: {} } }], input: [], profile: functionsProfile }));
   }
   assert.doesNotThrow(() => encodeToolDialect({ tools: [{ type: "function", name: "strict", strict: true, parameters: { type: ["null", "object"], properties: {} } }], input: [], profile: functionsProfile }));
+  for (const unsupported of [{ oneOf: [] }, { anyOf: [] }, { minimum: 1 }]) {
+    code(() => encodeToolDialect({ tools: [{
+      type: "function", name: "strict", strict: true,
+      parameters: { type: ["object", "null"], properties: { value: { type: "string" } }, ...unsupported },
+    }], input: [], profile: functionsProfile }));
+  }
+});
+
+test("restores completed output as the exact terminal representation of custom and strict namespace streams", () => {
+  const custom = encodeToolDialect({ tools: [customTool], input: [], profile: functionsProfile });
+  const customItem = mappedCall(custom, { arguments: "" }).item;
+  restoreToolEvent({ type: "response.output_item.added", item: customItem }, custom.mapping);
+  restoreToolEvent({ type: "response.function_call_arguments.done", item_id: customItem.id, arguments: '{"input":"final"}' }, custom.mapping);
+  restoreToolEvent({ type: "response.output_item.done", item: { ...customItem, arguments: '{"input":"final"}' } }, custom.mapping);
+  assert.deepEqual(restoreToolEvent({
+    type: "response.completed",
+    response: { output: [{ ...customItem, arguments: '{"input":"final"}' }] },
+  }, custom.mapping).response.output[0], {
+    type: "custom_tool_call", id: "fc_1", call_id: "call_1", name: "computer", input: "final",
+  });
+
+  const namespaceTool = { type: "namespace", name: "mcp", tools: [{
+    type: "function", name: "paint", strict: true,
+    parameters: { type: "object", properties: { color: { type: "string" } }, required: ["color"], additionalProperties: false },
+  }] };
+  const namespaced = encodeToolDialect({ tools: [namespaceTool], input: [], profile: functionsProfile });
+  const namespaceItem = { type: "function_call", id: "ns_item", call_id: "ns_call", name: namespaced.tools[0].name, arguments: "" };
+  restoreToolEvent({ type: "response.output_item.added", item: namespaceItem }, namespaced.mapping);
+  restoreToolEvent({ type: "response.function_call_arguments.done", item_id: namespaceItem.id, arguments: '{"color":"blue"}' }, namespaced.mapping);
+  restoreToolEvent({ type: "response.output_item.done", item: { ...namespaceItem, arguments: '{"color":"blue"}' } }, namespaced.mapping);
+  assert.deepEqual(restoreToolEvent({
+    type: "response.completed",
+    response: { output: [{ ...namespaceItem, arguments: '{"color":"blue"}' }] },
+  }, namespaced.mapping).response.output[0], {
+    ...namespaceItem, name: "paint", namespace: "mcp", arguments: '{"color":"blue"}',
+  });
+});
+
+test("rejects completed output that conflicts with a streamed invocation identity or final arguments", () => {
+  const build = encodeToolDialect({ tools: [customTool], input: [], profile: functionsProfile });
+  const item = mappedCall(build, { arguments: "" }).item;
+  restoreToolEvent({ type: "response.output_item.added", item }, build.mapping);
+  restoreToolEvent({ type: "response.function_call_arguments.done", item_id: item.id, arguments: '{"input":"final"}' }, build.mapping);
+  restoreToolEvent({ type: "response.output_item.done", item: { ...item, arguments: '{"input":"final"}' } }, build.mapping);
+  for (const conflicting of [
+    { ...item, arguments: '{"input":"different"}' },
+    { ...item, id: "other_item", arguments: '{"input":"final"}' },
+    { ...item, call_id: "other_call", arguments: '{"input":"final"}' },
+  ]) code(() => restoreToolEvent({ type: "response.completed", response: { output: [conflicting] } }, build.mapping));
+});
+
+test("forced validation merges exact completed terminal calls but rejects conflicting completed calls", () => {
+  const custom = encodeToolDialect({ tools: [customTool], toolChoice: "required", input: [], profile: functionsProfile });
+  const customItem = mappedCall(custom, { arguments: "" }).item;
+  const customLifecycle = [
+    { type: "response.output_item.added", item: customItem },
+    { type: "response.function_call_arguments.done", item_id: customItem.id, arguments: '{"input":"final"}' },
+    { type: "response.output_item.done", item: { ...customItem, arguments: '{"input":"final"}' } },
+  ];
+  const customCompleted = { type: "response.completed", response: { output: [{ ...customItem, arguments: '{"input":"final"}' }] } };
+  assert.doesNotThrow(() => validateForcedToolResult({ bytes: 1, elapsedMs: 1, events: [...customLifecycle, customCompleted] }, custom));
+  const conflictingCustom = { type: "response.completed", response: { output: [{ ...customItem, arguments: '{"input":"different"}' }] } };
+  assert.throws(() => validateForcedToolResult({ bytes: 1, elapsedMs: 1, events: [...customLifecycle, conflictingCustom] }, custom), /required_tool_not_called/);
+
+  const namespaceTool = { type: "namespace", name: "mcp", tools: [{
+    type: "function", name: "paint", strict: true,
+    parameters: { type: "object", properties: { color: { type: "string" } }, required: ["color"], additionalProperties: false },
+  }] };
+  const namespaced = encodeToolDialect({
+    tools: [namespaceTool], toolChoice: { type: "function", namespace: "mcp", name: "paint" }, input: [], profile: functionsProfile,
+  });
+  const namespaceItem = { type: "function_call", id: "ns_item", call_id: "ns_call", name: namespaced.tools[0].name, arguments: "" };
+  const namespaceEvents = [
+    { type: "response.output_item.added", item: namespaceItem },
+    { type: "response.function_call_arguments.done", item_id: namespaceItem.id, arguments: '{"color":"blue"}' },
+    { type: "response.output_item.done", item: { ...namespaceItem, arguments: '{"color":"blue"}' } },
+    { type: "response.completed", response: { output: [{ ...namespaceItem, arguments: '{"color":"blue"}' }] } },
+  ];
+  assert.doesNotThrow(() => validateForcedToolResult({ bytes: 1, elapsedMs: 1, events: namespaceEvents }, namespaced));
+});
+
+test("rejects unsafe event roots and non-array completed response output with ToolDialectError", () => {
+  const restored = encodeToolDialect({ tools: [customTool], input: [], profile: functionsProfile });
+  code(() => restoreToolEvent(null, restored.mapping));
+  code(() => restoreToolEvent({ type: "response.completed", response: { output: {} } }, restored.mapping));
+
+  const forced = encodeToolDialect({ tools: [customTool], toolChoice: "required", input: [], profile: functionsProfile });
+  assert.throws(() => validateForcedToolResult({ bytes: 0, elapsedMs: 0, events: [null] }, forced), (error) => error instanceof ToolDialectError && error.code === "required_tool_not_called");
+  assert.throws(() => validateForcedToolResult({ bytes: 0, elapsedMs: 0, events: [{ type: "response.completed", response: { output: {} } }] }, forced), (error) => error instanceof ToolDialectError && error.code === "required_tool_not_called");
 });
 
 test("forced result merges one streamed invocation and admits more than 512 bounded events", () => {

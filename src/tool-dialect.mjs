@@ -297,7 +297,10 @@ export function encodeToolDialect(options = {}) {
     // A nullable object root is the one documented provider normalization.
     // Every other unsupported source form must be rejected, not erased by the
     // provider-facing repair before the local strict validator can see it.
-    if (!isExactNullableObjectRoot(entry.parameters)) assertStrictSchema(entry.parameters);
+    const sourceSchema = isExactNullableObjectRoot(entry.parameters)
+      ? { ...entry.parameters, type: "object" }
+      : entry.parameters;
+    assertStrictSchema(sourceSchema);
     assertStrictSchema(schema);
     state.strictValidators.set(entry.encodedName, schema);
   }
@@ -312,13 +315,15 @@ function isExactNullableObjectRoot(schema) {
   return new Set(schema.type).size === 2 && schema.type.includes("object") && schema.type.includes("null");
 }
 
-function restoreItem(item, state) {
+function restoreItem(item, state, context) {
   if (!item || typeof item !== "object" || item.type !== "function_call") return item;
   if (typeof item.name !== "string" || typeof item.call_id !== "string" || !item.call_id || state.callIds.has(item.call_id)) fail();
   const entry = state.byEncodedName.get(item.name);
   if (!entry) fail();
+  if (context.seenCallIds.has(item.call_id)) fail();
+  context.seenCallIds.add(item.call_id);
   const prior = state.returnedCallIds.get(item.call_id);
-  if (prior && (prior.entry !== entry || prior.itemId !== item.id || item.id === undefined)) fail();
+  if (prior && (!context.lifecycleCallIds.has(item.call_id) || prior.entry !== entry || prior.itemId !== item.id || item.id === undefined)) fail();
   const strictSchema = state.strictValidators.get(item.name);
   if (strictSchema && item.arguments !== "" && !schemaAccepts(parseArguments(item.arguments), strictSchema)) fail();
   if (entry.kind === "custom" && item.arguments !== "") exactInput(item.arguments);
@@ -338,12 +343,51 @@ function restoreOutput(item, state) {
   return entry.kind === "custom" ? { ...item, type: "custom_tool_call_output" } : item;
 }
 
-function restoreValue(value, state) {
+function restoreValue(value, state, context) {
   if (!value || typeof value !== "object") return value;
-  const item = restoreOutput(restoreItem(value, state), state);
-  if (Array.isArray(item.output)) return { ...item, output: item.output.map((entry) => restoreValue(entry, state)) };
-  if (Array.isArray(item.response?.output)) return { ...item, response: { ...item.response, output: item.response.output.map((entry) => restoreValue(entry, state)) } };
-  return item.item ? { ...item, item: restoreValue(item.item, state) } : item;
+  const item = restoreOutput(restoreItem(value, state, context), state);
+  if (Array.isArray(item.output)) return { ...item, output: item.output.map((entry) => restoreValue(entry, state, context)) };
+  if (Array.isArray(item.response?.output)) return { ...item, response: { ...item.response, output: item.response.output.map((entry) => restoreValue(entry, state, context)) } };
+  return item.item ? { ...item, item: restoreValue(item.item, state, context) } : item;
+}
+
+function safeEventSnapshot(value, code = "tool_mapping_error") {
+  const event = safeSnapshot(value, { nodes: 0 }, new WeakSet(), 0, code);
+  if (!event || typeof event !== "object" || Array.isArray(event)) fail(code);
+  if (event.type === "response.completed") {
+    if (event.response !== undefined) {
+      if (!event.response || typeof event.response !== "object" || Array.isArray(event.response) || !Array.isArray(event.response.output)) fail(code);
+    } else if (!Array.isArray(event.output)) fail(code);
+  }
+  return event;
+}
+
+function lifecycleCallIds(event, state) {
+  const allowed = new Set();
+  if (event.type === "response.output_item.done" && event.item?.type === "function_call") {
+    const tracked = state.itemCalls.get(event.item.id);
+    if (!tracked || !tracked.added || tracked.done || !tracked.argumentsDone) fail();
+    if (event.item.call_id !== tracked.callId || state.byEncodedName.get(event.item.name) !== tracked.entry || event.item.arguments !== tracked.finalArguments) fail();
+    tracked.done = true;
+    allowed.add(tracked.callId);
+  }
+  if (event.type === "response.completed") {
+    const terminal = [];
+    for (const call of eventFunctionCalls(event)) {
+      const tracked = typeof call.id === "string" ? state.itemCalls.get(call.id) : undefined;
+      const prior = typeof call.call_id === "string" ? state.returnedCallIds.get(call.call_id) : undefined;
+      if (!tracked) {
+        if (prior) fail();
+        continue;
+      }
+      const entry = state.byEncodedName.get(call.name);
+      if (!tracked.done || tracked.terminal || tracked.entry !== entry || tracked.callId !== call.call_id || tracked.finalArguments !== call.arguments || prior?.entry !== tracked.entry || prior?.itemId !== call.id) fail();
+      allowed.add(tracked.callId);
+      terminal.push(tracked);
+    }
+    for (const tracked of terminal) tracked.terminal = true;
+  }
+  return allowed;
 }
 
 function lifecycleItem(event, state) {
@@ -360,7 +404,7 @@ function lifecycleItem(event, state) {
 
 export function restoreToolEvent(event, mapping) {
   const state = stateFor(mapping);
-  const safeEvent = safeSnapshot(event);
+  const safeEvent = safeEventSnapshot(event);
   if (state.native) return event;
   const type = safeEvent?.type;
   if (type === "response.function_call_arguments.delta" || type === "response.function_call_arguments.done") {
@@ -381,15 +425,8 @@ export function restoreToolEvent(event, mapping) {
     const { arguments: _arguments, ...metadata } = safeEvent;
     return { ...metadata, type: "response.custom_tool_call_input.done", input: exactInput(tracked.finalArguments) };
   }
-  if (type === "response.output_item.done" && safeEvent.item?.type === "function_call") {
-    const tracked = state.itemCalls.get(safeEvent.item.id);
-    // Non-streaming Responses use response.output. A stream's done event must
-    // always close a prior added event and must repeat its finalized payload.
-    if (!tracked || !tracked.added || tracked.done || !tracked.argumentsDone) fail();
-    if (safeEvent.item.arguments !== tracked.finalArguments) fail();
-    tracked.done = true;
-  }
-  const restored = restoreValue(safeEvent, state);
+  const context = { lifecycleCallIds: lifecycleCallIds(safeEvent, state), seenCallIds: new Set() };
+  const restored = restoreValue(safeEvent, state, context);
   if (safeEvent?.type === "response.output_item.added" && safeEvent.item?.type === "function_call") lifecycleItem(safeEvent, state);
   return restored;
 }
@@ -409,8 +446,8 @@ function forcedBufferHeader(buffer) {
 function eventFunctionCalls(event) {
   const calls = [];
   if (event.item?.type === "function_call") calls.push(event.item);
-  for (const item of event.output ?? []) if (item?.type === "function_call") calls.push(item);
-  for (const item of event.response?.output ?? []) if (item?.type === "function_call") calls.push(item);
+  if (Array.isArray(event.output)) for (const item of event.output) if (item?.type === "function_call") calls.push(item);
+  if (Array.isArray(event.response?.output)) for (const item of event.response.output) if (item?.type === "function_call") calls.push(item);
   return calls;
 }
 
@@ -430,7 +467,7 @@ export function validateForcedToolResult(buffer, build) {
   for (let index = 0; index < length; index += 1) {
     const descriptor = ownData(events, String(index), "required_tool_not_called");
     if (descriptor === undefined) fail("required_tool_not_called");
-    const event = safeSnapshot(descriptor, { nodes: 0 }, new WeakSet(), 0, "required_tool_not_called");
+    const event = safeEventSnapshot(descriptor, "required_tool_not_called");
     const type = event.type;
     if (type === "response.function_call_arguments.delta" || type === "response.function_call_arguments.done") {
       const invocation = byItemId.get(event.item_id);
@@ -449,16 +486,19 @@ export function validateForcedToolResult(buffer, build) {
       const existing = byCallId.get(call.call_id);
       if (type === "response.output_item.added") {
         if (existing || typeof call.id !== "string" || !call.id || byItemId.has(call.id)) fail("required_tool_not_called");
-        const invocation = { entry, callId: call.call_id, itemId: call.id, arguments: call.arguments === "" ? undefined : call.arguments, argumentsDone: call.arguments !== "", completed: false };
+        const invocation = { entry, callId: call.call_id, itemId: call.id, arguments: call.arguments === "" ? undefined : call.arguments, argumentsDone: call.arguments !== "", completed: false, streamed: true, terminal: false };
         byCallId.set(call.call_id, invocation); byItemId.set(call.id, invocation);
       } else if (type === "response.output_item.done") {
         const invocation = byItemId.get(call.id);
         if (!invocation || invocation !== existing || invocation.entry !== entry || invocation.completed || !invocation.argumentsDone || call.arguments !== invocation.arguments) fail("required_tool_not_called");
         invocation.completed = true;
+      } else if (type === "response.completed" && existing) {
+        if (!existing.streamed || !existing.completed || existing.terminal || existing.entry !== entry || existing.itemId !== call.id || existing.arguments !== call.arguments) fail("required_tool_not_called");
+        existing.terminal = true;
       } else {
         if (existing) fail("required_tool_not_called");
         if (typeof call.arguments !== "string") fail("required_tool_not_called");
-        byCallId.set(call.call_id, { entry, callId: call.call_id, itemId: call.id, arguments: call.arguments, argumentsDone: true, completed: true });
+        byCallId.set(call.call_id, { entry, callId: call.call_id, itemId: call.id, arguments: call.arguments, argumentsDone: true, completed: true, streamed: false, terminal: type === "response.completed" });
       }
     }
   }
