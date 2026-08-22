@@ -2413,6 +2413,16 @@ async function handleDirectRoutedRequest(request, response, payload, route, cont
   const usageObserver = new ResponseUsageTransform(contentType);
   try {
     await pipeResponse(upstream, response, HOP_BY_HOP_HEADERS, [...result.transforms, usageObserver]);
+  } catch (error) {
+    const safeStatus = response.headersSent ? 502 : 502;
+    if (response.headersSent) {
+      writeStreamErrorEvent(response, { code: "reasoning_protocol_error", message: "The provider response could not be completed." });
+      endStreamedResponse(response);
+    } else {
+      writeJson(response, safeStatus, { error: { type: "router_error", code: "reasoning_protocol_error", message: "The provider response could not be completed." } });
+    }
+    recordUsageEvent({ model: result.model.slug, provider: canonicalProviderId(result.model.provider), status: safeStatus, durationMs: Date.now() - startedAt, ...(forcedUsage?.tokenUsage?.() || {}), retries: result.retries || undefined });
+    return;
   } finally {
     forcedDeadline?.clear();
   }

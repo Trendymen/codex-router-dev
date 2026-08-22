@@ -165,6 +165,11 @@ export function canFailoverTo(candidate, sourceModel, payload, { proof } = {}) {
   if (providerCooldown(candidate.provider)) return false;
   const estimatedTokens = estimateInputTokens(JSON.stringify(payload ?? {}));
   if (Number.isFinite(candidate.contextWindow) && candidate.contextWindow < estimatedTokens) return false;
+  const serialized = JSON.stringify(payload ?? {});
+  const needsImage = serialized.includes('"input_image"') || serialized.includes('"image_url"');
+  if (needsImage && !(candidate.inputModalities || []).includes("image") && candidate.visionBridge === false) return false;
+  const needsCollaboration = serialized.includes("spawn_agent") || serialized.includes("wait_agent");
+  if (needsCollaboration && (candidate.multiAgentVersion || "v1") !== "v2") return false;
   if (candidate.rolloutState === "experimental") {
     const matchingProof = proof || readProtocolProof(candidate.slug);
     if (!proofMatchesModel(matchingProof, candidate)) return false;

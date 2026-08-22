@@ -31,26 +31,26 @@ async function request(suffix, body, timeoutMs = 180_000) {
   return { response, payload };
 }
 
-async function toolCall(model) {
+const PROBE_TOOL = {
+  type: "function",
+  name: "codex_router_probe",
+  description: "Compatibility probe",
+  parameters: {
+    type: "object",
+    properties: { value: { type: "string" } },
+    required: ["value"],
+    additionalProperties: false,
+  },
+  strict: true,
+};
+
+async function toolCall(model, toolChoice = "required") {
   const { response, payload } = await request("/responses", {
     model,
     stream: false,
     input: "Call codex_router_probe exactly once with value set to ok. Do not answer normally.",
-    tools: [
-      {
-        type: "function",
-        name: "codex_router_probe",
-        description: "Compatibility probe",
-        parameters: {
-          type: "object",
-          properties: { value: { type: "string" } },
-          required: ["value"],
-          additionalProperties: false,
-        },
-        strict: true,
-      },
-    ],
-    tool_choice: "required",
+    tools: [PROBE_TOOL],
+    tool_choice: toolChoice,
   });
   const call = (payload?.output || []).find(
     (item) => item?.type === "function_call" && item?.name === "codex_router_probe",
@@ -62,10 +62,48 @@ async function toolCall(model) {
     // Invalid tool arguments are a compatibility failure.
   }
   return {
+    call,
+    usage: payload?.usage,
     ok: response.ok && Boolean(call) && argumentsValid,
     status: response.status,
     detail: call && argumentsValid ? "function call and JSON arguments verified" : responseText(payload) || payload?.error?.message || "function call missing",
   };
+}
+
+function streamedEvents(body) {
+  return body.split(/\r\n\r\n|\n\n|\r\r/).flatMap((block) => {
+    const line = block.split(/\r\n|\n|\r/).find((entry) => entry.startsWith("data:"));
+    if (!line || line.slice(5).trim() === "[DONE]") return [];
+    try { return [JSON.parse(line.slice(5).trim())]; } catch { return []; }
+  });
+}
+
+async function reasoningProbe(model) {
+  const response = await fetch(`${installedRouterBaseUrl()}/responses`, {
+    method: "POST",
+    headers: { Authorization: "Bearer codex-router-local-compatibility-test", "Content-Type": "application/json" },
+    body: JSON.stringify({ model, stream: true, input: "Reason briefly, then answer with exactly PROBE_REASONING_OK." }),
+    signal: AbortSignal.timeout(180_000),
+  });
+  const events = streamedEvents(await response.text());
+  const lifecycle = events.some((event) => ["response.reasoning_summary_part.added", "response.reasoning_summary_text.delta", "response.reasoning_text.delta", "response.reasoning_summary_text.done"].includes(event.type));
+  const completed = events.find((event) => event.type === "response.completed")?.response;
+  const item = (completed?.output || []).find((entry) => entry?.type === "reasoning");
+  const measuredFinalReasoningShape = item?.thinking?.length ? "anthropic-thinking" : item?.summary?.length && item?.content?.length ? "hybrid-summary" : item?.summary?.length ? "provider-summary" : item?.content?.length ? "raw-content" : "unverified";
+  return { ok: response.ok && lifecycle && Boolean(item), measuredFinalReasoningShape, status: response.status, detail: item ? `reasoning lifecycle and ${measuredFinalReasoningShape} final shape observed` : "reasoning lifecycle missing" };
+}
+
+async function continuationProbe(model) {
+  const first = await toolCall(model, "required");
+  if (!first.ok || !first.call) return { ok: false, status: first.status, detail: `initial tool call unavailable: ${first.detail}` };
+  const followup = await request("/responses", {
+    model,
+    stream: false,
+    input: [first.call, { type: "function_call_output", call_id: first.call.call_id, output: "ok" }],
+    tools: [PROBE_TOOL],
+    tool_choice: "auto",
+  });
+  return { ok: followup.response.ok && Boolean(responseText(followup.payload)), status: followup.response.status, detail: followup.response.ok ? "tool output continuation completed" : followup.payload?.error?.message || "continuation failed" };
 }
 
 async function streaming(model) {
@@ -149,26 +187,23 @@ export async function subagentCapabilityProbe(model) {
 
 export async function compatibilityTest(model, options = {}) {
   if (!MODEL_BY_SLUG.has(model)) throw new Error(`Unknown registry model: ${model}`);
-  const results = [];
-  const basic = await smokeTestModel(model);
-  results.push({ name: "basic response", ...basic });
-  if (!options.quick) {
-    results.push({ name: "streaming", ...(await streaming(model)) });
-    results.push({ name: "tool calling", ...(await toolCall(model)) });
-    results.push({ name: "compaction", ...(await compaction(model)) });
-  }
-  const byName = new Map(results.map((result) => [result.name, result]));
+  const basic = await request("/responses", { model, stream: false, input: "Reply with exactly PROBE_BASIC_OK." });
+  const reasoning = await reasoningProbe(model);
+  const autoTool = await toolCall(model, "auto");
+  const continuation = await continuationProbe(model);
+  const usage = basic.payload?.usage;
   const checks = [
-    { name: "nonstream", ok: byName.get("basic response")?.ok === true, detail: byName.get("basic response")?.detail },
-    { name: "stream-reasoning", ok: options.quick ? true : byName.get("streaming")?.ok === true, detail: byName.get("streaming")?.detail },
-    { name: "auto-tool", ok: options.quick ? true : byName.get("tool calling")?.ok === true, detail: byName.get("tool calling")?.detail },
-    { name: "continuation", ok: options.quick ? true : byName.get("compaction")?.ok === true, detail: byName.get("compaction")?.detail },
-    { name: "usage", ok: byName.get("basic response")?.ok === true, detail: "usage is observed on the same non-stream response" },
+    { name: "nonstream", ok: basic.response.ok && Boolean(responseText(basic.payload)), detail: basic.response.ok ? "non-stream response completed" : basic.payload?.error?.message || "non-stream failed" },
+    { name: "stream-reasoning", ...reasoning },
+    { name: "auto-tool", ok: autoTool.ok, detail: autoTool.detail },
+    { name: "continuation", ok: continuation.ok, detail: continuation.detail },
+    { name: "usage", ok: Number.isFinite(usage?.input_tokens) && Number.isFinite(usage?.output_tokens) && Number.isFinite(usage?.total_tokens), detail: "authoritative input/output/total usage fields observed" },
   ];
+  const results = checks.map((check) => ({ name: check.name, ok: check.ok, status: check.status, detail: check.detail }));
   return {
     model,
     verdict: checks.every((check) => check.ok) ? "passing" : "failed",
-    measuredFinalReasoningShape: MODEL_BY_SLUG.get(model)?.declaredFinalReasoningShape || "unverified",
+    measuredFinalReasoningShape: reasoning.measuredFinalReasoningShape,
     checks,
     ok: checks.every((check) => check.ok),
     results,
