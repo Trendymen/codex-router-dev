@@ -23,6 +23,23 @@ function fail(code = "tool_mapping_error") {
   throw new ToolDialectError(code);
 }
 
+function privateUsageSnapshot(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const copy = {};
+  let keys;
+  try { keys = Object.keys(value); } catch { fail(); }
+  if (keys.length > 64) fail();
+  for (const key of keys) {
+    let descriptor;
+    try { descriptor = Object.getOwnPropertyDescriptor(value, key); } catch { fail(); }
+    if (!descriptor || !Object.hasOwn(descriptor, "value")) fail();
+    const item = descriptor.value;
+    if (item !== null && typeof item !== "string" && typeof item !== "boolean" && !(typeof item === "number" && Number.isFinite(item))) fail();
+    copy[key] = item;
+  }
+  return Object.freeze(copy);
+}
+
 function base32(buffer) {
   let output = "";
   let value = 0;
@@ -244,7 +261,7 @@ function choiceFor(toolChoice, mapping, usesFunctions) {
     const kind = toolChoice.type === "custom" ? "custom" : toolChoice.namespace === undefined ? "function" : "namespace";
     const entry = mapping.byOriginal.get(callKey(kind, toolChoice.namespace, toolChoice.name));
     if (!entry) fail();
-    return { toolChoice: "auto", forcedRequirement: { type: "named", name: toolChoice.name, kind, namespace: toolChoice.namespace } };
+    return { toolChoice: "auto", forcedRequirement: Object.freeze({ type: "named", name: toolChoice.name, kind, namespace: toolChoice.namespace }) };
   }
   fail();
 }
@@ -275,7 +292,7 @@ export function encodeToolDialect({ tools, toolChoice, input, profile } = {}) {
   const strictValidators = new Map();
   if (usesFunctions) {
     for (const entry of state.byEncodedName.values()) {
-      if (entry.kind === "function" && entry.nested.strict === true) {
+      if (entry.kind !== "custom" && entry.nested.strict === true) {
         assertStrictSchema(entry.parameters);
         const schema = providerToolSchema(entry.parameters);
         assertStrictSchema(schema);
@@ -362,6 +379,7 @@ export function restoreToolEvent(event, mapping) {
     const entry = state.byEncodedName.get(item.name);
     if (!entry) fail();
     const previous = state.itemCalls.get(item.id);
+    if (event.type === "response.output_item.added" && previous) fail();
     if (previous && (previous.entry !== entry || previous.callId !== item.call_id)) fail();
     if (!previous) state.itemCalls.set(item.id, { entry, callId: item.call_id });
   }
@@ -447,6 +465,7 @@ export function createForcedToolBuffer({
     terminal = true;
     aborted = true;
     cleanup();
+    if (usage !== undefined) onUsage?.(usage);
     abort();
   };
   const deadline = () => {
@@ -484,7 +503,7 @@ export function createForcedToolBuffer({
     },
     observeUsage(nextUsage) {
       if (terminal) return false;
-      usage = nextUsage;
+      usage = privateUsageSnapshot(nextUsage);
       return true;
     },
     finish(events) {
