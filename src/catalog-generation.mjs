@@ -254,17 +254,20 @@ function captureRegularFile(operations, target) {
 function restoreRegularFile(operations, snapshot) {
   if (!snapshot || snapshot.preserve) return;
   const parent = path.dirname(snapshot.path);
-  if (isPresent(operations, snapshot.path)) {
-    operations.unlink(snapshot.path);
-    operations.fsyncDirectory(parent);
+  if (!snapshot.present) {
+    if (isPresent(operations, snapshot.path)) {
+      operations.unlink(snapshot.path);
+      operations.fsyncDirectory(parent);
+    }
+    return;
   }
-  if (!snapshot.present) return;
   operations.mkdir(path.dirname(snapshot.path), { recursive: true, mode: 0o700 });
   const temporary = `${snapshot.path}.catalog-rollback-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
   try {
     operations.writeFile(temporary, snapshot.contents, { mode: snapshot.mode });
     operations.chmod(temporary, snapshot.mode);
     operations.protect(temporary);
+    operations.chmod(temporary, snapshot.mode);
     operations.fsyncFile(temporary);
     operations.rename(temporary, snapshot.path);
     operations.fsyncDirectory(parent);
@@ -424,10 +427,10 @@ function completeRoutedTemplate(template) {
   return { ...template, base_instructions: baseInstructions, model_messages: messages };
 }
 
-export function buildRoutedCatalog({ nativeModels = [], routedModels = [] } = {}) {
-  const template = nativeModels.find((model) => model?.slug === "gpt-5.5")
-    || nativeModels.find((model) => model?.visibility === "list")
-    || nativeModels[0];
+export function buildRoutedCatalog({ nativeModels = [], routedModels = [], templateModels = nativeModels } = {}) {
+  const template = templateModels.find((model) => model?.slug === "gpt-5.5")
+    || templateModels.find((model) => model?.visibility === "list")
+    || templateModels[0];
   if (!template) throw new Error("A routed catalog needs a native template.");
   const completeTemplate = completeRoutedTemplate(template);
   const byPriorityAndSlug = (left, right) => Number(left.priority ?? 999) - Number(right.priority ?? 999)

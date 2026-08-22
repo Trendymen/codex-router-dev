@@ -14,7 +14,12 @@ import { buildRoutedCatalog, publishCatalogGeneration } from "./catalog-generati
 import { withCatalogPublicationLock } from "./catalog-publication-lock.mjs";
 import { protectPrivateFile } from "./file-security.mjs";
 import { withModelOverlayLock } from "./model-overlay-lock.mjs";
-import { MERGED_CATALOG_PATH, NATIVE_CATALOG_PATH, ROUTED_CATALOG_PATH } from "./paths.mjs";
+import {
+  MERGED_CATALOG_PATH,
+  NATIVE_CATALOG_PATH,
+  NODE_ROUTES_PATH,
+  ROUTED_CATALOG_PATH,
+} from "./paths.mjs";
 
 let activeRebuild;
 let queuedRebuild;
@@ -76,7 +81,7 @@ function route(model) {
  * Shape a full six-artifact generation from the existing native/merged
  * template and the current Node contract. No active provider profile is read.
  */
-export async function buildNodeSnapshotFiles() {
+export async function buildNodeSnapshotFiles({ nodeModels: injectedNodeModels } = {}) {
   const [{ nodeRoutableModels }, { configuredProviderIds }, { readHiddenModels }] =
     await Promise.all([
       import("./model-contract.mjs"),
@@ -88,13 +93,14 @@ export async function buildNodeSnapshotFiles() {
     throw new Error("Cannot rebuild Node snapshots: merged catalog has no native template.");
   }
   const hiddenModels = readHiddenModels();
-  const nodeModels = nodeRoutableModels({
+  const nodeModels = injectedNodeModels || nodeRoutableModels({
     enabledProviders: new Set(configuredProviderIds()),
     hiddenModels,
   });
-  // Prefer the native capture; when it is unavailable subtract the previous
-  // routed artifact, never today's registry. A deleted routed slug must not
-  // become a fossilized native entry in the next merged catalog.
+  // A current routed catalog contains both native and Node entries, so it
+  // cannot itself establish Node provenance. Prefer the prior route snapshot;
+  // only a genuinely pre-snapshot generation uses the old routed-artifact
+  // compatibility interpretation.
   let nativeModels;
   if (existsSync(NATIVE_CATALOG_PATH)) {
     const native = readJson(NATIVE_CATALOG_PATH, "native catalog");
@@ -103,10 +109,22 @@ export async function buildNodeSnapshotFiles() {
     }
     nativeModels = native.models;
   } else {
-    const priorRouted = existsSync(ROUTED_CATALOG_PATH)
-      ? readJson(ROUTED_CATALOG_PATH, "prior routed catalog")
-      : { models: [] };
-    const routedSlugs = new Set((priorRouted.models || []).map((model) => String(model?.slug || "")));
+    let routedSlugs;
+    if (existsSync(NODE_ROUTES_PATH)) {
+      const priorRoutes = readJson(NODE_ROUTES_PATH, "prior Node route snapshot");
+      if (!Array.isArray(priorRoutes.routes)) {
+        throw new Error("Cannot rebuild Node snapshots: prior Node route snapshot has no routes.");
+      }
+      routedSlugs = new Set(priorRoutes.routes.map((route) => String(route?.slug || "")));
+    } else {
+      const priorRouted = existsSync(ROUTED_CATALOG_PATH)
+        ? readJson(ROUTED_CATALOG_PATH, "legacy prior routed catalog")
+        : { models: [] };
+      if (!Array.isArray(priorRouted.models)) {
+        throw new Error("Cannot rebuild Node snapshots: legacy prior routed catalog has no models.");
+      }
+      routedSlugs = new Set(priorRouted.models.map((model) => String(model?.slug || "")));
+    }
     nativeModels = previous.models.filter((model) => !routedSlugs.has(String(model?.slug)));
   }
   nativeModels = nativeModels.map((model) => ({
@@ -114,10 +132,12 @@ export async function buildNodeSnapshotFiles() {
     supports_parallel_tool_calls: model?.supports_parallel_tool_calls === true,
     ...(hiddenModels.has(String(model?.slug)) ? { visibility: "hide" } : {}),
   }));
-  // A legacy generation can lack an authoritative native capture. Keep its
-  // template only for shaping; do not carry it into the merged result.
+  // A legacy generation can lack an authoritative native capture. Its prior
+  // catalog is a behavior template only when no actual native models remain;
+  // it must never be copied into the next routed/merged output.
   const routed = buildRoutedCatalog({
-    nativeModels: nativeModels.length ? nativeModels : previous.models,
+    nativeModels,
+    templateModels: nativeModels.length ? nativeModels : previous.models,
     routedModels: nodeModels,
   });
   const merged = {

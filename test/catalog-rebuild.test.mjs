@@ -26,7 +26,12 @@ const {
   writePassingProtocolProof,
 } = await import("../src/protocol-proof.mjs");
 const { verifyProtocolProof } = await import("../src/protocol-proof-verifier.mjs");
-const { PROTOCOL_PROOFS_PATH } = await import("../src/paths.mjs");
+const {
+  NATIVE_CATALOG_PATH,
+  NODE_ROUTES_PATH,
+  PROTOCOL_PROOFS_PATH,
+  ROUTED_CATALOG_PATH,
+} = await import("../src/paths.mjs");
 const { setExperimentalModel, experimentalModelEnabled } = await import("../src/experimental-models.mjs");
 
 const primarySlug = "qwen-plan/qwen3.7-max";
@@ -136,6 +141,43 @@ test("an empty native capture fails closed without replacing the current generat
 
   await assert.rejects(buildNodeSnapshotFiles(), /native catalog has no models/);
   assert.deepEqual(readFileSync(path.join(stateDir, "merged-models.json")), previous);
+});
+
+test("missing native capture preserves prior native models using node-route provenance without reviving removed routes", async () => {
+  const native = {
+    slug: "router/native-provenance",
+    base_instructions: "native instructions",
+    model_messages: { instructions_template: "native instructions" },
+    supports_parallel_tool_calls: false,
+  };
+  const obsoleteRoute = {
+    slug: "router/removed-node-route", provider: "router", upstreamModel: "removed",
+    effectiveTransport: "openai-responses", toolDialect: "responses-functions", requestProfile: "router",
+    reasoningDisplayMode: "raw-preserve", effectiveFinalReasoningShape: "raw-content", purpose: "primary",
+  };
+  const currentRoute = {
+    slug: "router/current-node-route", provider: "router", upstreamModel: "current",
+    effectiveTransport: "openai-responses", toolDialect: "responses-functions", requestProfile: "router",
+    reasoningDisplayMode: "raw-preserve", effectiveFinalReasoningShape: "raw-content",
+    declaredFinalReasoningShape: "raw-content", rolloutState: "stable", purpose: "primary",
+    routable: true, listed: true, visible: true,
+  };
+  const old = artifacts("provenance-old");
+  old["merged-models.json"] = { models: [native, { ...native, slug: obsoleteRoute.slug }] };
+  old["routed-models.json"] = { models: [native, { ...native, slug: obsoleteRoute.slug }] };
+  old["node-routes.json"] = { version: 1, routes: [obsoleteRoute] };
+  publishCatalogGeneration({ files: old, operations: testOperations() });
+  rmSync(NATIVE_CATALOG_PATH, { force: true });
+
+  const rebuilt = await buildNodeSnapshotFiles({ nodeModels: [currentRoute] });
+
+  assert.deepEqual(rebuilt["node-routes.json"].routes.map((route) => route.slug), [currentRoute.slug]);
+  assert.deepEqual(
+    rebuilt["routed-models.json"].models.map((model) => model.slug),
+    [native.slug, currentRoute.slug],
+  );
+  assert.ok(existsSync(NODE_ROUTES_PATH));
+  assert.ok(existsSync(ROUTED_CATALOG_PATH));
 });
 
 test("a queued rebuild runs after an active rebuild fails and returns its own result", async () => {

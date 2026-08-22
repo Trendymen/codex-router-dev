@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import {
+  chmodSync,
   existsSync,
   lstatSync,
   linkSync,
@@ -443,6 +444,110 @@ test("a first-generation bootstrap-pointer failure restores the regular file", (
       assert.deepEqual(readFileSync(legacyPaths[name]), oldBytes[name]);
       if (process.platform !== "win32") assert.equal(statSync(legacyPaths[name]).mode & 0o777, 0o640);
     }
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("bootstrap rollback never leaves a stable legacy path missing while restoring regular files", () => {
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), "catalog-generation-restore-visible-"));
+  const generationsDir = path.join(stateDir, "catalog-generations");
+  const legacyPaths = Object.fromEntries(artifactNames.map((name) => [name, path.join(stateDir, name)]));
+  const old = artifacts("restore-visible-old");
+  const oldBytes = Object.fromEntries(artifactNames.map((name) => [
+    name,
+    Buffer.from(`${JSON.stringify(old[name], null, 2)}\n`),
+  ]));
+  try {
+    for (const name of artifactNames) writeFileSync(legacyPaths[name], oldBytes[name], { mode: 0o640 });
+    const base = testOperations();
+    let failedNewPointer = false;
+    let restoreObservations = 0;
+    const operations = {
+      ...base,
+      symlink(source, target, type) {
+        if (!failedNewPointer && path.basename(target).startsWith(".current-next-")) {
+          failedNewPointer = true;
+          throw new Error("injected new-pointer failure after stable topology");
+        }
+        return base.symlink(source, target, type);
+      },
+      rename(source, target) {
+        const result = base.rename(source, target);
+        if (source.includes(".catalog-rollback-") && Object.values(legacyPaths).includes(target)) {
+          restoreObservations += 1;
+          for (const name of artifactNames) {
+            assert.equal(existsSync(legacyPaths[name]), true, `${name} disappeared after restore ${restoreObservations}`);
+            assert.deepEqual(readFileSync(legacyPaths[name]), oldBytes[name], `${name} changed after restore ${restoreObservations}`);
+          }
+        }
+        return result;
+      },
+    };
+    let failure;
+    try {
+      publishCatalogGeneration({ files: artifacts("restore-visible-new"), generationsDir, legacyPaths, operations });
+    } catch (error) {
+      failure = error;
+    }
+    assert.match(failure?.message || "", /injected new-pointer failure after stable topology/);
+    assert.equal(failure instanceof AggregateError, false, "rollback must not add a restoration failure");
+    assert.equal(restoreObservations, artifactNames.length);
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("bootstrap rollback restores each regular legacy file to its captured mode after protection", () => {
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), "catalog-generation-restore-mode-"));
+  const generationsDir = path.join(stateDir, "catalog-generations");
+  const legacyPaths = Object.fromEntries(artifactNames.map((name) => [name, path.join(stateDir, name)]));
+  const old = artifacts("restore-mode-old");
+  try {
+    for (const name of artifactNames) {
+      writeFileSync(legacyPaths[name], `${JSON.stringify(old[name], null, 2)}\n`, { mode: 0o640 });
+    }
+    const base = testOperations();
+    let failedNewPointer = false;
+    const restoredModes = new Map();
+    const operations = {
+      ...base,
+      lstat(target) {
+        const stat = base.lstat(target);
+        if (Object.values(legacyPaths).includes(target)) {
+          const captured = Object.create(stat);
+          captured.mode = (stat.mode & ~0o777) | 0o640;
+          return captured;
+        }
+        return stat;
+      },
+      chmod(target, mode) {
+        if (target.includes(".catalog-rollback-")) restoredModes.set(target, mode);
+        return base.chmod(target, mode);
+      },
+      protect(target) {
+        // Production protection can tighten a recreated file. The restore
+        // contract must still put the captured mode back afterwards.
+        chmodSync(target, 0o600);
+      },
+      symlink(source, target, type) {
+        if (!failedNewPointer && path.basename(target).startsWith(".current-next-")) {
+          failedNewPointer = true;
+          throw new Error("injected mode-restore pointer failure");
+        }
+        return base.symlink(source, target, type);
+      },
+    };
+    let failure;
+    try {
+      publishCatalogGeneration({ files: artifacts("restore-mode-new"), generationsDir, legacyPaths, operations });
+    } catch (error) {
+      failure = error;
+    }
+    assert.match(failure?.message || "", /injected mode-restore pointer failure/);
+    assert.equal(failure instanceof AggregateError, false, "rollback must not add a restoration failure");
+    assert.equal(restoredModes.size, artifactNames.length);
+    for (const [target, mode] of restoredModes) assert.equal(mode, 0o640, target);
   } finally {
     rmSync(stateDir, { recursive: true, force: true });
   }
