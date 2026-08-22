@@ -8,6 +8,7 @@ import {
   flattenNamespacedHistory,
   flattenNamespaceTools,
   flattenToolSearchHistory,
+  namespaceToolEntries,
   rewriteNamespaceFunctionCall,
   rewriteNamespaceResponsePayload,
   repairToolSchemaRoots,
@@ -96,6 +97,15 @@ function clientToolSearchControl() {
     },
   };
 }
+
+test("namespaceToolEntries preserves exact native namespace relationships without parsing names", () => {
+  const child = { type: "function", name: "read__value" };
+  assert.deepEqual(namespaceToolEntries([
+    { type: "namespace", name: "mcp__tools", tools: [child] },
+    { type: "function", name: "ordinary" },
+  ]), [{ namespace: "mcp__tools", tool: child }]);
+  assert.deepEqual(namespaceToolEntries(undefined), []);
+});
 
 test("flattenNamespaceTools flattens every namespace, including MCP ones", () => {
   const { tools, flattened, namespaces } = flattenNamespaceTools(clientRoutedTools());

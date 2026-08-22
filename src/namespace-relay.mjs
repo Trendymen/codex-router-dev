@@ -38,6 +38,22 @@ import {
 
 export const NAMESPACE_DELIMITER = "__";
 
+// The native Responses adapters need the exact declaration relationship too,
+// but must not derive it later by splitting a provider-visible name. Keep this
+// small traversal beside the legacy flattening relay so both paths retain the
+// caller's namespace/name pair as request-local data.
+export function namespaceToolEntries(tools) {
+  if (!Array.isArray(tools)) return [];
+  const entries = [];
+  for (const tool of tools) {
+    if (tool?.type !== "namespace" || typeof tool.name !== "string" || !Array.isArray(tool.tools)) {
+      continue;
+    }
+    for (const child of tool.tools) entries.push({ namespace: tool.name, tool: child });
+  }
+  return entries;
+}
+
 // Metadata derived from the request's exact tool schema. Keeping it beside the
 // Map in a WeakMap preserves the Map's public shape for existing callers while
 // letting the response path validate model-generated overrides.
