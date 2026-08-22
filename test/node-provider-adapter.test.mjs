@@ -163,6 +163,21 @@ test("GLM Responses maps tools while preserving required/named choice semantics"
   assert.deepEqual(glm.json.tool_choice, { type: "function", name: "run" });
   assert.equal(glm.toolBuild.forcedRequirement, undefined);
   assert.equal("reasoning" in glm.json, false);
+
+  const mapped = buildOpenAIResponsesRequest({
+    model: { ...qwen, slug: "qwen-plan-responses/glm-5.2", upstreamModel: "glm-5.2" },
+    payload: {
+      input: [{ type: "custom_tool_call", call_id: "old", name: "shell", input: "pwd" }],
+      tools: [
+        { type: "custom", name: "shell", description: "run" },
+        { type: "namespace", name: "mcp", tools: [{ type: "function", name: "读", strict: true, parameters: { type: "object", properties: {} } }] },
+      ],
+      tool_choice: { type: "function", namespace: "mcp", name: "读" },
+    },
+  });
+  assert.notEqual(mapped.json.tool_choice.name, "读");
+  assert.equal(mapped.json.tools[1].strict, true);
+  assert.equal(mapped.json.input[0].type, "function_call");
 });
 
 test("adapter normalizes final JSON only for third-party Responses and native OpenAI bypasses byte-identically", () => {
@@ -398,6 +413,54 @@ test("caller cancellation aborts a direct forced dispatch without relaying or re
       closedUpstream,
       new Promise((_, reject) => setTimeout(() => reject(new Error("upstream was not cancelled")), 1_000)),
     ]);
+  } finally { await stop(forwarder, upstream.server); }
+});
+
+test("forced provider 429 bypasses validation and preserves its status and retry header", async () => {
+  const upstream = await directServer((_request, response) => {
+    response.writeHead(429, { "content-type": "application/json", "retry-after": "17" });
+    response.end(JSON.stringify({ error: { message: "provider throttle" } }));
+  });
+  const port = await openPort(); const forwarder = directForwarder(port, `http://127.0.0.1:${upstream.port}/v1`);
+  try {
+    await waitForwarder(port);
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: "POST", headers: { Authorization: `Bearer ${INTERNAL_KEY}`, "content-type": "application/json" },
+      body: JSON.stringify({ model: "deepseek-v4-flash", input: "hello", tools: [{ type: "function", name: "run", parameters: { type: "object" } }], tool_choice: "required" }),
+    });
+    assert.equal(response.status, 429);
+    assert.equal(response.headers.get("retry-after"), "17");
+    assert.match(await response.text(), /provider throttle/);
+  } finally { await stop(forwarder, upstream.server); }
+});
+
+test("multiline data frames parse as one event while unchanged bytes remain exact", async () => {
+  const raw = "event: response\r\ndata: {\"type\":\r\ndata: \"response.created\",\"sequence_number\":1,\"response\":{\"id\":\"resp_multiline\",\"model\":\"deepseek-v4-flash\",\"output\":[]}}\r\n\r\n: untouched comment\n\ndata: [DONE]\r\r";
+  const adapter = adaptOpenAIResponses({
+    model: { ...deepseek, reasoningDisplayMode: "raw-preserve" },
+    upstream: new Response("", { headers: { "content-type": "text/event-stream" } }),
+  });
+  assert.equal(await through(adapter.transforms, [Buffer.from(raw)]), raw);
+});
+
+test("a relayed completed terminal prevents a second failure terminal", async () => {
+  const upstream = await directServer((_request, response) => {
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.end(
+      "data: " + JSON.stringify({ type: "response.completed", sequence_number: 7, response: { id: "resp_done", model: "deepseek-v4-flash", output: [], usage: { input_tokens: 1 } } }) + "\n\n" +
+      "data: {malformed}\n\n",
+    );
+  });
+  const port = await openPort(); const forwarder = directForwarder(port, `http://127.0.0.1:${upstream.port}/v1`);
+  try {
+    await waitForwarder(port);
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: "POST", headers: { Authorization: `Bearer ${INTERNAL_KEY}`, "content-type": "application/json" }, body: JSON.stringify({ model: "deepseek-v4-flash", input: "hello" }),
+    });
+    const body = await response.text();
+    assert.equal((body.match(/response\.completed/g) || []).length, 1);
+    assert.equal((body.match(/response\.failed/g) || []).length, 0);
+    assert.equal((body.match(/data: \[DONE\]/g) || []).length, 1);
   } finally { await stop(forwarder, upstream.server); }
 });
 

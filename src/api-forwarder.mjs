@@ -1020,7 +1020,12 @@ async function handleRequest(request, response) {
   // never sends headers or a body. Abort the dispatch controller exactly once;
   // the shared forced coordinator remains sealed by the same signal.
   const forcedDeadline = forcedBuffer
-    ? setTimeout(() => controller.abort(), 30_001)
+    ? setTimeout(() => {
+        // Preserve the timeout cause across fetch's generic AbortError so the
+        // public boundary can distinguish a caller disconnect from 30s expiry.
+        response._codexRouterForcedTimeout = true;
+        controller.abort();
+      }, 30_001)
     : undefined;
   forcedDeadline?.unref?.();
   // Command Code's documented API is an entitlement, not a credential: the
@@ -1158,7 +1163,10 @@ async function handleRequest(request, response) {
   // provider-derived context on the response object rather than reconstructing
   // an anonymous terminal after a partial direct relay.
   if (relayContext) response._codexRouterRelayContext = relayContext;
-  const responseAdapter = normalized.providerRequest
+  // Provider failures are opaque provider responses, not completed Responses
+  // events.  They must retain their status/Retry-After path and never enter
+  // forced-tool validation, retry, or failover state intended for success.
+  const responseAdapter = normalized.providerRequest && upstream.status >= 200 && upstream.status < 300
     ? adaptOpenAIResponses({
         model: normalized.model,
         upstream,
@@ -1196,19 +1204,26 @@ const server = http.createServer((request, response) => {
     console.error(
       `[api-forwarder] request failed: ${formatErrorChain(error, { messages: false })}`,
     );
-    const candidate = error instanceof ToolDialectError ||
+    const candidate = response._codexRouterForcedTimeout
+      ? "forced_tool_buffer_timeout"
+      : error instanceof ToolDialectError ||
       error instanceof OpenAIResponsesAdapterError || error instanceof ReasoningProtocolError
       ? error.code
       : undefined;
     const publicCode = ERROR_DEFINITIONS[candidate]
       ? candidate
       : candidate ? "reasoning_protocol_error" : undefined;
-    if (publicCode && !response.headersSent) {
+    const context = response._codexRouterRelayContext;
+    if (context?.terminalSeen && !response.writableEnded && !response.destroyed) {
+      // The provider terminal was already committed.  A later malformed frame
+      // cannot become a second terminal; finish the framing once if needed.
+      if (!context.doneSeen) response.write("data: [DONE]\n\n");
+      response.end();
+    } else if (publicCode && !response.headersSent) {
       const safe = routerError(publicCode);
       writeJson(response, safe.status, safe.body);
     } else if (publicCode && !response.writableEnded && !response.destroyed) {
       const safe = routerError(publicCode);
-      const context = response._codexRouterRelayContext;
       response.write(formatTerminalFrames(failedResponseEvent({
         responseId: context?.responseId ?? "resp_adapter",
         model: context?.model ?? "unknown",

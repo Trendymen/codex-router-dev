@@ -1,4 +1,5 @@
 import { Duplex, Transform } from "node:stream";
+import { isDeepStrictEqual } from "node:util";
 
 import { providerEndpoint } from "./provider-endpoint.mjs";
 import { reasoningTransformForModel, normalizeReasoningResponse } from "./reasoning-summary-compat.mjs";
@@ -20,10 +21,12 @@ export function createResponsesRelayContext() {
     output: [],
     usage: undefined,
     relayedBytes: 0,
+    terminalSeen: false,
+    doneSeen: false,
   };
 }
 
-function observeResponseContext(context, event) {
+function observeResponseContext(context, event, { terminal = true } = {}) {
   if (!context || !event || typeof event !== "object") return;
   const response = event.response && typeof event.response === "object" ? event.response : undefined;
   const sequence = event.sequence_number;
@@ -36,6 +39,7 @@ function observeResponseContext(context, event) {
   else if (Array.isArray(event.output)) context.output = event.output;
   const usage = event.usage ?? response?.usage;
   if (usage && typeof usage === "object" && !Array.isArray(usage)) context.usage = usage;
+  if (terminal && ["response.completed", "response.incomplete", "response.failed"].includes(event.type)) context.terminalSeen = true;
 }
 
 export class OpenAIResponsesAdapterError extends Error {
@@ -77,6 +81,27 @@ function forcedChoice(choice) {
 
 function qwenGlmCompatibility(model) {
   return model.slug === "qwen-plan-responses/glm-5.2";
+}
+
+function mappedGlmChoice(choice, sourceTools, encodedTools) {
+  if (!choice || typeof choice !== "object" || Array.isArray(choice) || choice.type !== "function" || typeof choice.name !== "string") return choice;
+  const flattened = [];
+  for (const tool of sourceTools || []) {
+    if (tool?.type === "namespace" && Array.isArray(tool.tools)) for (const child of tool.tools) flattened.push({ tool: child, namespace: tool.name });
+    else flattened.push({ tool, namespace: undefined });
+  }
+  const index = flattened.findIndex(({ tool, namespace }) => tool?.type === "function" && tool.name === choice.name && namespace === choice.namespace);
+  if (index < 0 || typeof encodedTools?.[index]?.name !== "string") return choice;
+  return { type: "function", name: encodedTools[index].name };
+}
+
+function glmMappedTools(sourceTools, encodedTools) {
+  const flattened = [];
+  for (const tool of sourceTools || []) {
+    if (tool?.type === "namespace" && Array.isArray(tool.tools)) flattened.push(...tool.tools);
+    else flattened.push(tool);
+  }
+  return encodedTools.map((tool, index) => flattened[index]?.strict === true ? { ...tool, strict: true } : tool);
 }
 
 function applyResponsesProfile(model, payload, toolBuild) {
@@ -130,7 +155,7 @@ export function buildOpenAIResponsesRequest({ model, payload, credential } = {})
   // choices. Rebuild only the public selection fields; the private mapping
   // state remains the one Task2 created for the encoded declarations.
   const toolBuild = qwenGlmCompatibility(model)
-    ? Object.freeze({ ...encodedBuild, toolChoice: source.tool_choice, forcedRequirement: undefined })
+    ? Object.freeze({ ...encodedBuild, tools: glmMappedTools(source.tools, encodedBuild.tools), toolChoice: mappedGlmChoice(source.tool_choice, source.tools, encodedBuild.tools), forcedRequirement: undefined })
     : encodedBuild;
   const json = applyResponsesProfile(model, source, toolBuild);
   return Object.freeze({
@@ -172,10 +197,18 @@ export function restoreOpenAIResponsesEvent(event, toolBuild) {
 
 function dataLine(block) {
   const lines = block.split(/\r\n|\n|\r/);
-  const index = lines.findIndex((line) => line.startsWith("data:"));
-  if (index === -1) return undefined;
-  const data = lines[index].slice(5).trimStart();
-  return { lines, index, data };
+  const indexes = [];
+  const values = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    if (!lines[index].startsWith("data:")) continue;
+    indexes.push(index);
+    values.push(lines[index].slice(5).replace(/^ /, ""));
+  }
+  if (!indexes.length) return undefined;
+  // SSE delivers each `data:` line joined by LF, independent of the frame's
+  // physical delimiter.  This parsing result is used only for inspection;
+  // semantically unchanged events still write the original bytes below.
+  return { lines, indexes, index: indexes[0], data: values.join("\n") };
 }
 
 // Byte framing is deliberately independent from JSON parsing. It accepts the
@@ -293,6 +326,7 @@ class ResponsesSseToolTransform extends Transform {
         this.#forced.finish(this.#events);
         this.#release();
       }
+      if (data?.data === "[DONE]") this.#context.doneSeen = true;
       this.#output(raw);
       return;
     }
@@ -307,9 +341,10 @@ class ResponsesSseToolTransform extends Transform {
     // exact input is known. A suppressed event is a suppressed frame; JSON
     // stringifying it would manufacture the invalid `data: undefined` event.
     if (restored === undefined) return;
-    if (restored === event || JSON.stringify(restored) === data.data) { this.#output(raw); return; }
+    if (restored === event || isDeepStrictEqual(restored, event)) { this.#output(raw); return; }
     const lines = [...data.lines];
     lines[data.index] = `data: ${JSON.stringify(restored)}`;
+    for (const index of data.indexes.slice(1)) lines[index] = "";
     this.#output(Buffer.from(`${lines.join("\n")}\n\n`, "utf8"));
   }
 }
@@ -335,13 +370,17 @@ class ResponsesJsonTransform extends Transform {
       const original = Buffer.concat(this.#chunks);
       let json;
       try { json = JSON.parse(original.toString("utf8")); } catch { fail("provider_response_malformed"); }
-      observeResponseContext(this.#context, json);
+      // A JSON terminal is not committed merely because it parsed: forced
+      // validation still has to succeed before this context suppresses the
+      // safe pre-relay error response.
+      observeResponseContext(this.#context, json, { terminal: false });
       const usage = json.usage ?? json.response?.usage;
       if (usage && typeof usage === "object") this.#forced?.observeUsage(usage);
       // A single JSON response is the complete forced lifecycle.  Validate it
       // before creating the transformed output, so validation failure writes
       // exactly zero provider bytes to the caller.
       this.#forced?.finish([json]);
+      observeResponseContext(this.#context, json);
       json = restoreOpenAIResponsesEvent(json, this.#toolBuild);
       json = normalizeReasoningResponse(json, responseReasoningModel(this.#model));
       const output = Buffer.from(JSON.stringify(json), "utf8");
