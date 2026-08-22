@@ -1,13 +1,13 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import http from "node:http";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { Readable, Writable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import test from "node:test";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import {
   adaptOpenAIResponses,
@@ -63,13 +63,36 @@ async function directServer(handler) {
   await new Promise((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", resolve); });
   return { server, port: server.address().port };
 }
-function directForwarder(port, base) {
-  const child = spawn(process.execPath, [path.join(root, "src", "api-forwarder.mjs")], {
+function directForwarder(port, base, { env = {}, importFile } = {}) {
+  const child = spawn(process.execPath, [...(importFile ? ["--import", pathToFileURL(importFile).href] : []), path.join(root, "src", "api-forwarder.mjs")], {
     cwd: root,
-    env: { ...process.env, MODEL_ROUTER_STATE_DIR: mkdtempSync(path.join(os.tmpdir(), "task4-direct-")), CODEX_ROUTER_INTERNAL_KEY: INTERNAL_KEY, CODEX_ROUTER_API_PORT: String(port), DEEPSEEK_API_BASE_URL: base, DEEPSEEK_API_KEY: "DIRECT_SECRET_MUST_NOT_LEAK", CODEX_ROUTER_QUIET: "1" },
+    env: { ...process.env, ...env, MODEL_ROUTER_STATE_DIR: mkdtempSync(path.join(os.tmpdir(), "task4-direct-")), CODEX_ROUTER_INTERNAL_KEY: INTERNAL_KEY, CODEX_ROUTER_API_PORT: String(port), DEEPSEEK_API_BASE_URL: base, DEEPSEEK_API_KEY: "DIRECT_SECRET_MUST_NOT_LEAK", CODEX_ROUTER_QUIET: "1" },
     stdio: "ignore",
   });
   return child;
+}
+
+function abortTracePreload({ accelerateDeadline = false } = {}) {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "task4-abort-trace-"));
+  const trace = path.join(directory, "trace.jsonl");
+  const preload = path.join(directory, "preload.mjs");
+  writeFileSync(preload, `
+import { appendFileSync } from "node:fs";
+import http from "node:http";
+const trace = ${JSON.stringify(trace)};
+const NativeAbortController = globalThis.AbortController;
+globalThis.AbortController = class extends NativeAbortController {
+  constructor() { super(); this.traceOwner = new Error().stack?.split("\\n")[2]?.includes("handleRequest") === true; }
+  abort(reason) { if (this.traceOwner) appendFileSync(trace, JSON.stringify({ type: "abort", reason }) + "\\n"); return super.abort(reason); }
+};
+const nativeEnd = http.ServerResponse.prototype.end;
+http.ServerResponse.prototype.end = function (...args) {
+  if (this._codexRouterRequestTelemetry?.forcedUsage) appendFileSync(trace, JSON.stringify({ type: "usage", frozen: Object.isFrozen(this._codexRouterRequestTelemetry.forcedUsage) && Object.isFrozen(this._codexRouterRequestTelemetry.forcedUsage.input_tokens_details), value: this._codexRouterRequestTelemetry.forcedUsage }) + "\\n");
+  return nativeEnd.apply(this, args);
+};
+${accelerateDeadline ? `const nativeSetTimeout = globalThis.setTimeout; globalThis.setTimeout = (fn, delay, ...args) => nativeSetTimeout(fn, delay === 30_001 ? 20 : delay, ...args);` : ""}
+`, "utf8");
+  return { preload, trace, events() { try { return readFileSync(trace, "utf8").trim().split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line)); } catch { return []; } } };
 }
 async function waitForwarder(port) {
   for (let i = 0; i < 100; i += 1) {
@@ -105,10 +128,11 @@ test("injected dispatch deadline admits 30000 and aborts once at 30001 without w
   let callback;
   let delay;
   let cancels = 0;
+  let reason;
   const controller = new AbortController();
   const deadline = createForcedDispatchDeadline({
-    controller,
-    onTimeout: () => { cancels += 1; },
+    signal: controller.signal,
+    onTimeout: (nextReason) => { cancels += 1; reason = nextReason; controller.abort(nextReason); },
     timers: { setTimeout(fn, value) { callback = fn; delay = value; return 1; }, clearTimeout() {} },
   });
   assert.equal(delay, 30_001);
@@ -117,6 +141,7 @@ test("injected dispatch deadline admits 30000 and aborts once at 30001 without w
   assert.equal(controller.signal.aborted, true);
   assert.equal(deadline.fired, true);
   assert.equal(cancels, 1);
+  assert.equal(reason, "forced_tool_buffer_timeout");
 });
 
 test("DeepSeek Responses preserves nested reasoning and never emits chat-only thinking fields", () => {
@@ -197,6 +222,24 @@ test("GLM Responses maps tools while preserving required/named choice semantics"
   assert.notEqual(mapped.json.tool_choice.name, "读");
   assert.equal(mapped.json.tools[1].strict, true);
   assert.equal(mapped.json.input[0].type, "function_call");
+
+  const customNamed = buildOpenAIResponsesRequest({
+    model: { ...qwen, slug: "qwen-plan-responses/glm-5.2", upstreamModel: "glm-5.2" },
+    payload: {
+      input,
+      tools: [{ type: "custom", name: "shell", description: "run" }],
+      tool_choice: { type: "custom", name: "shell" },
+    },
+  });
+  assert.deepEqual(customNamed.json.tool_choice, { type: "function", name: customNamed.json.tools[0].name });
+  assert.notEqual(customNamed.json.tool_choice.name, "shell");
+
+  const required = buildOpenAIResponsesRequest({
+    model: { ...qwen, slug: "qwen-plan-responses/glm-5.2", upstreamModel: "glm-5.2" },
+    payload: { input, tools: [tool], tool_choice: "required" },
+  });
+  assert.equal(required.json.tool_choice, "required");
+  assert.equal(required.json.tools[0].strict, true);
 });
 
 test("adapter normalizes final JSON only for third-party Responses and native OpenAI bypasses byte-identically", () => {
@@ -267,6 +310,31 @@ test("custom argument delta frames are dropped instead of serializing data undef
   assert.doesNotMatch(output, /undefined/);
   assert.doesNotMatch(output, /function_call_arguments\.delta/);
   assert.match(output, /response\.custom_tool_call_input\.done/);
+});
+
+test("an aborted forced coordinator never releases already held provider bytes", async () => {
+  const request = buildOpenAIResponsesRequest({
+    model: deepseek,
+    payload: { input, tools: [{ type: "function", name: "run", parameters: { type: "object", properties: {} } }], tool_choice: "required" },
+  });
+  const controller = new AbortController();
+  const adapter = adaptOpenAIResponses({
+    model: { ...deepseek, reasoningDisplayMode: "raw-preserve" },
+    upstream: new Response("", { headers: { "content-type": "text/event-stream" } }),
+    requestContext: { toolBuild: request.toolBuild, signal: controller.signal, abort() {} },
+  });
+  const held = `data: ${JSON.stringify({ type: "response.created", sequence_number: 1, response: { id: "resp_must_not_release", model: "provider-secret", output: [] } })}\n\n`;
+  const source = new Readable({
+    read() {
+      this.push(held);
+      controller.abort("caller_aborted");
+      this.push("data: [DONE]\n\n");
+      this.push(null);
+    },
+  });
+  const output = [];
+  await pipeline(source, ...adapter.transforms, new Writable({ write(chunk, _encoding, callback) { output.push(Buffer.from(chunk)); callback(); } }));
+  assert.equal(Buffer.concat(output).length, 0);
 });
 
 test("byte framer accepts CR-only and split mixed SSE delimiters without changing untouched frames", async () => {
@@ -435,6 +503,70 @@ test("caller cancellation aborts a direct forced dispatch without relaying or re
   } finally { await stop(forwarder, upstream.server); }
 });
 
+test("real forwarder caller cancellation invokes the dispatch abort owner exactly once", async () => {
+  let arrived;
+  const arrivedAtUpstream = new Promise((resolve) => { arrived = resolve; });
+  const upstream = await directServer((_request, _response) => { arrived(); });
+  const trace = abortTracePreload();
+  const port = await openPort(); const forwarder = directForwarder(port, `http://127.0.0.1:${upstream.port}/v1`, { importFile: trace.preload });
+  try {
+    await waitForwarder(port);
+    const controller = new AbortController();
+    const pending = fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: "POST", signal: controller.signal,
+      headers: { Authorization: `Bearer ${INTERNAL_KEY}`, "content-type": "application/json" },
+      body: JSON.stringify({ model: "deepseek-v4-flash", input: "hello", tools: [{ type: "function", name: "run", parameters: { type: "object" } }], tool_choice: "required" }),
+    });
+    await arrivedAtUpstream;
+    controller.abort();
+    await assert.rejects(pending, /abort/i);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(trace.events().filter((event) => event.type === "abort" && /^caller_/.test(event.reason)).length, 1);
+  } finally { await stop(forwarder, upstream.server); }
+});
+
+test("real forwarder coordinator failure aborts once after privately snapshotting usage", async () => {
+  const upstream = await directServer((_request, response) => {
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.end(
+      "data: " + JSON.stringify({ type: "response.created", sequence_number: 1, response: { id: "resp_usage_abort", model: "deepseek-v4-flash", output: [] }, usage: { input_tokens: 9, output_tokens: 2, input_tokens_details: { cached_tokens: 4 } } }) + "\n\n" +
+      "data: " + JSON.stringify({ type: "response.completed", sequence_number: 2, response: { id: "resp_usage_abort", model: "deepseek-v4-flash", output: [] } }) + "\n\n" +
+      "data: [DONE]\n\n",
+    );
+  });
+  const trace = abortTracePreload();
+  const port = await openPort(); const forwarder = directForwarder(port, `http://127.0.0.1:${upstream.port}/v1`, { importFile: trace.preload });
+  try {
+    await waitForwarder(port);
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: "POST", headers: { Authorization: `Bearer ${INTERNAL_KEY}`, "content-type": "application/json" },
+      body: JSON.stringify({ model: "deepseek-v4-flash", input: "hello", tools: [{ type: "function", name: "run", parameters: { type: "object" } }], tool_choice: "required" }),
+    });
+    const body = await response.text();
+    const events = trace.events();
+    assert.equal(events.filter((event) => event.type === "abort" && event.reason === "forced_tool_coordinator").length, 1);
+    assert.equal(events.find((event) => event.type === "usage")?.frozen, true);
+    assert.deepEqual(events.find((event) => event.type === "usage")?.value, { input_tokens: 9, output_tokens: 2, input_tokens_details: { cached_tokens: 4 } });
+    assert.doesNotMatch(body, /input_tokens|cached_tokens|resp_usage_abort/);
+  } finally { await stop(forwarder, upstream.server); }
+});
+
+test("real forwarder deadline aborts once and classifies only that owner reason", async () => {
+  const upstream = await directServer((_request, _response) => {});
+  const trace = abortTracePreload({ accelerateDeadline: true });
+  const port = await openPort(); const forwarder = directForwarder(port, `http://127.0.0.1:${upstream.port}/v1`, { importFile: trace.preload });
+  try {
+    await waitForwarder(port);
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: "POST", headers: { Authorization: `Bearer ${INTERNAL_KEY}`, "content-type": "application/json" },
+      body: JSON.stringify({ model: "deepseek-v4-flash", input: "hello", tools: [{ type: "function", name: "run", parameters: { type: "object" } }], tool_choice: "required" }),
+    });
+    assert.equal(response.status, 504);
+    assert.match(await response.text(), /forced_tool_buffer_timeout/);
+    assert.equal(trace.events().filter((event) => event.type === "abort" && event.reason === "forced_tool_buffer_timeout").length, 1);
+  } finally { await stop(forwarder, upstream.server); }
+});
+
 test("forced provider 429 bypasses validation and preserves its status and retry header", async () => {
   const upstream = await directServer((_request, response) => {
     response.writeHead(429, { "content-type": "application/json", "retry-after": "17" });
@@ -453,6 +585,27 @@ test("forced provider 429 bypasses validation and preserves its status and retry
   } finally { await stop(forwarder, upstream.server); }
 });
 
+test("slow forced 429 clears its deadline immediately after headers and remains opaque JSON", async () => {
+  const upstream = await directServer((_request, response) => {
+    response.writeHead(429, { "content-type": "application/json", "retry-after": "23" });
+    response.flushHeaders();
+    setTimeout(() => response.end(JSON.stringify({ error: { message: "slow provider throttle" } })), 80);
+  });
+  const trace = abortTracePreload({ accelerateDeadline: true });
+  const port = await openPort(); const forwarder = directForwarder(port, `http://127.0.0.1:${upstream.port}/v1`, { importFile: trace.preload });
+  try {
+    await waitForwarder(port);
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: "POST", headers: { Authorization: `Bearer ${INTERNAL_KEY}`, "content-type": "application/json" },
+      body: JSON.stringify({ model: "deepseek-v4-flash", input: "hello", tools: [{ type: "function", name: "run", parameters: { type: "object" } }], tool_choice: "required" }),
+    });
+    assert.equal(response.status, 429);
+    assert.equal(response.headers.get("retry-after"), "23");
+    assert.equal(await response.text(), JSON.stringify({ error: { message: "slow provider throttle" } }));
+    assert.equal(trace.events().filter((event) => event.type === "abort").length, 0);
+  } finally { await stop(forwarder, upstream.server); }
+});
+
 test("multiline data frames parse as one event while unchanged bytes remain exact", async () => {
   const raw = "event: response\r\ndata: {\"type\":\r\ndata: \"response.created\",\"sequence_number\":1,\"response\":{\"id\":\"resp_multiline\",\"model\":\"deepseek-v4-flash\",\"output\":[]}}\r\n\r\n: untouched comment\n\ndata: [DONE]\r\r";
   const adapter = adaptOpenAIResponses({
@@ -462,20 +615,62 @@ test("multiline data frames parse as one event while unchanged bytes remain exac
   assert.equal(await through(adapter.transforms, [Buffer.from(raw)]), raw);
 });
 
-test("slow consumer drains more than 500 ordinary SSE frames in exact order", async () => {
-  const frames = Array.from({ length: 600 }, (_, sequence_number) => `data: ${JSON.stringify({ type: "response.created", sequence_number, response: { id: "resp_slow", model: "deepseek-v4-flash", output: [] } })}\n\n`);
+test("real ToolBuild preserves semantically unchanged multiline and unknown frames byte-for-byte", async () => {
+  const request = buildOpenAIResponsesRequest({
+    model: deepseek,
+    payload: { input, tools: [{ type: "function", name: "run", parameters: { type: "object", properties: {} } }] },
+  });
+  const raw = "event: vendor-extension\r\ndata: {\"type\":\r\ndata: \"vendor.unknown\",\"nested\":{\"value\":1}}\r\n\r\ndata: [DONE]\r\r";
   const adapter = adaptOpenAIResponses({
     model: { ...deepseek, reasoningDisplayMode: "raw-preserve" },
     upstream: new Response("", { headers: { "content-type": "text/event-stream" } }),
+    requestContext: { toolBuild: request.toolBuild },
   });
-  const output = [];
-  await pipeline(
-    Readable.from(frames),
-    ...adapter.transforms,
-    new Writable({ highWaterMark: 1, write(chunk, _encoding, callback) { output.push(Buffer.from(chunk)); setImmediate(callback); } }),
-  );
-  assert.equal(Buffer.concat(output).toString("utf8"), frames.join(""));
-  assert.ok(adapter.relayContext.relayedBytes < 1024 * 1024);
+  assert.equal(await through(adapter.transforms, [Buffer.from(raw)]), raw);
+});
+
+test("slow consumer demand-drains 100 and 600 ordinary SSE frames with O(frames) wakeups", async () => {
+  for (const count of [100, 600]) {
+    const frames = Array.from({ length: count }, (_, sequence_number) => `data: ${JSON.stringify({ type: "response.created", sequence_number, response: { id: "resp_slow", model: "deepseek-v4-flash", output: [] } })}\n\n`);
+    const adapter = adaptOpenAIResponses({
+      model: { ...deepseek, reasoningDisplayMode: "raw-preserve" },
+      upstream: new Response("", { headers: { "content-type": "text/event-stream" } }),
+    });
+    const output = [];
+    await pipeline(
+      Readable.from(frames),
+      ...adapter.transforms,
+      new Writable({ highWaterMark: 1, write(chunk, _encoding, callback) { output.push(Buffer.from(chunk)); setImmediate(callback); } }),
+    );
+    assert.equal(Buffer.concat(output).toString("utf8"), frames.join(""));
+    assert.ok(adapter.relayContext.readWakeups > 0);
+    assert.ok(adapter.relayContext.readWakeups <= count + 4, `${count} frames caused ${adapter.relayContext.readWakeups} wakeups`);
+  }
+});
+
+test("invalid completed reasoning is not committed and becomes one failed terminal with real monotonic context", async () => {
+  const upstream = await directServer((_request, response) => {
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.end(
+      "data: " + JSON.stringify({ type: "response.created", sequence_number: 7, response: { id: "resp_invalid_terminal", model: "deepseek-actual", output: [] } }) + "\n\n" +
+      "data: " + JSON.stringify({ type: "response.output_item.done", sequence_number: 5, output_index: 0, item: { id: "message_1", type: "message", status: "completed", role: "assistant", content: [] } }) + "\n\n" +
+      "data: " + JSON.stringify({ type: "response.completed", sequence_number: 8, response: { id: "resp_invalid_terminal", model: "deepseek-actual", output: [{ id: "reasoning_missing", type: "reasoning", summary: [] }] } }) + "\n\n" +
+      "data: {malformed}\n\n",
+    );
+  });
+  const port = await openPort(); const forwarder = directForwarder(port, `http://127.0.0.1:${upstream.port}/v1`);
+  try {
+    await waitForwarder(port);
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: "POST", headers: { Authorization: `Bearer ${INTERNAL_KEY}`, "content-type": "application/json" }, body: JSON.stringify({ model: "deepseek-v4-flash", input: "hello" }),
+    });
+    const body = await response.text();
+    assert.equal((body.match(/response\.completed/g) || []).length, 0);
+    assert.equal((body.match(/response\.failed/g) || []).length, 1);
+    assert.equal((body.match(/data: \[DONE\]/g) || []).length, 1);
+    assert.match(body, /"sequence_number":8/);
+    assert.match(body, /message_1/);
+  } finally { await stop(forwarder, upstream.server); }
 });
 
 test("a relayed completed terminal prevents a second failure terminal", async () => {

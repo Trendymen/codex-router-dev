@@ -1,5 +1,5 @@
 import { Duplex, Transform } from "node:stream";
-import { isDeepStrictEqual } from "node:util";
+import { types as utilTypes } from "node:util";
 
 import { providerEndpoint } from "./provider-endpoint.mjs";
 import { reasoningTransformForModel, normalizeReasoningResponse } from "./reasoning-summary-compat.mjs";
@@ -8,13 +8,16 @@ import { createForcedToolBuffer, encodeToolDialect, restoreToolEvent, ToolDialec
 const MAX_SSE_FRAME_BYTES = 8 * 1024 * 1024;
 const MAX_JSON_BYTES = 8 * 1024 * 1024;
 const MAX_SSE_WORK = 65_536;
+const MAX_JSON_COMPARE_DEPTH = 64;
+const MAX_JSON_COMPARE_WORK = 65_536;
+const RELAY_CONTEXT_STATE = new WeakMap();
 
 // This object is deliberately caller-owned but contains only JSON values read
 // from the provider stream.  The forwarder uses it if a transform fails after
 // committing bytes, so a terminal frame continues the actual response rather
 // than inventing a new response identity.
 export function createResponsesRelayContext() {
-  return {
+  const context = {
     responseId: "resp_unknown",
     model: "unknown",
     sequenceNumber: 0,
@@ -23,23 +26,68 @@ export function createResponsesRelayContext() {
     relayedBytes: 0,
     terminalSeen: false,
     doneSeen: false,
+    readWakeups: 0,
   };
+  RELAY_CONTEXT_STATE.set(context, { output: new Map() });
+  return context;
 }
 
 function observeResponseContext(context, event, { terminal = true } = {}) {
   if (!context || !event || typeof event !== "object") return;
+  const terminalEvent = ["response.completed", "response.incomplete", "response.failed"].includes(event.type);
+  if (terminalEvent && !terminal) return;
   const response = event.response && typeof event.response === "object" ? event.response : undefined;
   const sequence = event.sequence_number;
-  if (Number.isSafeInteger(sequence) && sequence >= 0) context.sequenceNumber = sequence;
+  const repeatedOrRegressed = Number.isSafeInteger(sequence) && sequence >= 0 && sequence <= context.sequenceNumber;
+  if (Number.isSafeInteger(sequence) && sequence >= 0 && sequence > context.sequenceNumber) context.sequenceNumber = sequence;
   const id = response?.id ?? event.response_id;
   if (typeof id === "string" && id) context.responseId = id;
   const model = response?.model ?? event.model;
   if (typeof model === "string" && model) context.model = model;
-  if (Array.isArray(response?.output)) context.output = response.output;
-  else if (Array.isArray(event.output)) context.output = event.output;
+  const state = RELAY_CONTEXT_STATE.get(context);
+  if (event.type === "response.output_item.done" && event.item && typeof event.item === "object") {
+    const index = Number.isSafeInteger(event.output_index) && event.output_index >= 0
+      ? event.output_index
+      : state?.output.size ?? context.output.length;
+    state?.output.set(index, event.item);
+    if (state) context.output = [...state.output.entries()].sort((left, right) => left[0] - right[0]).map((entry) => entry[1]);
+  }
+  if (!repeatedOrRegressed || terminalEvent) {
+    if (Array.isArray(response?.output)) context.output = response.output;
+    else if (Array.isArray(event.output)) context.output = event.output;
+  }
   const usage = event.usage ?? response?.usage;
   if (usage && typeof usage === "object" && !Array.isArray(usage)) context.usage = usage;
-  if (terminal && ["response.completed", "response.incomplete", "response.failed"].includes(event.type)) context.terminalSeen = true;
+  if (terminal && terminalEvent) context.terminalSeen = true;
+}
+
+function semanticJsonEqual(left, right, state = { work: 0 }, depth = 0) {
+  if (++state.work > MAX_JSON_COMPARE_WORK || depth > MAX_JSON_COMPARE_DEPTH) return false;
+  if (Object.is(left, right)) return true;
+  if (left === null || right === null || typeof left !== typeof right || typeof left !== "object") return false;
+  if (utilTypes.isProxy(left) || utilTypes.isProxy(right)) return false;
+  const leftArray = Array.isArray(left); const rightArray = Array.isArray(right);
+  if (leftArray !== rightArray) return false;
+  try {
+    if (!leftArray) {
+      const leftPrototype = Object.getPrototypeOf(left); const rightPrototype = Object.getPrototypeOf(right);
+      if (![null, Object.prototype].includes(leftPrototype) || ![null, Object.prototype].includes(rightPrototype)) return false;
+    }
+    const leftKeys = Reflect.ownKeys(left); const rightKeys = Reflect.ownKeys(right);
+    if (leftKeys.length !== rightKeys.length || state.work + leftKeys.length > MAX_JSON_COMPARE_WORK) return false;
+    const rightKeySet = new Set(rightKeys);
+    for (const key of leftKeys) {
+      if (typeof key !== "string" || !rightKeySet.has(key)) return false;
+      const leftDescriptor = Object.getOwnPropertyDescriptor(left, key);
+      const rightDescriptor = Object.getOwnPropertyDescriptor(right, key);
+      if (!leftDescriptor || !rightDescriptor || !("value" in leftDescriptor) || !("value" in rightDescriptor)
+        || leftDescriptor.enumerable !== rightDescriptor.enumerable
+        || !semanticJsonEqual(leftDescriptor.value, rightDescriptor.value, state, depth + 1)) return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export class OpenAIResponsesAdapterError extends Error {
@@ -84,13 +132,16 @@ function qwenGlmCompatibility(model) {
 }
 
 function mappedGlmChoice(choice, sourceTools, encodedTools) {
-  if (!choice || typeof choice !== "object" || Array.isArray(choice) || choice.type !== "function" || typeof choice.name !== "string") return choice;
+  if (!choice || typeof choice !== "object" || Array.isArray(choice) || !["function", "custom"].includes(choice.type) || typeof choice.name !== "string") return choice;
   const flattened = [];
   for (const tool of sourceTools || []) {
     if (tool?.type === "namespace" && Array.isArray(tool.tools)) for (const child of tool.tools) flattened.push({ tool: child, namespace: tool.name });
     else flattened.push({ tool, namespace: undefined });
   }
-  const index = flattened.findIndex(({ tool, namespace }) => tool?.type === "function" && tool.name === choice.name && namespace === choice.namespace);
+  const index = flattened.findIndex(({ tool, namespace }) => {
+    const kindMatches = choice.type === "custom" ? tool?.type === "custom" : tool?.type === "function";
+    return kindMatches && tool.name === choice.name && namespace === choice.namespace;
+  });
   if (index < 0 || typeof encodedTools?.[index]?.name !== "string") return choice;
   return { type: "function", name: encodedTools[index].name };
 }
@@ -256,7 +307,7 @@ class SseFramer {
 
 class ResponsesSseToolTransform extends Transform {
   #framer; #toolBuild; #work = 0; #forced; #events; #held = []; #context;
-  #backpressured = false; #pendingCallback; #resumeScheduled = false;
+  #backpressured = false; #pendingCallback; #validated = false;
   #outputQueue = []; #queuedBytes = 0;
   constructor(toolBuild, { signal, abort, limits, forcedBuffer, relayContext } = {}) {
     super(); this.#toolBuild = toolBuild;
@@ -280,28 +331,38 @@ class ResponsesSseToolTransform extends Transform {
       // history of an ordinary relay.
       if (this.#backpressured || this.#outputQueue.length) {
         this.#pendingCallback = callback;
-        this.#scheduleResume();
       }
       else callback();
     } catch (error) { callback(error); }
   }
+  _read(size) {
+    this.#context.readWakeups += 1;
+    if (this.#backpressured) this.#backpressured = false;
+    this.#drainOutput();
+    const callback = !this.#backpressured && !this.#outputQueue.length ? this.#pendingCallback : undefined;
+    if (callback) this.#pendingCallback = undefined;
+    callback?.();
+    super._read(size);
+  }
   _flush(callback) {
     try {
       if (this.#framer.finish((frame) => this.#rewrite(frame))) fail("upstream_stream_truncated");
-      if (this.#forced?.state.aborted === false) this.#forced.finish(this.#events);
+      if (this.#forced && !this.#validated) {
+        if (this.#forced.state.aborted || !this.#finishForced()) { this.#held.length = 0; callback(); return; }
+      }
       this.#release();
       callback();
     } catch (error) { callback(error); }
   }
   #output(chunk) {
-    if (this.#forced) {
+    if (this.#forced && !this.#validated) {
       this.#held.push(chunk);
       return;
     }
     this.#enqueueOutput(chunk);
   }
   #release() {
-    if (!this.#forced) return;
+    if (!this.#forced || !this.#validated) return;
     // `createForcedToolBuffer` has already bounded the raw upstream lifetime
     // at exactly 8 MiB.  Release the held fragments in source order instead of
     // concatenating them, which keeps the peak bounded and preserves framing.
@@ -322,28 +383,11 @@ class ResponsesSseToolTransform extends Transform {
       this.#context.relayedBytes += chunk.length;
       if (!this.push(chunk)) this.#backpressured = true;
     }
-    if (this.#backpressured || this.#outputQueue.length) this.#scheduleResume();
   }
-  #scheduleResume() {
-    if (this.#resumeScheduled) return;
-    this.#resumeScheduled = true;
-    setImmediate(() => {
-      this.#resumeScheduled = false;
-      // The readable buffer is owned by Node. Polling it on a scheduled turn
-      // avoids the Transform `_read` re-entrancy deadlock and gives the
-      // downstream writable a chance to consume exactly one bounded frame.
-      if (this.#backpressured && this.readableLength >= this.readableHighWaterMark) {
-        this.#scheduleResume();
-        return;
-      }
-      this.#backpressured = false;
-      this.#drainOutput();
-      if (!this.#backpressured && !this.#outputQueue.length && this.#pendingCallback) {
-        const callback = this.#pendingCallback;
-        this.#pendingCallback = undefined;
-        callback();
-      }
-    });
+  #finishForced() {
+    if (!this.#forced || this.#validated) return this.#validated;
+    this.#validated = this.#forced.finish(this.#events) === true;
+    return this.#validated;
   }
   #rewrite(raw) {
     if (++this.#work > MAX_SSE_WORK) fail("reasoning_protocol_error");
@@ -353,16 +397,14 @@ class ResponsesSseToolTransform extends Transform {
       // Forced turns release exactly once, after their terminal validation.
       // Heartbeats/comments are valid SSE but cannot open the relay early.
       if (data?.data === "[DONE]" && this.#forced) {
-        this.#forced.finish(this.#events);
-        this.#release();
+        if (this.#finishForced()) this.#release();
+        else this.#held.length = 0;
       }
-      if (data?.data === "[DONE]") this.#context.doneSeen = true;
       this.#output(raw);
       return;
     }
     let event;
     try { event = JSON.parse(data.data); } catch { fail("provider_response_malformed"); }
-    observeResponseContext(this.#context, event);
     this.#events?.push(event);
     const usage = event.usage ?? event.response?.usage;
     if (usage && typeof usage === "object") this.#forced?.observeUsage(usage);
@@ -371,11 +413,36 @@ class ResponsesSseToolTransform extends Transform {
     // exact input is known. A suppressed event is a suppressed frame; JSON
     // stringifying it would manufacture the invalid `data: undefined` event.
     if (restored === undefined) return;
-    if (restored === event || isDeepStrictEqual(restored, event)) { this.#output(raw); return; }
+    observeResponseContext(this.#context, restored, { terminal: false });
+    if (restored === event || semanticJsonEqual(restored, event)) { this.#output(raw); return; }
     const lines = [...data.lines];
     lines[data.index] = `data: ${JSON.stringify(restored)}`;
     for (const index of data.indexes.slice(1)) lines[index] = "";
     this.#output(Buffer.from(`${lines.join("\n")}\n\n`, "utf8"));
+  }
+}
+
+class ResponsesSseContextTransform extends Transform {
+  #framer; #context;
+  constructor(context) { super(); this.#context = context; this.#framer = new SseFramer(); }
+  _transform(chunk, _encoding, callback) {
+    try {
+      this.#framer.push(Buffer.from(chunk), (raw) => this.#observe(raw));
+      callback();
+    } catch (error) { callback(error); }
+  }
+  _flush(callback) {
+    try { if (this.#framer.finish((raw) => this.#observe(raw))) fail("upstream_stream_truncated"); callback(); }
+    catch (error) { callback(error); }
+  }
+  #observe(raw) {
+    const data = dataLine(raw.toString("utf8"));
+    if (data?.data === "[DONE]") this.#context.doneSeen = true;
+    else if (data?.data) {
+      let event; try { event = JSON.parse(data.data); } catch { fail("provider_response_malformed"); }
+      observeResponseContext(this.#context, event);
+    }
+    this.push(raw);
   }
 }
 
@@ -409,10 +476,10 @@ class ResponsesJsonTransform extends Transform {
       // A single JSON response is the complete forced lifecycle.  Validate it
       // before creating the transformed output, so validation failure writes
       // exactly zero provider bytes to the caller.
-      this.#forced?.finish([json]);
-      observeResponseContext(this.#context, json);
+      if (this.#forced && !this.#forced.finish([json])) { callback(); return; }
       json = restoreOpenAIResponsesEvent(json, this.#toolBuild);
       json = normalizeReasoningResponse(json, responseReasoningModel(this.#model));
+      observeResponseContext(this.#context, json);
       const output = Buffer.from(JSON.stringify(json), "utf8");
       this.#context.relayedBytes += output.length;
       this.push(output);
@@ -446,6 +513,6 @@ export function adaptOpenAIResponses({ model, upstream, requestContext = {} } = 
   return Object.freeze({
     upstream,
     relayContext,
-    transforms: [new ResponsesSseToolTransform(toolBuild, { ...requestContext, relayContext }), Duplex.fromWeb(reasoning)],
+    transforms: [new ResponsesSseToolTransform(toolBuild, { ...requestContext, relayContext }), Duplex.fromWeb(reasoning), new ResponsesSseContextTransform(relayContext)],
   });
 }

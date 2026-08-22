@@ -947,6 +947,20 @@ function localModels(response) {
   });
 }
 
+function immutableUsageSnapshot(usage) {
+  const copy = structuredClone(usage);
+  const stack = [copy]; const seen = new WeakSet(); let work = 0;
+  while (stack.length) {
+    const value = stack.pop();
+    if (!value || typeof value !== "object" || seen.has(value)) continue;
+    if (++work > 1_024) throw new TypeError("forced usage snapshot exceeds its private telemetry bound");
+    seen.add(value);
+    for (const child of Object.values(value)) stack.push(child);
+    Object.freeze(value);
+  }
+  return copy;
+}
+
 async function handleRequest(request, response) {
   const startedAt = Date.now();
   const requestUrl = new URL(
@@ -1003,30 +1017,27 @@ async function handleRequest(request, response) {
   }
 
   const controller = new AbortController();
-  request.once("aborted", () => controller.abort());
+  const requestTelemetry = Object.seal({ forcedUsage: undefined });
+  Object.defineProperty(response, "_codexRouterRequestTelemetry", { value: requestTelemetry });
+  const abortDispatch = (reason) => {
+    if (controller.signal.aborted) return false;
+    if (reason === "forced_tool_buffer_timeout") response._codexRouterForcedTimeout = true;
+    controller.abort(reason);
+    return true;
+  };
+  request.once("aborted", () => abortDispatch("caller_aborted"));
   response.once("close", () => {
-    if (!response.writableEnded) controller.abort();
+    if (!response.writableEnded) abortDispatch("caller_closed");
   });
   // Start the forced-choice lifetime at dispatch, not at the first body
-  // chunk.  The adapter consumes this same coordinator once the response
-  // arrives, so caller cancellation can never release held bytes.
-  const forcedBuffer = normalized.providerRequest?.toolBuild?.forcedRequirement
-    ? createForcedToolBuffer({
-        build: normalized.providerRequest.toolBuild,
-        signal: controller.signal,
-        abort: () => controller.abort(),
-      })
-    : undefined;
+  // chunk. The success-only coordinator below receives this same start time.
+  const forcedDispatch = Boolean(normalized.providerRequest?.toolBuild?.forcedRequirement);
+  const forcedStartedAt = Date.now();
   // A forced tool choice has a hard wall-clock budget even when the provider
   // never sends headers or a body. Abort the dispatch controller exactly once;
   // the shared forced coordinator remains sealed by the same signal.
-  const forcedDeadline = forcedBuffer
-    ? createForcedDispatchDeadline({ controller, onTimeout: () => {
-        // Preserve the timeout cause across fetch's generic AbortError so the
-        // public boundary can distinguish a caller disconnect from 30s expiry.
-        response._codexRouterForcedTimeout = true;
-        controller.abort();
-      } })
+  let forcedDeadline = forcedDispatch
+    ? createForcedDispatchDeadline({ signal: controller.signal, onTimeout: abortDispatch })
     : undefined;
   // Command Code's documented API is an entitlement, not a credential: the
   // same key that runs its CLI is refused by /provider/v1 on the plans most of
@@ -1122,6 +1133,13 @@ async function handleRequest(request, response) {
       signal: controller.signal,
     });
   }
+  // A provider error owns its body from the moment its headers arrive. Stop
+  // the forced-success lifetime before waiting for that body; it is not a tool
+  // lifecycle and must never be aborted or decorated by the Responses relay.
+  if (normalized.providerRequest && !upstream.ok) {
+    forcedDeadline?.clear();
+    forcedDeadline = undefined;
+  }
   // Falling back here is legal for the same reason the Copilot replay above
   // is: nothing has been relayed yet. The refusal is read rather than piped
   // because only its body distinguishes "this plan has no API access" from
@@ -1158,6 +1176,21 @@ async function handleRequest(request, response) {
   if (commandCode?.recheck && upstream.ok) {
     recordCommandCodeRoute(commandCode.id, credential.value, { providerApi: true });
   }
+  let firstForcedClock = true;
+  const forcedBuffer = forcedDispatch && upstream.ok
+    ? createForcedToolBuffer({
+        build: normalized.providerRequest.toolBuild,
+        signal: controller.signal,
+        abort: () => abortDispatch("forced_tool_coordinator"),
+        clock: () => {
+          if (firstForcedClock) { firstForcedClock = false; return forcedStartedAt; }
+          return Date.now();
+        },
+        onUsage: (usage) => {
+          requestTelemetry.forcedUsage = immutableUsageSnapshot(usage);
+        },
+      })
+    : undefined;
   const relayContext = normalized.providerRequest ? createResponsesRelayContext() : undefined;
   // The error boundary lives outside this function, so retain the safe,
   // provider-derived context on the response object rather than reconstructing
