@@ -334,14 +334,23 @@ export function restoreToolEvent(event, mapping) {
   if (event?.type === "response.function_call_arguments.delta" || event?.type === "response.function_call_arguments.done") {
     const tracked = state.itemCalls.get(event.item_id);
     if (!tracked) fail();
+    if (event.type.endsWith("delta")) {
+      if (tracked.done) fail();
+      if (typeof event.delta !== "string") fail();
+      tracked.argumentBytes = (tracked.argumentBytes ?? 0) + Buffer.byteLength(event.delta);
+      if (tracked.argumentBytes > FORCED_MAX_BYTES) fail();
+      return undefined;
+    }
     if (event.type.endsWith("done")) {
+      if (tracked.done) fail();
+      tracked.done = true;
       tracked.finalArguments = event.arguments;
       const strictSchema = state.strictValidators?.get(tracked.entry.encodedName);
       if (strictSchema && !schemaAccepts(parseArguments(event.arguments), strictSchema)) fail();
     }
     if (tracked.entry.kind !== "custom") return event;
-    if (event.type.endsWith("delta")) return { ...event, type: "response.custom_tool_call_input.delta" };
-    return { type: "response.custom_tool_call_input.done", item_id: event.item_id, input: exactInput(event.arguments) };
+    const { arguments: _arguments, ...metadata } = event;
+    return { ...metadata, type: "response.custom_tool_call_input.done", input: exactInput(event.arguments) };
   }
   if (event?.type === "response.output_item.done" && event.item?.type === "function_call") {
     const tracked = state.itemCalls.get(event.item.id);
@@ -374,13 +383,29 @@ function callsFrom(value, found = []) {
 
 export function validateForcedToolResult(buffer, build) {
   if (!build?.forcedRequirement) return;
-  if (!buffer || buffer.bytes > FORCED_MAX_BYTES) fail("forced_tool_buffer_limit");
-  if (buffer.elapsedMs > FORCED_MAX_MS) fail("forced_tool_buffer_timeout");
+  if (!buffer || !Number.isSafeInteger(buffer.bytes) || buffer.bytes < 0 || buffer.bytes > FORCED_MAX_BYTES) fail("forced_tool_buffer_limit");
+  if (!Number.isSafeInteger(buffer.elapsedMs) || buffer.elapsedMs < 0 || buffer.elapsedMs > FORCED_MAX_MS) fail("forced_tool_buffer_timeout");
   const calls = callsFrom(buffer.events);
   if (!calls.length) fail("required_tool_not_called");
   const state = stateFor(build.mapping);
+  const seen = new Set();
+  const validCalls = calls.filter((call) => {
+    if (!call || typeof call.call_id !== "string" || !call.call_id || seen.has(call.call_id)) return false;
+    seen.add(call.call_id);
+    const entry = state.byEncodedName.get(call.name);
+    if (!entry) return false;
+    if (entry.kind === "custom") {
+      try { exactInput(call.arguments); } catch { return false; }
+    }
+    const strictSchema = state.strictValidators?.get(entry.encodedName);
+    if (strictSchema) {
+      try { if (!schemaAccepts(parseArguments(call.arguments), strictSchema)) return false; } catch { return false; }
+    }
+    return true;
+  });
+  if (!validCalls.length) fail("required_tool_not_called");
   if (build.forcedRequirement.type === "named") {
-    const matched = calls.some((call) => {
+    const matched = validCalls.some((call) => {
       const entry = state.byEncodedName.get(call.name);
       return entry?.name === build.forcedRequirement.name && entry.kind === build.forcedRequirement.kind;
     });

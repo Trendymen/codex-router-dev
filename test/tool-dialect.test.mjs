@@ -171,9 +171,9 @@ test("streamed custom arguments are restored only when done while strict argumen
   assert.deepEqual(restoreToolEvent({ type: "response.output_item.added", item: { ...call, arguments: "" } }, custom.mapping).item, {
     type: "custom_tool_call", id: "fc_1", call_id: "call_1", name: "computer",
   });
-  assert.equal(restoreToolEvent({ type: "response.function_call_arguments.delta", item_id: "fc_1", delta: '{"input":"move' }, custom.mapping).type, "response.custom_tool_call_input.delta");
-  assert.deepEqual(restoreToolEvent({ type: "response.function_call_arguments.done", item_id: "fc_1", arguments: '{"input":"move pointer"}' }, custom.mapping), {
-    type: "response.custom_tool_call_input.done", item_id: "fc_1", input: "move pointer",
+  assert.equal(restoreToolEvent({ type: "response.function_call_arguments.delta", item_id: "fc_1", delta: '{"input":"move' }, custom.mapping), undefined);
+  assert.deepEqual(restoreToolEvent({ type: "response.function_call_arguments.done", item_id: "fc_1", output_index: 4, sequence_number: 9, arguments: '{"input":"move pointer"}' }, custom.mapping), {
+    type: "response.custom_tool_call_input.done", item_id: "fc_1", output_index: 4, sequence_number: 9, input: "move pointer",
   });
   assert.equal(restoreToolEvent({ type: "response.output_item.done", item: call }, custom.mapping).item.input, "move pointer");
 
