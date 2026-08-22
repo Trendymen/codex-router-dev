@@ -148,20 +148,22 @@ test("Windows catalog filesystem retries one transient staging rename", () => {
 });
 
 test("Windows catalog filesystem preserves the original transient rename error after its retry bound", () => {
-  const original = new Error("transient sharing violation");
-  original.code = "EPERM";
+  const first = new Error("first transient sharing violation");
+  first.code = "EPERM";
+  const second = new Error("second transient sharing violation");
+  second.code = "EBUSY";
   let attempts = 0;
   const waits = [];
   const operations = createCatalogGenerationFileSystem({
     platform: "win32",
     renameSystemCall() {
       attempts += 1;
-      throw original;
+      throw attempts === 1 ? first : second;
     },
     wait(milliseconds) { waits.push(milliseconds); },
   });
 
-  assert.throws(() => operations.rename("staging", "generation"), (error) => error === original);
+  assert.throws(() => operations.rename("staging", "generation"), (error) => error === first);
   assert.equal(attempts, 2);
   assert.deepEqual(waits, [10]);
 });

@@ -172,6 +172,7 @@ function waitForWindowsRenameRetry(milliseconds) {
 }
 
 function renameWithWindowsTransientRetry(rename, source, target, platform, wait) {
+  let firstTransientError;
   for (let attempt = 0; attempt < WINDOWS_RENAME_ATTEMPTS; attempt += 1) {
     try {
       return rename(source, target);
@@ -179,10 +180,11 @@ function renameWithWindowsTransientRetry(rename, source, target, platform, wait)
       if (
         platform !== "win32"
         || !WINDOWS_TRANSIENT_RENAME_CODES.has(error?.code)
-        || attempt === WINDOWS_RENAME_ATTEMPTS - 1
       ) {
         throw error;
       }
+      firstTransientError ||= error;
+      if (attempt === WINDOWS_RENAME_ATTEMPTS - 1) throw firstTransientError;
       wait(WINDOWS_RENAME_RETRY_DELAY_MS);
     }
   }
