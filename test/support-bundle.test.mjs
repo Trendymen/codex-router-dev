@@ -69,6 +69,17 @@ model_catalog_json = ${JSON.stringify(path.join(stateDir, "merged-models.json"))
     assert.doesNotMatch(contents, new RegExp(callerSentinel));
     assert.match(bundle.config.openai_base_url, /\[REDACTED\]/);
     assert.equal("redactedLogTail" in bundle, false);
+
+    const logDecoys = [
+      "support-log-prompt-decoy-7640c044",
+      "support-log-provider-body-decoy-6f7af55c",
+      "support-log-exception-decoy-6886d4ea",
+    ];
+    writeFileSync(path.join(stateDir, "router.log"), logDecoys.map((value) => `prompt=${value}`).join("\n"));
+    const withLogs = createSupportBundle({ includeLogs: true });
+    const withLogsContents = readFileSync(withLogs.path, "utf8");
+    for (const decoy of logDecoys) assert.doesNotMatch(withLogsContents, new RegExp(decoy));
+    assert.match(withLogsContents, /\[REDACTED\]/);
   } finally {
     rmSync(testRoot, { recursive: true, force: true });
   }

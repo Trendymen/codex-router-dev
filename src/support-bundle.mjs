@@ -12,6 +12,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { redactCallerUrl } from "./caller-auth.mjs";
+import { redactSensitive } from "./sensitive-redactor.mjs";
 import { readInstallManifest } from "./install-manifest.mjs";
 import { protectPrivateFile } from "./file-security.mjs";
 import { detectLegacyInstallations } from "./legacy-migration.mjs";
@@ -68,11 +69,11 @@ function fileMetadata(target) {
 }
 
 function redactLogs(contents) {
-  return redactCallerUrl(contents)
-    .replace(/(authorization\s*[:=]\s*bearer\s+)[^\s"']+/gi, "$1[REDACTED]")
-    .replace(/("(?:api[_-]?key|access[_-]?token|refresh[_-]?token)"\s*:\s*")[^"]+/gi, "$1[REDACTED]")
-    .replace(/((?:api[_-]?key|access[_-]?token|refresh[_-]?token)\s*[=:]\s*["']?)[^\s"',}]+/gi, "$1[REDACTED]")
-    .replace(/\bsk-[A-Za-z0-9_-]{12,}\b/g, "[REDACTED_KEY]");
+  // Log lines can contain arbitrary prompt and provider-response text without
+  // a key name. Preserve only the fact that a tail existed rather than making
+  // a best-effort decision about whether it is safe to disclose.
+  if (!contents) return "";
+  return redactSensitive(contents, { sensitive: true });
 }
 
 function logTail() {
@@ -104,7 +105,7 @@ function knownLocalSecrets() {
 }
 
 function redactBundle(contents) {
-  let redacted = redactCallerUrl(contents);
+  let redacted = redactSensitive(redactCallerUrl(contents));
   for (const secret of knownLocalSecrets()) {
     redacted = redacted.replaceAll(secret, "[REDACTED]");
   }
@@ -139,7 +140,7 @@ export function createSupportBundle(options = {}) {
     schemaVersion: 1,
     createdAt: new Date().toISOString(),
     privacy: options.includeLogs
-      ? "Includes a redacted log tail that may still contain prompts or provider responses."
+      ? "Includes only a redacted log-tail marker; log content is excluded."
       : "Credential values, prompts, response bodies, and log contents are excluded.",
     runtime: {
       platform: process.platform,

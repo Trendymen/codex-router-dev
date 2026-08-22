@@ -223,7 +223,10 @@ export function translateGatewayError({
     providerKind,
     retryAfterSeconds,
   });
-  const suffix = detail ? ` (HTTP ${status}: ${detail})` : ` (HTTP ${status})`;
+  // `detail` is intentionally retained above only for the internal failure
+  // classifier. Provider error text routinely includes request bodies, prompt
+  // excerpts, and credentials, so Appendix I forbids exposing it to callers.
+  const suffix = ` (HTTP ${status})`;
   return {
     error: {
       message: `${failure.message}${suffix}`,

@@ -37,7 +37,18 @@ test("extractUpstreamDetail returns empty string for empty bodies", () => {
   assert.equal(extractUpstreamDetail(undefined), "");
 });
 
-test("a 5xx names the provider and keeps the upstream detail", () => {
+test("translated gateway errors never expose a raw provider body", () => {
+  const decoy = "task1-translator-provider-body-decoy-8d99b9f8";
+  const payload = translateGatewayError({
+    status: 503,
+    bodyText: JSON.stringify({ error: { message: decoy, type: "server_error" } }),
+    modelName: "Test Model",
+    providerName: "test-provider",
+  });
+  assert.doesNotMatch(JSON.stringify(payload), new RegExp(decoy));
+});
+
+test("a 5xx names the provider without copying the upstream detail", () => {
   const payload = translateGatewayError({
     status: 503,
     bodyText: LITELLM_503_BODY,
@@ -46,7 +57,7 @@ test("a 5xx names the provider and keeps the upstream detail", () => {
   });
   assert.equal(
     payload.error.message,
-    "Something is wrong at opencode: Grok 4.5 (opencode Go) is unavailable right now. Retry in a few minutes or switch models. (HTTP 503: Upstream request failed: Endpoint is unavailable.)",
+    "Something is wrong at opencode: Grok 4.5 (opencode Go) is unavailable right now. Retry in a few minutes or switch models. (HTTP 503)",
   );
   assert.equal(payload.error.type, "server_error");
   assert.equal(payload.error.code, "503");
@@ -64,7 +75,7 @@ test("a 429 mentions rate limiting and the retry hint", () => {
   });
   assert.equal(
     payload.error.message,
-    "kimi is rate-limiting Kimi K3. Retry in about 30s. (HTTP 429: rate limited)",
+    "kimi is rate-limiting Kimi K3. Retry in about 30s. (HTTP 429)",
   );
   assert.equal(payload.error.type, "rate_limit_error");
 });
@@ -91,7 +102,7 @@ test("a 401 points at credentials and setup", () => {
   });
   assert.equal(
     payload.error.message,
-    "deepseek rejected the stored credentials while serving DeepSeek V4 Pro. Re-run codex-router setup to refresh them. (HTTP 401: invalid api key)",
+    "deepseek rejected the stored credentials while serving DeepSeek V4 Pro. Re-run codex-router setup to refresh them. (HTTP 401)",
   );
   assert.equal(payload.error.type, "authentication_error");
 });
@@ -111,7 +122,7 @@ test("a 401 from an OAuth provider says sign in again, not re-run setup", () => 
   });
   assert.equal(
     payload.error.message,
-    "kimi rejected the OAuth session while serving Kimi K3. Sign in to kimi again. (HTTP 401: Kimi OAuth was rejected; run `kimi login` again.)",
+    "kimi rejected the OAuth session while serving Kimi K3. Sign in to kimi again. (HTTP 401)",
   );
   assert.equal(payload.error.type, "authentication_error");
   assert.ok(!payload.error.message.includes("codex-router setup"));
@@ -212,7 +223,7 @@ test("a 429 whose body says quota is exhausted becomes an out-of-usage error, no
   });
   assert.equal(
     payload.error.message,
-    "You have run out of usage at opencode for GPT 5.6 Luna (opencode). Top up or check the plan on your opencode account. (HTTP 429: You exceeded your current quota, please check your plan and billing details.)",
+    "You have run out of usage at opencode for GPT 5.6 Luna (opencode). Top up or check the plan on your opencode account. (HTTP 429)",
   );
   assert.equal(payload.error.type, "billing_error");
   assert.ok(!payload.error.message.includes("Wait a bit"));
@@ -227,7 +238,7 @@ test("a 402 insufficient-balance body becomes an out-of-usage error", () => {
   });
   assert.equal(
     payload.error.message,
-    "You have run out of usage at deepseek for DeepSeek V4 Pro. Top up or check the plan on your deepseek account. (HTTP 402: Insufficient Balance)",
+    "You have run out of usage at deepseek for DeepSeek V4 Pro. Top up or check the plan on your deepseek account. (HTTP 402)",
   );
   assert.equal(payload.error.type, "billing_error");
 });
@@ -328,7 +339,7 @@ test("a Chinese insufficient-balance body is out-of-usage", () => {
   assert.ok(payload.error.message.startsWith("You have run out of usage at alibaba"));
 });
 
-test("a MiniMax base_resp error body is readable and classified", () => {
+test("a MiniMax base_resp error body is classified without disclosure", () => {
   const payload = translateGatewayError({
     status: 429,
     bodyText: JSON.stringify({
@@ -338,17 +349,17 @@ test("a MiniMax base_resp error body is readable and classified", () => {
     providerName: "minimax",
   });
   assert.equal(payload.error.type, "billing_error");
-  assert.ok(payload.error.message.includes("(HTTP 429: insufficient balance)"));
+  assert.ok(payload.error.message.includes("(HTTP 429)"));
 });
 
-test("a top-level detail field (FastAPI style) is used as the detail", () => {
+test("a top-level detail field (FastAPI style) is used only for classification", () => {
   const payload = translateGatewayError({
     status: 503,
     bodyText: JSON.stringify({ detail: "model is overloaded" }),
     modelName: "HY3 (opencode Go)",
     providerName: "opencode",
   });
-  assert.ok(payload.error.message.includes("(HTTP 503: model is overloaded)"));
+  assert.ok(payload.error.message.includes("(HTTP 503)"));
 });
 
 test("a plain rate-limit 429 still gets the retry hint, not the quota message", () => {
@@ -373,7 +384,7 @@ test("an unclassified 4xx still names the provider", () => {
   });
   assert.equal(
     payload.error.message,
-    "alibaba rejected the request for Qwen 3.8 Max. (HTTP 422: bad payload)",
+    "alibaba rejected the request for Qwen 3.8 Max. (HTTP 422)",
   );
   assert.equal(payload.error.type, "invalid_request_error");
 });
@@ -398,8 +409,8 @@ test("a plan without API access is not reported as a bad credential", () => {
   assert.doesNotMatch(translated.error.message, /rejected the stored credentials/);
   assert.doesNotMatch(translated.error.message, /Re-run codex-router setup/);
   assert.doesNotMatch(translated.error.message, /run out of usage/);
-  // The provider's own wording still rides along.
-  assert.match(translated.error.message, /Upgrade to Provider or higher/);
+  // Provider wording remains private, while the safe remediation remains.
+  assert.match(translated.error.message, /Upgrade the plan on your commandcode account/);
 });
 
 test("a genuine 403 credential rejection still says so", () => {
