@@ -255,3 +255,97 @@ test("forced buffer aborts exactly once on the first excess byte or caller cance
   assert.equal(callerAborts, 1);
   assert.deepEqual(cancelled.state, { bytes: 0, usage: undefined, aborted: true, relayedBytes: 0, retries: 0, failovers: 0 });
 });
+
+test("custom stream keeps wrapper private and rejects reversed, duplicate, post-done, and cross-item lifecycle events", () => {
+  const build = encodeToolDialect({ tools: [customTool], input: [], profile: functionsProfile });
+  const call = mappedCall(build).item;
+  code(() => restoreToolEvent({ type: "response.function_call_arguments.delta", item_id: "missing", delta: "x" }, build.mapping));
+  assert.equal(restoreToolEvent({ type: "response.output_item.added", item: { ...call, arguments: "" } }, build.mapping).item.type, "custom_tool_call");
+  assert.equal(restoreToolEvent({ type: "response.function_call_arguments.delta", item_id: "fc_1", delta: '{"input":"x' }, build.mapping), undefined);
+  const done = restoreToolEvent({ type: "response.function_call_arguments.done", item_id: "fc_1", output_index: 2, sequence_number: 3, arguments: '{"input":"x"}' }, build.mapping);
+  assert.deepEqual(done, { type: "response.custom_tool_call_input.done", item_id: "fc_1", output_index: 2, sequence_number: 3, input: "x" });
+  code(() => restoreToolEvent({ type: "response.function_call_arguments.delta", item_id: "fc_1", delta: "x" }, build.mapping));
+  assert.equal(restoreToolEvent({ type: "response.output_item.done", item: call }, build.mapping).item.input, "x");
+  code(() => restoreToolEvent({ type: "response.output_item.done", item: call }, build.mapping));
+  code(() => restoreToolEvent({ type: "response.output_item.added", item: { ...call, id: "fc_1", call_id: "other", arguments: "" } }, build.mapping));
+});
+
+test("forced named choice retains exact kind namespace and name privately", () => {
+  const namespaceTool = { type: "namespace", name: "mcp__apps", tools: [{ type: "function", name: "run", parameters: { type: "object" } }] };
+  const build = encodeToolDialect({ tools: [namespaceTool, { type: "function", name: "run", parameters: { type: "object" } }], toolChoice: { type: "function", namespace: "mcp__apps", name: "run" }, input: [], profile: functionsProfile });
+  assert.ok(Object.isFrozen(build.forcedRequirement));
+  assert.deepEqual(build.forcedRequirement, { type: "named", kind: "namespace", namespace: "mcp__apps", name: "run" });
+  const foreign = { type: "response.output_item.done", item: { type: "function_call", call_id: "c", name: "run", arguments: "{}" } };
+  assert.throws(() => validateForcedToolResult({ bytes: 0, elapsedMs: 0, events: [foreign] }, build), /required_tool_mismatch/);
+  const matching = { type: "response.output_item.done", item: { type: "function_call", call_id: "n", name: build.tools[0].name, arguments: "{}" } };
+  assert.doesNotThrow(() => validateForcedToolResult({ bytes: 0, elapsedMs: 0, events: [matching] }, build));
+  for (const choice of [{ type: "unknown", name: "run" }, { type: "custom", namespace: "mcp__apps", name: "run" }]) {
+    code(() => encodeToolDialect({ tools: [namespaceTool], toolChoice: choice, input: [], profile: functionsProfile }));
+  }
+});
+
+test("strict namespace validation normalizes nullable roots and compares bounded structural enum and const", () => {
+  const tool = { type: "namespace", name: "mcp", tools: [{ type: "function", name: "set", strict: true, parameters: {
+    type: ["object", "null"], properties: {
+      payload: { type: "object", enum: [{ lane: "a" }], const: { lane: "a" } },
+    }, required: ["payload"], additionalProperties: false,
+  } }] };
+  const build = encodeToolDialect({ tools: [tool], input: [], profile: functionsProfile });
+  assert.equal(build.tools[0].parameters.type, "object");
+  const valid = { type: "response.output_item.done", item: { type: "function_call", id: "ok", call_id: "ok", name: build.tools[0].name, arguments: '{"payload":{"lane":"a"}}' } };
+  assert.equal(restoreToolEvent(valid, build.mapping).item.namespace, "mcp");
+  const invalid = { ...valid, item: { ...valid.item, id: "bad", call_id: "bad", arguments: '{"payload":{"lane":"b"}}' } };
+  code(() => restoreToolEvent(invalid, build.mapping));
+});
+
+test("forced direct validation rejects invalid numeric counters and invalid calls as a whole", () => {
+  const build = encodeToolDialect({ tools: [customTool], toolChoice: "required", input: [], profile: functionsProfile });
+  for (const buffer of [
+    { bytes: NaN, elapsedMs: 0, events: [] }, { bytes: -1, elapsedMs: 0, events: [] },
+    { bytes: Number.MAX_SAFE_INTEGER + 1, elapsedMs: 0, events: [] }, { bytes: 0, elapsedMs: Infinity, events: [] },
+    { bytes: 0, elapsedMs: -1, events: [] },
+  ]) assert.throws(() => validateForcedToolResult(buffer, build), ToolDialectError);
+  const valid = mappedCall(build);
+  const duplicate = { ...valid, item: { ...valid.item } };
+  assert.throws(() => validateForcedToolResult({ bytes: 0, elapsedMs: 0, events: [valid, duplicate] }, build), /required_tool_not_called/);
+  const unknown = { ...valid, item: { ...valid.item, call_id: "u", name: "not_declared" } };
+  assert.throws(() => validateForcedToolResult({ bytes: 0, elapsedMs: 0, events: [unknown] }, build), /required_tool_not_called/);
+});
+
+test("buffer seals invalid clocks and counters, cleans listeners, and reports immutable usage before one abort", () => {
+  const build = encodeToolDialect({ tools: [customTool], toolChoice: "required", input: [], profile: functionsProfile });
+  const listeners = new Set();
+  const signal = { aborted: false, addEventListener(_name, listener) { listeners.add(listener); }, removeEventListener(_name, listener) { listeners.delete(listener); } };
+  const trace = []; let now = 5;
+  const buffer = createForcedToolBuffer({ build, signal, clock: () => now, abort: () => trace.push("abort"), onUsage: (usage) => { trace.push("usage"); usage.input_tokens = 999; } });
+  const rawUsage = { input_tokens: 7 };
+  buffer.observeUsage(rawUsage); rawUsage.input_tokens = 8;
+  now = 4;
+  assert.throws(() => buffer.push("x"), /forced_tool_buffer_timeout/);
+  assert.deepEqual(trace, ["usage", "abort"]);
+  assert.equal(listeners.size, 0);
+  assert.equal(buffer.push("x"), false);
+  assert.ok(Object.isFrozen(buffer.state.usage));
+  assert.equal(buffer.state.usage.input_tokens, 7);
+  let counterAborts = 0;
+  const invalidCounter = createForcedToolBuffer({ build, byteCounter: () => NaN, abort: () => { counterAborts += 1; } });
+  assert.throws(() => invalidCounter.push("x"), /forced_tool_buffer_limit/);
+  assert.equal(counterAborts, 1);
+});
+
+test("descriptor-only bounded reads turn hostile graphs into ToolDialectError without invoking getters", () => {
+  let reads = 0;
+  const getterTool = { type: "function", get name() { reads += 1; return "run"; } };
+  code(() => encodeToolDialect({ tools: [getterTool], input: [], profile: functionsProfile }));
+  assert.equal(reads, 0);
+  const cyclic = []; cyclic.push(cyclic);
+  code(() => encodeToolDialect({ tools: [], input: cyclic, profile: functionsProfile }));
+  const proxy = new Proxy({}, { ownKeys() { throw new Error("decoy"); } });
+  const build = encodeToolDialect({ tools: [customTool], toolChoice: "required", input: [], profile: functionsProfile });
+  assert.throws(() => restoreToolEvent(proxy, build.mapping), ToolDialectError);
+  assert.throws(() => validateForcedToolResult({ bytes: 0, elapsedMs: 0, get events() { throw new Error("decoy"); } }, build), ToolDialectError);
+  const deep = {}; let cursor = deep;
+  for (let index = 0; index < 30; index += 1) { cursor.next = {}; cursor = cursor.next; }
+  assert.throws(() => restoreToolEvent(deep, build.mapping), ToolDialectError);
+  code(() => encodeToolDialect({ tools: [customTool], input: [{ type: "function_call", call_id: "x", name: "unknown", arguments: "{}" }], profile: functionsProfile }));
+});
