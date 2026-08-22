@@ -422,3 +422,49 @@ test("every legal mixed blank-line delimiter is framed across byte boundaries", 
     assert.equal(events(output).at(-1).type, "response.completed", JSON.stringify(delimiter));
   }
 });
+
+test("closed-item terminal comparison covers missing and extra summary parts without leaking text", async () => {
+  const seen = [];
+  const base = [
+    { type: "response.output_item.added", output_index: 0, item: { id: "rs_terminal_parts", type: "reasoning" } },
+    { type: "response.output_item.done", output_index: 0, item: { id: "rs_terminal_parts", type: "reasoning", summary: [{ type: "summary_text", text: "one" }, { type: "summary_text", text: "two" }], content: [] } },
+  ];
+  await transform([...base, { type: "response.completed", response: { output: [{ id: "rs_terminal_parts", type: "reasoning", summary: [{ type: "summary_text", text: "one" }], content: [] }] } }].map(sse), {
+    responseId: "resp_terminal_parts", model: model(), observeReasoningProtocol: (event) => seen.push(event),
+  });
+  assert.equal(seen.at(-1).summaryIndex, 1);
+  assert.equal(JSON.stringify(seen).includes("two"), false);
+  await assert.rejects(() => transform([...base, { type: "response.completed", response: { output: [{ id: "rs_terminal_parts", type: "reasoning", summary: [{ type: "summary_text", text: "one" }, { type: "summary_text", text: "two" }, { type: "summary_text", text: "three" }], content: [] }] } }].map(sse), { responseId: "resp_terminal_extra", model: model() }), { code: "reasoning_final_part_missing" });
+});
+
+test("nonstream anonymous reasoning keeps actual unique output indexes in IDs and output", () => {
+  const normalized = normalizeReasoningResponse({ id: "resp_nonstream_index", output: [
+    { type: "message", output_index: 4 },
+    { type: "reasoning", summary: [], content: [] },
+    { type: "reasoning", output_index: 9, summary: [], content: [] },
+  ] }, model());
+  assert.deepEqual(normalized.output.slice(1).map((item) => [item.output_index, item.id]), [
+    [1, "rsn_PEn3VNOjst90jzvJWan-hGJE"],
+    [9, "rsn_-b0JgioJ0XNLX_5IwU35q-FI"],
+  ]);
+});
+
+test("CR plus CRLF blank lines frame unknown bytes at every split", async () => {
+  const unknown = Buffer.from("data: {\"type\":\"unknown\"}\r\r\n", "utf8");
+  const terminal = Buffer.from("data: {\"type\":\"response.completed\",\"response\":{\"output\":[]}}\r\r\n", "utf8");
+  const input = Buffer.concat([unknown, terminal]);
+  for (let split = 0; split <= input.length; split += 1) {
+    const output = await transform([input.subarray(0, split), input.subarray(split)], { responseId: "resp_cr_crlf", model: model() });
+    assert.deepEqual(Buffer.from(output).subarray(0, unknown.length), unknown, String(split));
+  }
+});
+
+test("all injected compatibility limits reject invalid numeric values with the registered protocol code", () => {
+  for (const field of ["maxPendingFrameBytes", "maxReasoningBytes", "maxItems", "maxParts", "maxWork"]) {
+    for (const value of [NaN, Infinity, -Infinity, -1, 0, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+      assert.throws(() => createReasoningCompatTransform({ responseId: "resp_limits", model: model(), [field]: value }), { code: "reasoning_protocol_error" }, `${field}=${value}`);
+    }
+  }
+  assert.throws(() => normalizeReasoningResponse({ output: [] }, model(), { maxReasoningBytes: NaN }), { code: "reasoning_protocol_error" });
+  assert.doesNotThrow(() => createReasoningCompatTransform({ responseId: "resp_limit_valid", model: model(), maxPendingFrameBytes: 1, maxReasoningBytes: 1, maxItems: 1, maxParts: 1, maxWork: 1 }));
+});

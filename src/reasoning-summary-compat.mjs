@@ -60,6 +60,7 @@ function canonicalItem(source, id, summary, status) {
   const { thinking: _thinking, reasoning_content: _reasoning, content: _content, summary: _summary, status: _status, encrypted_content: _envelope, ...rest } = safe;
   return { ...rest, id, type: "reasoning", status, summary: summary.map((text) => ({ type: "summary_text", text })), content: [], ...(envelope === undefined ? {} : { encrypted_content: envelope }) };
 }
+function validLimit(value) { return Number.isSafeInteger(value) && value > 0 && value <= 64 * 1024 * 1024; }
 function frame(type, payload, eol = "\n") { return Buffer.from(`data: ${JSON.stringify({ type, ...payload })}${eol}${eol}`, "utf8"); }
 function parseSse(raw) {
   const text = raw.toString("utf8");
@@ -86,7 +87,7 @@ class Framer {
       }
       const next = this.#tail + String.fromCharCode(chunk[offset]);
       const deferred = next.endsWith("\n\r") || next.endsWith("\r\n\r") || next.endsWith("\r\r");
-      const boundary = !deferred && (next.endsWith("\n\n") || next.endsWith("\r\n\r\n") || next.endsWith("\n\r\n") || next.endsWith("\r\n\n"));
+      const boundary = !deferred && (next.endsWith("\n\n") || next.endsWith("\r\n\r\n") || next.endsWith("\n\r\n") || next.endsWith("\r\n\n") || next.endsWith("\r\r\n"));
       this.#tail = next.slice(-3);
       this.#deferred = deferred;
       if (!boundary) continue;
@@ -123,7 +124,7 @@ export function createReasoningCompatTransform({
 } = {}) {
   mode(model);
   const sourceKind = shape(model, finalShape);
-  if (!Number.isSafeInteger(maxPendingFrameBytes) || maxPendingFrameBytes < 1) fail("reasoning_protocol_error");
+  if (![maxPendingFrameBytes, maxReasoningBytes, maxItems, maxParts, maxWork].every(validLimit)) fail("reasoning_protocol_error");
   const items = new Map(); const byIndex = new Map(); const framer = new Framer(maxPendingFrameBytes);
   let terminal = false; let canceled = Boolean(signal?.aborted); let frames = 0; let bytes = 0; let work = 0;
   const observe = (code, item, extra = {}) => {
@@ -131,10 +132,10 @@ export function createReasoningCompatTransform({
   };
   const reportMismatch = (item, summaryIndex, emitted, final) => observe("reasoning_final_mismatch", item, {
     summaryIndex,
-    emittedBytes: Buffer.byteLength(emitted),
-    finalBytes: Buffer.byteLength(final),
-    emittedHash: createHash("sha256").update(emitted).digest("hex"),
-    finalHash: createHash("sha256").update(final).digest("hex"),
+    emittedBytes: Buffer.byteLength(emitted ?? ""),
+    finalBytes: Buffer.byteLength(final ?? ""),
+    emittedHash: createHash("sha256").update(emitted ?? "").digest("hex"),
+    finalHash: createHash("sha256").update(final ?? "").digest("hex"),
   });
   const spend = (count = 0, units = 1) => {
     bytes += count; work += units;
@@ -258,7 +259,8 @@ export function createReasoningCompatTransform({
         if (!item.closed) reconcile(item, final, eol, controller);
         else {
           const terminalParts = selectedFinalParts(sourceKind, final);
-          for (let index = 0; index < terminalParts.length; index += 1) {
+          if (terminalParts.length > item.summary.length) fail("reasoning_final_part_missing");
+          for (let index = 0; index < Math.max(item.summary.length, terminalParts.length); index += 1) {
             if (item.summary[index] !== terminalParts[index]) reportMismatch(item, index, item.summary[index] ?? "", terminalParts[index]);
           }
         }
@@ -322,6 +324,7 @@ export function normalizeReasoningResponse(json, model, { maxReasoningBytes = MA
   if (mode(model) === "raw-preserve") return normalizeRawReasoningResponse(json);
   const sourceKind = shape(model);
   if (!json || typeof json !== "object" || !Array.isArray(json.output)) return json;
+  if (!validLimit(maxReasoningBytes)) fail("reasoning_protocol_error");
   const indexes = new Set(); const ids = new Set(); let bytes = 0;
   return { ...json, output: json.output.map((item, arrayIndex) => {
     if (item?.type !== "reasoning") return item;
@@ -332,7 +335,7 @@ export function normalizeReasoningResponse(json, model, { maxReasoningBytes = MA
     const parts = selectedFinalParts(sourceKind, item);
     bytes += parts.reduce((sum, text) => sum + Buffer.byteLength(text), 0);
     if (bytes > maxReasoningBytes) fail("reasoning_protocol_error");
-    return canonicalItem(item, id, parts, "completed");
+    return canonicalItem({ ...item, output_index: outputIndex }, id, parts, "completed");
   }) };
 }
 export function reasoningTransformForModel(model, options = {}) {
