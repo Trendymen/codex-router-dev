@@ -66,12 +66,15 @@ export async function verifyProtocolProof(slug, options = {}) {
   // candidate commit with this revision: an operator revoke during the probe
   // wins instead of being silently resurrected by stale evidence.
   const expectedRevision = protocolProofRevision(model.slug);
-  const probe = options.dispatchProtocolProbe ?? dispatchNodeProtocolProbe;
-  const evidence = await probe(model, {
+  const probe = options.dispatchProtocolProbe ?? ((candidate, probeOptions) =>
+    dispatchNodeProtocolProbe(candidate, probeOptions, { runProbe: options.runProbe }));
+  const probeOptions = {
     retry: false,
     failover: false,
     checks: CHECKS,
-  });
+    ...(options.dispatchProtocolProbe ? {} : { confirmed: options.confirmed === true }),
+  };
+  const evidence = await probe(model, probeOptions);
   if (
     evidence?.verdict !== "passing" ||
     !VERIFIED_FINAL_SHAPES.has(evidence.measuredFinalReasoningShape)

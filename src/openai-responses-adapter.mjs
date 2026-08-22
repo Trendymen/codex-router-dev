@@ -198,8 +198,8 @@ function applyResponsesProfile(model, payload, toolBuild) {
 export function providerHeaders(model, credential) {
   responseModel(model);
   const value = credential?.value ?? credential;
-  if (typeof value !== "string" || !value) return { Accept: "application/json" };
-  return { Authorization: `Bearer ${value}`, Accept: "application/json" };
+  if (typeof value !== "string" || !value) return { "Content-Type": "application/json", Accept: "application/json" };
+  return { Authorization: `Bearer ${value}`, "Content-Type": "application/json", Accept: "application/json" };
 }
 
 export function buildOpenAIResponsesRequest({ model, payload, credential } = {}) {

@@ -172,3 +172,24 @@ test("the Phase 1 dispatcher fails closed without a network seam", async () => {
   }
   assert.equal(calls, 0);
 });
+
+test("an explicitly injected authorized probe runner uses the production verifier seam", async () => {
+  const proof = await verifyProtocolProof(slug, {
+    confirmed: true,
+    runProbe: async ({ argv, model: candidate, options }) => {
+      assert.equal(argv[0], process.execPath);
+      assert.match(argv[1], /compatibility-test\.mjs$/);
+      assert.deepEqual(argv.slice(2), [candidate.slug, "--live", "--yes", "--json"]);
+      assert.deepEqual(options, { retry: false, failover: false });
+      return {
+        model: candidate.slug,
+        verdict: "passing",
+        measuredFinalReasoningShape: "hybrid-summary",
+        checks: ["nonstream", "stream-reasoning", "auto-tool", "continuation", "usage"].map((name) => ({ name, ok: true })),
+      };
+    },
+    clock: () => new Date("2026-08-22T01:02:03.000Z"),
+    transactionOptions: { transaction: async ({ mutate }) => mutate() },
+  });
+  assert.equal(proof.verdict, "passing");
+});

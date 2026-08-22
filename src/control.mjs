@@ -2271,20 +2271,27 @@ async function handleProtocolProof(action, slug, flags) {
     "./protocol-proof.mjs"
   );
   const command = action || "status";
+  const usage = "Usage: control protocol-proof status [model-slug]|verify <model-slug> [--yes]|revoke <model-slug>";
+  const positionalFlags = (Array.isArray(flags) ? flags : []).filter((flag) => !String(flag).startsWith("--"));
+  const unknownFlags = (Array.isArray(flags) ? flags : []).filter((flag) => String(flag).startsWith("--") && flag !== "--yes");
+  if (unknownFlags.length || positionalFlags.length || (flags || []).filter((flag) => flag === "--yes").length > 1) throw new Error(usage);
   if (command === "status") {
+    if (flags?.length || (slug && String(slug).startsWith("--"))) throw new Error(usage);
     const proof = slug ? readProtocolProof(slug) : undefined;
     process.stdout.write(`${JSON.stringify(slug ? { slug, proof } : { proofs: protocolProofSnapshot() })}\n`);
     return;
   }
   if (!slug) {
-    throw new Error("Usage: control protocol-proof status|verify|revoke <model-slug> [--yes]");
+    throw new Error(usage);
   }
   if (command === "revoke") {
+    if (flags?.length) throw new Error(usage);
     await revokeProtocolProof(slug);
     process.stdout.write(`${JSON.stringify({ slug, proof: null })}\n`);
     return;
   }
   if (command === "verify") {
+    if (flags?.some((flag) => flag !== "--yes")) throw new Error(usage);
     if (!flags.includes("--yes")) {
       process.stderr.write("Protocol verification can consume provider quota. Re-run with --yes to confirm.\n");
       return;
@@ -2293,7 +2300,7 @@ async function handleProtocolProof(action, slug, flags) {
     process.stdout.write(`${JSON.stringify(await verifyProtocolProof(slug, { confirmed: true }))}\n`);
     return;
   }
-  throw new Error("Usage: control protocol-proof status|verify|revoke <model-slug> [--yes]");
+  throw new Error(usage);
 }
 
 // --- dispatch ---------------------------------------------------------------

@@ -1,8 +1,14 @@
 import { adaptAnthropicMessages, buildAnthropicMessagesRequest } from "./anthropic-messages-adapter.mjs";
+import { Readable, Writable } from "node:stream";
+import { pipeline } from "node:stream/promises";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { adaptOpenAIResponses, buildOpenAIResponsesRequest, createResponsesRelayContext } from "./openai-responses-adapter.mjs";
 import { providerEndpoint } from "./provider-endpoint.mjs";
 import { fetchWithRetry } from "./upstream-retry.mjs";
-import { classifyRoutedFailure, FAILOVER_BUDGET_MS, MAX_FAILOVER_HOPS } from "./model-failover.mjs";
+import { classifyRoutedFailure, FAILOVER_BUDGET_MS, MAX_FAILOVER_HOPS, providerCooldown, recordProviderCooldown } from "./model-failover.mjs";
+import { canonicalProviderId } from "./provider-selection.mjs";
+import { estimateInputTokens } from "./response-usage.mjs";
 import { proofMatchesModel } from "./model-contract.mjs";
 import { readProtocolProof } from "./protocol-proof.mjs";
 
@@ -12,9 +18,17 @@ import { readProtocolProof } from "./protocol-proof.mjs";
 export const DIRECT_RETRY_LIMIT = 2;
 export const DIRECT_RETRY_BACKOFF_MS = 250;
 export const DIRECT_RETRY_BUDGET_MS = 5_000;
+
+export function parseRetryAfter(value) {
+  const text = String(value ?? "").trim();
+  if (!/^\d+$/.test(text)) return undefined;
+  const seconds = Number(text);
+  return Number.isSafeInteger(seconds) && seconds >= 0 && seconds <= 6 * 60 * 60 ? seconds : undefined;
+}
 export function protocolProbeArgv(model) {
   if (!model?.slug) throw new TypeError("protocol probe model is required");
-  return Object.freeze(["src/compatibility-test.mjs", model.slug, "--live", "--yes", "--json"]);
+  const script = fileURLToPath(new URL("./compatibility-test.mjs", import.meta.url));
+  return Object.freeze([process.execPath, path.resolve(script), model.slug, "--live", "--yes", "--json"]);
 }
 
 const RESPONSES_MARKERS = new Set([
@@ -121,8 +135,13 @@ export function canFailoverTo(candidate, sourceModel, payload, { proof } = {}) {
   if (!candidate || !sourceModel) return false;
   if (!candidate.slug || candidate.slug === sourceModel.slug) return false;
   if (candidate.effectiveTransport === "native-openai") return false;
-  if (candidate.provider === sourceModel.provider) return false;
+  if (canonicalProviderId(candidate.provider) === canonicalProviderId(sourceModel.provider)) return false;
+  if (candidate.effectiveTransport !== sourceModel.effectiveTransport) return false;
+  if (candidate.toolDialect && sourceModel.toolDialect && candidate.toolDialect !== sourceModel.toolDialect) return false;
   if (candidate.routable === false || candidate.listed === false || candidate.visible === false) return false;
+  if (providerCooldown(candidate.provider)) return false;
+  const estimatedTokens = estimateInputTokens(JSON.stringify(payload ?? {}));
+  if (Number.isFinite(candidate.contextWindow) && candidate.contextWindow < estimatedTokens) return false;
   if (candidate.rolloutState === "experimental") {
     const matchingProof = proof || readProtocolProof(candidate.slug);
     if (!proofMatchesModel(matchingProof, candidate)) return false;
@@ -131,6 +150,14 @@ export function canFailoverTo(candidate, sourceModel, payload, { proof } = {}) {
   if (markers.size && candidate.effectiveTransport !== "openai-responses") return false;
   if (markers.has("reasoning") && candidate.reasoningDisplayMode === "raw-preserve") return false;
   return true;
+}
+
+export function rankRoutedCandidates(candidates, sourceModel, payload, options = {}) {
+  return (Array.isArray(candidates) ? candidates : [])
+    .filter((candidate) => canFailoverTo(candidate, sourceModel, payload, options))
+    .filter((candidate) => !options.usedModels?.has(candidate.slug))
+    .sort((left, right) => Number(left.priority ?? 999) - Number(right.priority ?? 999) || String(left.slug).localeCompare(String(right.slug)))
+    .slice(0, options.limit ?? MAX_FAILOVER_HOPS);
 }
 
 function shouldFailover(response, bodyText) {
@@ -146,9 +173,16 @@ function candidateList(options, current, payload) {
   const supplied = typeof options.failoverCandidates === "function"
     ? options.failoverCandidates(current, payload)
     : options.failoverCandidates;
-  return (Array.isArray(supplied) ? supplied : [])
-    .filter((candidate) => canFailoverTo(candidate, current, payload, options))
-    .slice(0, MAX_FAILOVER_HOPS);
+  return rankRoutedCandidates(supplied, current, payload, options);
+}
+
+function candidateCredential(options, candidate) {
+  const resolved = options.credentialFor?.(candidate);
+  if (resolved !== undefined && resolved !== null && resolved !== "") return resolved;
+  if (candidate?.keyless === true || candidate?.authMode === "anonymous") {
+    return { value: undefined, source: "explicit keyless/anonymous marker" };
+  }
+  return undefined;
 }
 
 function adapterFor(built, upstream, options) {
@@ -172,7 +206,12 @@ function adapterFor(built, upstream, options) {
 export async function dispatchRoutedRequest(built, options = {}) {
   if (!built?.url || !built?.body) throw new TypeError("built routed request is required");
   const fetchImpl = options.fetchImpl || fetch;
-  const signal = options.signal || built.context?.signal;
+  const callerSignal = options.signal || built.context?.signal;
+  const deadlineController = new AbortController();
+  const deadlineTimer = setTimeout(() => deadlineController.abort(new Error("routed failover budget exceeded")), options.failoverBudgetMs ?? FAILOVER_BUDGET_MS);
+  const signal = callerSignal
+    ? (AbortSignal.any ? AbortSignal.any([callerSignal, deadlineController.signal]) : callerSignal)
+    : deadlineController.signal;
   const startedAt = options.now ? options.now() : Date.now();
   const retryOptions = {
     retries: options.retries ?? DIRECT_RETRY_LIMIT,
@@ -191,7 +230,9 @@ export async function dispatchRoutedRequest(built, options = {}) {
   let retries = 0;
   const failures = [];
   const usedModels = new Set([currentModel.slug]);
-  for (;;) {
+  let originalFailure;
+  try {
+   for (;;) {
     const attempted = await fetchWithRetry(currentBuilt.url, {
       method: "POST",
       headers: currentBuilt.headers,
@@ -205,7 +246,7 @@ export async function dispatchRoutedRequest(built, options = {}) {
       throw new Error("routed provider returned no response");
     }
     if (upstream.ok || (upstream.status >= 200 && upstream.status < 300)) {
-      const adapter = adapterFor(currentBuilt, upstream, options);
+      const adapter = adapterFor(currentBuilt, upstream, { ...options, signal });
       return Object.freeze({
         response: upstream,
         adapter,
@@ -219,17 +260,19 @@ export async function dispatchRoutedRequest(built, options = {}) {
       });
     }
     const bodyText = await upstream.text().catch(() => "");
+    originalFailure ??= { status: upstream.status, bodyText, headers: upstream.headers };
     failures.push({ model: currentModel, status: upstream.status });
     const verdict = classifyRoutedFailure({
       status: upstream.status,
       bodyText,
-      retryAfterSeconds: Number(upstream.headers?.get?.("retry-after")),
+      retryAfterSeconds: parseRetryAfter(upstream.headers?.get?.("retry-after")),
     });
     if (!verdict.swap || hops >= MAX_FAILOVER_HOPS) {
+      const finalFailure = hops ? originalFailure : { status: upstream.status, bodyText, headers: upstream.headers };
       return Object.freeze({
-        response: new Response(bodyText, { status: upstream.status, headers: upstream.headers }),
-        model: currentModel,
-        built: currentBuilt,
+        response: new Response(finalFailure.bodyText, { status: finalFailure.status, headers: finalFailure.headers }),
+        model: hops ? built.model : currentModel,
+        built: hops ? built : currentBuilt,
         retries,
         hops,
         failures,
@@ -238,23 +281,39 @@ export async function dispatchRoutedRequest(built, options = {}) {
     }
     const elapsed = (options.now ? options.now() : Date.now()) - startedAt;
     if (elapsed >= (options.failoverBudgetMs ?? FAILOVER_BUDGET_MS)) {
-      return Object.freeze({ response: new Response(bodyText, { status: upstream.status, headers: upstream.headers }), model: currentModel, built: currentBuilt, retries, hops, failures, elapsedMs: elapsed });
+      return Object.freeze({ response: new Response(originalFailure.bodyText, { status: originalFailure.status, headers: originalFailure.headers }), model: built.model, built, retries, hops, failures, elapsedMs: elapsed });
     }
-    const [candidate] = candidateList(options, currentModel, built.pristinePayload)
-      .filter((entry) => !usedModels.has(entry.slug));
+    recordProviderCooldown(currentModel.provider, verdict);
+    const candidate = candidateList(options, currentModel, built.pristinePayload)
+      .filter((entry) => !usedModels.has(entry.slug))
+      .map((entry) => ({ model: entry, credential: candidateCredential(options, entry) }))
+      .find((entry) => entry.credential !== undefined);
     if (!candidate) {
-      return Object.freeze({ response: new Response(bodyText, { status: upstream.status, headers: upstream.headers }), model: currentModel, built: currentBuilt, retries, hops, failures, elapsedMs: elapsed });
+      return Object.freeze({ response: new Response(originalFailure.bodyText, { status: originalFailure.status, headers: originalFailure.headers }), model: built.model, built, retries, hops, failures, elapsedMs: elapsed });
     }
     hops += 1;
-    usedModels.add(candidate.slug);
-    currentModel = candidate;
-    currentBuilt = buildRoutedRequest(built.pristinePayload, candidate, {
+    usedModels.add(candidate.model.slug);
+    currentModel = candidate.model;
+    currentBuilt = buildRoutedRequest(built.pristinePayload, candidate.model, {
       ...built.context,
       ...options,
-      credential: options.credentialFor?.(candidate) ?? candidate.credential ?? built.context?.credential,
-      baseUrl: options.baseUrlFor?.(candidate) ?? candidate.baseUrl,
+      signal,
+      credential: candidate.credential,
+      baseUrl: options.baseUrlFor?.(candidate.model) ?? candidate.model.baseUrl,
     });
+   }
+  } finally {
+    clearTimeout(deadlineTimer);
   }
+}
+
+export async function readDispatchBody(result) {
+  if (!result?.response?.body) return Buffer.alloc(0);
+  const chunks = [];
+  const sink = new Writable({ write(chunk, _encoding, callback) { chunks.push(Buffer.from(chunk)); callback(); } });
+  const source = Readable.fromWeb(result.response.body);
+  await pipeline(source, ...(result.transforms || []), sink);
+  return Buffer.concat(chunks);
 }
 
 export function routedProviderEndpoint(baseUrl, transport) {
@@ -273,6 +332,9 @@ export async function dispatchProtocolProbe(model, options = {}, { runProbe } = 
       status: 500,
     });
   }
+  if (options.confirmed !== true) {
+    throw Object.assign(new Error("protocol probe requires explicit quota confirmation"), { code: "quota_confirmation_required", status: 409 });
+  }
   if (!model?.slug || typeof runProbe !== "function") {
     throw Object.assign(new Error("protocol probe is unavailable without an injected runner"), {
       code: "protocol_probe_not_implemented",
@@ -281,7 +343,9 @@ export async function dispatchProtocolProbe(model, options = {}, { runProbe } = 
   }
   const argv = protocolProbeArgv(model);
   const evidence = await runProbe({ argv, model, options: { retry: false, failover: false } });
-  if (!evidence || evidence.model !== model.slug || !Array.isArray(evidence.results)) {
+  const requiredChecks = new Set(["nonstream", "stream-reasoning", "auto-tool", "continuation", "usage"]);
+  const checks = Array.isArray(evidence?.checks) ? evidence.checks : [];
+  if (!evidence || evidence.model !== model.slug || evidence.verdict !== "passing" || typeof evidence.measuredFinalReasoningShape !== "string" || !checks.every((check) => requiredChecks.has(check?.name)) || checks.length !== requiredChecks.size || ![...requiredChecks].every((name) => checks.some((check) => check.name === name && check.ok === true))) {
     throw Object.assign(new Error("protocol probe returned no compatibility verdict"), {
       code: "protocol_probe_invalid_evidence",
       status: 422,

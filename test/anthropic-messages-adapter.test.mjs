@@ -358,6 +358,21 @@ test("destroy settles a backpressured transform callback once and cancels its qu
   assert.equal(callbacks, 1);
 });
 
+test("destroy settles a pending flush callback exactly once under the same backpressure race", async () => {
+  const upstream = { status: 200, headers: new Headers({ "content-type": "text/event-stream" }) };
+  const transform = adaptAnthropicMessages({ model: MODEL, upstream, requestContext: { internalKey: KEY } }).transforms[0];
+  transform.push = () => false;
+  transform.once("error", () => {});
+  let callbacks = 0;
+  transform._flush((error) => {
+    callbacks += 1;
+    assert.equal(error?.message, "flush destroyed");
+  });
+  transform.destroy(new Error("flush destroyed"));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(callbacks, 1);
+});
+
 test("rejects malformed/unknown/duplicate/truncated streams and passes non-2xx untouched", async () => {
   const bad = { status: 200, headers: new Headers({ "content-type": "text/event-stream" }), body: Readable.toWeb(Readable.from("data: {bad}\n\n")) };
   const adapted = adaptAnthropicMessages({ model: MODEL, upstream: bad, requestContext: { internalKey: KEY } });

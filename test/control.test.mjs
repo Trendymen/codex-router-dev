@@ -349,6 +349,24 @@ test("model-router restricts protocol-proof to codex and Phase 1 --yes fails clo
   }
 });
 
+test("protocol-proof control commands reject extra positionals, unknown flags, and duplicate yes", () => {
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), "control-protocol-proof-argv-"));
+  const env = { ...process.env, MODEL_ROUTER_TARGET: "codex", MODEL_ROUTER_STATE_DIR: stateDir, CODEX_HOME: path.join(stateDir, "codex-home") };
+  try {
+    for (const argv of [
+      ["protocol-proof", "status", "--yes"],
+      ["protocol-proof", "verify", "slug", "--yes", "--yes"],
+      ["protocol-proof", "revoke", "slug", "extra"],
+    ]) {
+      const result = spawnSync(process.execPath, [path.join(root, "src", "control.mjs"), ...argv], { cwd: root, encoding: "utf8", env });
+      assert.notEqual(result.status, 0, argv.join(" "));
+      assert.match(result.stderr, /Usage: control protocol-proof/i, argv.join(" "));
+    }
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
 test("control toggles tool-result aging without a router restart", () => {
   const stateDir = mkdtempSync(path.join(os.tmpdir(), "control-tool-result-aging-"));
   const env = {

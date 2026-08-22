@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-const { buildRoutedRequest, dispatchRoutedRequest, dispatchProtocolProbe, protocolProbeArgv } = await import("../src/provider-dispatch.mjs");
+const { buildRoutedRequest, dispatchRoutedRequest, dispatchProtocolProbe, protocolProbeArgv, rankRoutedCandidates, readDispatchBody } = await import("../src/provider-dispatch.mjs");
+const { clearAllProviderCooldowns } = await import("../src/model-failover.mjs");
+clearAllProviderCooldowns();
 
 const model = {
   slug: "fixture/openai",
@@ -54,21 +56,23 @@ test("dispatchRoutedRequest retries only before a response is relayed", async ()
 
 test("protocol probes use the exact live compatibility argv and require a real verdict", async () => {
   const candidate = { slug: "fixture/openai" };
-  assert.deepEqual(protocolProbeArgv(candidate), ["src/compatibility-test.mjs", candidate.slug, "--live", "--yes", "--json"]);
+  const expectedArgv = [process.execPath, (await import("node:path")).resolve("src/compatibility-test.mjs"), candidate.slug, "--live", "--yes", "--json"];
+  assert.deepEqual(protocolProbeArgv(candidate), expectedArgv);
   let invocation;
-  const evidence = await dispatchProtocolProbe(candidate, { retry: false, failover: false }, {
+  const evidence = await dispatchProtocolProbe(candidate, { retry: false, failover: false, confirmed: true }, {
     runProbe: async (request) => {
       invocation = request;
-      return { model: candidate.slug, results: [{ ok: true }] };
+      return { model: candidate.slug, verdict: "passing", measuredFinalReasoningShape: "raw-content", checks: ["nonstream", "stream-reasoning", "auto-tool", "continuation", "usage"].map((name) => ({ name, ok: true })) };
     },
   });
   assert.deepEqual(invocation.argv, protocolProbeArgv(candidate));
-  assert.deepEqual(evidence.results, [{ ok: true }]);
+  assert.equal(evidence.verdict, "passing");
 });
 
 test("Appendix D failover swaps only a long rate limit and keeps the pristine request", async () => {
-  const fallback = { ...model, slug: "fallback/openai", provider: "fallback", upstreamModel: "fallback-model", baseUrl: "http://127.0.0.1:9998/v1" };
+  const fallback = { ...model, slug: "z-test-fallback/openai", provider: "z-test-fallback", upstreamModel: "fallback-model", baseUrl: "http://127.0.0.1:9998/v1" };
   let calls = [];
+  assert.equal(rankRoutedCandidates([fallback], model, { input: "same request" }).length, 1);
   const built = buildRoutedRequest({ input: "same request" }, model, { credential: "primary" });
   const result = await dispatchRoutedRequest(built, {
     fetchImpl: async (url, init) => {
@@ -88,7 +92,7 @@ test("Appendix D failover swaps only a long rate limit and keeps the pristine re
 });
 
 test("a 429 without a long Retry-After is returned without retry or failover", async () => {
-  const fallback = { ...model, slug: "fallback/openai", provider: "fallback", baseUrl: "http://127.0.0.1:9998/v1" };
+  const fallback = { ...model, slug: "z-test-fallback/openai", provider: "z-test-fallback", baseUrl: "http://127.0.0.1:9998/v1" };
   let calls = 0;
   const built = buildRoutedRequest({ input: "same request" }, model, { credential: "primary" });
   const result = await dispatchRoutedRequest(built, {
@@ -98,4 +102,64 @@ test("a 429 without a long Retry-After is returned without retry or failover", a
   });
   assert.equal(calls, 1);
   assert.equal(result.response.status, 429);
+});
+
+test("failover never reuses the source credential when the candidate resolver has no key", async () => {
+  const fallback = { ...model, slug: "z-test-fallback/openai", provider: "z-test-fallback", baseUrl: "http://127.0.0.1:9998/v1", credential: "B_SECRET" };
+  const seen = [];
+  const built = buildRoutedRequest({ input: "secret A" }, model, { credential: "A_SECRET" });
+  const result = await dispatchRoutedRequest(built, {
+    fetchImpl: async (_url, init) => {
+      seen.push({ authorization: new Headers(init.headers).get("authorization"), body: Buffer.from(init.body).toString("utf8") });
+      return new Response("rate limited", { status: 429, headers: { "retry-after": "61" } });
+    },
+    failoverCandidates: [fallback],
+    credentialFor: () => undefined,
+    baseUrlFor: (candidate) => candidate.baseUrl,
+    retries: 0,
+  });
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0].authorization, "Bearer A_SECRET");
+  assert.doesNotMatch(seen.join("\n"), /B_SECRET/);
+  assert.equal(result.model.slug, model.slug);
+});
+
+test("the shared routed ranker excludes a different family, transport, dialect, marker, and undersized context", () => {
+  const base = { ...model, provider: "other", slug: "other/openai", priority: 1, routable: true, listed: true, visible: true };
+  const candidates = [
+    base,
+    { ...base, slug: "other/anthropic", effectiveTransport: "anthropic-messages" },
+    { ...base, slug: "other/dialect", toolDialect: "responses-native" },
+    { ...base, slug: "other/small", contextWindow: 1 },
+  ];
+  assert.deepEqual(rankRoutedCandidates(candidates, model, { input: [{ type: "function_call_output", output: "x".repeat(10000) }] }).map((entry) => entry.slug), ["other/openai"]);
+});
+
+test("readDispatchBody consumes the selected adapter output for direct compaction", async () => {
+  const built = buildRoutedRequest({ input: "compact" }, model, { credential: "secret" });
+  const result = await dispatchRoutedRequest(built, {
+    fetchImpl: async () => new Response(JSON.stringify({ id: "r1", output_text: "summary" }), { status: 200, headers: { "content-type": "application/json" } }),
+    retries: 0,
+  });
+  assert.equal(JSON.parse((await readDispatchBody(result)).toString("utf8")).output_text, "summary");
+});
+
+test("all failed failover hops return the originally selected provider error", async () => {
+  const fallback = { ...model, slug: "z-test-fallback/openai", provider: "z-test-fallback", baseUrl: "http://127.0.0.1:9998/v1" };
+  let calls = 0;
+  const built = buildRoutedRequest({ input: "same" }, model, { credential: "A" });
+  const result = await dispatchRoutedRequest(built, {
+    fetchImpl: async () => {
+      calls += 1;
+      return new Response(calls === 1 ? "primary" : "fallback", { status: calls === 1 ? 402 : 401 });
+    },
+    failoverCandidates: [fallback],
+    credentialFor: () => "B",
+    baseUrlFor: (candidate) => candidate.baseUrl,
+    retries: 0,
+  });
+  assert.equal(calls, 2);
+  assert.equal(result.model.slug, model.slug);
+  assert.equal(result.response.status, 402);
+  assert.equal(await result.response.text(), "primary");
 });

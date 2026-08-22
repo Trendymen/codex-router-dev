@@ -35,6 +35,7 @@ import { zaiResponsesCompatTransform } from "./zai-responses-compat.mjs";
 import {
   MERGED_CATALOG_PATH,
   NATIVE_CATALOG_PATH,
+  NODE_ROUTES_PATH,
   PORTS,
   loopback,
 } from "./paths.mjs";
@@ -125,10 +126,14 @@ import { nativeSessionHeaders } from "./codex-native-session.mjs";
 import { installStableFetchTransport } from "./fetch-transport.mjs";
 import {
   buildRoutedRequest as buildDirectRoutedRequest,
-  canFailoverTo,
   dispatchRoutedRequest,
+  rankRoutedCandidates,
+  readDispatchBody,
+  parseRetryAfter,
 } from "./provider-dispatch.mjs";
 import { resolveProviderCredential } from "./provider-credentials.mjs";
+import { createForcedDispatchDeadline } from "./forced-dispatch-deadline.mjs";
+import { createForcedToolBuffer } from "./tool-dialect.mjs";
 
 installStableFetchTransport();
 
@@ -2287,10 +2292,29 @@ function writeIdleNoProviderError(response) {
   });
 }
 
-// The direct path is opt-in while the legacy gateway remains available for
-// existing installations. Once enabled, the provider request is built and
-// selected completely before pipeResponse receives a single byte.
-async function handleDirectRoutedRequest(request, response, payload, route, signal, startedAt) {
+function readResolvedNodeRoute(slug) {
+  if (!slug) return undefined;
+  try {
+    const document = JSON.parse(readFileSync(NODE_ROUTES_PATH, "utf8"));
+    const route = Array.isArray(document?.routes)
+      ? document.routes.find((entry) => entry?.slug === slug)
+      : undefined;
+    if (!route) return undefined;
+    // node-routes.json is emitted only from resolveNodeModel(). Presence in
+    // this protected snapshot is therefore the runtime routability proof;
+    // retain the full registry descriptor for endpoint/capability fields.
+    return { ...MODEL_BY_SLUG.get(slug), ...route, routable: true, listed: true, visible: true };
+  } catch {
+    return undefined;
+  }
+}
+
+// A resolved node-routes snapshot selects the direct path by default. The
+// explicit `=1` form is useful for isolated fixtures without a snapshot and
+// `=0` is the documented emergency kill switch while the legacy gateway stays
+// available for rollback.
+async function handleDirectRoutedRequest(request, response, payload, route, controller, startedAt) {
+  const signal = controller.signal;
   const endpoint = endpointForModel(route);
   const credential = resolveProviderCredential(endpoint);
   if (!credential && endpoint?.authMode !== "anonymous" && !endpoint?.keyless) {
@@ -2314,31 +2338,137 @@ async function handleDirectRoutedRequest(request, response, payload, route, sign
     }
     throw error;
   }
-  const candidates = selectedConfiguredListedModels().filter((candidate) => canFailoverTo(candidate, route, pristine));
-  const result = await dispatchRoutedRequest(built, {
-    signal,
-    failoverCandidates: candidates,
-    credentialFor: (candidate) => resolveProviderCredential(endpointForModel(candidate)),
-    baseUrlFor: (candidate) => resolveProviderBaseUrl(endpointForModel(candidate)).baseUrl,
-    onRetry: (event) => logUpstreamRetry(event, route.slug, "/responses"),
-  });
+  const forcedDispatch = Boolean(built.toolBuild?.forcedRequirement);
+  let forcedDeadline;
+  let forcedUsage;
+  if (forcedDispatch) {
+    const forcedStartedAt = Date.now();
+    const forcedUsageObserver = new ResponseUsageTransform("application/json");
+    forcedUsage = forcedUsageObserver;
+    const forcedBuffer = createForcedToolBuffer({
+      build: built.toolBuild,
+      signal,
+      abort: (reason) => controller.abort(reason),
+      clock: () => forcedStartedAt,
+      onUsage: (usage) => forcedUsageObserver.observeAuthoritativeUsage(usage),
+    });
+    let forcedValidated = false;
+    forcedDeadline = createForcedDispatchDeadline({
+      signal,
+      onTimeout: (reason) => {
+        response._codexRouterForcedTimeout = true;
+        controller.abort(reason);
+      },
+    });
+    built = buildDirectRoutedRequest(pristine, route, {
+      baseUrl: base,
+      credential,
+      internalKey: INTERNAL_KEY,
+      signal,
+      forcedBuffer,
+      onForcedValidated: () => {
+        if (forcedValidated) return;
+        forcedValidated = true;
+        forcedDeadline?.clear();
+        forcedDeadline = undefined;
+      },
+    });
+  }
+  const candidates = rankRoutedCandidates(selectedConfiguredListedModels(), route, pristine);
+  let result;
+  try {
+    result = await dispatchRoutedRequest(built, {
+      signal,
+      failoverCandidates: candidates,
+      credentialFor: (candidate) => resolveProviderCredential(endpointForModel(candidate)),
+      baseUrlFor: (candidate) => resolveProviderBaseUrl(endpointForModel(candidate)).baseUrl,
+      onRetry: (event) => logUpstreamRetry(event, route.slug, "/responses"),
+    });
+  } catch (error) {
+    forcedDeadline?.clear();
+    if (response._codexRouterForcedTimeout && !response.headersSent) {
+      writeJson(response, 504, { error: { type: "router_error", code: "forced_tool_buffer_timeout", message: "The forced tool dispatch exceeded its time limit." } });
+      recordUsageEvent({ model: route.slug, provider: canonicalProviderId(route.provider), status: 504, durationMs: Date.now() - startedAt, ...(forcedUsage?.tokenUsage?.() || {}) });
+      return;
+    }
+    throw error;
+  }
   const upstream = result.response;
   if (!upstream.ok) {
     const bodyText = await upstream.text().catch(() => "");
+    const retryAfter = parseRetryAfter(upstream.headers.get("retry-after"));
+    if (retryAfter !== undefined) response.setHeader("Retry-After", String(retryAfter));
     writeJson(response, upstream.status, translateGatewayError({
       status: upstream.status,
       bodyText,
       modelName: route.displayName || route.slug,
       providerName: providerForModel(result.model)?.ownedBy || result.model.provider,
     }));
-    recordUsageEvent({ model: result.model.slug, provider: canonicalProviderId(result.model.provider), status: upstream.status, durationMs: Date.now() - startedAt, retries: result.retries || undefined, ...(result.hops ? { failoverFrom: route.slug } : {}) });
+    const callerGone = request.aborted || (response.destroyed && !response.writableFinished);
+    recordUsageEvent({ model: result.model.slug, provider: canonicalProviderId(result.model.provider), status: callerGone ? 0 : upstream.status, durationMs: Date.now() - startedAt, ...(forcedUsage?.tokenUsage?.() || {}), retries: result.retries || undefined, ...(result.hops ? { failoverFrom: route.slug } : {}) });
+    forcedDeadline?.clear();
     return;
   }
   const contentType = upstream.headers.get("content-type") || "application/json";
   const usageObserver = new ResponseUsageTransform(contentType);
-  await pipeResponse(upstream, response, HOP_BY_HOP_HEADERS, [...result.transforms, usageObserver]);
+  try {
+    await pipeResponse(upstream, response, HOP_BY_HOP_HEADERS, [...result.transforms, usageObserver]);
+  } finally {
+    forcedDeadline?.clear();
+  }
   const usage = usageObserver.tokenUsage?.();
-  recordUsageEvent({ model: result.model.slug, provider: canonicalProviderId(result.model.provider), status: upstream.status, durationMs: Date.now() - startedAt, ...usage, retries: result.retries || undefined, ...(result.hops ? { failoverFrom: route.slug } : {}) });
+  const callerGone = request.aborted || (response.destroyed && !response.writableFinished);
+  recordUsageEvent({ model: result.model.slug, provider: canonicalProviderId(result.model.provider), status: callerGone ? 0 : upstream.status, durationMs: Date.now() - startedAt, ...usage, ...(forcedUsage?.tokenUsage?.() || {}), retries: result.retries || undefined, ...(result.hops ? { failoverFrom: route.slug } : {}) });
+}
+
+function parseDirectCompactionBody(bytes) {
+  const text = bytes.toString("utf8");
+  try {
+    const json = JSON.parse(text);
+    return { payload: json, summary: extractResponseText(json) };
+  } catch {}
+  let completed;
+  for (const block of text.split(/\r\n\r\n|\n\n|\r\r/)) {
+    const line = block.split(/\r\n|\n|\r/).find((entry) => entry.startsWith("data:"));
+    if (!line) continue;
+    try {
+      const event = JSON.parse(line.slice(5).trim());
+      if (event.type === "response.completed") completed = event.response || event;
+    } catch {}
+  }
+  return { payload: completed || {}, summary: extractResponseText(completed || {}) };
+}
+
+async function summarizeDirect(request, payload, route, signal) {
+  const originalInput = Array.isArray(payload.input) ? payload.input : [];
+  const normalized = await normalizeRoutedAgentInput(request, originalInput, signal);
+  const aged = ageToolResults(normalized, { enabled: toolResultAgingEnabled() });
+  const endpoint = endpointForModel(route);
+  const credential = resolveProviderCredential(endpoint);
+  if (!credential && endpoint?.authMode !== "anonymous" && !endpoint?.keyless) {
+    return { ok: false, status: 503, payload: { error: { message: "The selected provider credential is not configured." } }, input: originalInput, toolResultAging: aged.stats, route };
+  }
+  const body = {
+    ...payload,
+    stream: false,
+    tools: [],
+    input: [...aged.input, messageItem(COMPACT_PROMPT)],
+  };
+  delete body.previous_response_id;
+  delete body.client_metadata;
+  const built = buildDirectRoutedRequest(body, route, { baseUrl: resolveProviderBaseUrl(endpoint).baseUrl, credential, internalKey: INTERNAL_KEY, signal });
+  const result = await dispatchRoutedRequest(built, {
+    signal,
+    failoverCandidates: rankRoutedCandidates(selectedConfiguredListedModels(), route, body),
+    credentialFor: (candidate) => resolveProviderCredential(endpointForModel(candidate)),
+    baseUrlFor: (candidate) => resolveProviderBaseUrl(endpointForModel(candidate)).baseUrl,
+    onRetry: (event) => logUpstreamRetry(event, route.slug, "/responses/compact"),
+  });
+  const bytes = await readDispatchBody(result);
+  const parsed = parseDirectCompactionBody(bytes);
+  const usage = tokenUsageFromPayload(parsed.payload);
+  if (!result.response.ok) return { ok: false, status: result.response.status, payload: parsed.payload, usage, input: originalInput, toolResultAging: aged.stats, route: result.model, failed: result.failures?.map((failure) => ({ route: failure.model, status: failure.status })) || [] };
+  return { ok: true, summary: parsed.summary, input: originalInput, usage, toolResultAging: aged.stats, route: result.model, failed: result.failures?.map((failure) => ({ route: failure.model, status: failure.status })) || [], ...(result.hops ? { failoverFrom: route.slug } : {}) };
 }
 
 async function handleResponses(request, response, requestUrl) {
@@ -2399,6 +2529,8 @@ async function handleResponses(request, response, requestUrl) {
     route = registeredRoute && readProviderSelection().includes(registeredRoute.provider)
       ? registeredRoute
       : undefined;
+    const resolvedNodeRoute = route && readResolvedNodeRoute(route.slug);
+    if (resolvedNodeRoute) route = resolvedNodeRoute;
     if (registeredRoute && !route) {
       writeJson(response, 409, {
         error: {
@@ -2442,7 +2574,20 @@ async function handleResponses(request, response, requestUrl) {
     });
 
     if (route && (compactV1 || compactV2)) {
-      const compaction = await handleRoutedCompaction(
+      const compaction = resolvedNodeRoute && process.env.CODEX_ROUTER_DIRECT_DISPATCH !== "0"
+        ? await (async () => {
+            const result = await summarizeDirect(request, payload, route, controller.signal);
+            const served = { route: result.route, failed: (result.failed || []).filter((entry) => entry.route !== result.route), ...(result.failoverFrom ? { failoverFrom: result.failoverFrom } : {}) };
+            if (!result.ok) return { status: result.status, usage: result.usage, toolResultAging: result.toolResultAging, payload: result.payload, ...served };
+            if (compactV2) {
+              if (payload.stream === false) {
+                const item = { type: "compaction", id: `cmp_${randomUUID().replaceAll("-", "")}`, encrypted_content: encodeSummary(result.summary) };
+                writeJson(response, 200, compactionSnapshot(payload.model, item));
+              } else writeCompactionSse(response, payload.model, result.summary);
+            } else writeJson(response, 200, { output: compactOutput(result.input, result.summary) });
+            return { status: 200, usage: result.usage, toolResultAging: result.toolResultAging, ...served };
+          })()
+        : await handleRoutedCompaction(
         request,
         response,
         payload,
@@ -2495,8 +2640,13 @@ async function handleResponses(request, response, requestUrl) {
       return;
     }
 
-    if (route && process.env.CODEX_ROUTER_DIRECT_DISPATCH === "1") {
-      await handleDirectRoutedRequest(request, response, payload, route, controller.signal, startedAt);
+    if (
+      route &&
+      route.effectiveTransport !== undefined &&
+      (resolvedNodeRoute || process.env.CODEX_ROUTER_DIRECT_DISPATCH === "1") &&
+      process.env.CODEX_ROUTER_DIRECT_DISPATCH !== "0"
+    ) {
+      await handleDirectRoutedRequest(request, response, payload, route, controller, startedAt);
       finalStatus = response.statusCode;
       activityStatus = finalStatus;
       usageRecorded = true;
