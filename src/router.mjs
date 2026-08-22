@@ -134,6 +134,12 @@ import {
 import { resolveProviderCredential } from "./provider-credentials.mjs";
 import { createForcedDispatchDeadline } from "./forced-dispatch-deadline.mjs";
 import { createForcedToolBuffer } from "./tool-dialect.mjs";
+import {
+  ERROR_DEFINITIONS,
+  failedResponseEvent,
+  formatTerminalFrames,
+  routerError,
+} from "./public-error.mjs";
 
 installStableFetchTransport();
 
@@ -2315,6 +2321,11 @@ function readResolvedNodeRoute(slug) {
 // available for rollback.
 async function handleDirectRoutedRequest(request, response, payload, route, controller, startedAt) {
   const signal = controller.signal;
+  if (!["native-openai", "openai-responses", "anthropic-messages"].includes(route?.effectiveTransport)) {
+    const safe = routerError("provider_not_available_in_node_build");
+    writeJson(response, safe.status, safe.body);
+    return;
+  }
   const endpoint = endpointForModel(route);
   const credential = resolveProviderCredential(endpoint);
   if (!credential && endpoint?.authMode !== "anonymous" && !endpoint?.keyless) {
@@ -2403,6 +2414,7 @@ async function handleDirectRoutedRequest(request, response, payload, route, cont
       bodyText,
       modelName: route.displayName || route.slug,
       providerName: providerForModel(result.model)?.ownedBy || result.model.provider,
+      retryAfterSeconds: retryAfter,
     }));
     const callerGone = request.aborted || (response.destroyed && !response.writableFinished);
     recordUsageEvent({ model: result.model.slug, provider: canonicalProviderId(result.model.provider), status: callerGone ? 0 : upstream.status, durationMs: Date.now() - startedAt, ...(forcedUsage?.tokenUsage?.() || {}), retries: result.retries || undefined, ...(result.hops ? { failoverFrom: route.slug } : {}) });
@@ -2414,14 +2426,38 @@ async function handleDirectRoutedRequest(request, response, payload, route, cont
   try {
     await pipeResponse(upstream, response, HOP_BY_HOP_HEADERS, [...result.transforms, usageObserver]);
   } catch (error) {
-    const safeStatus = response.headersSent ? 502 : 502;
-    if (response.headersSent) {
-      writeStreamErrorEvent(response, { code: "reasoning_protocol_error", message: "The provider response could not be completed." });
-      endStreamedResponse(response);
+    const candidate = typeof error?.code === "string" && ERROR_DEFINITIONS[error.code]
+      ? error.code
+      : "reasoning_protocol_error";
+    const safe = routerError(candidate, { internalReason: error?.code || error?.name });
+    const relayContext = result.adapter?.relayContext;
+    if (relayContext?.terminalSeen) {
+      if (!relayContext.doneSeen && !response.writableEnded && !response.destroyed) {
+        response.write("data: [DONE]\n\n");
+        relayContext.doneSeen = true;
+      }
+      if (!response.writableEnded && !response.destroyed) response.end();
+    } else if (response.headersSent) {
+      if (!response.writableEnded && !response.destroyed) {
+        response.write(formatTerminalFrames(failedResponseEvent({
+          responseId: relayContext?.responseId ?? "resp_direct_adapter",
+          model: relayContext?.model ?? result.model.slug,
+          createdAt: Date.now(),
+          sequenceNumber: (relayContext?.sequenceNumber ?? 0) + 1,
+          output: relayContext?.output ?? [],
+          usage: relayContext?.usage,
+        }, safe)));
+        response.end();
+      }
     } else {
-      writeJson(response, safeStatus, { error: { type: "router_error", code: "reasoning_protocol_error", message: "The provider response could not be completed." } });
+      writeJson(response, safe.status, safe.body);
     }
-    recordUsageEvent({ model: result.model.slug, provider: canonicalProviderId(result.model.provider), status: safeStatus, durationMs: Date.now() - startedAt, ...(forcedUsage?.tokenUsage?.() || {}), retries: result.retries || undefined });
+    const retainedForcedUsage = forcedUsage?.tokenUsage?.();
+    const observedUsage = usageObserver.tokenUsage?.();
+    const failureUsage = retainedForcedUsage && Object.values(retainedForcedUsage).some((value) => Number(value) > 0)
+      ? retainedForcedUsage
+      : observedUsage || tokenUsageFromPayload({ usage: relayContext?.usage });
+    recordUsageEvent({ model: result.model.slug, provider: canonicalProviderId(result.model.provider), status: safe.status, durationMs: Date.now() - startedAt, ...(failureUsage || {}), retries: result.retries || undefined, ...(result.hops ? { failoverFrom: route.slug } : {}) });
     return;
   } finally {
     forcedDeadline?.clear();
@@ -2674,7 +2710,6 @@ async function handleResponses(request, response, requestUrl) {
 
     if (
       route &&
-      route.effectiveTransport !== undefined &&
       (resolvedNodeRoute || process.env.CODEX_ROUTER_DIRECT_DISPATCH === "1") &&
       process.env.CODEX_ROUTER_DIRECT_DISPATCH !== "0"
     ) {

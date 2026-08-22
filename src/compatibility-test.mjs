@@ -3,10 +3,7 @@ import { fileURLToPath } from "node:url";
 
 import { redactCallerUrl } from "./caller-auth.mjs";
 import { MODEL_BY_SLUG } from "./model-registry.mjs";
-import {
-  installedRouterBaseUrl,
-  smokeTestModel,
-} from "./smoke-test.mjs";
+import { installedRouterBaseUrl } from "./smoke-test.mjs";
 
 function responseText(payload) {
   if (typeof payload?.output_text === "string") return payload.output_text;
@@ -144,25 +141,6 @@ async function streaming(model) {
   };
 }
 
-async function compaction(model) {
-  const { response, payload } = await request("/responses/compact", {
-    model,
-    input: [
-      {
-        type: "message",
-        role: "user",
-        content: [{ type: "input_text", text: "Remember that the probe value is 42." }],
-      },
-    ],
-  });
-  const text = responseText(payload);
-  return {
-    ok: response.ok && Boolean(text),
-    status: response.status,
-    detail: response.ok && text ? "compaction response verified" : payload?.error?.message || `HTTP ${response.status}`,
-  };
-}
-
 // The two capabilities a Codex spawn actually exercises, and nothing else:
 // a child turn is a streamed conversation driven by tool calls, so a model
 // that streams and answers a forced tool call can hold the child role. Basic
@@ -188,12 +166,23 @@ export async function subagentCapabilityProbe(model) {
 export async function compatibilityTest(model, options = {}) {
   if (!MODEL_BY_SLUG.has(model)) throw new Error(`Unknown registry model: ${model}`);
   const basic = await request("/responses", { model, stream: false, input: "Reply with exactly PROBE_BASIC_OK." });
+  const basicCheck = { name: "nonstream", ok: basic.response.ok && Boolean(responseText(basic.payload)), detail: basic.response.ok ? "non-stream response completed" : basic.payload?.error?.message || "non-stream failed" };
+  if (options.quick === true) {
+    return {
+      model,
+      verdict: basicCheck.ok ? "passing" : "failed",
+      measuredFinalReasoningShape: "unverified",
+      checks: [basicCheck],
+      ok: basicCheck.ok,
+      results: [{ ...basicCheck, status: basic.response.status }],
+    };
+  }
   const reasoning = await reasoningProbe(model);
   const autoTool = await toolCall(model, "auto");
   const continuation = await continuationProbe(model);
   const usage = basic.payload?.usage;
   const checks = [
-    { name: "nonstream", ok: basic.response.ok && Boolean(responseText(basic.payload)), detail: basic.response.ok ? "non-stream response completed" : basic.payload?.error?.message || "non-stream failed" },
+    basicCheck,
     { name: "stream-reasoning", ...reasoning },
     { name: "auto-tool", ok: autoTool.ok, detail: autoTool.detail },
     { name: "continuation", ok: continuation.ok, detail: continuation.detail },
@@ -214,9 +203,10 @@ async function main() {
   if (process.argv.includes("--help")) {
     process.stdout.write(`Usage: test-model MODEL --live --yes [--quick] [--json]
 
-Runs billed live checks for text, streaming, tool calling, and compaction through
-the installed router. Both --live and --yes are required to prevent accidental
-provider charges. --quick runs only the basic response check.
+Runs billed live checks for basic text, streamed reasoning, automatic tool
+calling, a tool-result continuation, and authoritative usage through the
+installed router. Both --live and --yes are required to prevent accidental
+provider charges. --quick makes exactly one basic response request.
 `);
     return;
   }

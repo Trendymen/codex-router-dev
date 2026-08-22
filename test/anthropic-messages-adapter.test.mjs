@@ -373,6 +373,29 @@ test("destroy settles a pending flush callback exactly once under the same backp
   assert.equal(callbacks, 1);
 });
 
+for (const pendingKind of ["transform", "flush"]) {
+  test(`AbortSignal settles a backpressured pending ${pendingKind} callback exactly once`, async () => {
+    const controller = new AbortController();
+    const upstream = { status: 200, headers: new Headers({ "content-type": "text/event-stream" }) };
+    const transform = adaptAnthropicMessages({ model: MODEL, upstream, requestContext: { internalKey: KEY, signal: controller.signal } }).transforms[0];
+    transform.push = () => false;
+    transform.once("error", () => {});
+    let callbacks = 0;
+    const callback = (error) => {
+      callbacks += 1;
+      assert.equal(error?.code, "request_aborted");
+    };
+    if (pendingKind === "transform") {
+      transform.write(Buffer.from(frame("message_start", { type: "message_start", message: { id: "msg_signal_abort", model: "glm-5.2" } })), callback);
+    } else {
+      transform._flush(callback);
+    }
+    controller.abort(new DOMException("caller left", "AbortError"));
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(callbacks, 1);
+  });
+}
+
 test("rejects malformed/unknown/duplicate/truncated streams and passes non-2xx untouched", async () => {
   const bad = { status: 200, headers: new Headers({ "content-type": "text/event-stream" }), body: Readable.toWeb(Readable.from("data: {bad}\n\n")) };
   const adapted = adaptAnthropicMessages({ model: MODEL, upstream: bad, requestContext: { internalKey: KEY } });

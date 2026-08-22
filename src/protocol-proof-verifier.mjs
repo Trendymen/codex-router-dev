@@ -67,18 +67,34 @@ export async function verifyProtocolProof(slug, options = {}) {
   // wins instead of being silently resurrected by stale evidence.
   const expectedRevision = protocolProofRevision(model.slug);
   const probe = options.dispatchProtocolProbe ?? ((candidate, probeOptions) =>
-    dispatchNodeProtocolProbe(candidate, probeOptions, { runProbe: options.runProbe }));
+    dispatchNodeProtocolProbe(candidate, {
+      ...probeOptions,
+      ...(options.allowLive === undefined ? {} : { allowLive: options.allowLive === true }),
+      ...(options.fetchImpl ? { fetchImpl: options.fetchImpl } : {}),
+      ...(options.baseUrl ? { baseUrl: options.baseUrl } : {}),
+      ...(options.credential ? { credential: options.credential } : {}),
+      ...(options.internalKey ? { internalKey: options.internalKey } : {}),
+      ...(options.signal ? { signal: options.signal } : {}),
+      targetSlug: model.slug,
+    }));
   const probeOptions = {
     retry: false,
     failover: false,
     checks: CHECKS,
     ...(options.dispatchProtocolProbe ? {} : { confirmed: options.confirmed === true }),
-    ...(options.dispatchProtocolProbe || options.allowLive === undefined ? {} : { allowLive: options.allowLive === true }),
   };
   const evidence = await probe(model, probeOptions);
+  const checks = Array.isArray(evidence?.checks) ? evidence.checks : [];
+  const byName = new Map(checks.map((check) => [check?.name, check]));
+  const detailedChecksPass = checks.length === CHECKS.length && CHECKS.every((name) => {
+    const check = byName.get(name);
+    return check?.ok === true && check.observed && typeof check.observed === "object" && !Array.isArray(check.observed);
+  });
   if (
+    evidence?.model !== model.slug ||
     evidence?.verdict !== "passing" ||
-    !VERIFIED_FINAL_SHAPES.has(evidence.measuredFinalReasoningShape)
+    !VERIFIED_FINAL_SHAPES.has(evidence.measuredFinalReasoningShape) ||
+    !detailedChecksPass
   ) {
     throw publicError("protocol_proof_verification_failed", 422);
   }

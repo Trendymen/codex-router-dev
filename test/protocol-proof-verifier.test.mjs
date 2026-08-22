@@ -24,8 +24,10 @@ const model = MODEL_BY_SLUG.get(slug);
 
 function passingEvidence(overrides = {}) {
   return {
+    model: slug,
     verdict: "passing",
     measuredFinalReasoningShape: "hybrid-summary",
+    checks: ["nonstream", "stream-reasoning", "auto-tool", "continuation", "usage"].map((name) => ({ name, ok: true, observed: { fixture: true } })),
     ...overrides,
   };
 }
@@ -118,6 +120,21 @@ test("a failed first verification fails closed and creates no proof", async () =
   assert.equal(readProtocolProof(slug), null);
 });
 
+test("a claimed passing verdict without all five detailed successful checks fails closed", async () => {
+  for (const evidence of [
+    passingEvidence({ checks: passingEvidence().checks.slice(0, 4) }),
+    passingEvidence({ checks: passingEvidence().checks.map((check) => check.name === "usage" ? { ...check, ok: false } : check) }),
+    passingEvidence({ checks: passingEvidence().checks.map((check) => check.name === "usage" ? { name: check.name, ok: true } : check) }),
+    passingEvidence({ model: "qwen-plan/substitute" }),
+  ]) {
+    await assert.rejects(
+      () => verifyProtocolProof(slug, verifierOptions({ dispatchProtocolProbe: async () => evidence })),
+      { code: "protocol_proof_verification_failed" },
+    );
+    assert.equal(readProtocolProof(slug), null);
+  }
+});
+
 test("an illegal final shape fails closed on first verification", async () => {
   await assert.rejects(
     () => verifyProtocolProof(
@@ -173,23 +190,18 @@ test("the Phase 1 dispatcher fails closed without a network seam", async () => {
   assert.equal(calls, 0);
 });
 
-test("an explicitly injected authorized probe runner uses the production verifier seam", async () => {
+test("the production verifier seam forwards only the confirmed exact target runtime", async () => {
+  let dispatched;
   const proof = await verifyProtocolProof(slug, {
     confirmed: true,
-    runProbe: async ({ argv, model: candidate, options }) => {
-      assert.equal(argv[0], process.execPath);
-      assert.match(argv[1], /compatibility-test\.mjs$/);
-      assert.deepEqual(argv.slice(2), [candidate.slug, "--live", "--yes", "--json"]);
-      assert.deepEqual(options, { retry: false, failover: false });
-      return {
-        model: candidate.slug,
-        verdict: "passing",
-        measuredFinalReasoningShape: "hybrid-summary",
-        checks: ["nonstream", "stream-reasoning", "auto-tool", "continuation", "usage"].map((name) => ({ name, ok: true })),
-      };
+    dispatchProtocolProbe: async (candidate, options) => {
+      dispatched = { candidate, options };
+      return passingEvidence();
     },
     clock: () => new Date("2026-08-22T01:02:03.000Z"),
     transactionOptions: { transaction: async ({ mutate }) => mutate() },
   });
+  assert.equal(dispatched.candidate.slug, slug);
+  assert.deepEqual(dispatched.options, { retry: false, failover: false, checks: ["nonstream", "stream-reasoning", "auto-tool", "continuation", "usage"] });
   assert.equal(proof.verdict, "passing");
 });

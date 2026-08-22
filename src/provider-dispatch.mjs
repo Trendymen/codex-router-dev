@@ -1,9 +1,6 @@
 import { adaptAnthropicMessages, buildAnthropicMessagesRequest } from "./anthropic-messages-adapter.mjs";
 import { Readable, Writable } from "node:stream";
 import { pipeline } from "node:stream/promises";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
-import { spawn } from "node:child_process";
 import { adaptOpenAIResponses, buildOpenAIResponsesRequest, createResponsesRelayContext } from "./openai-responses-adapter.mjs";
 import { providerEndpoint } from "./provider-endpoint.mjs";
 import { fetchWithRetry } from "./upstream-retry.mjs";
@@ -12,6 +9,13 @@ import { canonicalProviderId } from "./provider-selection.mjs";
 import { estimateInputTokens } from "./response-usage.mjs";
 import { proofMatchesModel } from "./model-contract.mjs";
 import { readProtocolProof } from "./protocol-proof.mjs";
+import { endpointForModel, resolveProviderBaseUrl } from "./model-registry.mjs";
+import { resolveProviderCredential } from "./provider-credentials.mjs";
+import { inputHasImage } from "./vision-bridge.mjs";
+import { flattenNamespaceTools } from "./namespace-relay.mjs";
+import { collaborationToolAvailable } from "./subagent-completion.mjs";
+
+const PROTOCOL_PROBE_BYPASS = Symbol("protocol-probe-bypass");
 
 // Appendix D is intentionally independent of the native ChatGPT retry knobs.
 // A routed request is cheap only until its first response byte is committed;
@@ -30,28 +34,6 @@ export function parseRetryAfter(value) {
   if (!Number.isFinite(date)) return undefined;
   const seconds = Math.ceil((date - Date.now()) / 1_000);
   return Number.isSafeInteger(seconds) && seconds > 0 ? seconds : undefined;
-}
-export function protocolProbeArgv(model) {
-  if (!model?.slug) throw new TypeError("protocol probe model is required");
-  const script = fileURLToPath(new URL("./compatibility-test.mjs", import.meta.url));
-  return Object.freeze([process.execPath, path.resolve(script), model.slug, "--live", "--yes", "--json"]);
-}
-
-export function runProtocolProbe({ argv, timeoutMs = 180_000 } = {}) {
-  if (!Array.isArray(argv) || argv.length < 3 || argv[0] !== process.execPath) throw new TypeError("invalid protocol probe argv");
-  return new Promise((resolve, reject) => {
-    const child = spawn(argv[0], argv.slice(1), { cwd: path.dirname(argv[1]), env: process.env, stdio: ["ignore", "pipe", "pipe"] });
-    let stdout = "";
-    child.stdout.setEncoding("utf8");
-    child.stdout.on("data", (chunk) => { stdout += chunk; });
-    const timer = setTimeout(() => { child.kill(); reject(Object.assign(new Error("protocol probe timed out"), { code: "protocol_probe_timeout", status: 504 })); }, timeoutMs);
-    child.once("error", (error) => { clearTimeout(timer); reject(Object.assign(new Error("protocol probe could not start"), { code: "protocol_probe_failed", status: 502, cause: error })); });
-    child.once("exit", (code) => {
-      clearTimeout(timer);
-      if (code !== 0) return reject(Object.assign(new Error("protocol probe failed"), { code: "protocol_probe_failed", status: 502 }));
-      try { resolve(JSON.parse(stdout)); } catch { reject(Object.assign(new Error("protocol probe returned invalid evidence"), { code: "protocol_probe_invalid_evidence", status: 422 })); }
-    });
-  });
 }
 
 const RESPONSES_MARKERS = new Set([
@@ -109,7 +91,7 @@ export function buildRoutedRequest(pristinePayload, model, context = {}) {
   if (!["native-openai", "openai-responses", "anthropic-messages"].includes(model.effectiveTransport)) {
     throw Object.assign(new Error("The selected model is not available in the Node router."), { code: "provider_not_available_in_node_build", status: 501 });
   }
-  if (model.rolloutState === "experimental" && !proofMatchesModel(context.proof || readProtocolProof(model.slug), model)) {
+  if (model.rolloutState === "experimental" && context.protocolProbeBypass !== PROTOCOL_PROBE_BYPASS && !proofMatchesModel(context.proof || readProtocolProof(model.slug), model)) {
     throw Object.assign(new Error("The selected canary model has no matching protocol proof."), { code: "model_not_enabled", status: 404 });
   }
   if (model.effectiveTransport === "native-openai") {
@@ -165,10 +147,10 @@ export function canFailoverTo(candidate, sourceModel, payload, { proof } = {}) {
   if (providerCooldown(candidate.provider)) return false;
   const estimatedTokens = estimateInputTokens(JSON.stringify(payload ?? {}));
   if (Number.isFinite(candidate.contextWindow) && candidate.contextWindow < estimatedTokens) return false;
-  const serialized = JSON.stringify(payload ?? {});
-  const needsImage = serialized.includes('"input_image"') || serialized.includes('"image_url"');
+  const needsImage = inputHasImage(Array.isArray(payload?.input) ? payload.input : []);
   if (needsImage && !(candidate.inputModalities || []).includes("image") && candidate.visionBridge === false) return false;
-  const needsCollaboration = serialized.includes("spawn_agent") || serialized.includes("wait_agent");
+  const namespaces = flattenNamespaceTools(payload?.tools, { bridgeToolSearch: false }).namespaces;
+  const needsCollaboration = collaborationToolAvailable(namespaces);
   if (needsCollaboration && (candidate.multiAgentVersion || "v1") !== "v2") return false;
   if (candidate.rolloutState === "experimental") {
     const matchingProof = proof || readProtocolProof(candidate.slug);
@@ -222,6 +204,9 @@ function adapterFor(built, upstream, options) {
     relayContext: createResponsesRelayContext(),
   };
   if (built.transport === "openai-responses") {
+    return adaptOpenAIResponses({ model: built.model, upstream, requestContext });
+  }
+  if (built.transport === "native-openai") {
     return adaptOpenAIResponses({ model: built.model, upstream, requestContext });
   }
   return adaptAnthropicMessages({ model: built.model, upstream, requestContext });
@@ -289,7 +274,7 @@ export async function dispatchRoutedRequest(built, options = {}) {
     }
     const bodyText = await upstream.text().catch(() => "");
     originalFailure ??= { status: upstream.status, bodyText, headers: upstream.headers };
-    failures.push({ model: currentModel, status: upstream.status });
+    failures.push({ model: currentModel, providerFamily: canonicalProviderId(currentModel.provider), kind: "response", status: upstream.status });
     const verdict = classifyRoutedFailure({
       status: upstream.status,
       bodyText,
@@ -357,6 +342,23 @@ export async function dispatchRoutedRequest(built, options = {}) {
         aborted: true,
       });
     }
+    if (originalFailure && !callerSignal?.aborted) {
+      failures.push({
+        model: currentModel,
+        providerFamily: canonicalProviderId(currentModel.provider),
+        kind: "transport",
+        errorCode: typeof error?.cause?.code === "string" ? error.cause.code : typeof error?.code === "string" ? error.code : undefined,
+      });
+      return Object.freeze({
+        response: new Response(originalFailure.bodyText, { status: originalFailure.status, headers: originalFailure.headers }),
+        model: built.model,
+        built,
+        retries,
+        hops,
+        failures,
+        elapsedMs: (options.now ? options.now() : Date.now()) - startedAt,
+      });
+    }
     throw error;
   } finally {
     if (deadlineTimer) clearTimeout(deadlineTimer);
@@ -376,12 +378,160 @@ export function routedProviderEndpoint(baseUrl, transport) {
   return providerEndpoint(baseUrl, transport === "anthropic-messages" ? "messages" : "responses");
 }
 
-// Phase 1 owns the quota gate, while this seam owns the exact command shape.
-// Keeping the command construction here prevents a future proof path from
-// substituting a generic "command ran" check for the compatibility verdict.
-// The injected runner is the unit-test seam; production live execution is
-// deliberately unavailable until the explicit Phase 5 quota gate is opened.
-export async function dispatchProtocolProbe(model, options = {}, { runProbe } = {}) {
+const PROBE_TOOL = Object.freeze({
+  type: "function",
+  name: "codex_router_probe",
+  description: "Protocol proof tool",
+  parameters: Object.freeze({
+    type: "object",
+    properties: Object.freeze({ value: Object.freeze({ type: "string" }) }),
+    required: Object.freeze(["value"]),
+    additionalProperties: false,
+  }),
+  strict: true,
+});
+
+function rawEvents(text) {
+  const events = [];
+  for (const block of String(text).split(/\r\n\r\n|\n\n|\r\r/)) {
+    const data = block.split(/\r\n|\n|\r/)
+      .filter((line) => line.startsWith("data:"))
+      .map((line) => line.slice(5).replace(/^ /, ""))
+      .join("\n");
+    if (!data || data === "[DONE]") continue;
+    try { events.push(JSON.parse(data)); } catch {}
+  }
+  return events;
+}
+
+function rawDocument(text, contentType) {
+  if (String(contentType).toLowerCase().includes("text/event-stream")) {
+    const events = rawEvents(text);
+    const terminal = [...events].reverse().find((event) => ["response.completed", "response.incomplete", "response.failed"].includes(event?.type));
+    if (terminal) return { events, payload: terminal.response || terminal };
+    const started = events.find((event) => event?.type === "message_start")?.message;
+    if (started && typeof started === "object") {
+      const blocks = new Map();
+      let usage = started.usage && typeof started.usage === "object" ? { ...started.usage } : undefined;
+      for (const event of events) {
+        if (event?.type === "content_block_start" && Number.isSafeInteger(event.index) && event.content_block && typeof event.content_block === "object") {
+          blocks.set(event.index, { ...event.content_block });
+          continue;
+        }
+        if (event?.type === "content_block_delta" && Number.isSafeInteger(event.index)) {
+          const block = blocks.get(event.index);
+          const delta = event.delta;
+          if (!block || !delta || typeof delta !== "object") continue;
+          if (delta.type === "thinking_delta") block.thinking = `${block.thinking || ""}${delta.thinking || ""}`;
+          if (delta.type === "text_delta") block.text = `${block.text || ""}${delta.text || ""}`;
+          if (delta.type === "input_json_delta") block._arguments = `${block._arguments || ""}${delta.partial_json || ""}`;
+          continue;
+        }
+        if (event?.type === "message_delta" && event.usage && typeof event.usage === "object") usage = { ...(usage || {}), ...event.usage };
+      }
+      const content = [...blocks.entries()].sort((left, right) => left[0] - right[0]).map(([, block]) => {
+        if (block.type !== "tool_use" || block.input !== undefined || block._arguments === undefined) return block;
+        try { return { ...block, input: JSON.parse(block._arguments), _arguments: undefined }; }
+        catch { return block; }
+      });
+      return { events, payload: { ...started, content, usage } };
+    }
+    return { events, payload: {} };
+  }
+  try { return { events: [], payload: JSON.parse(text) }; }
+  catch { return { events: [], payload: {} }; }
+}
+
+function outputItems(document) {
+  if (Array.isArray(document?.payload?.output)) return document.payload.output;
+  if (Array.isArray(document?.payload?.content)) return document.payload.content;
+  return [];
+}
+
+function textFromRaw(document) {
+  const payload = document?.payload || {};
+  if (typeof payload.output_text === "string" && payload.output_text) return payload.output_text;
+  return outputItems(document).flatMap((item) => {
+    if (typeof item?.text === "string") return [item.text];
+    return Array.isArray(item?.content) ? item.content.map((part) => part?.text).filter((text) => typeof text === "string") : [];
+  }).join("");
+}
+
+function rawToolCall(document) {
+  const item = outputItems(document).find((entry) => entry?.type === "function_call" || entry?.type === "tool_use");
+  if (!item) return undefined;
+  const name = item.name;
+  const callId = item.call_id ?? item.id;
+  const args = item.arguments ?? (item.input === undefined ? undefined : JSON.stringify(item.input));
+  if (typeof name !== "string" || !name || typeof callId !== "string" || !callId || typeof args !== "string") return undefined;
+  let parsed;
+  try { parsed = JSON.parse(args); } catch { return undefined; }
+  return { type: "function_call", id: item.id || `fc_${callId}`, call_id: callId, name, arguments: args, parsed };
+}
+
+function rawUsage(document) {
+  const payload = document?.payload || {};
+  const usage = payload.usage ?? [...(document?.events || [])].reverse().find((event) => event?.usage)?.usage;
+  if (!usage || typeof usage !== "object" || Array.isArray(usage)) return undefined;
+  const input = usage.input_tokens;
+  const output = usage.output_tokens;
+  if (![input, output].every((value) => Number.isFinite(value) && value >= 0)) return undefined;
+  const total = Number.isFinite(usage.total_tokens) && usage.total_tokens >= 0 ? usage.total_tokens : input + output;
+  return { input_tokens: input, output_tokens: output, total_tokens: total, totalDerived: usage.total_tokens === undefined, rawFields: Object.keys(usage).sort() };
+}
+
+function measuredReasoningShape(document) {
+  const item = outputItems(document).find((entry) => entry?.type === "reasoning" || entry?.type === "thinking");
+  if (!item) return "unverified";
+  const summary = Array.isArray(item.summary) && item.summary.length > 0;
+  const content = Array.isArray(item.content) && item.content.length > 0;
+  const thinking = item.type === "thinking" || (Array.isArray(item.thinking) ? item.thinking.length > 0 : typeof item.thinking === "string" && item.thinking.length > 0);
+  if (thinking) return "anthropic-thinking";
+  if (summary && content) return "hybrid-summary";
+  if (summary) return "provider-summary";
+  if (content) return "raw-content";
+  return "unverified";
+}
+
+function probeRuntime(model, options) {
+  const endpoint = endpointForModel(model);
+  const baseUrl = options.baseUrl ?? resolveProviderBaseUrl(endpoint).baseUrl;
+  const credential = options.credential ?? resolveProviderCredential(endpoint);
+  if (!baseUrl) throw Object.assign(new Error("protocol probe transport is unavailable"), { code: "protocol_probe_transport_unavailable", status: 503 });
+  if (!credential && endpoint?.authMode !== "anonymous" && endpoint?.keyless !== true && model?.authMode !== "anonymous" && model?.keyless !== true) {
+    throw Object.assign(new Error("protocol probe credential is unavailable"), { code: "protocol_probe_credential_missing", status: 503 });
+  }
+  return { baseUrl, credential, internalKey: options.internalKey, fetchImpl: options.fetchImpl, signal: options.signal };
+}
+
+async function rawProbeRequest(model, payload, runtime) {
+  const built = buildRoutedRequest(payload, model, {
+    baseUrl: runtime.baseUrl,
+    credential: runtime.credential,
+    internalKey: runtime.internalKey,
+    signal: runtime.signal,
+    protocolProbeBypass: PROTOCOL_PROBE_BYPASS,
+  });
+  const result = await dispatchRoutedRequest(built, {
+    fetchImpl: runtime.fetchImpl,
+    signal: runtime.signal,
+    retries: 0,
+    failoverCandidates: [],
+  });
+  const contentType = result.response.headers.get("content-type") || "application/json";
+  const raw = await result.response.text();
+  return { ok: result.response.ok, status: result.response.status, contentType, raw, document: rawDocument(raw, contentType), request: JSON.parse(Buffer.from(built.body).toString("utf8")) };
+}
+
+function observedDetail(parts) {
+  return Object.fromEntries(Object.entries(parts).filter(([, value]) => value !== undefined));
+}
+
+// INTERNAL quota-confirmed diagnostic path. It calls the same pristine
+// builder/dispatcher as ordinary routed traffic, but its unforgeable bypass is
+// accepted only here so an experimental exact slug can earn its first proof.
+// Raw provider bytes are consumed before any response adapter/summary transform.
+export async function dispatchProtocolProbe(model, options = {}) {
   if (options.retry !== false || options.failover !== false) {
     throw Object.assign(new Error("protocol probes disable retry and failover"), {
       code: "protocol_probe_options_invalid",
@@ -391,22 +541,57 @@ export async function dispatchProtocolProbe(model, options = {}, { runProbe } = 
   if (options.confirmed !== true) {
     throw Object.assign(new Error("protocol probe requires explicit quota confirmation"), { code: "quota_confirmation_required", status: 409 });
   }
-  const runner = runProbe || (options.allowLive === false ? undefined : runProtocolProbe);
-  if (!model?.slug || typeof runner !== "function") {
-    throw Object.assign(new Error("protocol probe is unavailable without an injected runner"), {
-      code: "protocol_probe_not_implemented",
-      status: 501,
-    });
+  if (!model?.slug) throw new TypeError("protocol probe model is required");
+  if (options.targetSlug !== undefined && options.targetSlug !== model.slug) {
+    throw Object.assign(new Error("protocol probe target slug mismatch"), { code: "protocol_probe_target_mismatch", status: 409 });
   }
-  const argv = protocolProbeArgv(model);
-  const evidence = await runner({ argv, model, options: { retry: false, failover: false } });
-  const requiredChecks = new Set(["nonstream", "stream-reasoning", "auto-tool", "continuation", "usage"]);
-  const checks = Array.isArray(evidence?.checks) ? evidence.checks : [];
-  if (!evidence || evidence.model !== model.slug || evidence.verdict !== "passing" || typeof evidence.measuredFinalReasoningShape !== "string" || !checks.every((check) => requiredChecks.has(check?.name)) || checks.length !== requiredChecks.size || ![...requiredChecks].every((name) => checks.some((check) => check.name === name && check.ok === true))) {
-    throw Object.assign(new Error("protocol probe returned no compatibility verdict"), {
-      code: "protocol_probe_invalid_evidence",
-      status: 422,
-    });
+  if (options.allowLive === false && typeof options.fetchImpl !== "function") {
+    throw Object.assign(new Error("protocol probe is unavailable without an injected transport"), { code: "protocol_probe_not_implemented", status: 501 });
   }
-  return evidence;
+  const runtime = probeRuntime(model, options);
+  const checks = [];
+  let measuredFinalReasoningShape = "unverified";
+  const capture = async (name, operation) => {
+    try {
+      const result = await operation();
+      checks.push({ name, ...result });
+    } catch (error) {
+      checks.push({ name, ok: false, status: Number(error?.status) || 502, detail: "diagnostic transport failed", observed: observedDetail({ errorCode: error?.code || error?.cause?.code || error?.name }) });
+    }
+  };
+  await capture("nonstream", async () => {
+    const response = await rawProbeRequest(model, { model: model.slug, stream: false, input: "Reply with exactly PROBE_BASIC_OK." }, runtime);
+    const text = textFromRaw(response.document);
+    return { ok: response.ok && text.includes("PROBE_BASIC_OK"), status: response.status, detail: response.ok ? "raw non-stream basic response observed" : "basic request failed", observed: observedDetail({ contentType: response.contentType, rawBytes: Buffer.byteLength(response.raw), textMatched: text.includes("PROBE_BASIC_OK") }) };
+  });
+  await capture("stream-reasoning", async () => {
+    const nonstream = await rawProbeRequest(model, { model: model.slug, stream: false, input: "PROBE_REASONING_RAW: reason briefly, then answer." }, runtime);
+    const streamed = await rawProbeRequest(model, { model: model.slug, stream: true, input: "PROBE_REASONING_STREAM: reason briefly, then answer." }, runtime);
+    const nonstreamShape = measuredReasoningShape(nonstream.document);
+    const streamShape = measuredReasoningShape(streamed.document);
+    const lifecycle = streamed.document.events.some((event) => ["response.output_item.added", "response.reasoning_summary_part.added", "response.reasoning_summary_text.delta", "response.reasoning_text.delta", "content_block_start", "content_block_delta"].includes(event?.type));
+    measuredFinalReasoningShape = streamShape !== "unverified" ? streamShape : nonstreamShape;
+    const legal = ["provider-summary", "raw-content", "hybrid-summary", "anthropic-thinking"].includes(measuredFinalReasoningShape);
+    return { ok: nonstream.ok && streamed.ok && lifecycle && legal && (nonstreamShape === streamShape || nonstreamShape === "unverified" || streamShape === "unverified"), status: streamed.status, detail: legal ? `raw reasoning lifecycle and ${measuredFinalReasoningShape} final shape observed` : "raw reasoning lifecycle/final shape missing", observed: observedDetail({ nonstreamShape, streamShape, lifecycle, nonstreamRawBytes: Buffer.byteLength(nonstream.raw), streamRawBytes: Buffer.byteLength(streamed.raw) }) };
+  });
+  await capture("auto-tool", async () => {
+    const response = await rawProbeRequest(model, { model: model.slug, stream: false, input: "PROBE_AUTO_TOOL: call codex_router_probe with value ok.", tools: [PROBE_TOOL], tool_choice: "auto" }, runtime);
+    const call = rawToolCall(response.document);
+    return { ok: response.ok && call?.name === PROBE_TOOL.name && call?.parsed?.value === "ok", status: response.status, detail: call ? "raw automatic tool call and arguments observed" : "automatic tool call missing", observed: observedDetail({ name: call?.name, callId: call?.call_id, argumentsValid: call?.parsed?.value === "ok", rawBytes: Buffer.byteLength(response.raw) }) };
+  });
+  await capture("continuation", async () => {
+    const first = await rawProbeRequest(model, { model: model.slug, stream: false, input: "PROBE_CONTINUATION_START: call codex_router_probe with value ok.", tools: [PROBE_TOOL], tool_choice: "required" }, runtime);
+    const call = rawToolCall(first.document);
+    if (!first.ok || !call) return { ok: false, status: first.status, detail: "continuation tool call missing", observed: observedDetail({ firstRawBytes: Buffer.byteLength(first.raw) }) };
+    const followup = await rawProbeRequest(model, { model: model.slug, stream: false, input: [call, { type: "function_call_output", call_id: call.call_id, output: "PROBE_CONTINUATION_OK" }], tools: [PROBE_TOOL], tool_choice: "auto" }, runtime);
+    const text = textFromRaw(followup.document);
+    return { ok: followup.ok && text.includes("PROBE_CONTINUATION_OK"), status: followup.status, detail: followup.ok ? "actual tool-result continuation follow-up observed" : "continuation follow-up failed", observed: observedDetail({ callId: call.call_id, followupTextMatched: text.includes("PROBE_CONTINUATION_OK"), firstRawBytes: Buffer.byteLength(first.raw), followupRawBytes: Buffer.byteLength(followup.raw) }) };
+  });
+  await capture("usage", async () => {
+    const response = await rawProbeRequest(model, { model: model.slug, stream: false, input: "PROBE_USAGE: reply with ok." }, runtime);
+    const usage = rawUsage(response.document);
+    return { ok: response.ok && Boolean(usage), status: response.status, detail: usage ? "authoritative raw usage fields observed" : "authoritative usage missing", observed: observedDetail({ ...usage, rawBytes: Buffer.byteLength(response.raw) }) };
+  });
+  const verdict = checks.length === 5 && checks.every((check) => check.ok) ? "passing" : "failed";
+  return Object.freeze({ model: model.slug, transport: model.effectiveTransport, verdict, measuredFinalReasoningShape, checks: Object.freeze(checks), ok: verdict === "passing" });
 }

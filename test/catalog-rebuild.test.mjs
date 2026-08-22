@@ -86,9 +86,11 @@ function verifierOptions(label) {
   return {
     confirmed: true,
     clock: () => new Date("2026-08-22T01:02:03.000Z"),
-    dispatchProtocolProbe: async () => ({
+    dispatchProtocolProbe: async (candidate) => ({
+      model: candidate.slug,
       verdict: "passing",
       measuredFinalReasoningShape: "hybrid-summary",
+      checks: ["nonstream", "stream-reasoning", "auto-tool", "continuation", "usage"].map((name) => ({ name, ok: true, observed: { fixture: true } })),
     }),
     transactionOptions: rebuildOptions(label),
   };
@@ -232,10 +234,15 @@ test("a revoke wins over a verification candidate that started before it", async
   const entered = new Promise((resolve) => { enteredProbe = resolve; });
   const overlapping = verifyProtocolProof(primarySlug, {
     ...verifierOptions("candidate"),
-    dispatchProtocolProbe: async () => {
+    dispatchProtocolProbe: async (candidate) => {
       enteredProbe();
       await probeStarted;
-      return { verdict: "passing", measuredFinalReasoningShape: "hybrid-summary" };
+      return {
+        model: candidate.slug,
+        verdict: "passing",
+        measuredFinalReasoningShape: "hybrid-summary",
+        checks: ["nonstream", "stream-reasoning", "auto-tool", "continuation", "usage"].map((name) => ({ name, ok: true, observed: { fixture: true } })),
+      };
     },
   });
   await entered;
