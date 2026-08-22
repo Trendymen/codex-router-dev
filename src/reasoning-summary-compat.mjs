@@ -15,7 +15,7 @@ const nonempty = (value, code = "reasoning_duplicate_item") => {
   return value;
 };
 const indexOf = (value) => {
-  if (!Number.isSafeInteger(value) || value < 0 || value > 1_000_000) fail("reasoning_index_mismatch");
+  if (!Number.isSafeInteger(value) || value < 0) fail("reasoning_index_mismatch");
   return value;
 };
 const generatedId = (responseId, outputIndex) => `rsn_${createHash("sha256").update(`${responseId}:${outputIndex}`).digest("base64url").slice(0, 24)}`;
@@ -225,6 +225,13 @@ export function createReasoningCompatTransform({
     flushDone();
     for (const mismatch of mismatches) reportMismatch(item, mismatch.summaryIndex, mismatch.emitted, mismatch.final);
   };
+  const compareClosedTerminal = (item, finalItem) => {
+    const terminalParts = selectedFinalParts(sourceKind, finalItem);
+    if (item.summary.length > terminalParts.length) fail("reasoning_final_part_missing");
+    for (let index = 0; index < terminalParts.length; index += 1) {
+      if (item.summary[index] !== terminalParts[index]) reportMismatch(item, index, item.summary[index] ?? "", terminalParts[index]);
+    }
+  };
   const partial = (item, eol, controller) => {
     if (item.closed) return;
     for (let index = 0; index < item.nextPartIndex; index += 1) closePart(item, item.parts.get(index), eol, controller);
@@ -257,13 +264,7 @@ export function createReasoningCompatTransform({
         if (final.output_index !== undefined && indexOf(final.output_index) !== item.outputIndex) fail("reasoning_index_mismatch");
         used.add(item);
         if (!item.closed) reconcile(item, final, eol, controller);
-        else {
-          const terminalParts = selectedFinalParts(sourceKind, final);
-          if (terminalParts.length > item.summary.length) fail("reasoning_final_part_missing");
-          for (let index = 0; index < Math.max(item.summary.length, terminalParts.length); index += 1) {
-            if (item.summary[index] !== terminalParts[index]) reportMismatch(item, index, item.summary[index] ?? "", terminalParts[index]);
-          }
-        }
+        else compareClosedTerminal(item, final);
       }
       const candidates = [...items.values()].filter((item) => !used.has(item)).sort((a, b) => a.outputIndex - b.outputIndex);
       if (anonymous.length !== candidates.length) fail("reasoning_unclosed_at_terminal");
@@ -271,6 +272,7 @@ export function createReasoningCompatTransform({
         const item = candidates[index]; const final = anonymous[index];
         if (final.output_index !== undefined && indexOf(final.output_index) !== item.outputIndex) fail("reasoning_index_mismatch");
         if (!item.closed) reconcile(item, final, eol, controller);
+        else compareClosedTerminal(item, final);
       }
     } else for (const item of [...items.values()].sort((a, b) => a.outputIndex - b.outputIndex)) partial(item, eol, controller);
     flushDone();
@@ -326,10 +328,19 @@ export function normalizeReasoningResponse(json, model, { maxReasoningBytes = MA
   if (!json || typeof json !== "object" || !Array.isArray(json.output)) return json;
   if (!validLimit(maxReasoningBytes)) fail("reasoning_protocol_error");
   const indexes = new Set(); const ids = new Set(); let bytes = 0;
+  for (const item of json.output) {
+    if (!item || typeof item !== "object" || item.output_index === undefined) continue;
+    const outputIndex = indexOf(item.output_index);
+    if (indexes.has(outputIndex)) fail("reasoning_index_mismatch");
+    indexes.add(outputIndex);
+  }
   return { ...json, output: json.output.map((item, arrayIndex) => {
     if (item?.type !== "reasoning") return item;
-    const outputIndex = item.output_index === undefined ? arrayIndex : indexOf(item.output_index);
-    if (indexes.has(outputIndex)) fail("reasoning_index_mismatch"); indexes.add(outputIndex);
+    const outputIndex = item.output_index === undefined ? arrayIndex : item.output_index;
+    if (item.output_index === undefined) {
+      if (indexes.has(outputIndex)) fail("reasoning_index_mismatch");
+      indexes.add(outputIndex);
+    }
     const id = item.id === undefined || item.id === null ? generatedId(String(json.id || "resp_unknown"), outputIndex) : nonempty(item.id);
     if (ids.has(id)) fail("reasoning_duplicate_item"); ids.add(id);
     const parts = selectedFinalParts(sourceKind, item);

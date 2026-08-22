@@ -327,7 +327,10 @@ test("terminal finals and non-streaming anonymous items match one-to-one without
     { type: "reasoning", summary: [], content: [] },
     { type: "reasoning", summary: [], content: [] },
   ] }, model());
-  assert.equal(new Set(normalized.output.map((item) => item.id)).size, 2);
+  assert.deepEqual(normalized.output.map((item) => [item.output_index, item.id]), [
+    [0, "rsn_JbjRLBW9B3Q3H_VF5xKXI0_4"],
+    [1, "rsn_OI0-h9M8FVQK8iOB9hYPNB0C"],
+  ]);
   assert.deepEqual(normalized.output.map((item) => item.content), [[], []]);
   assert.throws(() => normalizeReasoningResponse({ output: [
     { id: "rs_same", type: "reasoning", output_index: 0, summary: [], content: [] },
@@ -423,26 +426,72 @@ test("every legal mixed blank-line delimiter is framed across byte boundaries", 
   }
 });
 
-test("closed-item terminal comparison covers missing and extra summary parts without leaking text", async () => {
-  const seen = [];
+test("closed-item terminal comparison rejects missing final parts and observes extra final parts without leaking text", async () => {
   const base = [
     { type: "response.output_item.added", output_index: 0, item: { id: "rs_terminal_parts", type: "reasoning" } },
     { type: "response.output_item.done", output_index: 0, item: { id: "rs_terminal_parts", type: "reasoning", summary: [{ type: "summary_text", text: "one" }, { type: "summary_text", text: "two" }], content: [] } },
   ];
-  await transform([...base, { type: "response.completed", response: { output: [{ id: "rs_terminal_parts", type: "reasoning", summary: [{ type: "summary_text", text: "one" }], content: [] }] } }].map(sse), {
-    responseId: "resp_terminal_parts", model: model(), observeReasoningProtocol: (event) => seen.push(event),
-  });
-  assert.equal(seen.at(-1).summaryIndex, 1);
+  await assert.rejects(() => transform([...base, {
+    type: "response.completed",
+    response: { output: [{ id: "rs_terminal_parts", type: "reasoning", summary: [{ type: "summary_text", text: "one" }], content: [] }] },
+  }].map(sse), { responseId: "resp_terminal_missing", model: model() }), { code: "reasoning_final_part_missing" });
+
+  const seen = [];
+  const authoritative = [
+    { type: "response.output_item.added", output_index: 0, item: { id: "rs_terminal_extra", type: "reasoning" } },
+    { type: "response.output_item.done", output_index: 0, item: { id: "rs_terminal_extra", type: "reasoning", summary: [{ type: "summary_text", text: "one" }], content: [] } },
+  ];
+  const output = events(await transform([...authoritative, {
+    type: "response.completed",
+    response: { output: [{ id: "rs_terminal_extra", type: "reasoning", summary: [{ type: "summary_text", text: "one" }, { type: "summary_text", text: "two" }], content: [] }] },
+  }].map(sse), {
+    responseId: "resp_terminal_extra", model: model(), observeReasoningProtocol: (event) => seen.push(event),
+  }));
+  assert.deepEqual(output.find((event) => event.type === "response.output_item.done").item.summary, [{ type: "summary_text", text: "one" }]);
+  assert.deepEqual(output.at(-1).response.output[0].summary, [{ type: "summary_text", text: "one" }]);
+  assert.deepEqual(seen.map(({ code, summaryIndex, emittedBytes, finalBytes }) => ({ code, summaryIndex, emittedBytes, finalBytes })), [
+    { code: "reasoning_final_mismatch", summaryIndex: 1, emittedBytes: 0, finalBytes: 3 },
+  ]);
   assert.equal(JSON.stringify(seen).includes("two"), false);
-  await assert.rejects(() => transform([...base, { type: "response.completed", response: { output: [{ id: "rs_terminal_parts", type: "reasoning", summary: [{ type: "summary_text", text: "one" }, { type: "summary_text", text: "two" }, { type: "summary_text", text: "three" }], content: [] }] } }].map(sse), { responseId: "resp_terminal_extra", model: model() }), { code: "reasoning_final_part_missing" });
 });
 
-test("nonstream anonymous reasoning keeps actual unique output indexes in IDs and output", () => {
+test("anonymous closed terminal items use the same safe extra-part comparison", async () => {
+  const seen = [];
+  const output = events(await transform([
+    { type: "response.output_item.done", output_index: 0, item: { type: "reasoning", summary: [{ type: "summary_text", text: "one" }], content: [] } },
+    { type: "response.completed", response: { output: [{ type: "reasoning", summary: [{ type: "summary_text", text: "one" }, { type: "summary_text", text: "two" }], content: [] }] } },
+  ].map(sse), {
+    responseId: "resp_anonymous_terminal_extra", model: model(), observeReasoningProtocol: (event) => seen.push(event),
+  }));
+  assert.deepEqual(output.at(-1).response.output[0].summary, [{ type: "summary_text", text: "one" }]);
+  assert.deepEqual(seen.map(({ code, summaryIndex, emittedBytes, finalBytes }) => ({ code, summaryIndex, emittedBytes, finalBytes })), [
+    { code: "reasoning_final_mismatch", summaryIndex: 1, emittedBytes: 0, finalBytes: 3 },
+  ]);
+  assert.equal(JSON.stringify(seen).includes("two"), false);
+});
+
+test("nonstream output indexes are globally unique and anonymous reasoning cannot claim an occupied array index", () => {
+  assert.throws(() => normalizeReasoningResponse({ output: [
+    { type: "message", output_index: 1 },
+    { type: "reasoning", summary: [], content: [] },
+  ] }, model()), { code: "reasoning_index_mismatch" });
+  assert.throws(() => normalizeReasoningResponse({ output: [
+    { type: "message", output_index: 7 },
+    { type: "reasoning", output_index: 7, summary: [], content: [] },
+  ] }, model()), { code: "reasoning_index_mismatch" });
+  for (const outputIndex of [NaN, Infinity, -1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+    assert.throws(() => normalizeReasoningResponse({ output: [{ type: "message", output_index: outputIndex }] }, model()), { code: "reasoning_index_mismatch" });
+  }
+});
+
+test("normal mixed nonstream output preserves nonreasoning identity and canonical anonymous reasoning indexes", () => {
+  const message = { type: "message", output_index: 1_000_001, content: [{ type: "output_text", text: "answer" }] };
   const normalized = normalizeReasoningResponse({ id: "resp_nonstream_index", output: [
-    { type: "message", output_index: 4 },
+    message,
     { type: "reasoning", summary: [], content: [] },
     { type: "reasoning", output_index: 9, summary: [], content: [] },
   ] }, model());
+  assert.equal(normalized.output[0], message);
   assert.deepEqual(normalized.output.slice(1).map((item) => [item.output_index, item.id]), [
     [1, "rsn_PEn3VNOjst90jzvJWan-hGJE"],
     [9, "rsn_-b0JgioJ0XNLX_5IwU35q-FI"],
