@@ -29,6 +29,16 @@ const definitions = [
 export const ERROR_DEFINITIONS = Object.freeze(
   Object.fromEntries(definitions.map(([code, status, message]) => [code, Object.freeze({ status, message })])),
 );
+const trustedErrors = new WeakSet();
+const trustedTerminalEvents = new WeakSet();
+const INCOMPLETE_REASONS = new Set(["max_output_tokens"]);
+
+function deepFreeze(value, seen = new WeakSet()) {
+  if (!value || typeof value !== "object" || seen.has(value)) return value;
+  seen.add(value);
+  for (const child of Object.values(value)) deepFreeze(child, seen);
+  return Object.freeze(value);
+}
 
 function publicBody(code, message) {
   return { error: { type: "router_error", code, message, param: null } };
@@ -44,12 +54,13 @@ export function routerError(code, privateDetails = {}) {
   // This property is deliberately non-enumerable so JSON serialization and
   // ordinary diagnostic snapshots cannot expose request or provider data.
   Object.defineProperty(error, "privateDetails", {
-    value: Object.freeze({ ...privateDetails }),
+    value: deepFreeze({ ...privateDetails }),
     enumerable: false,
     writable: false,
     configurable: false,
   });
-  return Object.freeze(error);
+  trustedErrors.add(error);
+  return deepFreeze(error);
 }
 
 function responseContext(context) {
@@ -58,29 +69,33 @@ function responseContext(context) {
     object: "response",
     created_at: context.createdAt,
     model: context.model,
-    output: context.output || [],
-    usage: context.usage || null,
+    output: structuredClone(context.output || []),
+    usage: context.usage ? structuredClone(context.usage) : null,
   };
 }
 
 export function failedResponseEvent(context, error) {
-  if (!error?.body?.error) throw new TypeError("failed response event requires a router public error");
-  const { code, message } = error.body.error;
-  return {
+  if (!trustedErrors.has(error)) throw new TypeError("failed response event requires a trusted router public error");
+  const code = error.body.error.code;
+  const definition = ERROR_DEFINITIONS[code];
+  if (!definition) throw new TypeError("failed response event requires a known router public error code");
+  const event = deepFreeze({
     type: "response.failed",
     sequence_number: context.sequenceNumber,
     response: {
       ...responseContext(context),
       status: "failed",
-      error: { code, message },
+      error: { code, message: definition.message },
       incomplete_details: null,
     },
-  };
+  });
+  trustedTerminalEvents.add(event);
+  return event;
 }
 
 export function incompleteResponseEvent(context, reason) {
-  if (typeof reason !== "string" || !reason) throw new TypeError("incomplete reason must be a non-empty string");
-  return {
+  if (!INCOMPLETE_REASONS.has(reason)) throw new TypeError("unsupported incomplete reason");
+  const event = deepFreeze({
     type: "response.incomplete",
     sequence_number: context.sequenceNumber,
     response: {
@@ -89,9 +104,12 @@ export function incompleteResponseEvent(context, reason) {
       error: null,
       incomplete_details: { reason },
     },
-  };
+  });
+  trustedTerminalEvents.add(event);
+  return event;
 }
 
 export function formatTerminalFrames(event) {
+  if (!trustedTerminalEvents.has(event)) throw new TypeError("terminal frames require a trusted terminal event");
   return `data: ${JSON.stringify(event)}\n\ndata: [DONE]\n\n`;
 }

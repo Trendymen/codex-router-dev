@@ -1,8 +1,12 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
+
+const sourceRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 const testRoot = mkdtempSync(path.join(os.tmpdir(), "codex-router-support-"));
 process.env.CODEX_HOME = path.join(testRoot, "codex");
@@ -60,14 +64,12 @@ model_catalog_json = ${JSON.stringify(path.join(stateDir, "merged-models.json"))
     const result = createSupportBundle();
     const contents = readFileSync(result.path, "utf8");
     const bundle = JSON.parse(contents);
-    assert.equal(bundle.credentialSources.deepseek.configured, true);
-    assert.equal(bundle.credentialSources.chutes.configured, true);
-    assert.equal(bundle.credentialSources["github-copilot"].configured, true);
+    assert.ok(bundle.configuredProviderCount >= 3);
     assert.doesNotMatch(contents, new RegExp(sentinel));
     assert.doesNotMatch(contents, new RegExp(chutesSentinel));
     assert.doesNotMatch(contents, new RegExp(copilotSentinel));
     assert.doesNotMatch(contents, new RegExp(callerSentinel));
-    assert.match(bundle.config.openai_base_url, /\[REDACTED\]/);
+    assert.deepEqual(bundle.config, {});
     assert.equal("redactedLogTail" in bundle, false);
 
     const logDecoys = [
@@ -80,6 +82,24 @@ model_catalog_json = ${JSON.stringify(path.join(stateDir, "merged-models.json"))
     const withLogsContents = readFileSync(withLogs.path, "utf8");
     for (const decoy of logDecoys) assert.doesNotMatch(withLogsContents, new RegExp(decoy));
     assert.match(withLogsContents, /\[REDACTED\]/);
+
+    const childErrorDecoy = "child command multi word decoy 52d361f0";
+    writeFileSync(
+      path.join(codexHome, "config.toml"),
+      `model = """${childErrorDecoy}`,
+      { mode: 0o600 },
+    );
+    const failedChildBundle = createSupportBundle();
+    const failedChildContents = readFileSync(failedChildBundle.path, "utf8");
+    assert.doesNotMatch(failedChildContents, new RegExp(childErrorDecoy));
+
+    const cliFailure = spawnSync(process.execPath, ["src/support-bundle.mjs", `--${childErrorDecoy}`], {
+      cwd: sourceRoot,
+      env: process.env,
+      encoding: "utf8",
+    });
+    assert.equal(cliFailure.status, 1);
+    assert.doesNotMatch(`${cliFailure.stdout}\n${cliFailure.stderr}`, new RegExp(childErrorDecoy));
   } finally {
     rmSync(testRoot, { recursive: true, force: true });
   }

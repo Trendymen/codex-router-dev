@@ -49,9 +49,40 @@ test("pre-stream errors expose only the safe envelope", () => {
   assertNoDecoys(error);
 });
 
+test("trusted public errors cannot be mutated or forged into terminal frames", () => {
+  const trusted = routerError("tool_mapping_error", { providerBody: DECOYS.providerBody });
+  assert.throws(() => {
+    trusted.body.error.message = DECOYS.providerBody;
+  }, TypeError);
+
+  assert.throws(
+    () => failedResponseEvent(
+      { sequenceNumber: 1, responseId: "resp_safe", createdAt: 0, model: "canonical/slug" },
+      {
+        status: 422,
+        body: { error: { code: "tool_mapping_error", message: DECOYS.providerBody } },
+      },
+    ),
+    /trusted router public error/,
+  );
+
+  const event = failedResponseEvent(
+    { sequenceNumber: 1, responseId: "resp_safe", createdAt: 0, model: "canonical/slug" },
+    trusted,
+  );
+  assert.equal(event.sequence_number, 1);
+  assert.equal(event.response.error.message, "Invalid tool mapping.");
+  assert.throws(() => {
+    event.response.error.message = DECOYS.providerBody;
+  }, TypeError);
+  assertNoDecoys(event);
+});
+
 test("redactor removes every sensitive diagnostic source while preserving safe fields", () => {
   const value = {
-    safe: { status: 503, requestId: "req_safe", retryAfter: "12" },
+    status: 503,
+    requestId: "req_safe",
+    retryAfter: "12",
     ...DECOYS,
     authorization: `Bearer ${DECOYS.bearer}`,
     api_key: DECOYS.apiKey,
@@ -59,7 +90,51 @@ test("redactor removes every sensitive diagnostic source while preserving safe f
   };
 
   const redacted = redactSensitive(value);
-  assert.deepEqual(redacted.safe, value.safe);
+  assert.deepEqual(redacted, { status: 503, requestId: "req_safe", retryAfter: "12" });
+  assertNoDecoys(redacted);
+});
+
+test("redactor retains only explicitly safe diagnostic fields and is cycle-safe", () => {
+  const decoy = "task1-redactor-bypass-decoy-05870213";
+  const diagnostic = {
+    status: 503,
+    code: "upstream_unavailable",
+    type: "server_error",
+    requestId: "req_safe",
+    headers: {
+      "x-request-id": "req_header_safe",
+      "retry-after": "12",
+      authorization: `Bearer ${decoy}`,
+    },
+    input: decoy,
+    content: decoy,
+    text: decoy,
+    cookie: decoy,
+    session: decoy,
+  };
+  diagnostic.self = diagnostic;
+
+  assert.deepEqual(redactSensitive(diagnostic), {
+    status: 503,
+    code: "upstream_unavailable",
+    type: "server_error",
+    requestId: "req_safe",
+    headers: { "x-request-id": "req_header_safe", "retry-after": "12" },
+  });
+  assertNoDecoys(redactSensitive(new Error(decoy, { cause: new Error(decoy) })));
+});
+
+test("redactor removes decoys from diagnostic output, snapshots, temp files, and cause chains", () => {
+  const channels = {
+    stdout: DECOYS.log,
+    stderr: DECOYS.providerBody,
+    logs: [DECOYS.prompt, DECOYS.reasoning],
+    jsonSnapshot: { input: DECOYS.arguments, content: DECOYS.providerBody },
+    tempFiles: [{ path: DECOYS.temporary, text: DECOYS.support }],
+    error: new Error(DECOYS.cause, { cause: new Error(DECOYS.providerBody) }),
+  };
+  const redacted = redactSensitive(channels);
+  assert.deepEqual(redacted, {});
   assertNoDecoys(redacted);
 });
 
@@ -96,6 +171,17 @@ test("post-relay failures use one safe terminal frame followed by one done frame
     formatTerminalFrames(event),
     `data: ${JSON.stringify(event)}\n\ndata: [DONE]\n\n`,
   );
+  const frames = formatTerminalFrames(event);
+  assert.equal((frames.match(/data: \[DONE\]/g) || []).length, 1);
+  assert.ok(frames.indexOf('"type":"response.failed"') < frames.indexOf("data: [DONE]"));
+  assert.throws(
+    () => formatTerminalFrames({
+      type: "response.failed",
+      sequence_number: 18,
+      response: { error: { code: "upstream_stream_truncated", message: DECOYS.providerBody } },
+    }),
+    /trusted terminal event/,
+  );
 });
 
 test("incomplete terminal retains only the authoritative reason", () => {
@@ -119,4 +205,14 @@ test("incomplete terminal retains only the authoritative reason", () => {
       usage: null,
     },
   });
+});
+
+test("incomplete terminals reject unrecognized or sensitive reasons", () => {
+  const context = { sequenceNumber: 19, responseId: "resp_req_safe", createdAt: 0, model: "canonical/slug" };
+  assert.throws(() => incompleteResponseEvent(context, "context_length_exceeded"), /unsupported incomplete reason/);
+  assert.throws(() => incompleteResponseEvent(context, DECOYS.reasoning), /unsupported incomplete reason/);
+});
+
+test("non-stream JSON never carries a done frame", () => {
+  assert.doesNotMatch(JSON.stringify(routerError("tool_mapping_error")), /\[DONE\]/);
 });

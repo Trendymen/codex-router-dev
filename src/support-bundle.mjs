@@ -37,10 +37,11 @@ function runJson(script, args = []) {
     [path.join(SOURCE_ROOT, "src", script), ...args],
     { cwd: SOURCE_ROOT, env: process.env, encoding: "utf8" },
   );
+  if (result.status !== 0) return { type: "child_command_failed", status: result.status ?? 1 };
   try {
     return JSON.parse(result.stdout || "{}");
   } catch {
-    return { error: result.stderr?.trim() || `exited with ${result.status}` };
+    return { type: "child_command_invalid_json" };
   }
 }
 
@@ -104,8 +105,9 @@ function knownLocalSecrets() {
   return [...values].filter((value) => value.length >= 8);
 }
 
-function redactBundle(contents) {
-  let redacted = redactSensitive(redactCallerUrl(contents));
+function redactBundle(bundle) {
+  let redacted = JSON.stringify(redactSensitive(bundle, { profile: "support-bundle" }), null, 2);
+  redacted = redactCallerUrl(redacted);
   for (const secret of knownLocalSecrets()) {
     redacted = redacted.replaceAll(secret, "[REDACTED]");
   }
@@ -121,19 +123,17 @@ function outputOption() {
 }
 
 export function createSupportBundle(options = {}) {
-  const credentialSources = {};
+  let configuredProviderCount = 0;
   for (const provider of PROVIDERS.values()) {
     if (provider.kind !== "openai-compatible") continue;
     const status = credentialStatus(provider);
-    credentialSources[provider.id] = status.configured
-      ? { configured: true, source: status.source, persistent: status.persistent }
-      : { configured: false };
+    if (status.configured) configuredProviderCount += 1;
   }
   let selection;
   try {
     selection = providerSelectionStatus();
   } catch (error) {
-    selection = { error: error instanceof Error ? error.message : String(error) };
+    selection = { type: "selection_status_unavailable" };
   }
   const packageJson = JSON.parse(readFileSync(path.join(SOURCE_ROOT, "package.json"), "utf8"));
   const bundle = {
@@ -149,26 +149,16 @@ export function createSupportBundle(options = {}) {
       node: process.version,
       packageVersion: packageJson.version,
       gitCommit: commandVersion("git", ["-C", SOURCE_ROOT, "rev-parse", "HEAD"]),
-      python: commandVersion(
-        path.join(
-          SOURCE_ROOT,
-          ".venv",
-          process.platform === "win32" ? "Scripts" : "bin",
-          process.platform === "win32" ? "python.exe" : "python",
-        ),
-        ["--version"],
-      ),
     },
     doctor: runJson("doctor.mjs", ["--json"]),
     config: runJson("config-manager.mjs", ["status"]),
     service: runJson("service.mjs", ["status"]),
     selection,
-    credentialSources,
-    ownership: detectLegacyInstallations(),
-    install: readInstallManifest() || { installed: false },
+    configuredProviderCount,
+    installed: Boolean(readInstallManifest()),
     files: {
-      config: fileMetadata(CONFIG_PATH),
-      log: fileMetadata(LOG_PATH),
+      configExists: fileMetadata(CONFIG_PATH).exists,
+      logExists: fileMetadata(LOG_PATH).exists,
     },
     ...(options.includeLogs ? { redactedLogTail: logTail() } : {}),
   };
@@ -180,7 +170,7 @@ export function createSupportBundle(options = {}) {
     options.output || path.join(SUPPORT_DIR, `codex-router-support-${timestamp}.json`),
   );
   mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
-  const serialized = redactBundle(`${JSON.stringify(bundle, null, 2)}\n`);
+  const serialized = `${redactBundle(bundle)}\n`;
   writeFileSync(target, serialized, {
     encoding: "utf8",
     mode: 0o600,
@@ -194,7 +184,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
     const known = new Set(["--help", "--include-logs", "--output"]);
     for (let index = 2; index < process.argv.length; index += 1) {
       const argument = process.argv[index];
-      if (!known.has(argument)) throw new Error(`Unknown option: ${argument}`);
+      if (!known.has(argument)) throw new Error("Unknown option.");
       if (argument === "--output") index += 1;
     }
     if (process.argv.includes("--help")) {
@@ -211,7 +201,7 @@ Logs are excluded by default because they may contain prompts or responses.
       process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
     }
   } catch (error) {
-    console.error(error instanceof Error ? error.message : String(error));
+    console.error("Support bundle failed.");
     process.exitCode = 1;
   }
 }
