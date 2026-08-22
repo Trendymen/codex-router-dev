@@ -121,10 +121,7 @@ export async function buildNodeSnapshotFiles() {
     routedModels: nodeModels,
   });
   const merged = {
-    models: [
-      ...nativeModels,
-      ...routed.models,
-    ],
+    models: routed.models,
   };
   const models = { version: 1, models: nodeModels.map(safeModel) };
   return {

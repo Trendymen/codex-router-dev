@@ -87,6 +87,34 @@ test("startup rebuild waits for a base catalog instead of failing a cold service
   assert.deepEqual(calls, ["service-startup"]);
 });
 
+test("deferred transaction never refreshes targets, while committed startup refreshes and propagates a retryable failure", async () => {
+  const calls = [];
+  const deferred = await transactNodeMutationAndRefreshTargets({
+    files: [], reason: "cold", hasBaseCatalog: () => false,
+    transaction: async (input) => input.rebuild(input.reason),
+    mutate: () => undefined,
+    refreshTargets: () => calls.push("deferred-refresh"),
+  });
+  assert.equal(deferred.deferred, true);
+  assert.deepEqual(calls, []);
+
+  await rebuildAfterStartup({
+    hasBaseCatalog: () => true,
+    rebuild: async () => ({ committed: true }),
+    refreshTargets: async () => calls.push("startup-refresh"),
+  });
+  assert.deepEqual(calls, ["startup-refresh"]);
+
+  await assert.rejects(
+    rebuildAfterStartup({
+      hasBaseCatalog: () => true,
+      rebuild: async () => ({ committed: true }),
+      refreshTargets: async () => { throw new Error("refresh retry"); },
+    }),
+    /refresh retry/,
+  );
+});
+
 test("startup forwards its real rebuild seam and leaves external refresh outside a failed publish", async () => {
   const calls = [];
   const oldGeneration = seedPublishedGeneration("startup-failure-old");

@@ -122,6 +122,8 @@ test("default Node snapshot rebuild republishes one complete generation from the
   });
 
   assert.equal(result.reason, "test-default-rebuild");
+  const routed = JSON.parse(readFileSync(path.join(stateDir, "routed-models.json"), "utf8"));
+  assert.ok(routed.models.some((model) => model.slug === "router/native-template"), "routed catalog retains native entries");
   for (const name of Object.keys(artifacts("unused"))) {
     assert.ok(readFileSync(path.join(stateDir, name)).byteLength > 0, name);
   }

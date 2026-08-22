@@ -71,6 +71,7 @@ test("authenticated aggregate snippet is deterministic and usable", () => {
   assert.match(first, /routed-models\.json/);
   assert.match(first, /_codex-router\/[^/]+\/v1/);
   assert.match(first, /model_provider = "custom"/);
+  assert.doesNotMatch(first, /^model\s*=/m);
   assert.match(first, /supports_standalone_web_search = true/);
   assert.match(first, /wire_api = "responses"/);
 });

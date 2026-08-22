@@ -17,7 +17,6 @@ export function renderAggregateSnippet({ routedCatalogPath, callerBaseUrl }) {
   const catalog = requiredString(routedCatalogPath, "routedCatalogPath");
   const baseUrl = requiredString(callerBaseUrl, "callerBaseUrl");
   return `model_provider = "custom"
-model = "gpt-5.6-sol"
 model_catalog_json = ${JSON.stringify(catalog)}
 
 [model_providers.custom]

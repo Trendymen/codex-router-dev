@@ -227,15 +227,21 @@ export async function invalidateProtocolProofsForModels(models, options = {}) {
       .filter((model) => String(model?.slug || ""))
       .map((model) => [String(model.slug), model]),
   );
-  const { transaction = transactNodeStateMutation, refreshTargets, ...transactionOptions } = options;
+  const { transaction = transactNodeStateMutation, refreshTargets, verifierVersion, ...transactionOptions } = options;
+  const expectedVerifierVersion = verifierVersion ?? (await import("./protocol-proof-verifier.mjs")).PROTOCOL_PROOF_VERIFIER_VERSION;
   return transactNodeMutationAndRefreshTargets({
     transaction,
     files: [PROTOCOL_PROOFS_PATH],
     reason: "protocol-proof:invalidate-registry",
     mutate: () => {
       const state = readProtocolProofState();
-      const stale = [...bySlug.entries()]
-        .filter(([slug, model]) => state.proofs[slug] && !recordMatchesModel(state.proofs[slug], model));
+      const stale = Object.keys(state.proofs)
+        .filter((slug) => {
+          const record = state.proofs[slug];
+          const model = bySlug.get(slug);
+          return !model || record.verifierVersion !== expectedVerifierVersion || !recordMatchesModel(record, model);
+        })
+        .map((slug) => [slug, state.proofs[slug]]);
       if (stale.length === 0) return;
       const proofs = { ...state.proofs };
       const revisions = { ...state.revisions };

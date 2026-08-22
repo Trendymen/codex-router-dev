@@ -89,6 +89,45 @@ const MERGED_CATALOG_SCHEMA = Object.freeze({
   },
 });
 
+const ROUTE_SNAPSHOT_SCHEMA = Object.freeze({
+  type: "object", required: ["version", "routes"], additionalProperties: false,
+  properties: {
+    version: { type: "number", const: 1 },
+    routes: {
+      type: "array", items: {
+        type: "object",
+        required: ["slug", "provider", "upstreamModel", "effectiveTransport", "toolDialect", "requestProfile", "reasoningDisplayMode", "effectiveFinalReasoningShape", "purpose"],
+        additionalProperties: false,
+        properties: {
+          slug: { type: "string" }, provider: { type: "string" }, upstreamModel: { type: "string" },
+          effectiveTransport: { type: "string" }, toolDialect: { type: "string" }, requestProfile: { type: "string" },
+          reasoningDisplayMode: { type: "string" }, effectiveFinalReasoningShape: { type: "string" }, purpose: { type: "string" },
+        },
+      },
+    },
+  },
+});
+
+const UI_SNAPSHOT_SCHEMA = Object.freeze({
+  type: "object", required: ["version", "models"], additionalProperties: false,
+  properties: {
+    version: { type: "number", const: 1 },
+    models: {
+      type: "array", items: {
+        type: "object",
+        required: ["slug", "provider", "upstreamModel", "effectiveTransport", "toolDialect", "reasoningDisplayMode", "declaredFinalReasoningShape", "effectiveFinalReasoningShape", "rolloutState", "purpose", "routable", "listed", "visible"],
+        additionalProperties: false,
+        properties: {
+          slug: { type: "string" }, provider: { type: "string" }, upstreamModel: { type: "string" },
+          effectiveTransport: { type: "string" }, toolDialect: { type: "string" }, reasoningDisplayMode: { type: "string" },
+          declaredFinalReasoningShape: { type: "string" }, effectiveFinalReasoningShape: { type: "string" }, rolloutState: { type: "string" }, purpose: { type: "string" },
+          routable: { type: "boolean" }, listed: { type: "boolean" }, visible: { type: "boolean" }, publicError: { type: "string" },
+        },
+      },
+    },
+  },
+});
+
 // Pre-generation merged catalogs were consumed by the 0.147 client contract.
 // Keep that historical validation separate from the stricter artifact written
 // by this version, so bootstrapping preserves old bytes rather than rewriting
@@ -176,13 +215,28 @@ function isPresent(operations, target) {
   }
 }
 
-function currentTarget(operations, currentDir) {
+function currentTarget(operations, currentDir, generationsDir = path.dirname(currentDir)) {
+  let stat;
   try {
-    return operations.readlink(currentDir);
+    stat = operations.lstat(currentDir);
   } catch (error) {
-    if (error?.code === "ENOENT" || error?.code === "EINVAL") return undefined;
+    if (error?.code === "ENOENT") return undefined;
     throw error;
   }
+  if (!stat.isSymbolicLink()) throw new Error("Catalog current authority must be a symbolic link.");
+  const target = operations.readlink(currentDir);
+  const relative = path.relative(generationsDir, path.resolve(path.dirname(currentDir), target));
+  if (!target || !relative || relative === ".." || relative.startsWith(`..${path.sep}`) || path.dirname(relative) !== ".") {
+    throw new Error("Catalog current authority must reference an in-tree generation.");
+  }
+  const generationDir = path.join(generationsDir, relative);
+  if (!operations.lstat(generationDir).isDirectory()) throw new Error("Catalog current authority references a non-directory generation.");
+  for (const name of CATALOG_GENERATION_FILES) {
+    if (!operations.lstat(path.join(generationDir, name)).isFile()) {
+      throw new Error("Catalog current authority references an incomplete generation.");
+    }
+  }
+  return target;
 }
 
 function captureRegularFile(operations, target) {
@@ -199,11 +253,27 @@ function captureRegularFile(operations, target) {
 
 function restoreRegularFile(operations, snapshot) {
   if (!snapshot || snapshot.preserve) return;
-  if (isPresent(operations, snapshot.path)) operations.unlink(snapshot.path);
+  const parent = path.dirname(snapshot.path);
+  if (isPresent(operations, snapshot.path)) {
+    operations.unlink(snapshot.path);
+    operations.fsyncDirectory(parent);
+  }
   if (!snapshot.present) return;
   operations.mkdir(path.dirname(snapshot.path), { recursive: true, mode: 0o700 });
-  operations.writeFile(snapshot.path, snapshot.contents, { mode: snapshot.mode });
-  operations.chmod(snapshot.path, snapshot.mode);
+  const temporary = `${snapshot.path}.catalog-rollback-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
+  try {
+    operations.writeFile(temporary, snapshot.contents, { mode: snapshot.mode });
+    operations.chmod(temporary, snapshot.mode);
+    operations.protect(temporary);
+    operations.fsyncFile(temporary);
+    operations.rename(temporary, snapshot.path);
+    operations.fsyncDirectory(parent);
+  } finally {
+    if (isPresent(operations, temporary)) {
+      operations.unlink(temporary);
+      operations.fsyncDirectory(parent);
+    }
+  }
 }
 
 function installStableLegacyTopology(operations, entries, snapshots) {
@@ -310,6 +380,7 @@ function bootstrapLegacyGeneration(operations, entries, snapshots, generationsDi
 
 function validateNode(value, schema, pathLabel = "catalog") {
   if (!schema || typeof schema !== "object") return;
+  if (Object.hasOwn(schema, "const") && value !== schema.const) throw new Error(`${pathLabel} must equal ${schema.const}.`);
   if (schema.type === "object") {
     if (!value || typeof value !== "object" || Array.isArray(value)) {
       throw new Error(`${pathLabel} must be an object.`);
@@ -319,6 +390,11 @@ function validateNode(value, schema, pathLabel = "catalog") {
     }
     for (const [key, child] of Object.entries(schema.properties || {})) {
       if (key in value) validateNode(value[key], child, `${pathLabel}.${key}`);
+    }
+    if (schema.additionalProperties === false) {
+      for (const key of Object.keys(value)) {
+        if (!(key in (schema.properties || {}))) throw new Error(`${pathLabel}.${key} is not allowed.`);
+      }
     }
   } else if (schema.type === "array") {
     if (!Array.isArray(value)) throw new Error(`${pathLabel} must be an array.`);
@@ -354,13 +430,26 @@ export function buildRoutedCatalog({ nativeModels = [], routedModels = [] } = {}
     || nativeModels[0];
   if (!template) throw new Error("A routed catalog needs a native template.");
   const completeTemplate = completeRoutedTemplate(template);
-  const models = routedModels.map((model) => {
+  const byPriorityAndSlug = (left, right) => Number(left.priority ?? 999) - Number(right.priority ?? 999)
+    || left.slug.localeCompare(right.slug);
+  const seen = new Set();
+  const native = nativeModels
+    .filter((model) => model && typeof model.slug === "string")
+    .sort(byPriorityAndSlug)
+    .filter((model) => !seen.has(model.slug) && seen.add(model.slug))
+    .map((model) => {
+      const next = completeRoutedTemplate(model);
+      next.supports_parallel_tool_calls = model.supports_parallel_tool_calls === true;
+      delete next.show_raw_agent_reasoning;
+      return next;
+    });
+  const routed = routedModels.map((model) => {
     const next = routedModel(completeTemplate, model);
     next.supports_parallel_tool_calls = model.supportsParallelToolCalls === true;
     delete next.show_raw_agent_reasoning;
     return next;
-  }).sort((left, right) => Number(left.priority ?? 999) - Number(right.priority ?? 999)
-    || left.slug.localeCompare(right.slug));
+  }).sort(byPriorityAndSlug).filter((model) => !seen.has(model.slug) && seen.add(model.slug));
+  const models = [...native, ...routed];
   validateCatalogSchema({ models }, CATALOG_0147_SCHEMA);
   return validateCatalogSchema({ models }, CATALOG_0149_SCHEMA);
 }
@@ -384,7 +473,7 @@ export function publishCatalogGeneration({
   const staging = path.join(generationsDir, `.staging-${generation}`);
   const final = path.join(generationsDir, generation);
   const nextPointer = path.join(generationsDir, `.current-next-${generation}`);
-  let previousPointer = currentTarget(operations, currentDir);
+  let previousPointer = currentTarget(operations, currentDir, generationsDir);
   const entries = legacyEntries(legacyPaths);
   const snapshots = entries.map(([, target]) => captureRegularFile(operations, target));
   let pointerSwitched = false;
@@ -407,6 +496,10 @@ export function publishCatalogGeneration({
     validateCatalogSchema(files["merged-models.json"], MERGED_CATALOG_SCHEMA);
     validateCatalogSchema(files["routed-models.json"], CATALOG_0147_SCHEMA);
     validateCatalogSchema(files["routed-models.json"], CATALOG_0149_SCHEMA);
+    validateCatalogSchema(files["node-routes.json"], ROUTE_SNAPSHOT_SCHEMA);
+    for (const name of ["control-models.json", "swift-models.json", "browser-models.json"]) {
+      validateCatalogSchema(files[name], UI_SNAPSHOT_SCHEMA);
+    }
     operations.mkdir(generationsDir, { recursive: true, mode: 0o700 });
     operations.mkdir(staging, { mode: 0o700 });
     for (const name of CATALOG_GENERATION_FILES) {
@@ -451,13 +544,16 @@ export function publishCatalogGeneration({
     return Object.freeze({ generation, path: final });
   } catch (error) {
     const rollbackErrors = [];
-    for (const snapshot of [...snapshots].reverse()) {
-      try { restoreRegularFile(operations, snapshot); } catch (rollbackError) { rollbackErrors.push(rollbackError); }
-    }
     const bootstrapRollback = bootstrapState?.pointerSwitched === true;
+    // A bootstrap may already have made `current` authoritative for the old
+    // complete generation. Restore that view first, before rewriting a single
+    // stable legacy path, so an operation seam never observes mixed old/new.
     if (bootstrapRollback) {
       try {
-        if (isPresent(operations, currentDir)) operations.remove(currentDir, { recursive: true, force: true });
+        if (isPresent(operations, nextPointer)) operations.unlink(nextPointer);
+        operations.symlink(bootstrapState.generation, nextPointer, "dir");
+        operations.rename(nextPointer, currentDir);
+        operations.fsyncDirectory(generationsDir);
       } catch (rollbackError) { rollbackErrors.push(rollbackError); }
     }
     if (pointerSwitched && !bootstrapRollback) {
@@ -474,20 +570,45 @@ export function publishCatalogGeneration({
         operations.fsyncDirectory(generationsDir);
       } catch (rollbackError) { rollbackErrors.push(rollbackError); }
     }
-    try { if (isPresent(operations, nextPointer)) operations.unlink(nextPointer); } catch (cleanupError) { rollbackErrors.push(cleanupError); }
+    for (const snapshot of [...snapshots].reverse()) {
+      try { restoreRegularFile(operations, snapshot); } catch (rollbackError) { rollbackErrors.push(rollbackError); }
+    }
+    if (bootstrapRollback) {
+      try {
+        if (isPresent(operations, currentDir)) {
+          operations.remove(currentDir, { recursive: true, force: true });
+          operations.fsyncDirectory(generationsDir);
+        }
+      } catch (rollbackError) { rollbackErrors.push(rollbackError); }
+    }
+    try {
+      if (isPresent(operations, nextPointer)) {
+        operations.unlink(nextPointer);
+        operations.fsyncDirectory(generationsDir);
+      }
+    } catch (cleanupError) { rollbackErrors.push(cleanupError); }
     try {
       const active = currentTarget(operations, currentDir);
-      if (isPresent(operations, staging)) operations.remove(staging, { recursive: true, force: true });
-      if (isPresent(operations, final) && active !== generation) operations.remove(final, { recursive: true, force: true });
+      if (isPresent(operations, staging)) {
+        operations.remove(staging, { recursive: true, force: true });
+        operations.fsyncDirectory(generationsDir);
+      }
+      if (isPresent(operations, final) && active !== generation) {
+        operations.remove(final, { recursive: true, force: true });
+        operations.fsyncDirectory(generationsDir);
+      }
       if (bootstrapState) {
         if (isPresent(operations, bootstrapState.pointer)) {
           operations.remove(bootstrapState.pointer, { recursive: true, force: true });
+          operations.fsyncDirectory(generationsDir);
         }
         if (isPresent(operations, bootstrapState.staging)) {
           operations.remove(bootstrapState.staging, { recursive: true, force: true });
+          operations.fsyncDirectory(generationsDir);
         }
         if (isPresent(operations, bootstrapState.final)) {
           operations.remove(bootstrapState.final, { recursive: true, force: true });
+          operations.fsyncDirectory(generationsDir);
         }
       }
     } catch (cleanupError) { rollbackErrors.push(cleanupError); }

@@ -35,7 +35,7 @@ export async function transactNodeMutationAndRefreshTargets({
     ...transactionOptions,
     ...(rebuild ? { rebuild } : {}),
   });
-  if (typeof refreshTargets === "function") await refreshTargets();
+  if (!result?.deferred && typeof refreshTargets === "function") await refreshTargets();
   return result;
 }
 
@@ -43,14 +43,25 @@ export async function transactNodeMutationAndRefreshTargets({
 export async function rebuildAfterStartup({
   hasBaseCatalog = () => existsSync(MERGED_CATALOG_PATH),
   rebuild,
+  refreshTargets,
   ...rebuildOptions
 } = {}) {
   if (!hasBaseCatalog()) return undefined;
+  let result;
   if (typeof rebuild !== "function") {
     const { rebuildNodeSnapshots } = await import("./catalog-rebuild.mjs");
-    return rebuildNodeSnapshots("service-startup", rebuildOptions);
+    result = await rebuildNodeSnapshots("service-startup", rebuildOptions);
+  } else {
+    result = await rebuild("service-startup");
   }
-  return rebuild("service-startup");
+  if (!result?.deferred) {
+    if (typeof refreshTargets === "function") await refreshTargets();
+    else {
+      const { refreshTargetPickerIfInstalled } = await import("./target-integration.mjs");
+      await refreshTargetPickerIfInstalled({ rebuildCodex: false });
+    }
+  }
+  return result;
 }
 
 /**
@@ -180,16 +191,11 @@ async function main() {
   if (process.argv[2] !== "registry-update") {
     throw new Error("Usage: node-snapshot-triggers.mjs registry-update");
   }
-  const [{ nodeRoutableModels }, { configuredProviderIds }, { readHiddenModels }] = await Promise.all([
+  const [{ nodeRegistryModels }] = await Promise.all([
     import("./model-contract.mjs"),
-    import("./provider-selection.mjs"),
-    import("./model-picker-state.mjs"),
   ]);
   await rebuildAfterRegistryUpdate({
-    models: nodeRoutableModels({
-      enabledProviders: new Set(configuredProviderIds()),
-      hiddenModels: readHiddenModels(),
-    }),
+    models: nodeRegistryModels(),
   });
 }
 

@@ -64,11 +64,33 @@ test("routed catalog is profile-independent and carries an explicit parallel-too
     nativeModels: [template],
     routedModels: [{ ...grok, provider: "deepseek", upstreamModel: "deepseek-chat", supportsParallelToolCalls: false }],
   });
-  assert.equal(catalog.models[0].slug, "grok-oauth/grok-4.5");
+  assert.equal(catalog.models[0].slug, "gpt-5.5");
+  assert.equal(catalog.models[1].slug, "grok-oauth/grok-4.5");
+  assert.equal(catalog.models[1].supports_parallel_tool_calls, false);
+  assert.equal(typeof catalog.models[1].base_instructions, "string");
+  assert.equal(typeof catalog.models[1].model_messages.instructions_template, "string");
+  assert.equal("show_raw_agent_reasoning" in catalog.models[1], false);
+});
+
+test("routed catalog retains normalized native models before deterministic Node models without duplicate slugs", () => {
+  const catalog = buildRoutedCatalog({
+    nativeModels: [
+      { ...template, slug: "gpt-native", priority: 20, supports_parallel_tool_calls: 1 },
+      { ...template, slug: "shared", priority: 10, supports_parallel_tool_calls: false },
+    ],
+    routedModels: [
+      { ...grok, slug: "shared", priority: 1, provider: "deepseek", upstreamModel: "ignored", supportsParallelToolCalls: false },
+      { ...grok, slug: "deepseek/z", priority: 2, provider: "deepseek", upstreamModel: "z", supportsParallelToolCalls: true },
+      { ...grok, slug: "deepseek/a", priority: 2, provider: "deepseek", upstreamModel: "a", supportsParallelToolCalls: false },
+    ],
+  });
+  assert.deepEqual(catalog.models.map((model) => model.slug), ["shared", "gpt-native", "deepseek/a", "deepseek/z"]);
   assert.equal(catalog.models[0].supports_parallel_tool_calls, false);
-  assert.equal(typeof catalog.models[0].base_instructions, "string");
-  assert.equal(typeof catalog.models[0].model_messages.instructions_template, "string");
-  assert.equal("show_raw_agent_reasoning" in catalog.models[0], false);
+  assert.equal(catalog.models[1].supports_parallel_tool_calls, false);
+  for (const model of catalog.models) {
+    assert.equal(typeof model.base_instructions, "string");
+    assert.equal(typeof model.model_messages.instructions_template, "string");
+  }
 });
 
 test("routed catalog is exposed only when the active provider reaches the router", () => {

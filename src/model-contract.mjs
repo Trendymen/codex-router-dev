@@ -227,11 +227,15 @@ export function resolveNodeModel(model, state = {}) {
 
 export function nodeRoutableModels(state = {}) {
   return Object.freeze(
-    MODELS
-      .filter((model) => NORMATIVE_NODE_SLUGS.has(model.slug) && isNodeModel(model))
+    nodeRegistryModels()
       .map((model) => resolveNodeModel(model, state))
       .filter((model) => model.routable),
   );
+}
+
+/** Complete Appendix-B model set for write-time registry/proof maintenance. */
+export function nodeRegistryModels() {
+  return Object.freeze(MODELS.filter((model) => NORMATIVE_NODE_SLUGS.has(model.slug) && isNodeModel(model)));
 }
 
 export { NODE_FIELDS };

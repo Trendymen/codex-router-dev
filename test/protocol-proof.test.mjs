@@ -28,6 +28,7 @@ const { EXPERIMENTAL_MODELS_PATH, PROTOCOL_PROOFS_PATH } = await import("../src/
 const { experimentalModelEnabled, setExperimentalModel } = await import("../src/experimental-models.mjs");
 const {
   readProtocolProof,
+  invalidateProtocolProofsForModels,
   registryFingerprint,
   revokeProtocolProof,
   writePassingProtocolProof,
@@ -222,6 +223,40 @@ test("proof state fails closed when corrupt and revoke is exact-slug scoped", as
 
   assert.equal(readProtocolProof(passingProof.slug), null);
   assert.deepEqual(readProtocolProof(other.slug), other);
+});
+
+test("registry invalidation removes removed, fingerprint-mismatched, and verifier-stale proofs in one transaction", async () => {
+  const current = {
+    slug: "deepseek/current", provider: "deepseek", upstreamModel: "current",
+    effectiveTransport: "openai-responses", toolDialect: "responses-functions", requestProfile: "deepseek",
+  };
+  const good = {
+    ...passingProof, ...current, transport: current.effectiveTransport,
+    fingerprint: registryFingerprint(current, 1), verifierVersion: 1,
+  };
+  const staleFingerprint = { ...good, slug: "deepseek/changed", upstreamModel: "old", fingerprint: "old" };
+  const staleVersion = { ...good, slug: "deepseek/version", verifierVersion: 2, fingerprint: registryFingerprint({ ...current, slug: "deepseek/version" }, 2) };
+  const removed = { ...good, slug: "deepseek/removed" };
+  writeFileSync(PROTOCOL_PROOFS_PATH, JSON.stringify({
+    version: 1, revision: 4, revisions: {}, proofs: {
+      [good.slug]: good, [staleFingerprint.slug]: staleFingerprint, [staleVersion.slug]: staleVersion, [removed.slug]: removed,
+    },
+  }));
+  let transactions = 0;
+  await invalidateProtocolProofsForModels([
+    current,
+    { ...current, slug: staleFingerprint.slug, upstreamModel: "new" },
+    { ...current, slug: staleVersion.slug },
+  ], {
+    verifierVersion: 1,
+    transaction: async (input) => { transactions += 1; await input.mutate(); return { generation: "one" }; },
+    refreshTargets: async () => undefined,
+  });
+  assert.equal(transactions, 1);
+  assert.deepEqual(readProtocolProof(good.slug), good);
+  assert.equal(readProtocolProof(staleFingerprint.slug), null);
+  assert.equal(readProtocolProof(staleVersion.slug), null);
+  assert.equal(readProtocolProof(removed.slug), null);
 });
 
 test("proof writes are owner-only atomic replacements", async () => {

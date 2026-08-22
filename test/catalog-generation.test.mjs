@@ -3,11 +3,13 @@ import {
   existsSync,
   lstatSync,
   linkSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
   rmSync,
   statSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import os from "node:os";
@@ -38,11 +40,22 @@ function artifacts(label) {
       supports_parallel_tool_calls: false,
     }],
   };
-  const models = { version: 1, models: [{ slug: `router/${label}`, provider: "router" }] };
+  const route = {
+    slug: `router/${label}`, provider: "router", upstreamModel: "router-model",
+    effectiveTransport: "openai-responses", toolDialect: "responses-functions", requestProfile: "router",
+    reasoningDisplayMode: "raw-preserve", effectiveFinalReasoningShape: "raw-content", purpose: "primary",
+  };
+  const models = { version: 1, models: [{
+    slug: route.slug, provider: route.provider, upstreamModel: route.upstreamModel,
+    effectiveTransport: route.effectiveTransport, toolDialect: route.toolDialect,
+    reasoningDisplayMode: route.reasoningDisplayMode, effectiveFinalReasoningShape: route.effectiveFinalReasoningShape,
+    declaredFinalReasoningShape: "raw-content", rolloutState: "stable", purpose: route.purpose,
+    routable: true, listed: true, visible: true,
+  }] };
   return {
     "merged-models.json": catalog,
     "routed-models.json": catalog,
-    "node-routes.json": { version: 1, routes: [{ slug: `router/${label}`, provider: "router" }] },
+    "node-routes.json": { version: 1, routes: [route] },
     "control-models.json": models,
     "swift-models.json": models,
     "browser-models.json": models,
@@ -147,6 +160,55 @@ test("merged entries require an explicit parallel-tool boolean", () => {
   }
 });
 
+test("generation rejects malformed routes and UI snapshots before staging any generation", () => {
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), "catalog-generation-safe-schema-"));
+  try {
+    for (const [name, value] of [
+      ["node-routes.json", { version: 1, routes: [{ slug: "x", provider: "p", unexpected: true }] }],
+      ["control-models.json", { version: 1, models: [{ slug: "x", provider: "p", unexpected: true }] }],
+      ["swift-models.json", { version: 2, models: [] }],
+      ["browser-models.json", { version: 1, models: "bad" }],
+    ]) {
+      const generationsDir = path.join(stateDir, `catalog-${name}`);
+      publishCatalogGeneration({ files: artifacts(`old-${name}`), generationsDir, legacyPaths: {}, operations: testOperations() });
+      const oldBytes = readCurrent(generationsDir);
+      const files = artifacts(`invalid-${name}`);
+      files[name] = value;
+      assert.throws(() => publishCatalogGeneration({
+        files, generationsDir, legacyPaths: {}, operations: testOperations(),
+      }), /safe snapshot|unexpected|version|models|routes/);
+      assert.deepEqual(readCurrent(generationsDir), oldBytes, `${name} malformed bytes must leave the old generation visible`);
+    }
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("current authority rejects regular files, directories, outside links and incomplete generations without mutation", () => {
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), "catalog-generation-current-authority-"));
+  try {
+    const generationsDir = path.join(stateDir, "catalog-generations");
+    for (const kind of ["file", "directory", "outside", "incomplete"]) {
+      rmSync(generationsDir, { recursive: true, force: true });
+      mkdirSync(generationsDir, { recursive: true });
+      const current = path.join(generationsDir, "current");
+      if (kind === "file") writeFileSync(current, "not a pointer");
+      if (kind === "directory") mkdirSync(current);
+      if (kind === "outside") {
+        const outside = path.join(stateDir, "outside"); mkdirSync(outside); testOperations().symlink(outside, current, "dir");
+      }
+      if (kind === "incomplete") {
+        const incomplete = path.join(generationsDir, "incomplete"); mkdirSync(incomplete); writeFileSync(path.join(incomplete, "merged-models.json"), "{}"); testOperations().symlink("incomplete", current, "dir");
+      }
+      const before = lstatSync(current);
+      assert.throws(() => publishCatalogGeneration({ files: artifacts(kind), generationsDir, legacyPaths: {}, operations: testOperations() }), /current|generation/i, kind);
+      assert.equal(lstatSync(current).ino, before.ino, `${kind} current object changed`);
+    }
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
 for (const boundary of ["write", "file-fsync", "directory-fsync", "symlink", "pointer-rename"]) {
   test(`a ${boundary} failure preserves the complete previous generation`, () => {
     const stateDir = mkdtempSync(path.join(os.tmpdir(), "catalog-generation-failure-"));
@@ -163,7 +225,7 @@ for (const boundary of ["write", "file-fsync", "directory-fsync", "symlink", "po
           operations: failingOperations(boundary, testOperations()),
           legacyPaths: {},
         }),
-        /injected/,
+        /injected|rollback was incomplete/,
       );
       assert.deepEqual(readCurrent(generationsDir), oldBytes);
       // On Windows the injected seam uses a privilege-free junction. The
