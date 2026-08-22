@@ -1,0 +1,14 @@
+{
+  "key": "task5-internal-key-with-enough-entropy",
+  "payload": {
+    "v": 1,
+    "provider": "qwen-plan",
+    "model": "glm-5.2",
+    "transport": "anthropic-messages",
+    "responseId": "msg_é",
+    "itemId": "rsn_1",
+    "textSha256": "hbM_dTeBAwsxg1bda31NgZOTjIqyLMHlNV_yg5keKqU",
+    "signature": "sig-opaque"
+  },
+  "sealed": "cr.reasoning.v1.eyJpdGVtSWQiOiJyc25fMSIsIm1vZGVsIjoiZ2xtLTUuMiIsInByb3ZpZGVyIjoicXdlbi1wbGFuIiwicmVzcG9uc2VJZCI6Im1zZ1_DqSIsInNpZ25hdHVyZSI6InNpZy1vcGFxdWUiLCJ0ZXh0U2hhMjU2IjoiaGJNX2RUZUJBd3N4ZzFiZGEzMU5nWk9UaklxeUxNSGxOVl95ZzVrZUtxVSIsInRyYW5zcG9ydCI6ImFudGhyb3BpYy1tZXNzYWdlcyIsInYiOjF9.dmcr8aBziKYWmZ06H-93DoiCltvqXpLb84Q_d1eupiQ"
+}
