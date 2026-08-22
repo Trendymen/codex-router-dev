@@ -43,6 +43,11 @@ import { relayCommandCodeGenerate } from "./commandcode-relay.mjs";
 import { VERSION } from "./version.mjs";
 import { installStableFetchTransport } from "./fetch-transport.mjs";
 import { zaiCacheUsageTransform } from "./zai-cache-usage.mjs";
+import {
+  adaptOpenAIResponses,
+  buildOpenAIResponsesRequest,
+} from "./openai-responses-adapter.mjs";
+import { providerEndpoint } from "./provider-endpoint.mjs";
 
 installStableFetchTransport();
 
@@ -546,10 +551,35 @@ function normalizeBody(buffer, contentType, route) {
       : provider.protocol === "openai-responses"
         ? "/responses"
         : "/chat/completions";
-  if (route !== expectedRoute) {
+  // Phase 2 publishes the direct Responses path before Phase 5 removes the
+  // legacy gateway route.  Accept it for a model that explicitly opted into
+  // the transport even while the provider still has Chat clients in flight.
+  const directResponsesRoute =
+    route === "/responses" && model.effectiveTransport === "openai-responses";
+  if (route !== expectedRoute && !directResponsesRoute) {
     const error = new Error(`Model ${model.gatewayModel} does not support ${route}.`);
     error.status = 400;
     throw error;
+  }
+
+  // Responses-native routes own a separate request contract.  In particular,
+  // their nested `reasoning` object must never be lowered into the legacy Chat
+  // Completions `thinking` fields below.  Keep this branch ahead of every
+  // chat-only provider profile so a future shared profile cannot regress it.
+  if (route === "/responses" && model.effectiveTransport === "openai-responses") {
+    const endpoint = endpointForModel(model);
+    const request = buildOpenAIResponsesRequest({
+      model: { ...model, baseUrl: providerBaseUrl(endpoint) },
+      payload,
+    });
+    return {
+      body: request.body,
+      model,
+      provider,
+      endpoint,
+      payload: request.json,
+      providerRequest: request,
+    };
   }
 
   payload.model = model.upstreamModel;
@@ -1020,7 +1050,9 @@ async function handleRequest(request, response) {
     {},
     normalized.endpoint,
   );
-  let target = `${session.baseUrl}${route}${requestUrl.search}`;
+  let target = normalized.providerRequest
+    ? `${providerEndpoint(session.baseUrl, "responses").href}${requestUrl.search}`
+    : `${session.baseUrl}${route}${requestUrl.search}`;
   let upstream = await fetch(target, {
     method: request.method,
     headers: upstreamHeaders(
@@ -1045,7 +1077,9 @@ async function handleRequest(request, response) {
       { force: true },
       normalized.endpoint,
     );
-    target = `${session.baseUrl}${route}${requestUrl.search}`;
+    target = normalized.providerRequest
+      ? `${providerEndpoint(session.baseUrl, "responses").href}${requestUrl.search}`
+      : `${session.baseUrl}${route}${requestUrl.search}`;
     upstream = await fetch(target, {
       method: request.method,
       headers: upstreamHeaders(
@@ -1096,12 +1130,18 @@ async function handleRequest(request, response) {
   if (commandCode?.recheck && upstream.ok) {
     recordCommandCodeRoute(commandCode.id, credential.value, { providerApi: true });
   }
-  await pipeResponse(
-    upstream,
-    response,
-    undefined,
+  const responseAdapter = normalized.providerRequest
+    ? adaptOpenAIResponses({
+        model: normalized.model,
+        upstream,
+        requestContext: { toolBuild: normalized.providerRequest.toolBuild, signal: controller.signal },
+      })
+    : undefined;
+  const transforms = [
+    ...(responseAdapter?.transforms || []),
     zaiCacheUsageTransform(normalized.provider.id, upstream.headers.get("content-type")),
-  );
+  ].filter(Boolean);
+  await pipeResponse(upstream, response, undefined, transforms.length ? transforms : undefined);
   recordUpstreamLimits(normalized, upstream);
   if (!QUIET) {
     console.error(
