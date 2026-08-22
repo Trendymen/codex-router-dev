@@ -2,7 +2,11 @@ import { Duplex, Transform } from "node:stream";
 
 import { providerEndpoint } from "./provider-endpoint.mjs";
 import { reasoningTransformForModel, normalizeReasoningResponse } from "./reasoning-summary-compat.mjs";
-import { encodeToolDialect, restoreToolEvent, ToolDialectError } from "./tool-dialect.mjs";
+import { createForcedToolBuffer, encodeToolDialect, restoreToolEvent, ToolDialectError } from "./tool-dialect.mjs";
+
+const MAX_SSE_FRAME_BYTES = 8 * 1024 * 1024;
+const MAX_JSON_BYTES = 8 * 1024 * 1024;
+const MAX_SSE_WORK = 65_536;
 
 export class OpenAIResponsesAdapterError extends Error {
   constructor(code = "provider_response_malformed") {
@@ -58,7 +62,7 @@ function applyResponsesProfile(model, payload, toolBuild) {
   if (Object.hasOwn(payload, "tool_choice")) body.tool_choice = toolBuild.toolChoice;
   if (Array.isArray(payload.input)) body.input = toolBuild.input;
 
-  if (["deepseek-thinking", "qwen-plan"].includes(model.requestProfile)) {
+  if (["deepseek-thinking", "qwen-plan"].includes(model.requestProfile) && !qwenGlmCompatibility(model)) {
     body.tool_choice = forcedChoice(body.tool_choice);
   }
   if (model.requestProfile === "qwen-plan") {
@@ -89,7 +93,10 @@ export function buildOpenAIResponsesRequest({ model, payload, credential } = {})
     // Tool lowering only applies to the structured Responses input array. A
     // string input is legal too and deliberately remains untouched.
     input: Array.isArray(source.input) ? source.input : undefined,
-    profile: model.requestProfile,
+    // The hidden GLM Responses alias uses native declarations and therefore
+    // retains required/named choices and strict schemas. It shares only Qwen's
+    // credential/store/reasoning profile, never its forced-choice downgrade.
+    profile: qwenGlmCompatibility(model) ? "glm" : model.requestProfile,
   });
   const json = applyResponsesProfile(model, source, toolBuild);
   return Object.freeze({
@@ -137,50 +144,100 @@ function dataLine(block) {
   return { lines, index, data };
 }
 
+// Byte framing is deliberately independent from JSON parsing. It accepts the
+// legal LF/CRLF/CR blank-line combinations across arbitrary chunks and hands
+// unmodified frames downstream as their original bytes.
+class SseFramer {
+  #chunks = []; #bytes = 0; #tail = ""; #limit;
+  constructor(limit = MAX_SSE_FRAME_BYTES) { this.#limit = limit; }
+  push(chunk, emit) {
+    let start = 0;
+    for (let offset = 0; offset < chunk.length; offset += 1) {
+      const next = (this.#tail + String.fromCharCode(chunk[offset])).slice(-4);
+      const boundary = next.endsWith("\n\n") || next.endsWith("\r\n\r\n") || next.endsWith("\n\r\n") || next.endsWith("\r\n\n") || next.endsWith("\r\r\n");
+      this.#tail = next;
+      if (!boundary) continue;
+      this.#append(chunk.subarray(start, offset + 1));
+      emit(Buffer.concat(this.#chunks));
+      this.#chunks = []; this.#bytes = 0; this.#tail = ""; start = offset + 1;
+    }
+    if (start < chunk.length) this.#append(chunk.subarray(start));
+  }
+  #append(chunk) {
+    this.#bytes += chunk.length;
+    if (!Number.isSafeInteger(this.#bytes) || this.#bytes > this.#limit) fail("forced_tool_buffer_limit");
+    this.#chunks.push(chunk);
+  }
+  finish() { return this.#bytes > 0; }
+}
+
 class ResponsesSseToolTransform extends Transform {
-  #buffer = "";
-  #toolBuild;
-  constructor(toolBuild) { super(); this.#toolBuild = toolBuild; }
+  #framer; #toolBuild; #work = 0; #forced; #events = []; #held = [];
+  constructor(toolBuild, { signal, abort, limits } = {}) {
+    super(); this.#toolBuild = toolBuild;
+    const frameBytes = limits?.maxFrameBytes ?? MAX_SSE_FRAME_BYTES;
+    if (!Number.isSafeInteger(frameBytes) || frameBytes <= 0 || frameBytes > MAX_SSE_FRAME_BYTES) fail("forced_tool_buffer_limit");
+    this.#framer = new SseFramer(frameBytes);
+    if (toolBuild?.forcedRequirement) {
+      this.#forced = createForcedToolBuffer({ build: toolBuild, signal, abort });
+    }
+  }
   _transform(chunk, _encoding, callback) {
-    this.#buffer += Buffer.from(chunk).toString("utf8");
     try {
-      this.#drain(false);
+      this.#framer.push(Buffer.from(chunk), (frame) => this.#rewrite(frame));
       callback();
     } catch (error) { callback(error); }
   }
   _flush(callback) {
     try {
-      this.#drain(true);
+      if (this.#framer.finish()) fail("upstream_stream_truncated");
+      if (this.#forced?.state.aborted === false) this.#forced.finish(this.#events);
+      this.#release();
       callback();
     } catch (error) { callback(error); }
   }
-  #drain(flush) {
-    const blocks = this.#buffer.split(/\r?\n\r?\n/);
-    this.#buffer = flush ? "" : blocks.pop() || "";
-    for (const block of blocks) this.#rewrite(block);
-    if (flush && this.#buffer) fail("provider_response_malformed");
+  #output(chunk) {
+    if (this.#forced) this.#held.push(chunk);
+    else this.push(chunk);
   }
-  #rewrite(block) {
-    const data = dataLine(block);
+  #release() { if (this.#forced) for (const chunk of this.#held.splice(0)) this.push(chunk); }
+  #rewrite(raw) {
+    if (++this.#work > MAX_SSE_WORK) fail("reasoning_protocol_error");
+    this.#forced?.push(raw);
+    const data = dataLine(raw.toString("utf8"));
     if (!data || !data.data || data.data === "[DONE]") {
-      this.push(Buffer.from(`${block}\n\n`, "utf8"));
+      if (data?.data === "[DONE]" && this.#forced) this.#forced.finish(this.#events);
+      this.#release();
+      this.#output(raw);
       return;
     }
     let event;
     try { event = JSON.parse(data.data); } catch { fail("provider_response_malformed"); }
+    this.#events.push(event);
+    const usage = event.usage ?? event.response?.usage;
+    if (usage && typeof usage === "object") this.#forced?.observeUsage(usage);
     const restored = restoreOpenAIResponsesEvent(event, this.#toolBuild);
+    // Task2 intentionally withholds custom argument deltas until the final
+    // exact input is known. A suppressed event is a suppressed frame; JSON
+    // stringifying it would manufacture the invalid `data: undefined` event.
+    if (restored === undefined) return;
+    if (restored === event || JSON.stringify(restored) === data.data) { this.#output(raw); return; }
     const lines = [...data.lines];
     lines[data.index] = `data: ${JSON.stringify(restored)}`;
-    this.push(Buffer.from(`${lines.join("\n")}\n\n`, "utf8"));
+    this.#output(Buffer.from(`${lines.join("\n")}\n\n`, "utf8"));
   }
 }
 
 class ResponsesJsonTransform extends Transform {
-  #chunks = [];
+  #chunks = []; #bytes = 0;
   #model;
   #toolBuild;
   constructor(model, toolBuild) { super(); this.#model = model; this.#toolBuild = toolBuild; }
-  _transform(chunk, _encoding, callback) { this.#chunks.push(Buffer.from(chunk)); callback(); }
+  _transform(chunk, _encoding, callback) {
+    const copy = Buffer.from(chunk); this.#bytes += copy.length;
+    if (!Number.isSafeInteger(this.#bytes) || this.#bytes > MAX_JSON_BYTES) { callback(new OpenAIResponsesAdapterError("forced_tool_buffer_limit")); return; }
+    this.#chunks.push(copy); callback();
+  }
   _flush(callback) {
     try {
       const original = Buffer.concat(this.#chunks);
@@ -213,6 +270,6 @@ export function adaptOpenAIResponses({ model, upstream, requestContext = {} } = 
   });
   return Object.freeze({
     upstream,
-    transforms: [new ResponsesSseToolTransform(toolBuild), Duplex.fromWeb(reasoning)],
+    transforms: [new ResponsesSseToolTransform(toolBuild, requestContext), Duplex.fromWeb(reasoning)],
   });
 }

@@ -6,8 +6,11 @@ export function providerEndpoint(baseUrl, leaf) {
   if (typeof baseUrl !== "string" || !baseUrl.trim()) {
     throw new TypeError("provider base URL must be a non-empty string");
   }
-  if (typeof leaf !== "string" || !leaf.replace(/^\/+|\/+$/g, "")) {
-    throw new TypeError("provider endpoint leaf must be a non-empty string");
+  if (typeof leaf !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(leaf.replace(/^\/+/, ""))) {
+    throw new TypeError("provider endpoint leaf must be one relative path segment");
+  }
+  if (/^[A-Za-z][A-Za-z0-9+.-]*:|[\\?#]|^\/\/|\.{1,2}(?:\/|$)/.test(leaf)) {
+    throw new TypeError("provider endpoint leaf must be a relative path segment");
   }
   const base = `${baseUrl.replace(/\/+$/, "")}/`;
   return new URL(leaf.replace(/^\/+/, ""), base);

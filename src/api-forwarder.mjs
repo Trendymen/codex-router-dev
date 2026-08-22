@@ -46,8 +46,12 @@ import { zaiCacheUsageTransform } from "./zai-cache-usage.mjs";
 import {
   adaptOpenAIResponses,
   buildOpenAIResponsesRequest,
+  OpenAIResponsesAdapterError,
 } from "./openai-responses-adapter.mjs";
 import { providerEndpoint } from "./provider-endpoint.mjs";
+import { failedResponseEvent, formatTerminalFrames, routerError, ERROR_DEFINITIONS } from "./public-error.mjs";
+import { ToolDialectError } from "./tool-dialect.mjs";
+import { ReasoningProtocolError } from "./reasoning-summary-compat.mjs";
 
 installStableFetchTransport();
 
@@ -1159,7 +1163,23 @@ const server = http.createServer((request, response) => {
     console.error(
       `[api-forwarder] request failed: ${formatErrorChain(error, { messages: false })}`,
     );
-    if (!response.headersSent) {
+    const candidate = error instanceof ToolDialectError ||
+      error instanceof OpenAIResponsesAdapterError || error instanceof ReasoningProtocolError
+      ? error.code
+      : undefined;
+    const publicCode = ERROR_DEFINITIONS[candidate]
+      ? candidate
+      : candidate ? "reasoning_protocol_error" : undefined;
+    if (publicCode && !response.headersSent) {
+      const safe = routerError(publicCode);
+      writeJson(response, safe.status, safe.body);
+    } else if (publicCode && !response.writableEnded && !response.destroyed) {
+      const safe = routerError(publicCode);
+      response.write(formatTerminalFrames(failedResponseEvent({
+        responseId: "resp_adapter", model: "unknown", createdAt: Date.now(), sequenceNumber: 0,
+      }, safe)));
+      response.end();
+    } else if (!response.headersSent) {
       writeJson(response, status, {
         error: {
           type: "provider_api_proxy_error",
@@ -1167,6 +1187,8 @@ const server = http.createServer((request, response) => {
         },
       });
     } else if (!response.writableEnded) {
+      // A direct Responses adapter failure after the first byte has a safe
+      // terminal above; legacy routes retain their historical behavior.
       response.destroy();
     }
   });
