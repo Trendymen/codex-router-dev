@@ -7,6 +7,9 @@ const UPSTREAM_NAME = /^[A-Za-z0-9_-]{1,64}$/;
 const BASE32 = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 const FORCED_MAX_BYTES = 8 * 1024 * 1024;
 const FORCED_MAX_MS = 30_000;
+const MAPPING_STATE = new WeakMap();
+const MAX_GRAPH_DEPTH = 24;
+const MAX_GRAPH_NODES = 512;
 
 export class ToolDialectError extends Error {
   constructor(code = "tool_mapping_error") {
@@ -51,6 +54,12 @@ function profileUsesFunctions(profile) {
   if (typeof profile === "string") return !/^(glm|glm-thinking)$/i.test(profile);
   if (!profile || typeof profile !== "object") return true;
   return !/^(glm|zai)$/i.test(String(profile.provider ?? profile.id ?? profile.requestProfile ?? ""));
+}
+
+function stateFor(mapping) {
+  const state = MAPPING_STATE.get(mapping);
+  if (!state) fail();
+  return state;
 }
 
 function callKey(kind, namespace, name) {
@@ -129,6 +138,26 @@ function exactInput(argumentsText) {
   return value.input;
 }
 
+// The local strict validator intentionally supports only this bounded JSON
+// Schema subset. Profiles that need another keyword fail closed at build time.
+const STRICT_KEYS = new Set(["type", "enum", "const", "properties", "required", "additionalProperties", "items"]);
+function assertStrictSchema(schema, seen = new WeakSet(), state = { nodes: 0 }, depth = 0) {
+  if (!schema || typeof schema !== "object" || Array.isArray(schema) || depth > MAX_GRAPH_DEPTH || state.nodes++ >= MAX_GRAPH_NODES || seen.has(schema)) fail();
+  seen.add(schema);
+  let keys;
+  try { keys = Object.keys(schema); } catch { fail(); }
+  if (keys.some((key) => !STRICT_KEYS.has(key))) fail();
+  if (schema.type !== undefined && typeof schema.type !== "string") fail();
+  if (schema.enum !== undefined && !Array.isArray(schema.enum)) fail();
+  if (schema.required !== undefined && (!Array.isArray(schema.required) || schema.required.some((key) => typeof key !== "string"))) fail();
+  if (schema.additionalProperties !== undefined && typeof schema.additionalProperties !== "boolean") fail();
+  if (schema.properties !== undefined) {
+    if (!schema.properties || typeof schema.properties !== "object" || Array.isArray(schema.properties)) fail();
+    for (const value of Object.values(schema.properties)) assertStrictSchema(value, seen, state, depth + 1);
+  }
+  if (schema.items !== undefined) assertStrictSchema(schema.items, seen, state, depth + 1);
+}
+
 function parseArguments(argumentsText) {
   if (typeof argumentsText !== "string") fail();
   try {
@@ -163,6 +192,7 @@ function schemaAccepts(value, schema) {
 }
 
 function mappingForCall(mapping, item) {
+  mapping = privateState(mapping);
   if (!item || typeof item !== "object" || typeof item.name !== "string") fail();
   const isCustom = item.type === "custom_tool_call" || item.type === "custom_tool_call_output";
   const kind = isCustom ? "custom" : item.namespace === undefined ? "function" : "namespace";
@@ -170,13 +200,19 @@ function mappingForCall(mapping, item) {
   return mapping.byOriginal.get(key) ?? (kind === "function" ? mapping.byOriginal.get(callKey("custom", undefined, item.name)) : undefined);
 }
 
+function privateState(mapping) {
+  return MAPPING_STATE.get(mapping) ?? mapping;
+}
+
 function registerHistory(mapping, item) {
+  mapping = privateState(mapping);
   if (typeof item.call_id !== "string" || !item.call_id) fail();
   if (mapping.callIds.has(item.call_id)) fail();
   mapping.callIds.set(item.call_id, mappingForCall(mapping, item));
 }
 
 function lowerInputItem(item, mapping) {
+  mapping = privateState(mapping);
   if (!item || typeof item !== "object") return item;
   if (item.type === "function_call" || item.type === "custom_tool_call") {
     registerHistory(mapping, item);
@@ -200,48 +236,61 @@ function lowerInputItem(item, mapping) {
 }
 
 function choiceFor(toolChoice, mapping, usesFunctions) {
+  mapping = privateState(mapping);
   if (!usesFunctions || toolChoice === undefined) return { toolChoice, forcedRequirement: undefined };
   if (toolChoice === "auto" || toolChoice === "none") return { toolChoice, forcedRequirement: undefined };
   if (toolChoice === "required") return { toolChoice: "auto", forcedRequirement: { type: "any" } };
-  if (toolChoice && typeof toolChoice === "object" && toolChoice.type === "function" && typeof toolChoice.name === "string") {
-    const entry = mapping.byOriginal.get(callKey("function", undefined, toolChoice.name));
+  if (toolChoice && typeof toolChoice === "object" && typeof toolChoice.name === "string") {
+    const kind = toolChoice.type === "custom" ? "custom" : toolChoice.namespace === undefined ? "function" : "namespace";
+    const entry = mapping.byOriginal.get(callKey(kind, toolChoice.namespace, toolChoice.name));
     if (!entry) fail();
-    return { toolChoice: "auto", forcedRequirement: { type: "named", name: toolChoice.name } };
+    return { toolChoice: "auto", forcedRequirement: { type: "named", name: toolChoice.name, kind, namespace: toolChoice.namespace } };
   }
   fail();
 }
 
 export function encodeToolDialect({ tools, toolChoice, input, profile } = {}) {
   const usesFunctions = profileUsesFunctions(profile);
-  const mapping = { byEncodedName: new Map(), byOriginal: new Map(), callIds: new Map(), returnedCallIds: new Map() };
+  if (!usesFunctions) {
+    const mapping = Object.freeze({ entries: Object.freeze([]) });
+    MAPPING_STATE.set(mapping, { native: true });
+    return Object.freeze({ tools, toolChoice, input, mapping, forcedRequirement: undefined, strictValidators: Object.freeze([]) });
+  }
+  const state = { byEncodedName: new Map(), byOriginal: new Map(), callIds: new Map(), returnedCallIds: new Map(), itemCalls: new Map() };
   const entries = declarationEntries(tools);
   const names = new Set();
   const builtTools = entries.map((entry) => {
     const original = originalName(entry);
     const mayPreserve = entry.kind === "function" && UPSTREAM_NAME.test(entry.name);
     const encodedName = mayPreserve ? entry.name : encodedToolName(entry.kind, original);
-    if (names.has(encodedName) || mapping.byEncodedName.has(encodedName)) fail();
+    if (names.has(encodedName) || state.byEncodedName.has(encodedName)) fail();
     names.add(encodedName);
     const record = Object.freeze({ ...entry, encodedName });
-    mapping.byEncodedName.set(encodedName, record);
-    mapping.byOriginal.set(callKey(entry.kind, entry.namespace, entry.name), record);
+    state.byEncodedName.set(encodedName, record);
+    state.byOriginal.set(callKey(entry.kind, entry.namespace, entry.name), record);
     return outputTool(entry, encodedName, usesFunctions);
   });
-  const loweredInput = Array.isArray(input) ? input.map((item) => lowerInputItem(item, mapping)) : input;
-  const selected = choiceFor(toolChoice, mapping, usesFunctions);
+  const loweredInput = Array.isArray(input) ? input.map((item) => lowerInputItem(item, state)) : input;
+  const selected = choiceFor(toolChoice, state, usesFunctions);
   const strictValidators = new Map();
   if (usesFunctions) {
-    for (const entry of mapping.byEncodedName.values()) {
+    for (const entry of state.byEncodedName.values()) {
       if (entry.kind === "function" && entry.nested.strict === true) {
-        strictValidators.set(entry.encodedName, providerToolSchema(entry.parameters));
+        assertStrictSchema(entry.parameters);
+        const schema = providerToolSchema(entry.parameters);
+        assertStrictSchema(schema);
+        strictValidators.set(entry.encodedName, schema);
       }
     }
   }
-  mapping.strictValidators = strictValidators;
-  return { tools: builtTools, toolChoice: selected.toolChoice, input: loweredInput, mapping, forcedRequirement: selected.forcedRequirement, strictValidators };
+  state.strictValidators = strictValidators;
+  const mapping = Object.freeze({ entries: Object.freeze([...state.byEncodedName.values()].map((entry) => Object.freeze({ kind: entry.kind, name: entry.name, namespace: entry.namespace, encodedName: entry.encodedName }))) });
+  MAPPING_STATE.set(mapping, state);
+  return Object.freeze({ tools: builtTools, toolChoice: selected.toolChoice, input: loweredInput, mapping, forcedRequirement: selected.forcedRequirement, strictValidators: Object.freeze([...strictValidators.keys()]) });
 }
 
 function restoreItem(item, mapping) {
+  mapping = privateState(mapping);
   if (!item || typeof item !== "object" || item.type !== "function_call") return item;
   if (typeof item.name !== "string" || typeof item.call_id !== "string" || !item.call_id) fail();
   const entry = mapping.byEncodedName.get(item.name);
@@ -249,18 +298,19 @@ function restoreItem(item, mapping) {
   const prior = mapping.returnedCallIds.get(item.call_id);
   if (prior && (prior.entry !== entry || prior.itemId !== item.id || item.id === undefined)) fail();
   if (entry.kind === "custom") {
-    const input = exactInput(item.arguments);
+    const input = item.arguments === "" ? undefined : exactInput(item.arguments);
     const { arguments: _arguments, ...rest } = item;
     if (!prior) mapping.returnedCallIds.set(item.call_id, { entry, itemId: item.id });
-    return { ...rest, type: "custom_tool_call", name: entry.name, input };
+    return { ...rest, type: "custom_tool_call", name: entry.name, ...(input === undefined ? {} : { input }) };
   }
   const strictSchema = mapping.strictValidators?.get(item.name);
-  if (strictSchema && !schemaAccepts(parseArguments(item.arguments), strictSchema)) fail();
+  if (strictSchema && item.arguments !== "" && !schemaAccepts(parseArguments(item.arguments), strictSchema)) fail();
   if (!prior) mapping.returnedCallIds.set(item.call_id, { entry, itemId: item.id });
   return entry.kind === "namespace" ? { ...item, name: entry.name, namespace: entry.namespace } : { ...item, name: entry.name };
 }
 
 function restoreOutput(item, mapping) {
+  mapping = privateState(mapping);
   if (!item || typeof item !== "object" || !["function_call_output", "custom_tool_call_output"].includes(item.type)) return item;
   if (typeof item.call_id !== "string" || !mapping.callIds.has(item.call_id)) fail();
   const entry = mapping.callIds.get(item.call_id);
@@ -279,8 +329,34 @@ function restoreValue(value, mapping) {
 }
 
 export function restoreToolEvent(event, mapping) {
-  if (!mapping?.byEncodedName || !mapping?.callIds || !mapping?.returnedCallIds) fail();
-  return restoreValue(event, mapping);
+  const state = stateFor(mapping);
+  if (state.native) return event;
+  if (event?.type === "response.function_call_arguments.delta" || event?.type === "response.function_call_arguments.done") {
+    const tracked = state.itemCalls.get(event.item_id);
+    if (!tracked) fail();
+    if (event.type.endsWith("done")) {
+      tracked.finalArguments = event.arguments;
+      const strictSchema = state.strictValidators?.get(tracked.entry.encodedName);
+      if (strictSchema && !schemaAccepts(parseArguments(event.arguments), strictSchema)) fail();
+    }
+    if (tracked.entry.kind !== "custom") return event;
+    if (event.type.endsWith("delta")) return { ...event, type: "response.custom_tool_call_input.delta" };
+    return { type: "response.custom_tool_call_input.done", item_id: event.item_id, input: exactInput(event.arguments) };
+  }
+  if (event?.type === "response.output_item.done" && event.item?.type === "function_call") {
+    const tracked = state.itemCalls.get(event.item.id);
+    if (tracked?.finalArguments !== undefined) event = { ...event, item: { ...event.item, arguments: tracked.finalArguments } };
+  }
+  const restored = restoreValue(event, mapping);
+  const item = event?.item;
+  if (item?.type === "function_call" && typeof item.id === "string") {
+    const entry = state.byEncodedName.get(item.name);
+    if (!entry) fail();
+    const previous = state.itemCalls.get(item.id);
+    if (previous && (previous.entry !== entry || previous.callId !== item.call_id)) fail();
+    if (!previous) state.itemCalls.set(item.id, { entry, callId: item.call_id });
+  }
+  return restored;
 }
 
 function callsFrom(value, found = []) {
@@ -302,10 +378,11 @@ export function validateForcedToolResult(buffer, build) {
   if (buffer.elapsedMs > FORCED_MAX_MS) fail("forced_tool_buffer_timeout");
   const calls = callsFrom(buffer.events);
   if (!calls.length) fail("required_tool_not_called");
+  const state = stateFor(build.mapping);
   if (build.forcedRequirement.type === "named") {
     const matched = calls.some((call) => {
-      const entry = build.mapping.byEncodedName.get(call.name);
-      return entry?.name === build.forcedRequirement.name;
+      const entry = state.byEncodedName.get(call.name);
+      return entry?.name === build.forcedRequirement.name && entry.kind === build.forcedRequirement.kind;
     });
     if (!matched) fail("required_tool_mismatch");
   }
@@ -322,17 +399,34 @@ export function createForcedToolBuffer({
   signal,
   onUsage,
 } = {}) {
-  const startedAt = clock();
+  const readClock = () => {
+    const value = clock();
+    if (!Number.isFinite(value)) fail("forced_tool_buffer_timeout");
+    if (value < lastClock) fail("forced_tool_buffer_timeout");
+    lastClock = value;
+    return value;
+  };
+  let lastClock = -Infinity;
+  const startedAt = readClock();
   let bytes = 0;
+  let terminal = false;
   let aborted = false;
   let usage;
+  let listener;
+  const cleanup = () => {
+    if (listener) signal?.removeEventListener("abort", listener);
+    listener = undefined;
+  };
   const cancel = () => {
-    if (aborted) return;
+    if (terminal) return;
+    terminal = true;
     aborted = true;
+    cleanup();
     abort();
   };
   const deadline = () => {
-    if (clock() - startedAt <= FORCED_MAX_MS) return;
+    const now = readClock();
+    if (now - startedAt <= FORCED_MAX_MS) return now;
     cancel();
     fail("forced_tool_buffer_timeout");
   };
@@ -341,13 +435,21 @@ export function createForcedToolBuffer({
   };
   if (signal) {
     if (signal.aborted) abortFromCaller();
-    else signal.addEventListener("abort", abortFromCaller, { once: true });
+    else {
+      listener = abortFromCaller;
+      signal.addEventListener("abort", listener, { once: true });
+    }
   }
   return {
     push(chunk) {
-      if (aborted) return false;
+      if (terminal) return false;
       deadline();
-      const nextBytes = bytes + byteCounter(chunk);
+      const counted = byteCounter(chunk);
+      if (!Number.isSafeInteger(counted) || counted < 0 || bytes > Number.MAX_SAFE_INTEGER - counted) {
+        cancel();
+        fail("forced_tool_buffer_limit");
+      }
+      const nextBytes = bytes + counted;
       if (nextBytes > FORCED_MAX_BYTES) {
         cancel();
         fail("forced_tool_buffer_limit");
@@ -356,13 +458,22 @@ export function createForcedToolBuffer({
       return true;
     },
     observeUsage(nextUsage) {
+      if (terminal) return false;
       usage = nextUsage;
-      onUsage?.(nextUsage);
+      return true;
     },
     finish(events) {
-      if (aborted) return false;
-      deadline();
-      validateForcedToolResult({ bytes, elapsedMs: clock() - startedAt, events }, build);
+      if (terminal) return false;
+      const now = deadline();
+      try {
+        validateForcedToolResult({ bytes, elapsedMs: now - startedAt, events }, build);
+      } catch (error) {
+        cancel();
+        throw error;
+      }
+      terminal = true;
+      cleanup();
+      onUsage?.(usage);
       return true;
     },
     abortFromCaller,

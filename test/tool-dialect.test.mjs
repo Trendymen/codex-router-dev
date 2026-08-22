@@ -117,14 +117,14 @@ test("restores one streamed call lifecycle without accepting the call ID for ano
 
 test("normalizes function schemas and enforces DeepSeek/Qwen choices locally", () => {
   const build = encodeToolDialect({
-    tools: [{ type: "function", name: "paint", strict: true, parameters: { type: ["object", "null"], properties: { color: { type: "string" } } } }],
+    tools: [{ type: "function", name: "paint", strict: true, parameters: { type: "object", properties: { color: { type: "string" } } } }],
     toolChoice: { type: "function", name: "paint" }, input: [], profile: functionsProfile,
   });
   assert.equal(build.tools[0].strict, undefined);
   assert.equal(build.tools[0].parameters.type, "object");
   assert.equal(build.toolChoice, "auto");
-  assert.deepEqual(build.forcedRequirement, { type: "named", name: "paint" });
-  assert.equal(build.strictValidators.size, 1);
+  assert.deepEqual(build.forcedRequirement, { type: "named", name: "paint", kind: "function", namespace: undefined });
+  assert.equal(build.strictValidators.length, 1);
   assert.deepEqual(encodeToolDialect({ tools: [], toolChoice: "none", input: [], profile: functionsProfile }).toolChoice, "none");
   assert.deepEqual(encodeToolDialect({ tools: [], toolChoice: "required", input: [], profile: functionsProfile }).toolChoice, "auto");
 });
@@ -147,6 +147,53 @@ test("GLM keeps native declarations, strict schemas, and all supported choices",
     assert.deepEqual(build.tools, [tool]);
     assert.deepEqual(build.toolChoice, choice);
     assert.equal(build.forcedRequirement, undefined);
+  }
+});
+
+test("GLM native dialect returns pristine declarations, choice and continuation by identity", () => {
+  const tools = [
+    { type: "function", name: "工具 name", strict: true, parameters: { type: "object", oneOf: [] } },
+    { type: "custom", name: "computer" },
+    { type: "namespace", name: "mcp__工具", tools: [{ type: "function", name: "读" }] },
+  ];
+  const input = [{ type: "custom_tool_call", call_id: "c", name: "computer", input: "原样" }];
+  const choice = { type: "function", name: "工具 name" };
+  const build = encodeToolDialect({ tools, toolChoice: choice, input, profile: glmProfile });
+  assert.equal(build.tools, tools);
+  assert.equal(build.input, input);
+  assert.equal(build.toolChoice, choice);
+  assert.deepEqual(tools[0], { type: "function", name: "工具 name", strict: true, parameters: { type: "object", oneOf: [] } });
+});
+
+test("streamed custom arguments are restored only when done while strict arguments validate then", () => {
+  const custom = encodeToolDialect({ tools: [customTool], input: [], profile: functionsProfile });
+  const call = mappedCall(custom).item;
+  assert.deepEqual(restoreToolEvent({ type: "response.output_item.added", item: { ...call, arguments: "" } }, custom.mapping).item, {
+    type: "custom_tool_call", id: "fc_1", call_id: "call_1", name: "computer",
+  });
+  assert.equal(restoreToolEvent({ type: "response.function_call_arguments.delta", item_id: "fc_1", delta: '{"input":"move' }, custom.mapping).type, "response.custom_tool_call_input.delta");
+  assert.deepEqual(restoreToolEvent({ type: "response.function_call_arguments.done", item_id: "fc_1", arguments: '{"input":"move pointer"}' }, custom.mapping), {
+    type: "response.custom_tool_call_input.done", item_id: "fc_1", input: "move pointer",
+  });
+  assert.equal(restoreToolEvent({ type: "response.output_item.done", item: call }, custom.mapping).item.input, "move pointer");
+
+  const strict = encodeToolDialect({ tools: [{ type: "function", name: "paint", strict: true, parameters: { type: "object", properties: { color: { type: "string" } }, required: ["color"] } }], input: [], profile: functionsProfile });
+  const strictCall = { type: "function_call", id: "fc_strict", call_id: "call_strict", name: "paint", arguments: "" };
+  assert.doesNotThrow(() => restoreToolEvent({ type: "response.output_item.added", item: strictCall }, strict.mapping));
+  code(() => restoreToolEvent({ type: "response.function_call_arguments.done", item_id: "fc_strict", arguments: '{"color":1}' }, strict.mapping));
+});
+
+test("mapping is opaque and strict declaration rejects unsupported schema forms", () => {
+  const build = encodeToolDialect({ tools: [customTool], input: [], profile: functionsProfile });
+  assert.throws(() => { build.mapping.byEncodedName = new Map(); }, TypeError);
+  assert.deepEqual(Object.keys(build.mapping), ["entries"]);
+  code(() => restoreToolEvent(mappedCall(build), { entries: build.mapping.entries }));
+  for (const schema of [
+    { type: "object", minimum: 1 }, { type: "object", properties: { s: { type: "string", pattern: "." } } },
+    { type: "array", minItems: 1 }, { type: "object", anyOf: [] }, { type: "object", not: {} },
+    { type: "object", additionalProperties: { type: "string" } },
+  ]) {
+    code(() => encodeToolDialect({ tools: [{ type: "function", name: "strict", strict: true, parameters: schema }], input: [], profile: functionsProfile }));
   }
 });
 
@@ -177,16 +224,16 @@ test("forced buffer uses injected counters and clock at exact limits without rel
     onUsage: (usage) => { observedUsage = usage; },
   });
   assert.equal(buffer.push({ size: 8 * 1024 * 1024 }), true);
+  buffer.observeUsage({ input_tokens: 7 });
   now = 30_000;
   assert.equal(buffer.finish([mappedCall(build)]), true);
-  assert.deepEqual(buffer.state, { bytes: 8 * 1024 * 1024, usage: undefined, aborted: false, relayedBytes: 0, retries: 0, failovers: 0 });
+  assert.deepEqual(buffer.state, { bytes: 8 * 1024 * 1024, usage: { input_tokens: 7 }, aborted: false, relayedBytes: 0, retries: 0, failovers: 0 });
   assert.equal(aborts, 0);
-  buffer.observeUsage({ input_tokens: 7 });
-  now = 30_001;
-  assert.throws(() => buffer.finish([]), /forced_tool_buffer_timeout/);
-  assert.equal(aborts, 1);
+  assert.equal(buffer.observeUsage({ input_tokens: 8 }), false);
+  assert.equal(buffer.finish([]), false);
+  assert.equal(aborts, 0);
   assert.deepEqual(observedUsage, { input_tokens: 7 });
-  assert.deepEqual(buffer.state, { bytes: 8 * 1024 * 1024, usage: { input_tokens: 7 }, aborted: true, relayedBytes: 0, retries: 0, failovers: 0 });
+  assert.deepEqual(buffer.state, { bytes: 8 * 1024 * 1024, usage: { input_tokens: 7 }, aborted: false, relayedBytes: 0, retries: 0, failovers: 0 });
 });
 
 test("forced buffer aborts exactly once on the first excess byte or caller cancellation", () => {
