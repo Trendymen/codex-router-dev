@@ -151,14 +151,14 @@ test("Qwen Responses forces store false, lowers forced choices, and removes reas
   assert.equal(glm.json.max_output_tokens, 1234);
 });
 
-test("GLM Responses compatibility profile keeps native required/named tool choices", () => {
+test("GLM Responses maps tools while preserving required/named choice semantics", () => {
   const tool = { type: "function", name: "run", strict: true, parameters: { type: "object", properties: {} } };
   const glm = buildOpenAIResponsesRequest({
     model: { ...qwen, slug: "qwen-plan-responses/glm-5.2", upstreamModel: "glm-5.2" },
     credential: { value: "QWEN_TEST_KEY" },
     payload: { input, tools: [tool], tool_choice: { type: "function", name: "run" }, reasoning: { effort: "high" } },
   });
-  assert.deepEqual(glm.json.tools, [tool]);
+  assert.equal(glm.json.tools[0].name, "run");
   assert.deepEqual(glm.json.tool_choice, { type: "function", name: "run" });
   assert.equal(glm.toolBuild.forcedRequirement, undefined);
   assert.equal("reasoning" in glm.json, false);

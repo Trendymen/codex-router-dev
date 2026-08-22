@@ -87,17 +87,21 @@ export function providerHeaders(model, credential) {
 export function buildOpenAIResponsesRequest({ model, payload, credential } = {}) {
   responseModel(model);
   const source = ownObject(payload, "provider_request_malformed");
-  const toolBuild = encodeToolDialect({
+  const encodedBuild = encodeToolDialect({
     tools: source.tools,
     toolChoice: source.tool_choice,
     // Tool lowering only applies to the structured Responses input array. A
     // string input is legal too and deliberately remains untouched.
     input: Array.isArray(source.input) ? source.input : undefined,
-    // The hidden GLM Responses alias uses native declarations and therefore
-    // retains required/named choices and strict schemas. It shares only Qwen's
-    // credential/store/reasoning profile, never its forced-choice downgrade.
-    profile: qwenGlmCompatibility(model) ? "glm" : model.requestProfile,
+    profile: model.requestProfile,
   });
+  // GLM keeps the Responses-functions mapping (custom/namespace/history still
+  // need lowering and restoration) but unlike Qwen accepts required/named
+  // choices. Rebuild only the public selection fields; the private mapping
+  // state remains the one Task2 created for the encoded declarations.
+  const toolBuild = qwenGlmCompatibility(model)
+    ? Object.freeze({ ...encodedBuild, toolChoice: source.tool_choice, forcedRequirement: undefined })
+    : encodedBuild;
   const json = applyResponsesProfile(model, source, toolBuild);
   return Object.freeze({
     url: providerEndpoint(model.baseUrl, "responses"),
