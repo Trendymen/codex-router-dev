@@ -51,6 +51,7 @@ function applyResponsesProfile(model, payload, toolBuild) {
   // These are legacy Chat Completions controls.  The native Responses profiles
   // preserve the caller's nested `reasoning` object instead.
   delete body.thinking;
+  delete body.think;
   delete body.reasoning_effort;
 
   if (Object.hasOwn(payload, "tools")) body.tools = toolBuild.tools;

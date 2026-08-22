@@ -70,6 +70,7 @@ test("DeepSeek Responses preserves nested reasoning and never emits chat-only th
       input,
       reasoning: { effort: "max", summary: "auto" },
       thinking: { type: "enabled" },
+      think: { type: "enabled" },
       reasoning_effort: "max",
       tool_choice: "required",
     },
@@ -78,6 +79,7 @@ test("DeepSeek Responses preserves nested reasoning and never emits chat-only th
   assert.equal(built.headers.Authorization, "Bearer DEEPSEEK_TEST_KEY");
   assert.deepEqual(built.json.reasoning, { effort: "max", summary: "auto" });
   assert.equal(built.json.thinking, undefined);
+  assert.equal(built.json.think, undefined);
   assert.equal(built.json.reasoning_effort, undefined);
   assert.equal(built.json.tool_choice, "auto");
   assert.equal(built.json.model, "deepseek-v4-flash");
@@ -90,6 +92,7 @@ test("Qwen Responses forces store false, lowers forced choices, and removes reas
     payload: {
       input,
       reasoning: { effort: "high" },
+      think: { type: "enabled" },
       store: true,
       tools: [{ type: "function", name: "run", parameters: { type: "object", properties: {} } }],
       tool_choice: { type: "function", name: "run" },
@@ -98,6 +101,7 @@ test("Qwen Responses forces store false, lowers forced choices, and removes reas
   assert.equal(normal.url.href, "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1/responses");
   assert.equal(normal.json.store, false);
   assert.deepEqual(normal.json.reasoning, { effort: "high" });
+  assert.equal(normal.json.think, undefined);
   assert.equal(normal.json.tool_choice, "auto");
 
   const glm = buildOpenAIResponsesRequest({
