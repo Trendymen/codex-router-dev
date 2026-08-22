@@ -38,7 +38,13 @@ import {
   PORTS,
   loopback,
 } from "./paths.mjs";
-import { MODEL_BY_SLUG, PROVIDERS, providerForModel } from "./model-registry.mjs";
+import {
+  MODEL_BY_SLUG,
+  PROVIDERS,
+  endpointForModel,
+  providerForModel,
+  resolveProviderBaseUrl,
+} from "./model-registry.mjs";
 import { createHealthCache } from "./health-cache.mjs";
 import { discoveryDisabled } from "./discovery-mode.mjs";
 import { readNativeAliases } from "./native-alias.mjs";
@@ -117,6 +123,12 @@ import {
 import { VERSION } from "./version.mjs";
 import { nativeSessionHeaders } from "./codex-native-session.mjs";
 import { installStableFetchTransport } from "./fetch-transport.mjs";
+import {
+  buildRoutedRequest as buildDirectRoutedRequest,
+  canFailoverTo,
+  dispatchRoutedRequest,
+} from "./provider-dispatch.mjs";
+import { resolveProviderCredential } from "./provider-credentials.mjs";
 
 installStableFetchTransport();
 
@@ -2275,6 +2287,60 @@ function writeIdleNoProviderError(response) {
   });
 }
 
+// The direct path is opt-in while the legacy gateway remains available for
+// existing installations. Once enabled, the provider request is built and
+// selected completely before pipeResponse receives a single byte.
+async function handleDirectRoutedRequest(request, response, payload, route, signal, startedAt) {
+  const endpoint = endpointForModel(route);
+  const credential = resolveProviderCredential(endpoint);
+  if (!credential && endpoint?.authMode !== "anonymous" && !endpoint?.keyless) {
+    writeJson(response, 503, { error: { type: "provider_credential_missing", provider: route.provider, message: "The selected provider credential is not configured." } });
+    return;
+  }
+  const base = resolveProviderBaseUrl(endpoint).baseUrl;
+  const pristine = { ...payload };
+  let built;
+  try {
+    built = buildDirectRoutedRequest(pristine, route, {
+      baseUrl: base,
+      credential,
+      internalKey: INTERNAL_KEY,
+      signal,
+    });
+  } catch (error) {
+    if (error?.code === "model_not_enabled" || error?.code === "provider_not_available_in_node_build") {
+      writeJson(response, error.status || 404, { error: { type: "router_error", code: error.code, message: error.code === "model_not_enabled" ? "The selected model is not enabled." : "The selected model is not available in this build." } });
+      return;
+    }
+    throw error;
+  }
+  const candidates = selectedConfiguredListedModels().filter((candidate) => canFailoverTo(candidate, route, pristine));
+  const result = await dispatchRoutedRequest(built, {
+    signal,
+    failoverCandidates: candidates,
+    credentialFor: (candidate) => resolveProviderCredential(endpointForModel(candidate)),
+    baseUrlFor: (candidate) => resolveProviderBaseUrl(endpointForModel(candidate)).baseUrl,
+    onRetry: (event) => logUpstreamRetry(event, route.slug, "/responses"),
+  });
+  const upstream = result.response;
+  if (!upstream.ok) {
+    const bodyText = await upstream.text().catch(() => "");
+    writeJson(response, upstream.status, translateGatewayError({
+      status: upstream.status,
+      bodyText,
+      modelName: route.displayName || route.slug,
+      providerName: providerForModel(result.model)?.ownedBy || result.model.provider,
+    }));
+    recordUsageEvent({ model: result.model.slug, provider: canonicalProviderId(result.model.provider), status: upstream.status, durationMs: Date.now() - startedAt, retries: result.retries || undefined, ...(result.hops ? { failoverFrom: route.slug } : {}) });
+    return;
+  }
+  const contentType = upstream.headers.get("content-type") || "application/json";
+  const usageObserver = new ResponseUsageTransform(contentType);
+  await pipeResponse(upstream, response, HOP_BY_HOP_HEADERS, [...result.transforms, usageObserver]);
+  const usage = usageObserver.tokenUsage?.();
+  recordUsageEvent({ model: result.model.slug, provider: canonicalProviderId(result.model.provider), status: upstream.status, durationMs: Date.now() - startedAt, ...usage, retries: result.retries || undefined, ...(result.hops ? { failoverFrom: route.slug } : {}) });
+}
+
 async function handleResponses(request, response, requestUrl) {
   const startedAt = Date.now();
   const activity = beginRequestActivity();
@@ -2308,6 +2374,7 @@ async function handleResponses(request, response, requestUrl) {
   let finalStatus;
   let activityStatus;
   let usageRecorded = false;
+  let upstreamUsageOwner;
   try {
     if (!requireCodexTransport(request, response)) return;
     const encoded = await readRequestBody(request);
@@ -2425,6 +2492,14 @@ async function handleResponses(request, response, requestUrl) {
           }`,
         );
       }
+      return;
+    }
+
+    if (route && process.env.CODEX_ROUTER_DIRECT_DISPATCH === "1") {
+      await handleDirectRoutedRequest(request, response, payload, route, controller.signal, startedAt);
+      finalStatus = response.statusCode;
+      activityStatus = finalStatus;
+      usageRecorded = true;
       return;
     }
 
@@ -2572,6 +2647,7 @@ async function handleResponses(request, response, requestUrl) {
     );
     upstreamRetries = retries;
     upstreamStatus = upstream.status;
+    upstreamUsageOwner = upstream.headers.get("x-codex-router-usage-owner");
     // Time until the upstream chain answered the request. Everything before
     // this is router-side work (body read, normalization, flattening, vision
     // bridge) plus the upstream's own time to produce response headers. For a
@@ -2654,7 +2730,7 @@ async function handleResponses(request, response, requestUrl) {
             : undefined,
         }),
       );
-      recordUsageEvent({
+      if (upstreamUsageOwner !== "forwarder-v1") recordUsageEvent({
         model: route.slug,
         provider: canonicalProviderId(route.provider),
         status: upstream.status,
@@ -2891,7 +2967,7 @@ async function handleResponses(request, response, requestUrl) {
     // is already gone) and only rejects for an upstream that actually failed.
     // A cancel is not a router failure, so it meters as 0 rather than the
     // committed 200 that the client never finished reading.
-    recordUsageEvent({
+    if (upstreamUsageOwner !== "forwarder-v1") recordUsageEvent({
       model: route?.slug || requestedModel,
       provider: route ? canonicalProviderId(route.provider) : "openai",
       status: finalStatus,
@@ -3028,7 +3104,7 @@ async function handleResponses(request, response, requestUrl) {
     finalStatus = response.headersSent ? 502 : httpErrorStatus(error);
     activityStatus = finalStatus;
     if (!usageRecorded) {
-      recordUsageEvent({
+      if (upstreamUsageOwner !== "forwarder-v1") recordUsageEvent({
         model: route?.slug || requestedModel,
         provider: route ? canonicalProviderId(route.provider) : "openai",
         status: finalStatus,

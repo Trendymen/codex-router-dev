@@ -173,16 +173,39 @@ function generatedToolId(responseId, outputIndex) { return `fc_${createHash("sha
 
 class AnthropicStreamTransform extends Transform {
   #buffer = Buffer.alloc(0); #queue = []; #queueBytes = 0; #backpressured = false; #pendingTransform; #pendingFlush;
-  #frameScanOffset = 0; #pendingBoundary; #settleScheduled = false;
+  #frameScanOffset = 0; #pendingBoundary; #settleScheduled = false; #settleGeneration = 0; #destroyed = false;
   #state = { id: undefined, model: "", created: undefined, messageStarted: false, blockProviderIndexes: new Set(), nextOutputIndex: 0, items: new Map(), usage: undefined, stopReason: undefined, messageStopped: false, terminal: false, sequence: 0, work: 0, bodyBytes: 0, textBytes: 0, argsBytes: 0, signatureBytes: 0 };
   #model; #requestContext; #key; #toolBuild; #abortListener; #abortCalled = false;
   constructor(model, requestContext) { super(); this.#model = model; this.#requestContext = requestContext; this.#key = requestContext.internalKey; this.#toolBuild = requestContext.toolBuild; if (requestContext.signal) { this.#abortListener = () => { if (this.#state.terminal) return; this.#callAbort(); this.destroy(new AnthropicMessagesAdapterError("request_aborted")); }; if (requestContext.signal.aborted) this.#abortListener(); else requestContext.signal.addEventListener("abort", this.#abortListener, { once: true }); } }
   #callAbort() { if (this.#abortCalled) return; this.#abortCalled = true; try { this.#requestContext.abort?.(); } catch {} }
   #cleanup() { if (this.#abortListener && this.#requestContext.signal) { try { this.#requestContext.signal.removeEventListener("abort", this.#abortListener); } catch {} this.#abortListener = undefined; } }
-  _destroy(error, callback) { this.#cleanup(); callback(error); }
-  _transform(chunk, _encoding, callback) { try { const bytes = Buffer.from(chunk); this.#state.bodyBytes += bytes.length; if (this.#state.bodyBytes > MAX_BODY_BYTES) fail("provider_response_malformed"); this.#buffer = Buffer.concat([this.#buffer, bytes]); this.#processBuffered(); this.#drain(); this.#settle(); if (this.#backpressured) this.#pendingTransform = callback; else callback(); } catch (error) { if (error?.code === "request_aborted") callback(error); else { this.#failSafe(error?.code || "provider_response_malformed"); this.#drain(); if (this.#backpressured) this.#pendingTransform = callback; else callback(); } } }
-  _flush(callback) { try { this.#processBuffered(); if (!this.#backpressured && this.#buffer.length) { const parsed = parseFrame(this.#buffer); this.#buffer = Buffer.alloc(0); if (parsed) this.#consumeParsed(parsed); } if (!this.#state.terminal && !this.#backpressured) { if (!this.#state.messageStopped) fail("upstream_stream_truncated"); this.#terminal(this.#state.stopReason === "max_tokens" ? "incomplete" : "completed"); } this.#drain(); this.#settle(); if (this.#backpressured || this.#queue.length || this.#buffer.length) this.#pendingFlush = callback; else callback(); } catch (error) { if (error?.code === "request_aborted") callback(error); else { this.#failSafe(error?.code || "upstream_stream_truncated"); this.#drain(); this.#settle(); if (this.#backpressured || this.#queue.length) this.#pendingFlush = callback; else callback(); } } }
-  _read() { this.#backpressured = false; this.#drain(); this.#processBuffered(); this.#drain(); this.#settle(); }
+  _destroy(error, callback) {
+    this.#destroyed = true;
+    this.#settleGeneration += 1;
+    this.#cleanup();
+    const pending = [this.#pendingTransform, this.#pendingFlush].filter(Boolean);
+    this.#pendingTransform = undefined;
+    this.#pendingFlush = undefined;
+    this.#buffer = Buffer.alloc(0);
+    this.#queue = [];
+    this.#queueBytes = 0;
+    this.#pendingBoundary = undefined;
+    this.#frameScanOffset = 0;
+    const reason = error || new Error("The stream was destroyed.");
+    for (const settle of pending) {
+      try { settle(reason); } catch {}
+    }
+    callback(error);
+  }
+  _transform(chunk, _encoding, callback) {
+    if (this.#destroyed) { callback(new Error("The stream was destroyed.")); return; }
+    try { const bytes = Buffer.from(chunk); this.#state.bodyBytes += bytes.length; if (this.#state.bodyBytes > MAX_BODY_BYTES) fail("provider_response_malformed"); this.#buffer = Buffer.concat([this.#buffer, bytes]); this.#processBuffered(); this.#drain(); this.#settle(); if (this.#backpressured) this.#pendingTransform = callback; else callback(); } catch (error) { if (error?.code === "request_aborted") callback(error); else { this.#failSafe(error?.code || "provider_response_malformed"); this.#drain(); if (this.#backpressured) this.#pendingTransform = callback; else callback(); } }
+  }
+  _flush(callback) {
+    if (this.#destroyed) { callback(new Error("The stream was destroyed.")); return; }
+    try { this.#processBuffered(); if (!this.#backpressured && this.#buffer.length) { const parsed = parseFrame(this.#buffer); this.#buffer = Buffer.alloc(0); if (parsed) this.#consumeParsed(parsed); } if (!this.#state.terminal && !this.#backpressured) { if (!this.#state.messageStopped) fail("upstream_stream_truncated"); this.#terminal(this.#state.stopReason === "max_tokens" ? "incomplete" : "completed"); } this.#drain(); this.#settle(); if (this.#backpressured || this.#queue.length || this.#buffer.length) this.#pendingFlush = callback; else callback(); } catch (error) { if (error?.code === "request_aborted") callback(error); else { this.#failSafe(error?.code || "upstream_stream_truncated"); this.#drain(); this.#settle(); if (this.#backpressured || this.#queue.length) this.#pendingFlush = callback; else callback(); } }
+  }
+  _read() { if (this.#destroyed) return; this.#backpressured = false; this.#drain(); this.#processBuffered(); this.#drain(); this.#settle(); }
   #locateBoundary() {
     if (this.#pendingBoundary) return this.#pendingBoundary;
     const boundary = frameBoundary(this.#buffer, this.#frameScanOffset);
@@ -198,10 +221,12 @@ class AnthropicStreamTransform extends Transform {
   #processBuffered() { let boundary; while ((boundary = this.#locateBoundary())) { if (this.#backpressured) return; const frame = this.#buffer.subarray(0, boundary.index); this.#buffer = this.#buffer.subarray(boundary.index + boundary.length); this.#pendingBoundary = undefined; this.#frameScanOffset = 0; this.#consume(frame); } }
   #drain() { while (!this.#backpressured && this.#queue.length) { const chunk = this.#queue.shift(); this.#queueBytes -= chunk.length; if (!this.push(chunk)) this.#backpressured = true; } }
   #settle() {
-    if (this.#settleScheduled || this.#backpressured || this.#queue.length || (!this.#pendingTransform && !this.#pendingFlush)) return;
+    if (this.#destroyed || this.#settleScheduled || this.#backpressured || this.#queue.length || (!this.#pendingTransform && !this.#pendingFlush)) return;
+    const generation = this.#settleGeneration;
     this.#settleScheduled = true;
     queueMicrotask(() => {
       this.#settleScheduled = false;
+      if (this.#destroyed || generation !== this.#settleGeneration) return;
       if (this.#backpressured || this.#queue.length) return;
       const callback = this.#pendingTransform || this.#pendingFlush;
       if (this.#pendingTransform) this.#pendingTransform = undefined;
@@ -210,6 +235,7 @@ class AnthropicStreamTransform extends Transform {
     });
   }
   #enqueue(chunk, terminal = false) {
+    if (this.#destroyed) return;
     if (!this.#backpressured && !this.#queue.length) {
       if (!this.push(chunk)) this.#backpressured = true;
       return;

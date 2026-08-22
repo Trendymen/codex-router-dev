@@ -953,6 +953,7 @@ function recordForcedFailureUsage(response, status) {
   const telemetry = response._codexRouterRequestTelemetry;
   if (!telemetry || telemetry.forcedValidated || telemetry.usageRecorded || !telemetry.forcedMetering) return;
   telemetry.usageRecorded = true;
+  response.setHeader("x-codex-router-usage-owner", "forwarder-v1");
   recordUsageEvent({
     model: telemetry.model,
     provider: telemetry.provider,

@@ -313,7 +313,7 @@ function supportsImageInput(model) {
 // (estimateInputTokens), which errs high by design -- the safe direction here,
 // because trading a quota failure for a context-window rejection is a strictly
 // worse turn than the one it replaced.
-function eligible(model, { fromProvider, estimatedTokens, needsImage, needsMultiAgentV2, cooled }) {
+function eligible(model, { fromProvider, estimatedTokens, needsImage, needsMultiAgentV2, cooled, requestMarkers, requiredToolDialect }) {
   if (!model?.slug) return false;
   if (canonicalProviderId(model.provider) === fromProvider) return false;
   if (cooled.has(canonicalProviderId(model.provider))) return false;
@@ -325,6 +325,8 @@ function eligible(model, { fromProvider, estimatedTokens, needsImage, needsMulti
   // is the registry saying this model must never be handed transcribed images.
   if (needsImage && !supportsImageInput(model) && model.visionBridge === false) return false;
   if (needsMultiAgentV2 && (model.multiAgentVersion || "v1") !== "v2") return false;
+  if (requiredToolDialect && model.toolDialect && model.toolDialect !== requiredToolDialect) return false;
+  if (requestMarkers?.size && model.effectiveTransport !== "openai-responses") return false;
   return true;
 }
 
@@ -339,14 +341,14 @@ function eligible(model, { fromProvider, estimatedTokens, needsImage, needsMulti
 // caller, which is the only place that knows whether a session exists.
 export function rankFailoverCandidates(
   models,
-  { from, estimatedTokens, needsImage = false, needsMultiAgentV2 = false, chain = [], now } = {},
+  { from, estimatedTokens, needsImage = false, needsMultiAgentV2 = false, chain = [], now, requestMarkers, requiredToolDialect } = {},
 ) {
   const fromProvider = canonicalProviderId(from?.provider || "");
   const cooled = new Set(Object.keys(readProviderCooldowns({ now })));
   const available = (Array.isArray(models) ? models : []).filter(
     (model) =>
       model.slug !== from?.slug &&
-      eligible(model, { fromProvider, estimatedTokens, needsImage, needsMultiAgentV2, cooled }),
+      eligible(model, { fromProvider, estimatedTokens, needsImage, needsMultiAgentV2, cooled, requestMarkers, requiredToolDialect }),
   );
 
   if (chain.length) {

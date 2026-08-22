@@ -4,6 +4,7 @@ import {
   registryFingerprint,
   writePassingProtocolProof,
 } from "./protocol-proof.mjs";
+import { dispatchProtocolProbe as dispatchNodeProtocolProbe } from "./provider-dispatch.mjs";
 
 export const PROTOCOL_PROOF_VERIFIER_VERSION = 1;
 
@@ -52,9 +53,7 @@ function recordFor(model, evidence, clock) {
   });
 }
 
-function unavailableDispatcher() {
-  throw publicError("protocol_probe_not_implemented", 501);
-}
+export const dispatchProtocolProbe = dispatchNodeProtocolProbe;
 
 // Phase 1 deliberately accepts only an injected dispatcher. It establishes the
 // quota gate and no-fallback contract without adding a live provider path.
@@ -67,8 +66,8 @@ export async function verifyProtocolProof(slug, options = {}) {
   // candidate commit with this revision: an operator revoke during the probe
   // wins instead of being silently resurrected by stale evidence.
   const expectedRevision = protocolProofRevision(model.slug);
-  const dispatchProtocolProbe = options.dispatchProtocolProbe ?? unavailableDispatcher;
-  const evidence = await dispatchProtocolProbe(model, {
+  const probe = options.dispatchProtocolProbe ?? dispatchNodeProtocolProbe;
+  const evidence = await probe(model, {
     retry: false,
     failover: false,
     checks: CHECKS,

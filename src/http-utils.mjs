@@ -333,6 +333,9 @@ export const HOP_BY_HOP_HEADERS = new Set([
   "trailer",
   "transfer-encoding",
   "upgrade",
+  // Private forwarder/router usage-owner marker. It coordinates exactly one
+  // meter row across the process boundary and must never reach callers.
+  "x-codex-router-usage-owner",
 ]);
 
 // Node closes an idle keep-alive connection after 5 seconds and advertises

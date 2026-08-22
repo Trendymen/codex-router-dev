@@ -343,6 +343,21 @@ test("caller abort invokes the upstream abort owner once and closes the transfor
   assert.equal(aborts, 1);
 });
 
+test("destroy settles a backpressured transform callback once and cancels its queued microtask", async () => {
+  const upstream = { status: 200, headers: new Headers({ "content-type": "text/event-stream" }) };
+  const transform = adaptAnthropicMessages({ model: MODEL, upstream, requestContext: { internalKey: KEY } }).transforms[0];
+  transform.push = () => false;
+  transform.once("error", () => {});
+  let callbacks = 0;
+  transform.write(Buffer.from(frame("message_start", { type: "message_start", message: { id: "msg_destroy", model: "glm-5.2" } })), (error) => {
+    callbacks += 1;
+    assert.equal(error?.message, "destroyed");
+  });
+  transform.destroy(new Error("destroyed"));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(callbacks, 1);
+});
+
 test("rejects malformed/unknown/duplicate/truncated streams and passes non-2xx untouched", async () => {
   const bad = { status: 200, headers: new Headers({ "content-type": "text/event-stream" }), body: Readable.toWeb(Readable.from("data: {bad}\n\n")) };
   const adapted = adaptAnthropicMessages({ model: MODEL, upstream: bad, requestContext: { internalKey: KEY } });
