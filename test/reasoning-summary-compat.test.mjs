@@ -10,6 +10,7 @@ import {
   reasoningTransformForModel,
   selectedFinalParts,
 } from "../src/reasoning-summary-compat.mjs";
+import { routerError } from "../src/public-error.mjs";
 
 const fixtures = new URL("./fixtures/reasoning-events/", import.meta.url);
 
@@ -176,7 +177,7 @@ test("state limits reject an unbounded number of reasoning items", async () => {
   }));
   await assert.rejects(
     () => transform(eventsAtLimit.map(sse), { responseId: "resp_limit", model: model(source.finalShape) }),
-    { code: "reasoning_limit_exceeded" },
+    { code: "reasoning_protocol_error" },
   );
 });
 
@@ -234,7 +235,7 @@ test("non-prefix final closes the visible lifecycle before one safe mismatch obs
     "response.output_item.done",
   ]);
   assert.equal(output.find((event) => event.type === "response.output_item.done").item.summary[0].text, "visible");
-  assert.deepEqual(observations.map((event) => event.code), ["reasoning_final_mismatch"]);
+  assert.deepEqual(observations.map((event) => event.code), ["reasoning_final_mismatch", "reasoning_final_mismatch"]);
   assert.equal(JSON.stringify(observations).includes("visible"), false);
   assert.equal(JSON.stringify(observations).includes("conflict"), false);
 });
@@ -300,7 +301,7 @@ test("empty, done-only, and over-limit frames fail safely while post-terminal da
   }
   await assert.rejects(
     () => transform(["data: {\"type\":\"provider.unknown\",\"payload\":\"12345\"}\n\n"], { responseId: "resp_limit", model: model(), maxPendingFrameBytes: 32 }),
-    { code: "reasoning_limit_exceeded" },
+    { code: "reasoning_protocol_error" },
   );
   const observed = [];
   await transform([
@@ -332,4 +333,92 @@ test("terminal finals and non-streaming anonymous items match one-to-one without
     { id: "rs_same", type: "reasoning", output_index: 0, summary: [], content: [] },
     { id: "rs_same", type: "reasoning", output_index: 1, summary: [], content: [] },
   ] }, model()), { code: "reasoning_duplicate_item" });
+});
+
+test("missing streaming Anthropic IDs use the exact deterministic response/output-index identity", async () => {
+  const source = fixture("final-only-anthropic");
+  const output = events(await transform(source.events.map(sse), { responseId: source.responseId, model: model(source.finalShape) }));
+  const id = "rsn_IrSIBdnVcrenOEAoH1FhX-Zi";
+  assert.equal(output.find((event) => event.type === "response.output_item.added").item.id, id);
+  assert.equal(output.find((event) => event.type === "response.output_item.done").item.id, id);
+  assert.equal(output.at(-1).response.output[0].id, id);
+});
+
+test("mixed known and anonymous terminal finals consume only their matching streaming states", async () => {
+  const source = [
+    { type: "response.output_item.added", output_index: 0, item: { id: "rs_known", type: "reasoning" } },
+    { type: "response.output_item.added", output_index: 1, item: { type: "reasoning" } },
+    { type: "response.completed", response: { output: [
+      { type: "reasoning", summary: [], content: [] },
+      { id: "rs_known", type: "reasoning", output_index: 0, summary: [], content: [] },
+    ] } },
+  ];
+  const output = events(await transform(source.map(sse), { responseId: "resp_mixed", model: model() }));
+  assert.deepEqual(output.at(-1).response.output.map((item) => item.id), ["rsn_6nIDUFR65o52d1tcKcWL-iUF", "rs_known"]);
+  await assert.rejects(() => transform([...source.slice(0, 2), {
+    type: "response.completed", response: { output: [{ id: "rs_missing", type: "reasoning", summary: [], content: [] }, { type: "reasoning", summary: [], content: [] }] },
+  }].map(sse), { responseId: "resp_mixed", model: model() }), { code: "reasoning_unclosed_at_terminal" });
+});
+
+test("late trusted envelopes persist from final reconciliation through completed output", async () => {
+  const envelope = "cr.reasoning.v1.late";
+  const output = events(await transform([
+    { type: "response.output_item.added", output_index: 0, item: { id: "rs_late", type: "reasoning" } },
+    { type: "response.output_item.done", output_index: 0, item: { id: "rs_late", type: "reasoning", encrypted_content: envelope, summary: [], content: [] } },
+    { type: "response.completed", response: { output: [{ id: "rs_late", type: "reasoning", summary: [], content: [] }] } },
+  ].map(sse), { responseId: "resp_late_envelope", model: model() }));
+  assert.equal(output.find((event) => event.type === "response.output_item.done").item.encrypted_content, envelope);
+  assert.equal(output.at(-1).response.output[0].encrypted_content, envelope);
+});
+
+test("mismatch observation includes only fixed hashes and UTF-8 lengths", async () => {
+  const seen = [];
+  await transform([
+    { type: "response.output_item.added", output_index: 0, item: { id: "rs_hash", type: "reasoning" } },
+    { type: "response.reasoning_summary_part.added", output_index: 0, item_id: "rs_hash", summary_index: 0, part: { type: "summary_text", text: "" } },
+    { type: "response.reasoning_summary_text.delta", output_index: 0, item_id: "rs_hash", summary_index: 0, delta: "发射" },
+    { type: "response.output_item.done", output_index: 0, item: { id: "rs_hash", type: "reasoning", summary: [{ type: "summary_text", text: "conflict" }], content: [] } },
+    { type: "response.completed", response: { output: [{ id: "rs_hash", type: "reasoning", summary: [{ type: "summary_text", text: "terminal conflict" }], content: [] }] } },
+  ].map(sse), { responseId: "resp_hash", model: model(), observeReasoningProtocol: (event) => seen.push(event) });
+  assert.equal(seen.length, 2);
+  for (const event of seen) {
+    assert.deepEqual(Object.keys(event).sort(), ["code", "emittedBytes", "emittedHash", "finalBytes", "finalHash", "outputIndex", "summaryIndex"]);
+    assert.match(event.emittedHash, /^[a-f0-9]{64}$/);
+    assert.match(event.finalHash, /^[a-f0-9]{64}$/);
+    assert.equal(JSON.stringify(event).includes("发射"), false);
+  }
+});
+
+test("mixed legal SSE delimiters preserve unknown frames and response budgets are exact", async () => {
+  const unknown = Buffer.from("event: x\ndata: {\"type\":\"unknown\"}\n\r\n", "utf8");
+  const terminal = Buffer.from(sse({ type: "response.completed", response: { output: [] } }).replace("\n\n", "\r\n\r"), "utf8");
+  const output = await transform([...Buffer.concat([unknown, terminal])].map((byte) => Buffer.from([byte])), { responseId: "resp_mixed_delim", model: model() });
+  assert.deepEqual(Buffer.from(output).subarray(0, unknown.length), unknown);
+  const stream = [
+    { type: "response.output_item.done", output_index: 0, item: { id: "rs_limit", type: "reasoning", summary: [{ type: "summary_text", text: "abcd" }], content: [] } },
+    { type: "response.completed", response: { output: [{ id: "rs_limit", type: "reasoning", summary: [{ type: "summary_text", text: "abcd" }], content: [] }] } },
+  ];
+  await transform(stream.map(sse), { responseId: "resp_exact", model: model(), maxReasoningBytes: 4 });
+  await assert.rejects(() => transform(stream.map(sse), { responseId: "resp_plus_one", model: model(), maxReasoningBytes: 3 }), { code: "reasoning_protocol_error" });
+  assert.throws(() => normalizeReasoningResponse({ output: [stream[0].item] }, model(), { maxReasoningBytes: 3 }), { code: "reasoning_protocol_error" });
+  assert.doesNotThrow(() => normalizeReasoningResponse({ output: [stream[0].item] }, model(), { maxReasoningBytes: 4 }));
+  const confirmedDelta = [
+    { type: "response.output_item.added", output_index: 0, item: { id: "rs_confirmed", type: "reasoning" } },
+    { type: "response.reasoning_summary_part.added", output_index: 0, item_id: "rs_confirmed", summary_index: 0, part: { type: "summary_text", text: "" } },
+    { type: "response.reasoning_summary_text.delta", output_index: 0, item_id: "rs_confirmed", summary_index: 0, delta: "abcd" },
+    { type: "response.output_item.done", output_index: 0, item: { id: "rs_confirmed", type: "reasoning", summary: [{ type: "summary_text", text: "abcd" }], content: [] } },
+    { type: "response.completed", response: { output: [{ id: "rs_confirmed", type: "reasoning", summary: [{ type: "summary_text", text: "abcd" }], content: [] }] } },
+  ];
+  await transform(confirmedDelta.map(sse), { responseId: "resp_confirmed", model: model(), maxReasoningBytes: 4 });
+  assert.equal(routerError("reasoning_protocol_error").status, 502);
+});
+
+test("every legal mixed blank-line delimiter is framed across byte boundaries", async () => {
+  for (const delimiter of ["\n\r", "\r\n\r", "\r\r", "\n\r\n", "\r\n\n", "\r\n\r\n"]) {
+    const unknown = Buffer.from(`event: x\ndata: {"type":"unknown","delimiter":${JSON.stringify(delimiter)}}${delimiter}`, "utf8");
+    const terminal = Buffer.from(`data: {"type":"response.completed","response":{"output":[]}}${delimiter}`, "utf8");
+    const output = await transform([...Buffer.concat([unknown, terminal])].map((byte) => Buffer.from([byte])), { responseId: "resp_all_delimiters", model: model() });
+    assert.deepEqual(Buffer.from(output).subarray(0, unknown.length), unknown, JSON.stringify(delimiter));
+    assert.equal(events(output).at(-1).type, "response.completed", JSON.stringify(delimiter));
+  }
 });
