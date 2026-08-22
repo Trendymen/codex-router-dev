@@ -1,449 +1,316 @@
 import { createHash } from "node:crypto";
 
+const MAX_PENDING_FRAME_BYTES = 256 * 1024;
+const MAX_REASONING_BYTES = 8 * 1024 * 1024;
 const MAX_ITEMS = 1_024;
-const MAX_PARTS_PER_ITEM = 1_024;
-const MAX_PART_TEXT_BYTES = 8 * 1024 * 1024;
+const MAX_PARTS = 1_024;
+const MAX_WORK = 65_536;
 
 export class ReasoningProtocolError extends Error {
-  constructor(code) {
-    super(code);
-    this.name = "ReasoningProtocolError";
-    this.code = code;
-  }
+  constructor(code) { super(code); this.name = "ReasoningProtocolError"; this.code = code; }
 }
+const fail = (code) => { throw new ReasoningProtocolError(code); };
+const nonempty = (value, code = "reasoning_duplicate_item") => {
+  if (typeof value !== "string" || !value) fail(code);
+  return value;
+};
+const indexOf = (value) => {
+  if (!Number.isSafeInteger(value) || value < 0 || value > 1_000_000) fail("reasoning_index_mismatch");
+  return value;
+};
+const generatedId = (responseId, outputIndex) => `rsn_${createHash("sha256").update(`${responseId}:${outputIndex}`).digest("base64url").slice(0, 24)}`;
 
-function protocol(code) {
-  return new ReasoningProtocolError(code);
-}
-
-function exactArray(value) {
-  return Array.isArray(value) ? value : null;
-}
-
-function textPart(part, type) {
-  if (!part || typeof part !== "object" || part.type !== type || typeof part.text !== "string") {
-    throw protocol("reasoning_final_mismatch");
-  }
+function finalPart(part, type) {
+  if (!part || typeof part !== "object" || part.type !== type || typeof part.text !== "string") fail("reasoning_final_mismatch");
   return part.text;
 }
 
-function emptyArray(value) {
-  return Array.isArray(value) && value.length === 0;
-}
-
-// This is deliberately the sole final-shape selector for streaming and JSON
-// responses. Shape is a provider contract, never inferred from received deltas.
-export function selectedFinalParts(sourceKind, finalItem) {
-  if (!finalItem || typeof finalItem !== "object") throw protocol("reasoning_final_mismatch");
+export function selectedFinalParts(sourceKind, item) {
+  if (!item || typeof item !== "object") fail("reasoning_final_mismatch");
   if (sourceKind === "raw-content") {
-    const content = exactArray(finalItem.content);
-    if (!content || !emptyArray(finalItem.summary)) throw protocol("reasoning_final_mismatch");
-    return content.map((part) => textPart(part, "reasoning_text"));
+    if (!Array.isArray(item.content) || !Array.isArray(item.summary) || item.summary.length) fail("reasoning_final_mismatch");
+    return item.content.map((part) => finalPart(part, "reasoning_text"));
   }
   if (sourceKind === "provider-summary" || sourceKind === "hybrid-summary") {
-    const summary = exactArray(finalItem.summary);
-    if (!summary || !emptyArray(finalItem.content)) throw protocol("reasoning_final_mismatch");
-    return summary.map((part) => textPart(part, "summary_text"));
+    if (!Array.isArray(item.summary) || !Array.isArray(item.content) || item.content.length) fail("reasoning_final_mismatch");
+    return item.summary.map((part) => finalPart(part, "summary_text"));
   }
   if (sourceKind === "anthropic-thinking") {
-    const thinking = exactArray(finalItem.thinking) ?? exactArray(finalItem.content);
-    if (!thinking) throw protocol("reasoning_final_mismatch");
-    return thinking.map((part) => textPart(part, "thinking"));
+    const thinking = Array.isArray(item.thinking) ? item.thinking : item.content;
+    if (!Array.isArray(thinking)) fail("reasoning_final_mismatch");
+    return thinking.map((part) => finalPart(part, "thinking"));
   }
-  throw protocol("reasoning_final_mismatch");
+  fail("reasoning_final_mismatch");
 }
 
-function generatedItemId(responseId, outputIndex) {
-  return `rsn_${createHash("sha256").update(`${responseId}:${outputIndex}`).digest("base64url").slice(0, 24)}`;
-}
-
-function canonicalItem(item, id, summary, status = "completed") {
-  const { thinking: _thinking, reasoning_content: _reasoningContent, encrypted_content: _encryptedContent, ...base } =
-    item && typeof item === "object" ? item : {};
-  return {
-    ...base,
-    id,
-    type: "reasoning",
-    status: item?.status || status,
-    summary: summary.map((text) => ({ type: "summary_text", text })),
-    content: [],
-  };
-}
-
-function parseBlock(bytes) {
-  const text = bytes.toString("utf8");
-  const lines = text.split(/\r?\n/);
-  const index = lines.findIndex((line) => line.startsWith("data:"));
-  if (index < 0) return null;
-  const value = lines[index].slice(5).trimStart();
-  if (!value || value === "[DONE]") return null;
-  try {
-    return { lines, index, newline: text.includes("\r\n") ? "\r\n" : "\n", event: JSON.parse(value) };
-  } catch {
-    return null;
-  }
-}
-
-function writeBlock(parsed, event) {
-  const lines = [...parsed.lines];
-  lines[parsed.index] = `data: ${JSON.stringify(event)}`;
-  return Buffer.from(lines.join(parsed.newline), "utf8");
-}
-
-function synthesize(parsed, type, event) {
-  const lines = parsed.lines.some((line) => line.startsWith("event:")) ? [`event: ${type}`] : [];
-  lines.push(`data: ${JSON.stringify({ type, ...event })}`);
-  return Buffer.from(`${lines.join(parsed.newline)}${parsed.newline}${parsed.newline}`, "utf8");
-}
-
-function requireIndex(value) {
-  if (!Number.isSafeInteger(value) || value < 0 || value >= MAX_ITEMS * MAX_PARTS_PER_ITEM) {
-    throw protocol("reasoning_index_mismatch");
-  }
-  return value;
-}
-
-function requireText(value) {
-  if (typeof value !== "string") throw protocol("reasoning_final_mismatch");
-  return value;
-}
-
-function contiguous(indices) {
-  const ordered = [...indices].sort((left, right) => left - right);
-  return ordered.every((index, expected) => index === expected);
-}
-
-function displayMode(model) {
-  const mode = model?.reasoningDisplayMode;
-  if (mode !== "summary-compat" && mode !== "raw-preserve") {
+function mode(model) {
+  if (!["summary-compat", "raw-preserve"].includes(model?.reasoningDisplayMode)) {
     throw new Error("Invalid Node model contract: reasoningDisplayMode must be one of summary-compat, raw-preserve");
   }
-  return mode;
+  return model.reasoningDisplayMode;
+}
+function shape(model, supplied) {
+  const value = supplied ?? model?.effectiveFinalReasoningShape ?? model?.finalReasoningShape;
+  if (!["raw-content", "provider-summary", "hybrid-summary", "anthropic-thinking"].includes(value)) fail("reasoning_final_mismatch");
+  return value;
+}
+function canonicalItem(source, id, summary, status) {
+  const safe = source && typeof source === "object" ? source : {};
+  const envelope = typeof safe.encrypted_content === "string" ? safe.encrypted_content : undefined;
+  const { thinking: _thinking, reasoning_content: _reasoning, content: _content, summary: _summary, status: _status, encrypted_content: _envelope, ...rest } = safe;
+  return { ...rest, id, type: "reasoning", status, summary: summary.map((text) => ({ type: "summary_text", text })), content: [], ...(envelope === undefined ? {} : { encrypted_content: envelope }) };
+}
+function frame(type, payload, eol = "\n") { return Buffer.from(`data: ${JSON.stringify({ type, ...payload })}${eol}${eol}`, "utf8"); }
+function parseSse(raw) {
+  const text = raw.toString("utf8");
+  const eol = text.includes("\r\n") ? "\r\n" : text.includes("\r") ? "\r" : "\n";
+  const body = text.endsWith(`${eol}${eol}`) ? text.slice(0, -eol.length * 2) : text;
+  const data = [];
+  for (const line of body.split(/\r\n|\n|\r/)) if (line.startsWith("data:")) data.push(line.slice(5).startsWith(" ") ? line.slice(6) : line.slice(5));
+  if (!data.length) return null;
+  const value = data.join("\n");
+  if (value === "[DONE]") return { done: true, eol };
+  try { return { event: JSON.parse(value), eol }; } catch { return null; }
 }
 
-function finalShape(model, supplied) {
-  const shape = supplied ?? model?.effectiveFinalReasoningShape ?? model?.finalReasoningShape;
-  if (!["raw-content", "provider-summary", "hybrid-summary", "anthropic-thinking"].includes(shape)) {
-    throw protocol("reasoning_final_mismatch");
+class Framer {
+  #chunks = []; #bytes = 0; #tail = ""; #limit;
+  constructor(limit) { this.#limit = limit; }
+  push(chunk, emit) {
+    let start = 0;
+    for (let offset = 0; offset < chunk.length; offset += 1) {
+      const next = this.#tail + String.fromCharCode(chunk[offset]);
+      const boundary = next.endsWith("\n\n") || next.endsWith("\r\r") || next.endsWith("\r\n\r\n");
+      this.#tail = next.slice(-3);
+      if (!boundary) continue;
+      this.#append(chunk.subarray(start, offset + 1));
+      emit(Buffer.concat(this.#chunks));
+      this.#chunks = []; this.#bytes = 0; this.#tail = ""; start = offset + 1;
+    }
+    if (start < chunk.length) this.#append(chunk.subarray(start));
   }
-  return shape;
+  #append(chunk) {
+    if (!chunk.length) return;
+    this.#bytes += chunk.length;
+    if (this.#bytes > this.#limit) fail("reasoning_limit_exceeded");
+    this.#chunks.push(chunk);
+  }
+  finish() { return this.#bytes > 0; }
 }
 
 export function createRawPreserveTransform() {
-  return new TransformStream({
-    transform(chunk, controller) {
-      controller.enqueue(chunk instanceof Uint8Array ? chunk : Buffer.from(chunk));
-    },
-  });
+  return new TransformStream({ transform(chunk, controller) { controller.enqueue(chunk instanceof Uint8Array ? chunk : Buffer.from(chunk)); } });
 }
+export function normalizeRawReasoningResponse(json) { return json; }
 
-export function normalizeRawReasoningResponse(json) {
-  return json;
-}
-
-export function createReasoningCompatTransform({ responseId, model, finalShape: suppliedFinalShape } = {}) {
-  displayMode(model);
-  const shape = finalShape(model, suppliedFinalShape);
-  const items = new Map();
-  const indexes = new Map();
-  let terminal = false;
-  let sawEvent = false;
-  let buffer = Buffer.alloc(0);
-
-  function itemId(event, outputIndex) {
-    const id = event?.item?.id ?? event?.item_id;
-    if (typeof id === "string" && id) return id;
-    return generatedItemId(String(responseId || "resp_unknown"), outputIndex);
-  }
-
-  function stateFor(id, part = false) {
-    const item = items.get(id);
-    if (!item) throw protocol(part ? "reasoning_part_without_item" : "reasoning_delta_without_item");
-    if (item.done) throw protocol("reasoning_delta_after_done");
+export function createReasoningCompatTransform({
+  responseId = "resp_unknown", model, finalShape, observeReasoningProtocol,
+  maxPendingFrameBytes = MAX_PENDING_FRAME_BYTES, maxReasoningBytes = MAX_REASONING_BYTES,
+  maxItems = MAX_ITEMS, maxParts = MAX_PARTS, maxWork = MAX_WORK, signal,
+} = {}) {
+  mode(model);
+  const sourceKind = shape(model, finalShape);
+  if (!Number.isSafeInteger(maxPendingFrameBytes) || maxPendingFrameBytes < 1) fail("reasoning_limit_exceeded");
+  const items = new Map(); const byIndex = new Map(); const framer = new Framer(maxPendingFrameBytes);
+  let terminal = false; let canceled = Boolean(signal?.aborted); let frames = 0; let bytes = 0; let work = 0;
+  const observe = (code, item, extra = {}) => {
+    try { observeReasoningProtocol?.(Object.freeze({ code, ...(item ? { outputIndex: item.outputIndex } : {}), ...extra })); } catch {}
+  };
+  const spend = (count = 0, units = 1) => {
+    bytes += count; work += units;
+    if (bytes > maxReasoningBytes || work > maxWork) fail("reasoning_limit_exceeded");
+  };
+  const partText = (part) => part.chunks.join("");
+  const addText = (part, value, suffix = false) => {
+    if (typeof value !== "string") fail("reasoning_final_mismatch");
+    if (part.closed || ((part.upstreamPartDone || part.textDone) && !suffix)) fail("reasoning_delta_after_done");
+    spend(Buffer.byteLength(value)); part.chunks.push(value);
+  };
+  const requireItem = (id, outputIndex, reason = "reasoning_delta_without_item") => {
+    const item = items.get(nonempty(id, reason));
+    if (!item) fail(reason);
+    if (indexOf(outputIndex) !== item.outputIndex) fail("reasoning_index_mismatch");
+    if (item.closed) fail("reasoning_delta_after_done");
     return item;
-  }
-
-  function start(event, parsed) {
-    const outputIndex = requireIndex(event.output_index);
-    const id = itemId(event, outputIndex);
-    if (items.has(id) || indexes.has(outputIndex)) throw protocol("reasoning_duplicate_item");
-    if (items.size >= MAX_ITEMS) throw protocol("reasoning_index_mismatch");
-    const item = { id, outputIndex, initial: event.item, parts: new Map(), done: false, queued: null };
-    items.set(id, item);
-    indexes.set(outputIndex, id);
-    return writeBlock(parsed, {
-      ...event,
-      output_index: outputIndex,
-      item: canonicalItem(event.item, id, [], "in_progress"),
-    });
-  }
-
-  function startPart(item, index, parsed, event, controller) {
-    requireIndex(index);
-    if (item.parts.has(index)) throw protocol("reasoning_duplicate_part");
-    if (item.parts.size >= MAX_PARTS_PER_ITEM) throw protocol("reasoning_index_mismatch");
-    const part = { index, text: "", textDone: false, done: false };
-    item.parts.set(index, part);
-    controller.enqueue(synthesize(parsed, "response.reasoning_summary_part.added", {
-      output_index: item.outputIndex,
-      item_id: item.id,
-      summary_index: index,
-      part: { type: "summary_text", text: "" },
-    }));
+  };
+  const addPart = (item, summaryIndex, eol, controller) => {
+    const index = indexOf(summaryIndex);
+    if (item.parts.has(index)) fail("reasoning_duplicate_part");
+    if (index !== item.nextPartIndex) fail("reasoning_index_mismatch");
+    if (item.parts.size >= maxParts) fail("reasoning_limit_exceeded");
+    spend();
+    const part = { index, chunks: [], textDone: false, upstreamPartDone: false, closed: false };
+    item.nextPartIndex += 1; item.parts.set(index, part);
+    controller.enqueue(frame("response.reasoning_summary_part.added", { output_index: item.outputIndex, item_id: item.id, summary_index: index, part: { type: "summary_text", text: "" } }, eol));
     return part;
-  }
-
-  function append(part, delta, allowDelayedDone = false) {
-    if (part.done || (part.textDone && !allowDelayedDone)) throw protocol("reasoning_delta_after_done");
-    const text = requireText(delta);
-    if (Buffer.byteLength(part.text) + Buffer.byteLength(text) > MAX_PART_TEXT_BYTES) {
-      throw protocol("reasoning_final_mismatch");
-    }
-    part.text += text;
-  }
-
-  function delayedTextDone(item, index) {
-    const part = item.parts.get(index);
-    if (!part) throw protocol("reasoning_part_without_item");
-    if (part.textDone) throw protocol("reasoning_duplicate_done");
-    part.textDone = true;
-  }
-
-  function closePart(item, part, parsed, controller) {
-    if (part.done) throw protocol("reasoning_duplicate_done");
-    part.textDone = true;
-    part.done = true;
-    controller.enqueue(synthesize(parsed, "response.reasoning_summary_text.done", {
-      output_index: item.outputIndex,
-      item_id: item.id,
-      summary_index: part.index,
-      text: part.text,
-    }));
-    controller.enqueue(synthesize(parsed, "response.reasoning_summary_part.done", {
-      output_index: item.outputIndex,
-      item_id: item.id,
-      summary_index: part.index,
-      part: { type: "summary_text", text: part.text },
-    }));
-  }
-
-  function queueItemDone(item, finalItem, parsed, controller, status = "completed") {
-    item.done = true;
-    const summary = [...item.parts.values()].sort((left, right) => left.index - right.index).map((part) => part.text);
-    item.queued = () => controller.enqueue(synthesize(parsed, "response.output_item.done", {
-      output_index: item.outputIndex,
-      item: canonicalItem(finalItem ?? item.initial, item.id, summary, status),
-    }));
-  }
-
-  function flushQueued(controller) {
+  };
+  const closePart = (item, part, eol, controller) => {
+    if (part.closed) return;
+    part.textDone = true; part.closed = true;
+    const text = partText(part);
+    controller.enqueue(frame("response.reasoning_summary_text.done", { output_index: item.outputIndex, item_id: item.id, summary_index: part.index, text }, eol));
+    controller.enqueue(frame("response.reasoning_summary_part.done", { output_index: item.outputIndex, item_id: item.id, summary_index: part.index, part: { type: "summary_text", text } }, eol));
+  };
+  const closeItem = (item, source, status, eol, controller) => {
+    if (item.closed) return;
+    item.closed = true; item.summary = [...item.parts.values()].map(partText);
+    const basis = item.envelope && !source?.encrypted_content ? { ...source, encrypted_content: item.envelope } : source ?? item.source;
+    item.pendingDone = () => controller.enqueue(frame("response.output_item.done", { output_index: item.outputIndex, item: canonicalItem(basis, item.id, item.summary, status) }, eol));
+  };
+  const flushDone = () => {
     for (;;) {
-      const queued = [...items.values()]
-        .filter((item) => item.queued)
-        .sort((left, right) => left.outputIndex - right.outputIndex);
-      const next = queued.find((item) => ![...items.values()].some((other) => !other.done && other.outputIndex < item.outputIndex));
-      if (!next) return;
-      const queuedEmit = next.queued;
-      next.queued = null;
-      queuedEmit(controller);
+      const candidate = [...items.values()]
+        .filter((item) => item.pendingDone)
+        .sort((a, b) => a.outputIndex - b.outputIndex)
+        .find((item) => ![...items.values()].some((other) => !other.closed && other.outputIndex < item.outputIndex));
+      if (!candidate) return;
+      const emit = candidate.pendingDone;
+      candidate.pendingDone = null;
+      emit();
     }
-  }
-
-  function ensureFinalItem(event, parsed, controller) {
-    const outputIndex = requireIndex(event.output_index);
-    const id = itemId(event, outputIndex);
-    let item = items.get(id);
-    if (!item) {
-      if (indexes.has(outputIndex)) throw protocol("reasoning_duplicate_item");
-      if (items.size >= MAX_ITEMS) throw protocol("reasoning_index_mismatch");
-      item = { id, outputIndex, initial: event.item, parts: new Map(), done: false, queued: null };
-      items.set(id, item);
-      indexes.set(outputIndex, id);
-      controller.enqueue(synthesize(parsed, "response.output_item.added", {
-        output_index: outputIndex,
-        item: canonicalItem(event.item, id, [], "in_progress"),
-      }));
+  };
+  const start = (event, eol, controller) => {
+    const outputIndex = indexOf(event.output_index); const id = nonempty(event.item?.id);
+    if (items.has(id) || byIndex.has(outputIndex)) fail("reasoning_duplicate_item");
+    if (items.size >= maxItems) fail("reasoning_limit_exceeded");
+    spend();
+    const item = { id, outputIndex, source: event.item, envelope: typeof event.item?.encrypted_content === "string" ? event.item.encrypted_content : undefined, parts: new Map(), nextPartIndex: 0, closed: false, summary: null, pendingDone: null, mismatchObserved: false };
+    items.set(id, item); byIndex.set(outputIndex, item);
+    controller.enqueue(frame("response.output_item.added", { output_index: outputIndex, item: canonicalItem(event.item, id, [], "in_progress") }, eol));
+  };
+  const reconcile = (item, finalItem, eol, controller) => {
+    const parts = selectedFinalParts(sourceKind, finalItem);
+    spend(parts.reduce((sum, value) => sum + Buffer.byteLength(value), 0));
+    let mismatch = false;
+    for (let index = 0; index < item.nextPartIndex; index += 1) {
+      if (!item.parts.has(index)) fail("reasoning_index_mismatch");
+      if (index >= parts.length) fail("reasoning_final_part_missing");
     }
-    if (item.done) throw protocol("reasoning_duplicate_done");
-    return item;
-  }
-
-  function closeWithFinal(event, parsed, controller) {
-    const item = ensureFinalItem(event, parsed, controller);
-    const finalParts = selectedFinalParts(shape, event.item);
-    if (!contiguous(item.parts.keys())) throw protocol("reasoning_index_mismatch");
-    for (const index of item.parts.keys()) {
-      if (index >= finalParts.length) throw protocol("reasoning_final_part_missing");
-    }
-    for (let index = 0; index < finalParts.length; index += 1) {
+    for (let index = 0; index < parts.length; index += 1) {
       let part = item.parts.get(index);
-      if (!part) part = startPart(item, index, parsed, event, controller);
-      const finalText = finalParts[index];
-      if (!finalText.startsWith(part.text)) throw protocol("reasoning_final_mismatch");
-      const suffix = finalText.slice(part.text.length);
-      if (suffix) {
-        append(part, suffix, true);
-        controller.enqueue(synthesize(parsed, "response.reasoning_summary_text.delta", {
-          output_index: item.outputIndex,
-          item_id: item.id,
-          summary_index: index,
-          delta: suffix,
-        }));
-      }
-      closePart(item, part, parsed, controller);
+      if (!part) part = addPart(item, index, eol, controller);
+      const emitted = partText(part);
+      if (parts[index].startsWith(emitted)) {
+        const suffix = parts[index].slice(emitted.length);
+        if (suffix) {
+          addText(part, suffix, true);
+          controller.enqueue(frame("response.reasoning_summary_text.delta", { output_index: item.outputIndex, item_id: item.id, summary_index: index, delta: suffix }, eol));
+        }
+      } else mismatch = true;
+      closePart(item, part, eol, controller);
     }
-    queueItemDone(item, event.item, parsed, controller);
-    flushQueued(controller);
-  }
-
-  function closePartial(item, parsed, controller, status = "incomplete") {
-    if (item.done) return;
-    if (!contiguous(item.parts.keys())) throw protocol("reasoning_index_mismatch");
-    for (const part of [...item.parts.values()].sort((left, right) => left.index - right.index)) {
-      closePart(item, part, parsed, controller);
+    closeItem(item, finalItem, "completed", eol, controller);
+    flushDone();
+    if (mismatch && !item.mismatchObserved) {
+      item.mismatchObserved = true;
+      observe("reasoning_final_mismatch", item, { partCount: parts.length });
     }
-    queueItemDone(item, item.initial, parsed, controller, status);
-  }
-
-  function terminalEvent(event, parsed, controller) {
-    const type = event.type;
+  };
+  const partial = (item, eol, controller) => {
+    if (item.closed) return;
+    for (let index = 0; index < item.nextPartIndex; index += 1) closePart(item, item.parts.get(index), eol, controller);
+    closeItem(item, item.source, "incomplete", eol, controller);
+  };
+  const ensureFinal = (event, eol, controller) => {
+    const outputIndex = indexOf(event.output_index); const id = nonempty(event.item?.id);
+    const existing = items.get(id);
+    if (existing) {
+      if (existing.outputIndex !== outputIndex) fail("reasoning_index_mismatch");
+      if (existing.closed) fail("reasoning_duplicate_done");
+      return existing;
+    }
+    if (byIndex.has(outputIndex)) fail("reasoning_duplicate_item");
+    if (items.size >= maxItems) fail("reasoning_limit_exceeded");
+    const item = { id, outputIndex, source: event.item, envelope: typeof event.item?.encrypted_content === "string" ? event.item.encrypted_content : undefined, parts: new Map(), nextPartIndex: 0, closed: false, summary: null, pendingDone: null, mismatchObserved: false };
+    items.set(id, item); byIndex.set(outputIndex, item); spend();
+    controller.enqueue(frame("response.output_item.added", { output_index: outputIndex, item: canonicalItem(event.item, id, [], "in_progress") }, eol));
+    return item;
+  };
+  const terminalOutput = (event, eol, controller) => {
     const output = Array.isArray(event.response?.output) ? event.response.output : [];
-    const anonymousFinals = [];
-    const finals = new Map();
-    for (const item of output.filter((candidate) => candidate?.type === "reasoning")) {
-      if (typeof item.id === "string" && item.id) finals.set(item.id, item);
-      else anonymousFinals.push(item);
-    }
-    const anonymousStates = [...items.values()].sort((left, right) => left.outputIndex - right.outputIndex);
-    if (type === "response.completed") {
-      for (const item of [...items.values()].filter((item) => !item.done).sort((left, right) => left.outputIndex - right.outputIndex)) {
-        const finalItem = finals.get(item.id) ?? anonymousFinals.shift();
-        if (!finalItem) throw protocol("reasoning_unclosed_at_terminal");
-        closeWithFinal({ output_index: item.outputIndex, item: finalItem }, parsed, controller);
+    if (event.type === "response.completed") {
+      const finals = output.filter((item) => item?.type === "reasoning"); const used = new Set(); const anonymous = [];
+      for (const final of finals) {
+        if (final.id === undefined || final.id === null) { anonymous.push(final); continue; }
+        const item = items.get(nonempty(final.id));
+        if (!item || used.has(item)) fail("reasoning_unclosed_at_terminal");
+        if (final.output_index !== undefined && indexOf(final.output_index) !== item.outputIndex) fail("reasoning_index_mismatch");
+        used.add(item);
+        if (!item.closed) reconcile(item, final, eol, controller);
+        else if (JSON.stringify(item.summary) !== JSON.stringify(selectedFinalParts(sourceKind, final)) && !item.mismatchObserved) {
+          item.mismatchObserved = true;
+          observe("reasoning_final_mismatch", item, { partCount: item.summary.length });
+        }
       }
-    } else {
-      for (const item of [...items.values()].sort((left, right) => left.outputIndex - right.outputIndex)) closePartial(item, parsed, controller);
-    }
-    flushQueued(controller);
-    const normalizedOutput = output.map((item) => {
+      const candidates = [...items.values()].filter((item) => !used.has(item)).sort((a, b) => a.outputIndex - b.outputIndex);
+      if (anonymous.length !== candidates.length) fail("reasoning_unclosed_at_terminal");
+      for (let index = 0; index < anonymous.length; index += 1) {
+        const item = candidates[index]; const final = anonymous[index];
+        if (final.output_index !== undefined && indexOf(final.output_index) !== item.outputIndex) fail("reasoning_index_mismatch");
+        if (!item.closed) reconcile(item, final, eol, controller);
+      }
+    } else for (const item of [...items.values()].sort((a, b) => a.outputIndex - b.outputIndex)) partial(item, eol, controller);
+    flushDone();
+    const anonymousStates = [...items.values()].sort((a, b) => a.outputIndex - b.outputIndex);
+    const rewritten = output.map((item) => {
       if (item?.type !== "reasoning") return item;
-      const id = typeof item.id === "string" && item.id ? item.id : undefined;
-      const state = (id && items.get(id)) ?? anonymousStates.shift();
-      return state
-        ? canonicalItem(item, state.id, [...state.parts.values()].sort((left, right) => left.index - right.index).map((part) => part.text), type === "response.completed" ? "completed" : "incomplete")
-        : item;
+      const state = item.id ? items.get(item.id) : anonymousStates.shift();
+      if (!state) fail("reasoning_unclosed_at_terminal");
+      const basis = state.envelope && !item.encrypted_content ? { ...item, encrypted_content: state.envelope } : item;
+      return canonicalItem(basis, state.id, state.summary ?? [], event.type === "response.completed" ? "completed" : "incomplete");
     });
     terminal = true;
-    if (!event.response || normalizedOutput === output) {
-      controller.enqueue(Buffer.from(parsed.lines.join(parsed.newline), "utf8"));
-      return;
-    }
-    controller.enqueue(writeBlock(parsed, { ...event, response: { ...event.response, output: normalizedOutput } }));
-  }
-
-  function handle(parsed, controller) {
-    const event = parsed.event;
-    const type = event?.type;
-    if (terminal) return;
-    sawEvent = true;
-    if (type === "response.output_item.added" && event.item?.type === "reasoning") {
-      controller.enqueue(start(event, parsed));
-      return;
-    }
-    if (type === "response.reasoning_summary_part.added") {
-      const item = stateFor(String(event.item_id), true);
-      const index = requireIndex(event.summary_index);
-      startPart(item, index, parsed, event, controller);
-      return;
-    }
-    if (type === "response.reasoning_summary_text.delta" || type === "response.reasoning_text.delta") {
-      const item = stateFor(String(event.item_id));
-      const index = requireIndex(type === "response.reasoning_text.delta" ? event.content_index : event.summary_index);
+    controller.enqueue(frame(event.type, { ...event, response: { ...event.response, output: rewritten } }, eol));
+  };
+  const process = (raw, controller) => {
+    frames += 1; if (frames > maxWork) fail("reasoning_limit_exceeded");
+    const parsed = parseSse(raw);
+    if (terminal) { if (parsed?.event) observe("event_after_terminal"); return; }
+    if (!parsed || parsed.done) { controller.enqueue(raw); return; }
+    const event = parsed.event; const eol = parsed.eol;
+    if (event?.type === "response.output_item.added" && event.item?.type === "reasoning") return start(event, eol, controller);
+    if (event?.type === "response.reasoning_summary_part.added") return addPart(requireItem(event.item_id, event.output_index, "reasoning_part_without_item"), event.summary_index, eol, controller);
+    if (["response.reasoning_summary_text.delta", "response.reasoning_text.delta"].includes(event?.type)) {
+      const item = requireItem(event.item_id, event.output_index); const index = indexOf(event.type === "response.reasoning_text.delta" ? event.content_index : event.summary_index);
       let part = item.parts.get(index);
-      if (!part) {
-        if (type !== "response.reasoning_text.delta") throw protocol("reasoning_part_without_item");
-        part = startPart(item, index, parsed, event, controller);
-      }
-      append(part, event.delta);
-      controller.enqueue(synthesize(parsed, "response.reasoning_summary_text.delta", {
-        output_index: item.outputIndex,
-        item_id: item.id,
-        summary_index: index,
-        delta: event.delta,
-      }));
-      return;
+      if (!part) { if (event.type !== "response.reasoning_text.delta") fail("reasoning_part_without_item"); part = addPart(item, index, eol, controller); }
+      addText(part, event.delta);
+      controller.enqueue(frame("response.reasoning_summary_text.delta", { output_index: item.outputIndex, item_id: item.id, summary_index: index, delta: event.delta }, eol)); return;
     }
-    if (type === "response.reasoning_summary_text.done") {
-      delayedTextDone(stateFor(String(event.item_id)), requireIndex(event.summary_index));
-      return;
+    if (event?.type === "response.reasoning_summary_text.done") {
+      const item = requireItem(event.item_id, event.output_index); const part = item.parts.get(indexOf(event.summary_index));
+      if (!part) fail("reasoning_part_without_item"); if (part.textDone || part.upstreamPartDone || part.closed) fail("reasoning_duplicate_done"); part.textDone = true; return;
     }
-    if (type === "response.reasoning_summary_part.done") return;
-    if (type === "response.output_item.done" && event.item?.type === "reasoning") {
-      closeWithFinal(event, parsed, controller);
-      return;
+    if (event?.type === "response.reasoning_summary_part.done") {
+      const item = requireItem(event.item_id, event.output_index); const part = item.parts.get(indexOf(event.summary_index));
+      if (!part || !part.textDone || part.upstreamPartDone || part.closed) fail("reasoning_duplicate_done"); part.upstreamPartDone = true; return;
     }
-    if (["response.completed", "response.incomplete", "response.failed"].includes(type)) {
-      terminalEvent(event, parsed, controller);
-      return;
-    }
-    controller.enqueue(Buffer.from(parsed.lines.join(parsed.newline), "utf8"));
-  }
-
-  function emitBlocks(controller, flush = false) {
-    for (;;) {
-      const crlf = buffer.indexOf(Buffer.from("\r\n\r\n"));
-      const lf = buffer.indexOf(Buffer.from("\n\n"));
-      const at = crlf >= 0 && (lf < 0 || crlf <= lf) ? crlf : lf;
-      const separator = at === crlf ? 4 : 2;
-      if (at < 0) {
-        if (flush && buffer.length) {
-          const remainder = buffer;
-          buffer = Buffer.alloc(0);
-          const parsed = parseBlock(remainder);
-          if (parsed) handle(parsed, controller);
-          else controller.enqueue(remainder);
-        }
-        if (flush && sawEvent && !terminal) throw protocol("upstream_stream_truncated");
-        return;
-      }
-      const block = buffer.subarray(0, at);
-      const terminator = buffer.subarray(at, at + separator);
-      buffer = buffer.subarray(at + separator);
-      const parsed = parseBlock(block);
-      const terminalBefore = terminal;
-      if (parsed) handle(parsed, controller);
-      else controller.enqueue(block);
-      if (!terminalBefore) controller.enqueue(terminator);
-    }
-  }
-
+    if (event?.type === "response.output_item.done" && event.item?.type === "reasoning") return reconcile(ensureFinal(event, eol, controller), event.item, eol, controller);
+    if (["response.completed", "response.incomplete", "response.failed"].includes(event?.type)) return terminalOutput(event, eol, controller);
+    controller.enqueue(raw);
+  };
+  signal?.addEventListener?.("abort", () => { canceled = true; }, { once: true });
   return new TransformStream({
-    transform(chunk, controller) {
-      buffer = Buffer.concat([buffer, chunk instanceof Uint8Array ? Buffer.from(chunk) : Buffer.from(chunk)]);
-      emitBlocks(controller);
-    },
-    flush(controller) {
-      emitBlocks(controller, true);
-    },
+    transform(chunk, controller) { if (!canceled) framer.push(chunk instanceof Uint8Array ? Buffer.from(chunk) : Buffer.from(chunk), (raw) => process(raw, controller)); },
+    flush() { if (!canceled && (framer.finish() || !terminal)) fail("upstream_stream_truncated"); },
   });
 }
 
 export function normalizeReasoningResponse(json, model) {
-  if (displayMode(model) === "raw-preserve") return normalizeRawReasoningResponse(json);
-  const shape = finalShape(model);
+  if (mode(model) === "raw-preserve") return normalizeRawReasoningResponse(json);
+  const sourceKind = shape(model);
   if (!json || typeof json !== "object" || !Array.isArray(json.output)) return json;
-  return {
-    ...json,
-    output: json.output.map((item) => {
-      if (item?.type !== "reasoning") return item;
-      const parts = selectedFinalParts(shape, item);
-      return canonicalItem(item, item.id || generatedItemId(String(json.id || "resp_unknown"), item.output_index || 0), parts);
-    }),
-  };
+  const indexes = new Set(); const ids = new Set();
+  return { ...json, output: json.output.map((item, arrayIndex) => {
+    if (item?.type !== "reasoning") return item;
+    const outputIndex = item.output_index === undefined ? arrayIndex : indexOf(item.output_index);
+    if (indexes.has(outputIndex)) fail("reasoning_index_mismatch"); indexes.add(outputIndex);
+    const id = item.id === undefined || item.id === null ? generatedId(String(json.id || "resp_unknown"), outputIndex) : nonempty(item.id);
+    if (ids.has(id)) fail("reasoning_duplicate_item"); ids.add(id);
+    return canonicalItem(item, id, selectedFinalParts(sourceKind, item), "completed");
+  }) };
 }
-
 export function reasoningTransformForModel(model, options = {}) {
   if (model?.effectiveTransport === "native-openai") return undefined;
-  if (displayMode(model) === "raw-preserve") return createRawPreserveTransform();
-  return createReasoningCompatTransform({ ...options, model });
+  return mode(model) === "raw-preserve" ? createRawPreserveTransform() : createReasoningCompatTransform({ ...options, model });
 }
