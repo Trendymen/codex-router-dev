@@ -192,6 +192,11 @@ test("GLM native dialect returns pristine declarations, choice and continuation 
   assert.deepEqual(tools[0], { type: "function", name: "工具 name", strict: true, parameters: { type: "object", oneOf: [] } });
 });
 
+test("normalizes a top-level string input before request-local lowering", () => {
+  const build = encodeToolDialect({ input: "plain continuation", tools: [], toolChoice: undefined, profile: { provider: "qwen-plan" } });
+  assert.deepEqual(build.input, [{ role: "user", content: "plain continuation" }]);
+});
+
 test("streamed custom arguments are restored only when done while strict arguments validate then", () => {
   const custom = encodeToolDialect({ tools: [customTool], input: [], profile: functionsProfile });
   const call = mappedCall(custom).item;

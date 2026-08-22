@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { Readable } from "node:stream";
 
 import { buildAnthropicMessagesRequest, adaptAnthropicMessages, AnthropicMessagesAdapterError } from "../src/anthropic-messages-adapter.mjs";
-import { sealReasoningEnvelope, reasoningTextHash } from "../src/reasoning-envelope.mjs";
+import { sealReasoningEnvelope, reasoningTextHash, reasoningItemId } from "../src/reasoning-envelope.mjs";
 
 const KEY = "task5-internal-key-with-enough-entropy";
 const MODEL = {
@@ -211,4 +211,53 @@ test("rejects malformed/unknown/duplicate/truncated streams and passes non-2xx u
   assert.throws(() => buildAnthropicMessagesRequest({ model: MODEL, payload: payload({ input: [{ role: "user", content: [{ type: "unsupported" }] }] }), credential: "k", internalKey: KEY }), /unsupported/);
   const non2xx = { status: 429, headers: new Headers({ "content-type": "application/json" }), body: Readable.toWeb(Readable.from('{"error":"provider"}')) };
   assert.deepEqual(adaptAnthropicMessages({ model: MODEL, upstream: non2xx }).transforms, []);
+});
+
+test("refuses to seal thinking when the internal key is absent", async () => {
+  const upstream = { status: 200, headers: new Headers({ "content-type": "text/event-stream" }) };
+  const transform = adaptAnthropicMessages({ model: MODEL, upstream }).transforms[0];
+  const output = await collect(transform, [Buffer.from([
+    frame("message_start", { type: "message_start", message: { id: "msg_no_key", model: "glm-5.2" } }),
+    frame("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "thinking" } }),
+    frame("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "private" } }),
+    frame("content_block_stop", { type: "content_block_stop", index: 0 }),
+    frame("message_delta", { type: "message_delta", delta: { stop_reason: "end_turn" } }),
+    frame("message_stop", { type: "message_stop" }),
+  ].join(""))]);
+  assert.match(output, /thinking_signature_missing|response\.failed/);
+  assert.doesNotMatch(output, /response\.completed/);
+});
+
+test("assigns contiguous internal output indexes and aggregates thinking into one summary part", async () => {
+  const upstream = { status: 200, headers: new Headers({ "content-type": "text/event-stream" }) };
+  const transform = adaptAnthropicMessages({ model: MODEL, upstream, requestContext: { internalKey: KEY } }).transforms[0];
+  const output = await collect(transform, [Buffer.from([
+    frame("message_start", { type: "message_start", message: { id: "msg_indexes", model: "glm-5.2" } }),
+    frame("content_block_start", { type: "content_block_start", index: 10, content_block: { type: "thinking" } }),
+    frame("content_block_delta", { type: "content_block_delta", index: 10, delta: { type: "thinking_delta", thinking: "a" } }),
+    frame("content_block_delta", { type: "content_block_delta", index: 10, delta: { type: "thinking_delta", thinking: "b" } }),
+    frame("content_block_stop", { type: "content_block_stop", index: 10 }),
+    frame("content_block_start", { type: "content_block_start", index: 20, content_block: { type: "text" } }),
+    frame("content_block_delta", { type: "content_block_delta", index: 20, delta: { type: "text_delta", text: "answer" } }),
+    frame("content_block_stop", { type: "content_block_stop", index: 20 }),
+    frame("message_delta", { type: "message_delta", delta: { stop_reason: "end_turn" } }),
+    frame("message_stop", { type: "message_stop" }),
+  ].join(""))]);
+  const events = output.split("\n\n").filter(Boolean).map((part) => part.split("\n").find((line) => line.startsWith("data:"))).filter(Boolean).filter((line) => !line.includes("[DONE]")).map((line) => JSON.parse(line.slice(5).trim()));
+  const added = events.filter((event) => event.type === "response.output_item.added");
+  assert.deepEqual(added.map((event) => event.output_index), [0, 1]);
+  const done = events.find((event) => event.type === "response.output_item.done" && event.item.type === "reasoning");
+  assert.deepEqual(done.item.summary, [{ type: "summary_text", text: "ab" }]);
+  assert.deepEqual(done.item.content, []);
+  assert.match(done.item.id, /^rsn_[A-Za-z0-9_-]{24}$/);
+});
+
+test("binds continuation identity to trusted provenance instead of caller response fields", () => {
+  const summary = ["previous thought"];
+  const responseId = "trusted_response";
+  const itemId = reasoningItemId(responseId, 3);
+  const envelope = sealReasoningEnvelope({ v: 1, provider: MODEL.provider, model: MODEL.upstreamModel, transport: "anthropic-messages", responseId, itemId, textSha256: reasoningTextHash(summary), signature: "sig" }, KEY);
+  const base = { role: "assistant", content: [{ type: "reasoning", id: itemId, summary, encrypted_content: envelope }] };
+  assert.doesNotThrow(() => buildAnthropicMessagesRequest({ model: MODEL, payload: payload({ response_id: "caller_forged", input: [base] }), credential: "k", internalKey: KEY, requestContext: { provenance: { [itemId]: { responseId, outputIndex: 3 } } } }));
+  assert.throws(() => buildAnthropicMessagesRequest({ model: MODEL, payload: payload({ input: [{ ...base, content: [{ ...base.content[0], id: reasoningItemId(responseId, 4) }] }] }), credential: "k", internalKey: KEY, requestContext: { provenance: { [reasoningItemId(responseId, 4)]: { responseId, outputIndex: 4 } } } }), /thinking_signature_invalid/);
 });

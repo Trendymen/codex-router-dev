@@ -5,7 +5,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 import { jcsBytes, jcs } from "../src/jcs.mjs";
-import { sealReasoningEnvelope, verifyReasoningEnvelope, reasoningTextHash } from "../src/reasoning-envelope.mjs";
+import { sealReasoningEnvelope, verifyReasoningEnvelope, reasoningTextHash, reasoningItemId } from "../src/reasoning-envelope.mjs";
 
 const KEY = "task5-internal-key-with-enough-entropy";
 const PAYLOAD = {
@@ -78,4 +78,10 @@ test("reasoning hash is JCS over exact ordered parts and does not normalize", ()
   const direct = createHash("sha256").update(Buffer.from('["a","é"]', "utf8")).digest("base64url");
   assert.equal(reasoningTextHash(["a", "e\u0301"]), direct);
   assert.notEqual(reasoningTextHash(["a", "é"]), direct);
+});
+
+test("reasoning item ids are response-scoped with the normative colon algorithm", () => {
+  assert.equal(reasoningItemId("resp_identity", 0), "rsn_NRjqp69R7Q94apmRES5JQ7F7");
+  assert.equal(reasoningItemId("resp_identity", 1), "rsn_eIruTspwXJXvoZs-tYFoFBSO");
+  assert.notEqual(reasoningItemId("resp_identity", 0), reasoningItemId("resp_identity", 1));
 });

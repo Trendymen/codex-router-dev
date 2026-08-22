@@ -6,6 +6,10 @@ const DOMAIN = Buffer.from("codex-router.reasoning-envelope.v1\0", "ascii");
 const FIELDS = ["v", "provider", "model", "transport", "responseId", "itemId", "textSha256", "signature"];
 
 function hashBytes(value) { return createHash("sha256").update(value).digest("base64url"); }
+export function reasoningItemId(responseId, outputIndex) {
+  if (typeof responseId !== "string" || !responseId || !Number.isSafeInteger(outputIndex) || outputIndex < 0) throw new TypeError("reasoning identity is invalid");
+  return `rsn_${createHash("sha256").update(`${responseId}:${outputIndex}`, "utf8").digest("base64url").slice(0, 24)}`;
+}
 export function reasoningTextHash(summaryParts) {
   if (!Array.isArray(summaryParts) || summaryParts.some((part) => typeof part !== "string")) throw new TypeError("summaryParts must be strings");
   return hashBytes(jcsBytes(summaryParts));

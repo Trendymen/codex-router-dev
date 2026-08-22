@@ -272,6 +272,7 @@ function choiceFor(choice, state, usesFunctions) {
 
 export function encodeToolDialect(options = {}) {
   const request = safeSnapshot(options);
+  if (typeof request.input === "string") request.input = [{ role: "user", content: request.input }];
   const usesFunctions = profileUsesFunctions(request.profile);
   if (!usesFunctions) {
     const mapping = Object.freeze({ entries: Object.freeze([]) });
