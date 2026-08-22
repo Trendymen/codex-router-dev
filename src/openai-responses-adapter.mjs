@@ -8,6 +8,36 @@ const MAX_SSE_FRAME_BYTES = 8 * 1024 * 1024;
 const MAX_JSON_BYTES = 8 * 1024 * 1024;
 const MAX_SSE_WORK = 65_536;
 
+// This object is deliberately caller-owned but contains only JSON values read
+// from the provider stream.  The forwarder uses it if a transform fails after
+// committing bytes, so a terminal frame continues the actual response rather
+// than inventing a new response identity.
+export function createResponsesRelayContext() {
+  return {
+    responseId: "resp_unknown",
+    model: "unknown",
+    sequenceNumber: 0,
+    output: [],
+    usage: undefined,
+    relayedBytes: 0,
+  };
+}
+
+function observeResponseContext(context, event) {
+  if (!context || !event || typeof event !== "object") return;
+  const response = event.response && typeof event.response === "object" ? event.response : undefined;
+  const sequence = event.sequence_number;
+  if (Number.isSafeInteger(sequence) && sequence >= 0) context.sequenceNumber = sequence;
+  const id = response?.id ?? event.response_id;
+  if (typeof id === "string" && id) context.responseId = id;
+  const model = response?.model ?? event.model;
+  if (typeof model === "string" && model) context.model = model;
+  if (Array.isArray(response?.output)) context.output = response.output;
+  else if (Array.isArray(event.output)) context.output = event.output;
+  const usage = event.usage ?? response?.usage;
+  if (usage && typeof usage === "object" && !Array.isArray(usage)) context.usage = usage;
+}
+
 export class OpenAIResponsesAdapterError extends Error {
   constructor(code = "provider_response_malformed") {
     super(code);
@@ -192,21 +222,39 @@ class SseFramer {
 }
 
 class ResponsesSseToolTransform extends Transform {
-  #framer; #toolBuild; #work = 0; #forced; #events = []; #held = [];
-  constructor(toolBuild, { signal, abort, limits, forcedBuffer } = {}) {
+  #framer; #toolBuild; #work = 0; #forced; #events; #held = []; #context;
+  #backpressured = false; #pendingCallback;
+  constructor(toolBuild, { signal, abort, limits, forcedBuffer, relayContext } = {}) {
     super(); this.#toolBuild = toolBuild;
+    this.#context = relayContext;
     const frameBytes = limits?.maxFrameBytes ?? MAX_SSE_FRAME_BYTES;
     if (!Number.isSafeInteger(frameBytes) || frameBytes <= 0 || frameBytes > MAX_SSE_FRAME_BYTES) fail("forced_tool_buffer_limit");
     this.#framer = new SseFramer(frameBytes);
     if (toolBuild?.forcedRequirement) {
       this.#forced = forcedBuffer ?? createForcedToolBuffer({ build: toolBuild, signal, abort });
+      // A forced relay must validate the full lifecycle before a single byte
+      // can commit.  Ordinary relays deliberately retain no prior events.
+      this.#events = [];
     }
   }
   _transform(chunk, _encoding, callback) {
     try {
       this.#framer.push(Buffer.from(chunk), (frame) => this.#rewrite(frame));
-      callback();
+      // Do not acknowledge more upstream input while our readable side has
+      // reached its high-water mark.  This leaves at most the current framed
+      // chunk in memory; unlike the former event array, it never retains the
+      // history of an ordinary relay.
+      if (this.#backpressured) this.#pendingCallback = callback;
+      else callback();
     } catch (error) { callback(error); }
+  }
+  _read(size) {
+    super._read(size);
+    if (!this.#backpressured) return;
+    this.#backpressured = false;
+    const callback = this.#pendingCallback;
+    this.#pendingCallback = undefined;
+    callback?.();
   }
   _flush(callback) {
     try {
@@ -217,10 +265,23 @@ class ResponsesSseToolTransform extends Transform {
     } catch (error) { callback(error); }
   }
   #output(chunk) {
-    if (this.#forced) this.#held.push(chunk);
-    else this.push(chunk);
+    if (this.#forced) {
+      this.#held.push(chunk);
+      return;
+    }
+    this.#context.relayedBytes += chunk.length;
+    if (!this.push(chunk)) this.#backpressured = true;
   }
-  #release() { if (this.#forced) for (const chunk of this.#held.splice(0)) this.push(chunk); }
+  #release() {
+    if (!this.#forced) return;
+    // `createForcedToolBuffer` has already bounded the raw upstream lifetime
+    // at exactly 8 MiB.  Release the held fragments in source order instead of
+    // concatenating them, which keeps the peak bounded and preserves framing.
+    for (const chunk of this.#held.splice(0)) {
+      this.#context.relayedBytes += chunk.length;
+      if (!this.push(chunk)) this.#backpressured = true;
+    }
+  }
   #rewrite(raw) {
     if (++this.#work > MAX_SSE_WORK) fail("reasoning_protocol_error");
     this.#forced?.push(raw);
@@ -237,7 +298,8 @@ class ResponsesSseToolTransform extends Transform {
     }
     let event;
     try { event = JSON.parse(data.data); } catch { fail("provider_response_malformed"); }
-    this.#events.push(event);
+    observeResponseContext(this.#context, event);
+    this.#events?.push(event);
     const usage = event.usage ?? event.response?.usage;
     if (usage && typeof usage === "object") this.#forced?.observeUsage(usage);
     const restored = restoreOpenAIResponsesEvent(event, this.#toolBuild);
@@ -254,22 +316,37 @@ class ResponsesSseToolTransform extends Transform {
 
 class ResponsesJsonTransform extends Transform {
   #chunks = []; #bytes = 0;
-  #model;
-  #toolBuild;
-  constructor(model, toolBuild) { super(); this.#model = model; this.#toolBuild = toolBuild; }
+  #model; #toolBuild; #forced; #context;
+  constructor(model, toolBuild, { forcedBuffer, signal, abort, relayContext } = {}) {
+    super(); this.#model = model; this.#toolBuild = toolBuild; this.#context = relayContext;
+    if (toolBuild?.forcedRequirement) this.#forced = forcedBuffer ?? createForcedToolBuffer({ build: toolBuild, signal, abort });
+  }
   _transform(chunk, _encoding, callback) {
     const copy = Buffer.from(chunk); this.#bytes += copy.length;
     if (!Number.isSafeInteger(this.#bytes) || this.#bytes > MAX_JSON_BYTES) { callback(new OpenAIResponsesAdapterError("forced_tool_buffer_limit")); return; }
-    this.#chunks.push(copy); callback();
+    try {
+      this.#forced?.push(copy);
+      this.#chunks.push(copy);
+      callback();
+    } catch (error) { callback(error); }
   }
   _flush(callback) {
     try {
       const original = Buffer.concat(this.#chunks);
       let json;
       try { json = JSON.parse(original.toString("utf8")); } catch { fail("provider_response_malformed"); }
+      observeResponseContext(this.#context, json);
+      const usage = json.usage ?? json.response?.usage;
+      if (usage && typeof usage === "object") this.#forced?.observeUsage(usage);
+      // A single JSON response is the complete forced lifecycle.  Validate it
+      // before creating the transformed output, so validation failure writes
+      // exactly zero provider bytes to the caller.
+      this.#forced?.finish([json]);
       json = restoreOpenAIResponsesEvent(json, this.#toolBuild);
       json = normalizeReasoningResponse(json, responseReasoningModel(this.#model));
-      this.push(Buffer.from(JSON.stringify(json), "utf8"));
+      const output = Buffer.from(JSON.stringify(json), "utf8");
+      this.#context.relayedBytes += output.length;
+      this.push(output);
       callback();
     } catch (error) { callback(error); }
   }
@@ -283,10 +360,15 @@ export function adaptOpenAIResponses({ model, upstream, requestContext = {} } = 
     return Object.freeze({ upstream, transforms: [] });
   }
   responseModel(model);
+  const relayContext = requestContext.relayContext ?? createResponsesRelayContext();
   const contentType = String(upstream?.headers?.get?.("content-type") || "").toLowerCase();
   const toolBuild = requestContext.toolBuild;
   if (contentType.includes("application/json")) {
-    return Object.freeze({ upstream, transforms: [new ResponsesJsonTransform(model, toolBuild)] });
+    return Object.freeze({
+      upstream,
+      relayContext,
+      transforms: [new ResponsesJsonTransform(model, toolBuild, { ...requestContext, relayContext })],
+    });
   }
   const reasoning = reasoningTransformForModel(responseReasoningModel(model), {
     responseId: requestContext.responseId,
@@ -294,6 +376,7 @@ export function adaptOpenAIResponses({ model, upstream, requestContext = {} } = 
   });
   return Object.freeze({
     upstream,
-    transforms: [new ResponsesSseToolTransform(toolBuild, requestContext), Duplex.fromWeb(reasoning)],
+    relayContext,
+    transforms: [new ResponsesSseToolTransform(toolBuild, { ...requestContext, relayContext }), Duplex.fromWeb(reasoning)],
   });
 }

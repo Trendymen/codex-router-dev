@@ -46,6 +46,7 @@ import { zaiCacheUsageTransform } from "./zai-cache-usage.mjs";
 import {
   adaptOpenAIResponses,
   buildOpenAIResponsesRequest,
+  createResponsesRelayContext,
   OpenAIResponsesAdapterError,
 } from "./openai-responses-adapter.mjs";
 import { providerEndpoint } from "./provider-endpoint.mjs";
@@ -1152,11 +1153,21 @@ async function handleRequest(request, response) {
   if (commandCode?.recheck && upstream.ok) {
     recordCommandCodeRoute(commandCode.id, credential.value, { providerApi: true });
   }
+  const relayContext = normalized.providerRequest ? createResponsesRelayContext() : undefined;
+  // The error boundary lives outside this function, so retain the safe,
+  // provider-derived context on the response object rather than reconstructing
+  // an anonymous terminal after a partial direct relay.
+  if (relayContext) response._codexRouterRelayContext = relayContext;
   const responseAdapter = normalized.providerRequest
     ? adaptOpenAIResponses({
         model: normalized.model,
         upstream,
-        requestContext: { toolBuild: normalized.providerRequest.toolBuild, signal: controller.signal, forcedBuffer },
+        requestContext: {
+          toolBuild: normalized.providerRequest.toolBuild,
+          signal: controller.signal,
+          forcedBuffer,
+          relayContext,
+        },
       })
     : undefined;
   const transforms = [
@@ -1197,8 +1208,14 @@ const server = http.createServer((request, response) => {
       writeJson(response, safe.status, safe.body);
     } else if (publicCode && !response.writableEnded && !response.destroyed) {
       const safe = routerError(publicCode);
+      const context = response._codexRouterRelayContext;
       response.write(formatTerminalFrames(failedResponseEvent({
-        responseId: "resp_adapter", model: "unknown", createdAt: Date.now(), sequenceNumber: 0,
+        responseId: context?.responseId ?? "resp_adapter",
+        model: context?.model ?? "unknown",
+        createdAt: Date.now(),
+        sequenceNumber: (context?.sequenceNumber ?? 0) + 1,
+        output: context?.output ?? [],
+        usage: context?.usage,
       }, safe)));
       response.end();
     } else if (!response.headersSent) {

@@ -12,6 +12,7 @@ import { fileURLToPath } from "node:url";
 import {
   adaptOpenAIResponses,
   buildOpenAIResponsesRequest,
+  createResponsesRelayContext,
   restoreOpenAIResponsesEvent,
 } from "../src/openai-responses-adapter.mjs";
 import { providerEndpoint } from "../src/provider-endpoint.mjs";
@@ -268,6 +269,136 @@ test("standalone completed responses reject duplicate item IDs before relay even
     },
   };
   assert.throws(() => restoreOpenAIResponsesEvent(completed, request.toolBuild), /tool_mapping_error/);
+});
+
+test("forced JSON Responses validates before relay at the exact 8 MiB boundary", async () => {
+  const request = buildOpenAIResponsesRequest({
+    model: deepseek,
+    payload: {
+      input,
+      tools: [{ type: "function", name: "run", parameters: { type: "object", properties: {} } }],
+      tool_choice: "required",
+    },
+  });
+  const completed = JSON.stringify({
+    type: "response.completed",
+    response: {
+      id: "resp_forced_json",
+      model: "deepseek-v4-flash",
+      output: [{ id: "item_json", type: "function_call", name: request.toolBuild.tools[0].name, call_id: "call_json", arguments: "{}" }],
+      usage: { input_tokens: 2, output_tokens: 1 },
+    },
+  });
+  const atLimit = Buffer.concat([Buffer.alloc(8 * 1024 * 1024 - Buffer.byteLength(completed), 0x20), Buffer.from(completed)]);
+  const context = createResponsesRelayContext();
+  const adapter = adaptOpenAIResponses({
+    model: deepseek,
+    upstream: new Response("", { headers: { "content-type": "application/json" } }),
+    requestContext: { toolBuild: request.toolBuild, relayContext: context },
+  });
+  const output = await through(adapter.transforms, [atLimit]);
+  assert.match(output, /resp_forced_json/);
+  assert.equal(context.relayedBytes, Buffer.byteLength(output));
+
+  const overLimit = Buffer.concat([Buffer.from(" "), atLimit]);
+  const rejected = adaptOpenAIResponses({
+    model: deepseek,
+    upstream: new Response("", { headers: { "content-type": "application/json" } }),
+    requestContext: { toolBuild: request.toolBuild },
+  });
+  await assert.rejects(through(rejected.transforms, [overLimit]), /forced_tool_buffer_limit/);
+});
+
+test("direct forced JSON failure is a safe zero-byte pre-relay response", async () => {
+  const seen = [];
+  const upstream = await directServer(async (request, response) => {
+    seen.push(request.url);
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({
+      type: "response.completed",
+      response: { id: "resp_upstream_secret", model: "provider-secret", output: [], usage: { input_tokens: 1 } },
+    }));
+  });
+  const port = await openPort(); const forwarder = directForwarder(port, `http://127.0.0.1:${upstream.port}/v1`);
+  try {
+    await waitForwarder(port);
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${INTERNAL_KEY}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "deepseek-v4-flash", input: "hello",
+        tools: [{ type: "function", name: "run", parameters: { type: "object", properties: {} } }],
+        tool_choice: "required",
+      }),
+    });
+    const body = await response.text();
+    assert.deepEqual(seen, ["/v1/responses"]);
+    assert.equal(response.status, 422);
+    assert.match(body, /required_tool_not_called/);
+    assert.doesNotMatch(body, /resp_upstream_secret|provider-secret|DIRECT_SECRET_MUST_NOT_LEAK/);
+  } finally { await stop(forwarder, upstream.server); }
+});
+
+test("post-relay adapter failure continues the real response once with a safe terminal", async () => {
+  const upstream = await directServer(async (_request, response) => {
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.end(
+      "data: " + JSON.stringify({
+        type: "response.created", sequence_number: 7,
+        response: { id: "resp_actual_7", model: "deepseek-actual", output: [], usage: { input_tokens: 4, output_tokens: 1 } },
+      }) + "\n\n" +
+      "data: {malformed}\n\n",
+    );
+  });
+  const port = await openPort(); const forwarder = directForwarder(port, `http://127.0.0.1:${upstream.port}/v1`);
+  try {
+    await waitForwarder(port);
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: "POST", headers: { Authorization: `Bearer ${INTERNAL_KEY}`, "content-type": "application/json" },
+      body: JSON.stringify({ model: "deepseek-v4-flash", input: "hello" }),
+    });
+    const body = await response.text();
+    assert.equal(response.status, 200);
+    assert.match(body, /resp_actual_7/);
+    assert.match(body, /deepseek-actual/);
+    assert.match(body, /"sequence_number":8/);
+    assert.equal((body.match(/response\.failed/g) || []).length, 1);
+    assert.equal((body.match(/data: \[DONE\]/g) || []).length, 1);
+    assert.doesNotMatch(body, /malformed|DIRECT_SECRET_MUST_NOT_LEAK/);
+  } finally { await stop(forwarder, upstream.server); }
+});
+
+test("caller cancellation aborts a direct forced dispatch without relaying or retrying", async () => {
+  let arrived;
+  let upstreamClosed;
+  const arrivedAtUpstream = new Promise((resolve) => { arrived = resolve; });
+  const closedUpstream = new Promise((resolve) => { upstreamClosed = resolve; });
+  const upstream = await directServer((request, _response) => {
+    arrived();
+    request.once("close", upstreamClosed);
+    // Deliberately never write headers: cancellation must reach fetch itself,
+    // rather than depending on a provider body or a real-time timeout.
+  });
+  const port = await openPort(); const forwarder = directForwarder(port, `http://127.0.0.1:${upstream.port}/v1`);
+  try {
+    await waitForwarder(port);
+    const controller = new AbortController();
+    const request = fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: "POST", signal: controller.signal,
+      headers: { Authorization: `Bearer ${INTERNAL_KEY}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "deepseek-v4-flash", input: "hello",
+        tools: [{ type: "function", name: "run", parameters: { type: "object", properties: {} } }], tool_choice: "required",
+      }),
+    });
+    await arrivedAtUpstream;
+    controller.abort();
+    await assert.rejects(request, /abort/i);
+    await Promise.race([
+      closedUpstream,
+      new Promise((_, reject) => setTimeout(() => reject(new Error("upstream was not cancelled")), 1_000)),
+    ]);
+  } finally { await stop(forwarder, upstream.server); }
 });
 
 test("direct /responses reaches only the provider Responses leaf and emits a redacted public failure", async () => {
