@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
+import { createHash, createHmac } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
@@ -29,6 +29,18 @@ test("JCS golden semantics sort keys and preserve combining Unicode", () => {
   assert.equal(Buffer.from(jcsBytes(PAYLOAD)).toString("utf8").includes("\\u00e9"), false);
 });
 
+test("JCS rejects proxies, unpaired surrogates, and every noncanonical array own key", () => {
+  assert.throws(() => jcs(new Proxy({ a: 1 }, {})), /proxy/);
+  assert.throws(() => jcs("\ud800"), /surrogate/);
+  assert.throws(() => jcs("\udfff"), /surrogate/);
+  const zero = []; Object.defineProperty(zero, "00", { value: "x", enumerable: true });
+  assert.throws(() => jcs(zero), /array property/);
+  const hole = []; hole.length = 1;
+  assert.throws(() => jcs(hole), /sparse/);
+  const accessor = []; Object.defineProperty(accessor, "0", { get() { throw new Error("trap"); }, enumerable: true });
+  assert.throws(() => jcs(accessor), /accessor/);
+});
+
 test("envelope seal is a stable unpadded base64url golden vector", () => {
   const value = sealReasoningEnvelope(PAYLOAD, KEY);
   assert.match(value, /^cr\.reasoning\.v1\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/);
@@ -51,6 +63,12 @@ test("envelope verification is fail-closed for tamper, foreign, unknown, and hos
   assert.equal(verifyReasoningEnvelope(value, { ...PAYLOAD, provider: "other" }, KEY).status, "foreign");
   assert.equal(verifyReasoningEnvelope("not-an-envelope", PAYLOAD, KEY).status, "unknown");
   assert.equal(verifyReasoningEnvelope(value, { provider: PAYLOAD.provider, model: PAYLOAD.model, transport: PAYLOAD.transport, responseId: PAYLOAD.responseId, itemId: PAYLOAD.itemId, summaryParts: ["different"] }, KEY).status, "invalid");
+  assert.equal(verifyReasoningEnvelope(value, { provider: PAYLOAD.provider, model: PAYLOAD.model, transport: PAYLOAD.transport, responseId: "other", itemId: PAYLOAD.itemId, summaryParts: ["a", "e\u0301"] }, KEY).status, "invalid");
+  assert.equal(verifyReasoningEnvelope(value, { provider: PAYLOAD.provider, model: PAYLOAD.model, transport: PAYLOAD.transport, summaryParts: ["a", "e\u0301"] }, KEY).status, "unknown");
+  const raw = JSON.stringify({ ...PAYLOAD, provider: PAYLOAD.provider });
+  const rawBytes = Buffer.from(raw, "utf8");
+  const rawMac = createHmac("sha256", KEY).update(Buffer.from("codex-router.reasoning-envelope.v1\0", "ascii")).update(rawBytes).digest("base64url");
+  assert.equal(verifyReasoningEnvelope(`cr.reasoning.v1.${rawBytes.toString("base64url")}.${rawMac}`, PAYLOAD, KEY).status, "invalid");
   const cyclic = {}; cyclic.self = cyclic;
   assert.throws(() => sealReasoningEnvelope(cyclic, KEY), TypeError);
   assert.throws(() => sealReasoningEnvelope({ x: 1n }, KEY), TypeError);

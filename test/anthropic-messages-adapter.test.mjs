@@ -56,6 +56,8 @@ test("builds canonical GLM Messages request with full base path", () => {
   assert.equal(built.headers["x-api-key"], "provider-secret");
   assert.equal(built.headers["anthropic-version"], "2023-06-01");
   assert.equal(built.json.stream, true);
+  const beijing = buildAnthropicMessagesRequest({ model: { ...MODEL, baseUrl: "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/" }, payload: payload(), credential: "k", internalKey: KEY });
+  assert.equal(beijing.url.href, "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/messages");
 });
 
 test("maps all reasoning budgets and exact output boundaries", () => {
@@ -79,13 +81,42 @@ test("maps all reasoning budgets and exact output boundaries", () => {
 test("accepts a valid current thinking continuation, omits foreign, and rejects unknown provenance", () => {
   const summary = ["previous thought"];
   const envelope = sealReasoningEnvelope({ v: 1, provider: MODEL.provider, model: MODEL.upstreamModel, transport: "anthropic-messages", responseId: "msg_old", itemId: "rsn_old", textSha256: reasoningTextHash(summary), signature: "sig" }, KEY);
-  const valid = buildAnthropicMessagesRequest({ model: MODEL, payload: payload({ input: [{ role: "assistant", content: [{ type: "reasoning", responseId: "msg_old", itemId: "rsn_old", summary: [{ type: "summary_text", text: summary[0] }], encrypted_content: envelope }] }] }), credential: "k", internalKey: KEY });
+  const valid = buildAnthropicMessagesRequest({ model: MODEL, payload: payload({ input: [{ role: "assistant", content: [{ type: "reasoning", id: "rsn_old", summary: [{ type: "summary_text", text: summary[0] }], encrypted_content: envelope }] }] }), credential: "k", internalKey: KEY, requestContext: { responseId: "msg_old" } });
   assert.deepEqual(valid.json.messages[0].content[0], { type: "thinking", thinking: summary[0], signature: "sig" });
   const foreign = sealReasoningEnvelope({ v: 1, provider: "other", model: MODEL.upstreamModel, transport: "anthropic-messages", responseId: "msg_old", itemId: "rsn_old", textSha256: reasoningTextHash(summary), signature: "sig" }, KEY);
-  const omitted = buildAnthropicMessagesRequest({ model: MODEL, payload: payload({ input: [{ role: "assistant", content: [{ type: "reasoning", responseId: "msg_old", itemId: "rsn_old", summary, encrypted_content: foreign }] }] }), credential: "k", internalKey: KEY });
+  const omitted = buildAnthropicMessagesRequest({ model: MODEL, payload: payload({ input: [{ role: "assistant", content: [{ type: "reasoning", id: "rsn_old", summary, encrypted_content: foreign }] }] }), credential: "k", internalKey: KEY, requestContext: { responseId: "msg_old" } });
   assert.deepEqual(omitted.json.messages[0].content, []);
+  const missingSignature = sealReasoningEnvelope({ v: 1, provider: MODEL.provider, model: MODEL.upstreamModel, transport: "anthropic-messages", responseId: "msg_old", itemId: "rsn_old", textSha256: reasoningTextHash(summary), signature: null }, KEY);
+  assert.throws(() => buildAnthropicMessagesRequest({ model: MODEL, payload: payload({ input: [{ role: "assistant", content: [{ type: "reasoning", id: "rsn_old", summary, encrypted_content: missingSignature }] }] }), credential: "k", internalKey: KEY, requestContext: { responseId: "msg_old" } }), /thinking_signature_missing/);
   assert.throws(() => buildAnthropicMessagesRequest({ model: MODEL, payload: payload({ input: [{ role: "assistant", content: [{ type: "reasoning", summary }] }] }), credential: "k", internalKey: KEY }), /thinking_provenance_unknown/);
   assert.throws(() => buildAnthropicMessagesRequest({ model: MODEL, payload: payload({ input: [{ role: "assistant", content: [{ type: "reasoning", summary, encrypted_content: "cr.reasoning.v2.bad.bad" }] }] }), credential: "k", internalKey: KEY }), /thinking_signature_invalid/);
+});
+
+test("lowers function, custom, and namespace history through the shared tool dialect", () => {
+  const tools = [
+    { type: "function", name: "lookup", parameters: { type: "object", properties: { q: { type: "string" } }, required: ["q"] }, strict: true },
+    { type: "custom", name: "freeform", description: "free" },
+    { type: "namespace", name: "files", tools: [{ type: "function", name: "read", parameters: { type: "object", properties: {} } }] },
+  ];
+  const sourceInput = [
+    { type: "function_call", id: "item_1", call_id: "call_1", name: "lookup", arguments: '{"q":"x"}' },
+    { type: "custom_tool_call", id: "item_2", call_id: "call_2", name: "freeform", input: "raw text" },
+    { type: "function_call", id: "item_3", call_id: "call_3", name: "read", namespace: "files", arguments: "{}" },
+    { type: "function_call_output", call_id: "call_1", output: "result" },
+    { type: "custom_tool_call_output", call_id: "call_2", output: "custom result" },
+  ];
+  const built = buildAnthropicMessagesRequest({ model: MODEL, payload: payload({ tools, tool_choice: "required", input: sourceInput, reasoning: { effort: "off" }, max_output_tokens: 131072 }), credential: "k", internalKey: KEY });
+  assert.equal(built.json.tool_choice.type, "any");
+  assert.equal(built.json.tools.length, 3);
+  assert.ok(built.json.tools.every((tool) => tool.name !== "freeform" || tool.input_schema.properties.input));
+  assert.deepEqual(built.json.messages[0].content[0].input, { q: "x" });
+  assert.deepEqual(built.json.messages[1].content[0].input, { input: "raw text" });
+  assert.equal(built.json.messages[2].content[0].name, "cr_files__read_LEZ5OZ2EUHBABJAL");
+  assert.equal(built.json.messages[3].content[0].type, "tool_result");
+  const none = buildAnthropicMessagesRequest({ model: MODEL, payload: payload({ tools, tool_choice: "none", parallel_tool_calls: false, reasoning: { effort: "off" }, max_output_tokens: 131072 }), credential: "k", internalKey: KEY });
+  assert.equal(none.json.tools, undefined);
+  assert.equal(none.json.tool_choice, undefined);
+  assert.equal(none.json.disable_parallel_tool_use, undefined);
 });
 
 test("converts text, thinking signature, tool input, usage and one terminal event", async () => {
@@ -115,13 +146,68 @@ test("converts text, thinking signature, tool input, usage and one terminal even
   const terminal = events.find((e) => e.type === "response.completed");
   assert.equal(terminal.response.status, "completed");
   assert.equal(terminal.response.usage.input_tokens, 10);
+  assert.deepEqual(terminal.response.usage.input_tokens_details, { cached_tokens: 3 });
   assert.equal(output.endsWith("data: [DONE]\n\n"), true);
+});
+
+test("frames arbitrary UTF-8 chunks and closes max-token, duplicate, and malformed lifecycles safely", async () => {
+  const source = [
+    frame("message_start", { type: "message_start", message: { id: "msg_chunks", model: "glm-5.2" } }),
+    frame("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text" } }),
+    frame("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "中文" } }),
+    frame("content_block_stop", { type: "content_block_stop", index: 0 }),
+    frame("message_delta", { type: "message_delta", delta: { stop_reason: "max_tokens" } }),
+    frame("message_stop", { type: "message_stop" }),
+    frame("message_stop", { type: "message_stop" }),
+  ].join("");
+  const upstream = { status: 200, headers: new Headers({ "content-type": "text/event-stream" }) };
+  const transform = adaptAnthropicMessages({ model: MODEL, upstream, requestContext: { internalKey: KEY } }).transforms[0];
+  const chunks = [...Buffer.from(source)].map((byte) => Buffer.from([byte]));
+  const output = await collect(transform, chunks);
+  assert.equal((output.match(/data: \{"type":"response\.incomplete"/g) || []).length, 1);
+  assert.equal((output.match(/data: \[DONE\]/g) || []).length, 1);
+  assert.match(output, /max_output_tokens/);
+  const badType = adaptAnthropicMessages({ model: MODEL, upstream, requestContext: { internalKey: KEY } }).transforms[0];
+  const failed = await collect(badType, [Buffer.from(frame("message_start", { message: { id: "m" } }) + frame("content_block_start", { index: 0, content_block: { type: "text" } }) + frame("content_block_delta", { index: 0, delta: { type: "thinking_delta", thinking: "wrong" } }))]);
+  assert.equal((failed.match(/data: \{"type":"response\.failed"/g) || []).length, 1);
+  assert.equal((failed.match(/data: \[DONE\]/g) || []).length, 1);
+});
+
+test("restores mapped provider tool calls only after the shared lifecycle mapping validates them", async () => {
+  const built = buildAnthropicMessagesRequest({ model: MODEL, payload: payload({ reasoning: { effort: "off" }, max_output_tokens: 131072 }), credential: "k", internalKey: KEY });
+  const encoded = built.json.tools[0].name;
+  const upstream = { status: 200, headers: new Headers({ "content-type": "text/event-stream" }) };
+  const transform = adaptAnthropicMessages({ model: MODEL, upstream, requestContext: { internalKey: KEY, toolBuild: built.toolBuild } }).transforms[0];
+  const output = await collect(transform, [Buffer.from([
+    frame("message_start", { type: "message_start", message: { id: "msg_tool", model: "glm-5.2" } }),
+    frame("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "tool_use", id: "call_tool", name: encoded, input: {} } }),
+    frame("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: '{"q":"x"}' } }),
+    frame("content_block_stop", { type: "content_block_stop", index: 0 }),
+    frame("message_delta", { type: "message_delta", delta: { stop_reason: "tool_use" } }),
+    frame("message_stop", { type: "message_stop" }),
+  ].join(""))]);
+  assert.match(output, /"type":"function_call"/);
+  assert.match(output, /"name":"lookup"/);
+});
+
+test("caller abort invokes the upstream abort owner once and closes the transform", async () => {
+  const controller = new AbortController();
+  let aborts = 0;
+  const upstream = { status: 200, headers: new Headers({ "content-type": "text/event-stream" }) };
+  const transform = adaptAnthropicMessages({ model: MODEL, upstream, requestContext: { internalKey: KEY, signal: controller.signal, abort: () => { aborts += 1; } } }).transforms[0];
+  const pending = new Promise((resolve) => { transform.once("error", (error) => resolve(error)); });
+  transform.write(Buffer.from(frame("message_start", { type: "message_start", message: { id: "msg_abort", model: "glm-5.2" } })));
+  controller.abort();
+  const error = await pending;
+  assert.equal(error.code, "request_aborted");
+  assert.equal(aborts, 1);
 });
 
 test("rejects malformed/unknown/duplicate/truncated streams and passes non-2xx untouched", async () => {
   const bad = { status: 200, headers: new Headers({ "content-type": "text/event-stream" }), body: Readable.toWeb(Readable.from("data: {bad}\n\n")) };
   const adapted = adaptAnthropicMessages({ model: MODEL, upstream: bad, requestContext: { internalKey: KEY } });
-  await assert.rejects(() => collect(adapted.transforms[0], [Buffer.from("data: {bad}\n\n")]), /provider_response_malformed/);
+  const malformedOutput = await collect(adapted.transforms[0], [Buffer.from("data: {bad}\n\n")]);
+  assert.match(malformedOutput, /response\.failed/);
   assert.throws(() => buildAnthropicMessagesRequest({ model: MODEL, payload: payload({ input: [{ role: "user", content: [{ type: "unsupported" }] }] }), credential: "k", internalKey: KEY }), /unsupported/);
   const non2xx = { status: 429, headers: new Headers({ "content-type": "application/json" }), body: Readable.toWeb(Readable.from('{"error":"provider"}')) };
   assert.deepEqual(adaptAnthropicMessages({ model: MODEL, upstream: non2xx }).transforms, []);
