@@ -267,10 +267,13 @@ function validTomlInteger(value) {
   const unsigned = sign ? value.slice(1) : value;
   const decimal = /^(?:0|[1-9](?:_?\d)*)$/;
   const based = /^0(?:x[0-9A-Fa-f](?:_?[0-9A-Fa-f])*|o[0-7](?:_?[0-7])*|b[01](?:_?[01])*)$/;
-  if (!decimal.test(unsigned) && !based.test(unsigned)) return false;
-  const magnitude = BigInt(unsigned.replaceAll("_", ""));
-  const integer = sign === "-" ? -magnitude : magnitude;
-  return integer >= -9223372036854775808n && integer <= 9223372036854775807n;
+  if (decimal.test(unsigned)) {
+    const magnitude = BigInt(unsigned.replaceAll("_", ""));
+    const integer = sign === "-" ? -magnitude : magnitude;
+    return integer >= -9223372036854775808n && integer <= 9223372036854775807n;
+  }
+  if (sign || !based.test(value)) return false;
+  return BigInt(value.replaceAll("_", "")) <= 9223372036854775807n;
 }
 
 function validTomlOtherPrimitive(value) {

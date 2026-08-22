@@ -176,13 +176,14 @@ standalone_web_search = true
   assert.match(status.invalid || "", /colliding TOML assignment paths/i);
 });
 
-test("standalone search enforces TOML signed int64 bounds for decimal and base integers", () => {
+test("standalone search enforces TOML integer bounds and forbids signs on base integers", () => {
   const valid = standaloneSearchStatus(`web_search = "live"
 suppress_unstable_features_warning = true
 decimal_max = +9_223_372_036_854_775_807
 decimal_min = -9_223_372_036_854_775_808
-hex_max = +0x7fff_ffff_ffff_ffff
-hex_min = -0x8000_0000_0000_0000
+hex_max = 0x7fff_ffff_ffff_ffff
+octal_max = 0o777_777_777_777_777_777_777
+binary_max = 0b111_111_111_111_111_111_111_111_111_111_111_111_111_111_111_111_111_111_111_111_111
 
 [features]
 standalone_web_search = true
@@ -192,8 +193,15 @@ standalone_web_search = true
   for (const value of [
     "+9_223_372_036_854_775_808",
     "-9_223_372_036_854_775_809",
-    "+0x8000_0000_0000_0000",
-    "-0x8000_0000_0000_0001",
+    "0x8000_0000_0000_0000",
+    "0o1_000_000_000_000_000_000_000",
+    "0b1_000_000_000_000_000_000_000_000_000_000_000_000_000_000_000_000_000_000_000_000_000_000",
+    "+0x1",
+    "-0x1",
+    "+0o1",
+    "-0o1",
+    "+0b1",
+    "-0b1",
   ]) {
     const status = standaloneSearchStatus(`web_search = "live"
 suppress_unstable_features_warning = true
