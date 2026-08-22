@@ -1,3 +1,5 @@
+import { types as utilTypes } from "node:util";
+
 const definitions = [
   ["provider_not_available_in_node_build", 404, "This provider is not available in the Node-native build."],
   ["model_not_enabled", 404, "This model is not enabled."],
@@ -36,6 +38,10 @@ const UNSAFE_SNAPSHOT_KEYS = new Set(["__proto__", "constructor", "prototype", "
 const SAFE_SNAPSHOT_KEY = /^[A-Za-z][A-Za-z0-9_]*$/;
 const SAFE_RESPONSE_ID = /^[A-Za-z0-9_-]{1,256}$/;
 const SAFE_MODEL = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,255}$/;
+const MAX_SNAPSHOT_ARRAY_LENGTH = 1_024;
+const MAX_SNAPSHOT_OBJECT_KEYS = 256;
+const MAX_SNAPSHOT_DEPTH = 32;
+const MAX_SNAPSHOT_WORK = 4_096;
 
 function deepFreeze(value, seen = new WeakSet()) {
   if (!value || typeof value !== "object" || seen.has(value)) return value;
@@ -54,29 +60,43 @@ function ownDataValue(value, key) {
   }
 }
 
-function safeSnapshot(value, seen = new WeakSet()) {
+function safeSnapshot(value, state = { seen: new WeakSet(), remainingWork: MAX_SNAPSHOT_WORK }, depth = 0) {
+  if (depth > MAX_SNAPSHOT_DEPTH || state.remainingWork <= 0) {
+    state.exhausted = true;
+    return undefined;
+  }
+  state.remainingWork -= 1;
   if (value === null || typeof value === "string" || typeof value === "boolean") return value;
   if (typeof value === "number") return Number.isFinite(value) ? value : undefined;
-  if (!value || typeof value !== "object" || seen.has(value)) return undefined;
+  if (!value || typeof value !== "object" || state.seen.has(value) || utilTypes.isProxy(value)) return undefined;
   try {
     const isArray = Array.isArray(value);
     const prototype = Object.getPrototypeOf(value);
     if (prototype !== Object.prototype && prototype !== null && !isArray) return undefined;
-    seen.add(value);
+    state.seen.add(value);
     if (isArray) {
       const length = ownDataValue(value, "length");
-      if (!Number.isSafeInteger(length) || length < 0) return undefined;
+      if (!Number.isSafeInteger(length) || length < 0 || length > MAX_SNAPSHOT_ARRAY_LENGTH) return undefined;
       const copy = [];
       for (let index = 0; index < length; index += 1) {
-        const snapshot = safeSnapshot(ownDataValue(value, String(index)), seen);
+        const snapshot = safeSnapshot(ownDataValue(value, String(index)), state, depth + 1);
+        if (state.exhausted) return undefined;
         if (snapshot !== undefined) copy.push(snapshot);
       }
       return copy;
     }
+    const keys = [];
+    let enumeratedKeys = 0;
+    for (const key in value) {
+      enumeratedKeys += 1;
+      if (enumeratedKeys > MAX_SNAPSHOT_OBJECT_KEYS) return undefined;
+      if (Object.hasOwn(value, key)) keys.push(key);
+    }
     const copy = {};
-    for (const key of Object.keys(value)) {
+    for (const key of keys) {
       if (!SAFE_SNAPSHOT_KEY.test(key) || UNSAFE_SNAPSHOT_KEYS.has(key)) continue;
-      const snapshot = safeSnapshot(ownDataValue(value, key), seen);
+      const snapshot = safeSnapshot(ownDataValue(value, key), state, depth + 1);
+      if (state.exhausted) return undefined;
       if (snapshot !== undefined) Object.defineProperty(copy, key, { value: snapshot, enumerable: true });
     }
     return copy;

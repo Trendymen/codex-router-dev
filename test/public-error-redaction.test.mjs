@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import test from "node:test";
 
 import {
@@ -29,6 +30,44 @@ const SERIALIZED_DECOYS = Object.values(DECOYS);
 function assertNoDecoys(value) {
   const serialized = JSON.stringify(value);
   for (const decoy of SERIALIZED_DECOYS) assert.doesNotMatch(serialized, new RegExp(decoy));
+}
+
+function runSparseArrayTerminal(kind) {
+  const moduleUrl = new URL("../src/public-error.mjs", import.meta.url).href;
+  const source = `
+    import {
+      failedResponseEvent,
+      formatTerminalFrames,
+      incompleteResponseEvent,
+      routerError,
+    } from ${JSON.stringify(moduleUrl)};
+    let getterRead = false;
+    const output = [];
+    output.length = 0xffff_ffff;
+    Object.defineProperty(output, "4294967293", {
+      enumerable: true,
+      get() {
+        getterRead = true;
+        throw new Error(${JSON.stringify(DECOYS.providerBody)});
+      },
+    });
+    const context = {
+      sequenceNumber: 1,
+      responseId: "resp_safe",
+      createdAt: 0,
+      model: "canonical/slug",
+      output,
+      usage: { input_tokens: 1 },
+    };
+    const event = ${kind === "failed"
+      ? 'failedResponseEvent(context, routerError("upstream_stream_truncated"))'
+      : 'incompleteResponseEvent(context, "max_output_tokens")'};
+    process.stdout.write(JSON.stringify({ getterRead, frames: formatTerminalFrames(event) }));
+  `;
+  return spawnSync(process.execPath, ["--input-type=module", "-e", source], {
+    encoding: "utf8",
+    timeout: 2_000,
+  });
 }
 
 test("pre-stream errors expose only the safe envelope", () => {
@@ -225,6 +264,51 @@ for (const [name, buildEvent] of [
     assert.equal((frames.match(/data: \[DONE\]/g) || []).length, 1);
     assert.ok(frames.indexOf(`\"type\":\"response.${name}\"`) < frames.indexOf("data: [DONE]"));
     assertNoDecoys(frames);
+  });
+}
+
+for (const [name, buildEvent] of [
+  ["failed", (context) => failedResponseEvent(context, routerError("upstream_stream_truncated"))],
+  ["incomplete", (context) => incompleteResponseEvent(context, "max_output_tokens")],
+]) {
+  test(`${name} terminal rejects huge sparse arrays within the snapshot budget`, () => {
+    const result = runSparseArrayTerminal(name);
+    assert.equal(result.error, undefined);
+    assert.equal(result.status, 0, result.stderr);
+
+    const { getterRead, frames } = JSON.parse(result.stdout);
+    assert.equal(getterRead, false);
+    const terminal = JSON.parse(frames.split("\n")[0].slice(6));
+    assert.deepEqual(terminal.response.output, []);
+    assert.equal((frames.match(/data: \[DONE\]/g) || []).length, 1);
+    assert.ok(frames.indexOf(`\"type\":\"response.${name}\"`) < frames.indexOf("data: [DONE]"));
+    assertNoDecoys(frames);
+
+    let nested = { type: "message", id: "msg_safe" };
+    for (let depth = 0; depth < 100; depth += 1) nested = [nested];
+    const event = buildEvent({
+      sequenceNumber: 1,
+      responseId: "resp_safe",
+      createdAt: 0,
+      model: "canonical/slug",
+      output: nested,
+      usage: { input_tokens: 1 },
+    });
+    assert.deepEqual(event.response.output, []);
+
+    const broadNestedOutput = Array.from(
+      { length: 64 },
+      () => Array.from({ length: 64 }, () => "safe"),
+    );
+    const broadEvent = buildEvent({
+      sequenceNumber: 1,
+      responseId: "resp_safe",
+      createdAt: 0,
+      model: "canonical/slug",
+      output: broadNestedOutput,
+      usage: { input_tokens: 1 },
+    });
+    assert.deepEqual(broadEvent.response.output, []);
   });
 }
 
