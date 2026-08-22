@@ -170,7 +170,7 @@ function assignmentAtLine(line, lineNumber) {
   if (boolean) return { key, kind: "boolean", value: boolean[1] === "true" };
   const quoteCharacter = rawValue[0];
   if (quoteCharacter !== '"' && quoteCharacter !== "'") {
-    return { key, kind: "other" };
+    return { key, kind: "other", rawValue };
   }
   if (rawValue.startsWith(quoteCharacter.repeat(3))) {
     return { key, kind: "multiline-string" };
@@ -204,6 +204,195 @@ function assignmentAtLine(line, lineNumber) {
   return { key, kind: "string", value };
 }
 
+function uncommentTomlValue(rawValue) {
+  let quote;
+  let escaped = false;
+  let output = "";
+  for (let index = 0; index < rawValue.length; index += 1) {
+    const character = rawValue[index];
+    if (quote === '"') {
+      if (escaped) escaped = false;
+      else if (character === "\\") escaped = true;
+      else if (character === quote) quote = undefined;
+      output += character;
+      continue;
+    }
+    if (quote === "'") {
+      if (character === quote) quote = undefined;
+      output += character;
+      continue;
+    }
+    if (character === '"' || character === "'") {
+      quote = character;
+      output += character;
+      continue;
+    }
+    if (character === "#") {
+      while (index < rawValue.length && rawValue[index] !== "\n") index += 1;
+      if (index < rawValue.length) output += "\n";
+      continue;
+    }
+    output += character;
+  }
+  return quote ? undefined : output;
+}
+
+function validTomlDateOrTime(value) {
+  const dateTime = value.match(/^(\d{4})-(\d{2})-(\d{2})[Tt ](\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?:Z|[+-](\d{2}):(\d{2}))?$/);
+  const date = value.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  const time = value.match(/^(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?$/);
+  const dateParts = dateTime || date;
+  if (dateParts) {
+    const [, year, month, day] = dateParts;
+    const yearNumber = Number(year);
+    const monthNumber = Number(month);
+    const dayNumber = Number(day);
+    if (monthNumber < 1 || monthNumber > 12) return false;
+    const days = new Date(Date.UTC(yearNumber, monthNumber, 0)).getUTCDate();
+    if (dayNumber < 1 || dayNumber > days) return false;
+  }
+  const timeParts = dateTime || time;
+  if (!timeParts) return Boolean(dateParts);
+  const start = dateTime ? 4 : 1;
+  const hour = Number(timeParts[start]);
+  const minute = Number(timeParts[start + 1]);
+  const second = Number(timeParts[start + 2]);
+  if (hour > 23 || minute > 59 || second > 60) return false;
+  if (dateTime && timeParts[7] !== undefined && (Number(timeParts[7]) > 23 || Number(timeParts[8]) > 59)) return false;
+  return true;
+}
+
+function validTomlOtherPrimitive(value) {
+  const decimal = "(?:0|[1-9](?:_?\\d)*)";
+  const digitSequence = "\\d(?:_?\\d)*";
+  const integer = new RegExp(`^[+-]?${decimal}$`);
+  const float = new RegExp(`^[+-]?(?:${decimal}\\.${digitSequence}(?:[eE][+-]?${digitSequence})?|${decimal}[eE][+-]?${digitSequence})$`);
+  const basedInteger = /^0(?:x[0-9A-Fa-f](?:_?[0-9A-Fa-f])*|o[0-7](?:_?[0-7])*|b[01](?:_?[01])*)$/;
+  return value === "true" || value === "false" || integer.test(value) || float.test(value) || basedInteger.test(value) ||
+    /^[+-]?(?:inf|nan)$/.test(value) || validTomlDateOrTime(value);
+}
+
+// Validate the subset left as `other` by the structural scanner. This is
+// deliberately a small, complete one-line value parser: status consumers may
+// ignore unrelated values only after proving they are syntactically TOML, not
+// merely after seeing an equals sign.
+function trustedTomlOtherValue(rawValue) {
+  const source = uncommentTomlValue(rawValue);
+  if (source === undefined) return false;
+  let index = 0;
+  const skipSpace = () => {
+    while (/\s/.test(source[index] || "")) index += 1;
+  };
+  const parseString = () => {
+    const quote = source[index++];
+    let body = "";
+    let closed = false;
+    while (index < source.length) {
+      const character = source[index++];
+      if (quote === '"' && character === "\\") {
+        body += character;
+        if (index >= source.length) return false;
+        body += source[index++];
+        if (body.at(-1) === "u") body += source.slice(index, index += 4);
+        else if (body.at(-1) === "U") body += source.slice(index, index += 8);
+        continue;
+      }
+      if (character === quote) {
+        closed = true;
+        break;
+      }
+      body += character;
+    }
+    return closed && (quote !== '"' || tomlBasicKey(body) !== undefined);
+  };
+  const parseInlineKey = () => {
+    const start = index;
+    let quote;
+    let escaped = false;
+    while (index < source.length) {
+      const character = source[index];
+      if (quote === '"') {
+        if (escaped) escaped = false;
+        else if (character === "\\") escaped = true;
+        else if (character === quote) quote = undefined;
+        index += 1;
+        continue;
+      }
+      if (quote === "'") {
+        if (character === quote) quote = undefined;
+        index += 1;
+        continue;
+      }
+      if (character === '"' || character === "'") {
+        quote = character;
+        index += 1;
+        continue;
+      }
+      if (character === "=") return Boolean(tomlDottedKey(source.slice(start, index).trim()));
+      if (character === "," || character === "}") return false;
+      index += 1;
+    }
+    return false;
+  };
+  const parseValue = () => {
+    skipSpace();
+    const character = source[index];
+    if (character === '"' || character === "'") return parseString();
+    if (character === "[") {
+      index += 1;
+      skipSpace();
+      if (source[index] === "]") {
+        index += 1;
+        return true;
+      }
+      while (true) {
+        if (!parseValue()) return false;
+        skipSpace();
+        if (source[index] === "]") {
+          index += 1;
+          return true;
+        }
+        if (source[index] !== ",") return false;
+        index += 1;
+        skipSpace();
+        if (source[index] === "]") {
+          index += 1;
+          return true;
+        }
+      }
+    }
+    if (character === "{") {
+      index += 1;
+      skipSpace();
+      if (source[index] === "}") {
+        index += 1;
+        return true;
+      }
+      while (true) {
+        if (!parseInlineKey() || source[index] !== "=") return false;
+        index += 1;
+        if (!parseValue()) return false;
+        skipSpace();
+        if (source[index] === "}") {
+          index += 1;
+          return true;
+        }
+        if (source[index] !== ",") return false;
+        index += 1;
+        skipSpace();
+      }
+    }
+    const start = index;
+    while (index < source.length && !",]}".includes(source[index])) index += 1;
+    const primitive = source.slice(start, index).trimEnd();
+    return Boolean(primitive) && validTomlOtherPrimitive(primitive);
+  };
+
+  if (!parseValue()) return false;
+  skipSpace();
+  return index === source.length;
+}
+
 // A small fail-closed structural lexer, not a general TOML value parser. It
 // identifies real table boundaries and active assignments while ignoring
 // table-looking text and assignments inside multiline strings.
@@ -214,6 +403,7 @@ export function scanTomlDocument(contents) {
   let tablePath = [];
   let multiline;
   let arrayDepth = 0;
+  let pendingArrayAssignment;
 
   for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
     const line = lines[lineIndex];
@@ -227,7 +417,11 @@ export function scanTomlDocument(contents) {
       }
       const assignment = assignmentAtLine(line, lineNumber);
       if (assignment) {
-        assignments.push({ index: lineIndex, tablePath: [...tablePath], ...assignment });
+        const entry = { index: lineIndex, tablePath: [...tablePath], ...assignment };
+        assignments.push(entry);
+        if (entry.kind === "other" && entry.rawValue.trimStart().startsWith("[")) {
+          pendingArrayAssignment = entry;
+        }
       } else if (line.trim() && !line.trimStart().startsWith("#")) {
         ambiguousToml(lineNumber, "unrecognized active TOML content");
       }
@@ -287,6 +481,10 @@ export function scanTomlDocument(contents) {
       }
       index += 1;
     }
+    if (pendingArrayAssignment && lineIndex > pendingArrayAssignment.index) {
+      pendingArrayAssignment.rawValue += `\n${line}`;
+    }
+    if (pendingArrayAssignment && arrayDepth === 0) pendingArrayAssignment = undefined;
   }
 
   if (multiline) {
@@ -327,6 +525,9 @@ export function assertUnambiguousTomlDocument(document) {
       throw new Error(
         `Refusing duplicate TOML assignments for ${[...assignment.tablePath, ...assignment.key].join(".")}.`,
       );
+    }
+    if (assignment.kind === "other" && !trustedTomlOtherValue(assignment.rawValue)) {
+      throw new Error(`Refusing untrusted TOML value at line ${assignment.index + 1}.`);
     }
     assignments.add(key);
   }

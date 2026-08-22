@@ -265,6 +265,109 @@ standalone_web_search = true
   }
 });
 
+test("runtime guard records canonical mutation paths, numeric flags, descriptors, FileHandles, and every CC Switch path position", () => {
+  const isolated = mkdtempSync(path.join(os.tmpdir(), "codex-router-runtime-guard-self-test-"));
+  const ccSwitchDatabase = path.join(isolated, ".cc-switch", "cc-switch.db");
+  const outside = path.join(os.tmpdir(), `codex-router-runtime-guard-outside-${process.pid}`, "blocked.txt");
+  mkdirSync(path.dirname(ccSwitchDatabase), { recursive: true, mode: 0o700 });
+  writeFileSync(ccSwitchDatabase, "do-not-touch", { mode: 0o600 });
+  const env = {
+    ...process.env,
+    TASK5_RUNTIME_GUARD_ROOT: isolated,
+    NODE_OPTIONS: `${process.env.NODE_OPTIONS || ""} --require=${runtimeGuard}`.trim(),
+  };
+  const script = String.raw`
+    const fs = require("node:fs");
+    const path = require("node:path");
+    const { pathToFileURL } = require("node:url");
+    const root = process.argv[1];
+    const cc = process.argv[2];
+    const outside = process.argv[3];
+    const source = path.join(root, "source.txt");
+    const numeric = path.join(root, "numeric.txt");
+    const handled = path.join(root, "handled.txt");
+    fs.writeFileSync(source, "source");
+    const fd = fs.openSync(numeric, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_TRUNC);
+    fs.writeSync(fd, "first");
+    fs.writevSync(fd, [Buffer.from("second")]);
+    fs.ftruncateSync(fd, 3);
+    try { fs.fchmodSync(fd, 0o600); } catch {}
+    try { fs.fchownSync(fd, 0, 0); } catch {}
+    try { fs.futimesSync(fd, new Date(), new Date()); } catch {}
+    fs.fdatasyncSync(fd); fs.fsyncSync(fd); fs.closeSync(fd);
+    fs.copyFileSync(source, path.join(root, "copy.txt"));
+    fs.renameSync(path.join(root, "copy.txt"), path.join(root, "renamed.txt"));
+    fs.linkSync(source, path.join(root, "linked.txt"));
+    try { fs.symlinkSync(source, path.join(root, "symlinked.txt")); } catch {}
+    const stream = fs.createWriteStream(path.join(root, "stream.txt"));
+    if (!stream || typeof stream.write !== "function") throw new Error("createWriteStream return shape changed");
+    stream.end("stream");
+    (async () => {
+      const handle = await fs.promises.open(handled, fs.constants.O_RDWR | fs.constants.O_CREAT | fs.constants.O_TRUNC);
+      await handle.write("one"); await handle.writev([Buffer.from("two")]);
+      await handle.writeFile("three"); await handle.appendFile("four"); await handle.truncate(2);
+      try { await handle.chmod(0o600); } catch {}
+      try { await handle.chown(0, 0); } catch {}
+      try { await handle.utimes(new Date(), new Date()); } catch {}
+      await handle.sync(); await handle.datasync();
+      const handleStream = handle.createWriteStream();
+      if (!handleStream || typeof handleStream.write !== "function") throw new Error("FileHandle createWriteStream return shape changed");
+      handleStream.end(); await handle.close();
+      for (const value of [Buffer.from(path.dirname(cc)), pathToFileURL(cc)]) {
+        try { fs.statSync(value); } catch {}
+      }
+      process.chdir(root);
+      try { await fs.promises.readFile(".cc-switch/cc-switch.db"); } catch {}
+      try { fs.copyFileSync(source, cc); } catch {}
+      try { fs.renameSync(cc, path.join(root, "blocked-rename.txt")); } catch {}
+      try { fs.writeFileSync(outside, "outside"); } catch {}
+    })().catch((error) => { console.error(error.stack); process.exitCode = 1; });
+  `;
+
+  try {
+    const result = spawnSync(process.execPath, ["-e", script, isolated, ccSwitchDatabase, outside], {
+      cwd: root,
+      env,
+      encoding: "utf8",
+    });
+    assert.equal(result.status, 0, result.stderr);
+    const events = guardEvents(result.stderr);
+    const expected = [
+      "fs.openSync",
+      "fs.writeSync",
+      "fs.writevSync",
+      "fs.ftruncateSync",
+      "fs.fchmodSync",
+      "fs.fchownSync",
+      "fs.futimesSync",
+      "fs.fdatasyncSync",
+      "fs.fsyncSync",
+      "fs.promises.open",
+      "fs.promises.FileHandle.write",
+      "fs.promises.FileHandle.writev",
+      "fs.promises.FileHandle.writeFile",
+      "fs.promises.FileHandle.appendFile",
+      "fs.promises.FileHandle.truncate",
+      "fs.promises.FileHandle.chmod",
+      "fs.promises.FileHandle.chown",
+      "fs.promises.FileHandle.utimes",
+      "fs.promises.FileHandle.sync",
+      "fs.promises.FileHandle.datasync",
+      "fs.createWriteStream",
+    ];
+    for (const kind of expected) assert.ok(events.some((event) => event.kind === kind), kind);
+    for (const kind of ["fs.copyFileSync", "fs.renameSync", "fs.linkSync", "fs.symlinkSync"]) {
+      assert.ok(events.filter((event) => event.kind === kind).length >= 2, kind);
+    }
+    assert.ok(events.some((event) => event.kind === "fs.openSync" && event.numericOpenFlags), "numeric flags");
+    assert.ok(events.filter((event) => event.ccSwitchAccess && event.blocked).length >= 5, "CC root and descendants");
+    assert.ok(events.some((event) => event.path === path.resolve(outside).replaceAll("\\", "/") && event.outsideIsolation), "outside isolation write");
+    assert.ok(events.every((event) => event.path === undefined || path.isAbsolute(event.path)), "canonical paths");
+  } finally {
+    rmSync(isolated, { recursive: true, force: true });
+  }
+});
+
 test("only the explicit local catalog command references protected snippet rendering", () => {
   const sourceFiles = readdirSync(path.join(root, "src"))
     .filter((name) => name.endsWith(".mjs"))

@@ -73,7 +73,13 @@ export function signedProviderBlockIsOwned(contents, state) {
   const lines = contents.split("\n");
   const slots = lines.filter((line) => line.startsWith(`${signedProviderSlotPrefix} `));
   if (slots.length !== expectedSlots || !Array.from({ length: expectedSlots }, (_, index) => signedProviderSlot(state, index)).every((slot) => slots.filter((line) => line === slot).length === 1)) return false;
-  const ranges = providerTableRanges(contents, state.managedProvider);
+  let ranges;
+  try {
+    ranges = providerTableRanges(contents, state.managedProvider);
+  } catch {
+    // Status ownership checks fail closed on a foreign duplicate table.
+    return false;
+  }
   if (state.mode === "root-openai") return ranges.length === 0;
   const range = signedManagedRange(contents);
   if (!range) return false;

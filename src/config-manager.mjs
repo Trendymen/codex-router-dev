@@ -650,37 +650,6 @@ function signedManagedRange(contents) {
 
 function signedProviderBlockIsOwned(contents, state) {
   return sharedSignedProviderBlockIsOwned(contents, state);
-  /* legacy implementation retained below for reference
-  if (state.version === 2) {
-    const range = signedManagedRange(contents);
-    if (!range) return false;
-    const actual = range.lines.slice(range.start, range.end).join("\n");
-    return managedSignedProviderBlockMatches(actual, state.managedProvider, state.managedBaseUrl);
-  }
-  if (state.version !== 3) return false;
-  const sections = state.previousProviderSections;
-  const expectedSlots = state.mode === "provider-table" ? Math.max(1, sections.length) : sections.length;
-  const lines = contents.split("\n");
-  const slots = lines.filter((line) => line.startsWith(`${signedProviderSlotPrefix} `));
-  if (
-    slots.length !== expectedSlots ||
-    !Array.from({ length: expectedSlots }, (_, index) => signedProviderSlot(state, index))
-      .every((slot) => slots.filter((line) => line === slot).length === 1)
-  ) {
-    return false;
-  }
-  const providerRanges = providerTableRanges(contents, state.managedProvider);
-  if (state.mode === "root-openai") return providerRanges.length === 0;
-  const range = signedManagedRange(contents);
-  if (!range) return false;
-  const actual = range.lines.slice(range.start, range.end).join("\n");
-  const slotIndex = lines.indexOf(signedProviderSlot(state, 0));
-  return (
-    managedSignedProviderBlockMatches(actual, state.managedProvider, state.managedBaseUrl) &&
-    slotIndex + 1 === range.start &&
-    providerRanges.length === 1 &&
-    providerRanges[0].start === range.start + 1
-  ); */
 }
 
 function restoreSignedProviderTable(contents, state) {
@@ -744,18 +713,6 @@ function signedProviderStateIsOwned(contents, state) {
     isManagedRouterBaseUrl,
     signedProviderId,
   });
-  /* legacy implementation retained below for reference
-  const { rootLines } = splitRoot(contents);
-  const activeProvider = rootValue(rootLines, "model_provider") || "openai";
-  if (activeProvider !== state.managedProvider) return false;
-  if (state.version === 1) return activeProvider === signedProviderId;
-  if (state.mode === "root-openai") {
-    return (
-      isManagedRouterBaseUrl(rootValue(rootLines, "openai_base_url")) &&
-      (state.version !== 3 || signedProviderBlockIsOwned(contents, state))
-    );
-  }
-  return signedProviderBlockIsOwned(contents, state); */
 }
 
 function readProviderModeState() {

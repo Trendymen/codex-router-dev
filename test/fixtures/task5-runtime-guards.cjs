@@ -6,21 +6,39 @@ const { fileURLToPath } = require("node:url");
 
 const events = [];
 const marker = "__TASK5_RUNTIME_GUARDS__";
+const fdPaths = new Map();
+const fileHandlePaths = new WeakMap();
+const isolationRoot = canonicalPath(process.env.TASK5_RUNTIME_GUARD_ROOT);
 
-function pathValue(value) {
+function canonicalPath(value) {
   try {
     const raw = value instanceof URL ? fileURLToPath(value) : Buffer.isBuffer(value) ? value.toString("utf8") : value;
-    return typeof raw === "string" ? path.resolve(raw).replaceAll("\\", "/") : "";
-  } catch { return ""; }
+    return typeof raw === "string" ? path.resolve(raw) : "";
+  } catch {
+    return "";
+  }
+}
+
+function pathValue(value) {
+  return canonicalPath(value).replaceAll("\\", "/");
 }
 
 function isCcSwitchPath(value) {
   return /(?:^|\/)\.cc-switch(?:\/|$)/.test(pathValue(value));
 }
 
+function outsideIsolation(value) {
+  const target = canonicalPath(value);
+  if (!isolationRoot || !target) return false;
+  const relative = path.relative(isolationRoot, target);
+  return relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative);
+}
+
 function record(kind, value, extra = {}) {
-  const event = { kind, ...extra };
-  if (isCcSwitchPath(value)) event.ccSwitchAccess = true;
+  const resolved = pathValue(value);
+  const event = { kind, ...(resolved ? { path: resolved } : {}), ...extra };
+  if (resolved && isCcSwitchPath(value)) event.ccSwitchAccess = true;
+  if (resolved && outsideIsolation(value)) event.outsideIsolation = true;
   events.push(event);
   return event;
 }
@@ -31,78 +49,192 @@ function blockCcSwitch(kind, value) {
   throw new Error("CC Switch database access is blocked by the Task 5 runtime guard.");
 }
 
-function mutationOpenFlags(flags) {
-  return typeof flags === "string" && /[wa+]/.test(flags);
+function blockPathArguments(kind, args, indices) {
+  for (const index of indices) blockCcSwitch(kind, args[index]);
 }
 
-function wrapFs(name, { mutation = false, open = false, stream = false } = {}) {
+function mutationOpenFlags(flags) {
+  if (typeof flags === "string") return /[wa+]/.test(flags);
+  if (!Number.isInteger(flags)) return false;
+  const { O_WRONLY = 0, O_RDWR = 0, O_CREAT = 0, O_TRUNC = 0, O_APPEND = 0 } = fs.constants;
+  return Boolean(flags & (O_WRONLY | O_RDWR | O_CREAT | O_TRUNC | O_APPEND));
+}
+
+function recordPathOrDescriptor(kind, value, extra = {}) {
+  if (typeof value === "number") {
+    record(kind, fdPaths.get(value), { fd: value, ...extra });
+    return;
+  }
+  if (value && typeof value === "object" && fileHandlePaths.has(value)) {
+    record(kind, fileHandlePaths.get(value), extra);
+    return;
+  }
+  record(kind, value, extra);
+}
+
+function guardFileHandle(handle, target) {
+  if (!handle || typeof handle !== "object" || fileHandlePaths.has(handle)) return handle;
+  fileHandlePaths.set(handle, target);
+  for (const name of [
+    "write", "writev", "writeFile", "appendFile", "truncate", "chmod", "chown", "utimes",
+    "sync", "datasync", "createWriteStream",
+  ]) {
+    if (typeof handle[name] !== "function") continue;
+    const original = handle[name];
+    handle[name] = function guardedFileHandleMutation(...args) {
+      record(`fs.promises.FileHandle.${name}`, target);
+      return original.apply(this, args);
+    };
+  }
+  if (typeof handle.close === "function") {
+    const originalClose = handle.close;
+    handle.close = function guardedFileHandleClose(...args) {
+      const result = originalClose.apply(this, args);
+      Promise.resolve(result).finally(() => fileHandlePaths.delete(handle));
+      return result;
+    };
+  }
+  return handle;
+}
+
+function wrapPathOperation(name, { mutation = false, paths = [0], pathOrDescriptor = false } = {}) {
   const original = fs[name];
   if (typeof original !== "function") return;
   fs[name] = function guardedFsOperation(...args) {
-    if (blockCcSwitch(`fs.${name}`, args[0])) return undefined;
-    if (mutation || stream || (open && mutationOpenFlags(args[1]))) record(`fs.${name}`, args[0]);
+    blockPathArguments(`fs.${name}`, args, paths);
+    if (mutation) {
+      for (const index of paths) {
+        if (pathOrDescriptor && index === 0) recordPathOrDescriptor(`fs.${name}`, args[index]);
+        else record(`fs.${name}`, args[index]);
+      }
+    }
+    return original.apply(this, args);
+  };
+}
+
+function wrapOpen(name, sync) {
+  const original = fs[name];
+  if (typeof original !== "function") return;
+  fs[name] = function guardedOpen(...args) {
+    blockCcSwitch(`fs.${name}`, args[0]);
+    const writes = mutationOpenFlags(args[1]);
+    if (writes) record(`fs.${name}`, args[0], { ...(typeof args[1] === "number" ? { numericOpenFlags: true } : {}) });
+    if (sync) {
+      const fd = original.apply(this, args);
+      fdPaths.set(fd, canonicalPath(args[0]));
+      return fd;
+    }
+    const callbackIndex = args.length - 1;
+    if (typeof args[callbackIndex] === "function") {
+      const callback = args[callbackIndex];
+      args[callbackIndex] = function guardedOpenCallback(error, fd, ...rest) {
+        if (!error && typeof fd === "number") fdPaths.set(fd, canonicalPath(args[0]));
+        return callback.call(this, error, fd, ...rest);
+      };
+    }
+    return original.apply(this, args);
+  };
+}
+
+function wrapClose(name, sync) {
+  const original = fs[name];
+  if (typeof original !== "function") return;
+  fs[name] = function guardedClose(...args) {
+    const fd = args[0];
+    if (sync) {
+      const result = original.apply(this, args);
+      fdPaths.delete(fd);
+      return result;
+    }
+    const callbackIndex = args.length - 1;
+    if (typeof args[callbackIndex] === "function") {
+      const callback = args[callbackIndex];
+      args[callbackIndex] = function guardedCloseCallback(error, ...rest) {
+        if (!error) fdPaths.delete(fd);
+        return callback.call(this, error, ...rest);
+      };
+    }
+    return original.apply(this, args);
+  };
+}
+
+function wrapDescriptorMutation(name) {
+  const original = fs[name];
+  if (typeof original !== "function") return;
+  fs[name] = function guardedDescriptorMutation(...args) {
+    recordPathOrDescriptor(`fs.${name}`, args[0]);
     return original.apply(this, args);
   };
 }
 
 for (const name of [
-  "access", "accessSync", "existsSync", "lstat", "lstatSync", "open", "openSync",
-  "opendir", "opendirSync", "readFile", "readFileSync", "readdir", "readdirSync",
-  "readlink", "readlinkSync", "realpath", "realpathSync", "stat", "statSync",
-  "statfs", "statfsSync", "watch", "watchFile", "unwatchFile", "createReadStream",
-]) wrapFs(name);
-for (const name of ["open", "openSync"]) wrapFs(name, { open: true });
-wrapFs("createWriteStream", { stream: true });
-
+  "access", "accessSync", "existsSync", "lstat", "lstatSync", "opendir", "opendirSync",
+  "readFile", "readFileSync", "readdir", "readdirSync", "readlink", "readlinkSync",
+  "realpath", "realpathSync", "stat", "statSync", "statfs", "statfsSync", "watch",
+  "watchFile", "unwatchFile", "createReadStream",
+]) wrapPathOperation(name);
+wrapOpen("open", false);
+wrapOpen("openSync", true);
+wrapClose("close", false);
+wrapClose("closeSync", true);
+wrapPathOperation("createWriteStream", { mutation: true });
 for (const name of [
-  "appendFile", "appendFileSync", "chmod", "chmodSync", "copyFile", "copyFileSync",
-  "chown", "chownSync", "cp", "cpSync", "lchown", "lchownSync", "link", "linkSync",
-  "lutimes", "lutimesSync", "mkdir", "mkdirSync", "mkdtemp", "mkdtempSync", "rename", "renameSync", "rm", "rmSync",
-  "symlink", "symlinkSync", "truncate", "truncateSync", "unlink", "unlinkSync", "utimes", "utimesSync",
-  "writeFile", "writeFileSync",
-]) wrapFs(name, { mutation: true });
+  "appendFile", "appendFileSync", "chmod", "chmodSync", "lchown", "lchownSync", "lutimes",
+  "lutimesSync", "mkdir", "mkdirSync", "mkdtemp", "mkdtempSync", "rm", "rmSync", "truncate",
+  "truncateSync", "unlink", "unlinkSync", "utimes", "utimesSync", "writeFile", "writeFileSync",
+]) wrapPathOperation(name, { mutation: true, pathOrDescriptor: ["appendFile", "appendFileSync", "writeFile", "writeFileSync"].includes(name) });
+for (const name of ["copyFile", "copyFileSync", "cp", "cpSync", "rename", "renameSync", "link", "linkSync", "symlink", "symlinkSync"]) {
+  wrapPathOperation(name, { mutation: true, paths: [0, 1] });
+}
+for (const name of [
+  "write", "writeSync", "writev", "writevSync", "ftruncate", "ftruncateSync", "fchmod", "fchmodSync",
+  "fchown", "fchownSync", "futimes", "futimesSync", "fdatasync", "fdatasyncSync", "fsync", "fsyncSync",
+]) wrapDescriptorMutation(name);
 
-function wrapPromise(name, { mutation = false, open = false } = {}) {
+function wrapPromisePathOperation(name, { mutation = false, paths = [0], pathOrDescriptor = false } = {}) {
   const original = fs.promises[name];
   if (typeof original !== "function") return;
-  fs.promises[name] = async function guardedPromiseOperation(...args) {
-    if (blockCcSwitch(`fs.promises.${name}`, args[0])) return undefined;
-    if (mutation || (open && mutationOpenFlags(args[1]))) record(`fs.promises.${name}`, args[0]);
-    const result = await original.apply(this, args);
-    if (name === "open") {
-      for (const method of ["write", "writeFile", "appendFile", "truncate", "createWriteStream"]) {
-        if (typeof result[method] !== "function") continue;
-        const originalMethod = result[method].bind(result);
-        result[method] = async (...methodArgs) => {
-          record(`fs.promises.FileHandle.${method}`, args[0]);
-          return originalMethod(...methodArgs);
-        };
+  fs.promises[name] = function guardedPromiseOperation(...args) {
+    blockPathArguments(`fs.promises.${name}`, args, paths);
+    if (mutation) {
+      for (const index of paths) {
+        if (pathOrDescriptor && index === 0) recordPathOrDescriptor(`fs.promises.${name}`, args[index]);
+        else record(`fs.promises.${name}`, args[index]);
       }
     }
-    return result;
+    return original.apply(this, args);
   };
 }
 
 for (const name of ["access", "lstat", "opendir", "readFile", "readdir", "readlink", "realpath", "stat", "statfs", "watch"]) {
-  wrapPromise(name);
+  wrapPromisePathOperation(name);
 }
-wrapPromise("open", { open: true });
-for (const name of ["appendFile", "chmod", "chown", "copyFile", "cp", "lchown", "link", "lutimes", "mkdir", "mkdtemp", "rename", "rm", "symlink", "truncate", "unlink", "utimes", "writeFile"]) {
-  wrapPromise(name, { mutation: true });
+for (const name of [
+  "appendFile", "chmod", "chown", "lchown", "lutimes", "mkdir", "mkdtemp", "rm", "truncate", "unlink",
+  "utimes", "writeFile",
+]) wrapPromisePathOperation(name, { mutation: true, pathOrDescriptor: ["appendFile", "writeFile"].includes(name) });
+for (const name of ["copyFile", "cp", "rename", "link", "symlink"]) {
+  wrapPromisePathOperation(name, { mutation: true, paths: [0, 1] });
+}
+
+if (typeof fs.promises.open === "function") {
+  const originalOpen = fs.promises.open;
+  fs.promises.open = function guardedPromiseOpen(...args) {
+    blockCcSwitch("fs.promises.open", args[0]);
+    const writes = mutationOpenFlags(args[1]);
+    if (writes) record("fs.promises.open", args[0], { ...(typeof args[1] === "number" ? { numericOpenFlags: true } : {}) });
+    return originalOpen.apply(this, args).then((handle) => guardFileHandle(handle, canonicalPath(args[0])));
+  };
 }
 
 for (const name of ["execFile", "execFileSync", "spawn", "spawnSync", "fork"]) {
   const original = childProcess[name];
   childProcess[name] = function guardedChildOperation(...args) {
-    if (args.some((value) => String(value || "").includes("config-manager.mjs"))) {
-      record("config-manager", "");
-    }
+    if (args.some((value) => String(value || "").includes("config-manager.mjs"))) record("config-manager", "");
     // Windows ACL probes are external host behavior, not Router state. Keep
     // the isolation test from creating PowerShell's first-run cache while
     // retaining the normal affirmative result the doctor needs for its check.
-    if (String(args[0]).toLowerCase() === "powershell.exe") {
-      return name.endsWith("Sync") ? "true" : undefined;
-    }
+    if (String(args[0]).toLowerCase() === "powershell.exe") return name.endsWith("Sync") ? "true" : undefined;
     return original.apply(this, args);
   };
 }

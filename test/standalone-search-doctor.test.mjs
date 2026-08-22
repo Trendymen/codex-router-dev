@@ -104,6 +104,46 @@ this is not TOML
   assert.match(status.invalid || "", /unrecognized active TOML content/i);
 });
 
+test("standalone search validates unrelated TOML other values without rejecting legal scalar and container forms", () => {
+  const valid = standaloneSearchStatus(`web_search = "live"
+suppress_unstable_features_warning = true
+integer = 1_000
+float = -3.14_15
+exponent = 6.02e+2_3
+infinity = +inf
+not_a_number = -nan
+hex = 0xdead_beef
+octal = 0o7_5_5
+binary = 0b1010_0101
+offset_date_time = 1979-05-27T07:32:00.999999-07:00
+local_date_time = 1979-05-27 07:32:00
+local_date = 1979-05-27
+local_time = 07:32:00.123
+array = [1, "quoted, # value", { nested = [true, 0x10] },]
+multiline_array = [
+  1,
+  { nested = ["quoted] value", 0x10] },
+]
+inline = { quoted = { "nested.key" = [1, 2] }, enabled = false }
+
+[features]
+standalone_web_search = true
+`);
+  assert.equal(valid.ok, true, valid.invalid);
+
+  for (const value of ["@@@", "???", "1__0", "0x", "2025-13-40", "[1,", "{ answer = 42", "{ answer 42 }"]) {
+    const status = standaloneSearchStatus(`web_search = "live"
+suppress_unstable_features_warning = true
+unrelated = ${value}
+
+[features]
+standalone_web_search = true
+`);
+    assert.equal(status.ok, false, value);
+    assert.match(status.invalid || "", /untrusted TOML value|ambiguous/i, value);
+  }
+});
+
 test("missing standalone search gates return the exact copyable snippet", () => {
   const status = standaloneSearchStatus(`web_search = "live"
 
