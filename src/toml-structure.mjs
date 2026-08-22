@@ -262,13 +262,22 @@ function validTomlDateOrTime(value) {
   return true;
 }
 
+function validTomlInteger(value) {
+  const sign = value[0] === "+" || value[0] === "-" ? value[0] : "";
+  const unsigned = sign ? value.slice(1) : value;
+  const decimal = /^(?:0|[1-9](?:_?\d)*)$/;
+  const based = /^0(?:x[0-9A-Fa-f](?:_?[0-9A-Fa-f])*|o[0-7](?:_?[0-7])*|b[01](?:_?[01])*)$/;
+  if (!decimal.test(unsigned) && !based.test(unsigned)) return false;
+  const magnitude = BigInt(unsigned.replaceAll("_", ""));
+  const integer = sign === "-" ? -magnitude : magnitude;
+  return integer >= -9223372036854775808n && integer <= 9223372036854775807n;
+}
+
 function validTomlOtherPrimitive(value) {
   const decimal = "(?:0|[1-9](?:_?\\d)*)";
   const digitSequence = "\\d(?:_?\\d)*";
-  const integer = new RegExp(`^[+-]?${decimal}$`);
   const float = new RegExp(`^[+-]?(?:${decimal}\\.${digitSequence}(?:[eE][+-]?${digitSequence})?|${decimal}[eE][+-]?${digitSequence})$`);
-  const basedInteger = /^0(?:x[0-9A-Fa-f](?:_?[0-9A-Fa-f])*|o[0-7](?:_?[0-7])*|b[01](?:_?[01])*)$/;
-  return value === "true" || value === "false" || integer.test(value) || float.test(value) || basedInteger.test(value) ||
+  return value === "true" || value === "false" || validTomlInteger(value) || float.test(value) ||
     /^[+-]?(?:inf|nan)$/.test(value) || validTomlDateOrTime(value);
 }
 
@@ -305,6 +314,9 @@ function trustedTomlOtherValue(rawValue) {
     }
     return closed && (quote !== '"' || tomlBasicKey(body) !== undefined);
   };
+  const pathKey = (parts) => parts.join("\u0000");
+  const isPrefix = (prefix, candidate) =>
+    prefix.length <= candidate.length && prefix.every((part, index) => candidate[index] === part);
   const parseInlineKey = () => {
     const start = index;
     let quote;
@@ -328,13 +340,13 @@ function trustedTomlOtherValue(rawValue) {
         index += 1;
         continue;
       }
-      if (character === "=") return Boolean(tomlDottedKey(source.slice(start, index).trim()));
+      if (character === "=") return tomlDottedKey(source.slice(start, index).trim());
       if (character === "," || character === "}") return false;
       index += 1;
     }
-    return false;
+    return undefined;
   };
-  const parseValue = () => {
+  const parseValue = (inlinePath, inlineEntries) => {
     skipSpace();
     const character = source[index];
     if (character === '"' || character === "'") return parseString();
@@ -362,6 +374,14 @@ function trustedTomlOtherValue(rawValue) {
       }
     }
     if (character === "{") {
+      return parseInlineTable(inlinePath || [], inlineEntries || new Map());
+    }
+    const start = index;
+    while (index < source.length && !",]}".includes(source[index])) index += 1;
+    const primitive = source.slice(start, index).trimEnd();
+    return Boolean(primitive) && validTomlOtherPrimitive(primitive);
+  };
+  const parseInlineTable = (prefix, entries) => {
       index += 1;
       skipSpace();
       if (source[index] === "}") {
@@ -369,9 +389,22 @@ function trustedTomlOtherValue(rawValue) {
         return true;
       }
       while (true) {
-        if (!parseInlineKey() || source[index] !== "=") return false;
+        const key = parseInlineKey();
+        if (!key || source[index] !== "=") return false;
         index += 1;
-        if (!parseValue()) return false;
+        skipSpace();
+        const valuePath = [...prefix, ...key];
+        const inline = source[index] === "{";
+        for (const existing of entries.values()) {
+          if (samePath(existing.path, valuePath)) return false;
+          if (isPrefix(existing.path, valuePath)) {
+            if (existing.kind !== "inline" || !isPrefix(existing.path, prefix)) return false;
+          } else if (isPrefix(valuePath, existing.path)) {
+            return false;
+          }
+        }
+        entries.set(pathKey(valuePath), { path: valuePath, kind: inline ? "inline" : "value" });
+        if (!parseValue(inline ? valuePath : undefined, inline ? entries : undefined)) return false;
         skipSpace();
         if (source[index] === "}") {
           index += 1;
@@ -381,11 +414,6 @@ function trustedTomlOtherValue(rawValue) {
         index += 1;
         skipSpace();
       }
-    }
-    const start = index;
-    while (index < source.length && !",]}".includes(source[index])) index += 1;
-    const primitive = source.slice(start, index).trimEnd();
-    return Boolean(primitive) && validTomlOtherPrimitive(primitive);
   };
 
   if (!parseValue()) return false;
@@ -516,6 +544,7 @@ export function assertUnambiguousTomlDocument(document) {
     tables.add(key);
   }
   const assignments = new Set();
+  const assignmentPaths = [];
   for (const assignment of document.assignments) {
     if (assignment.kind === "multiline-string") {
       throw new Error(`Refusing multiline TOML assignment at line ${assignment.index + 1}.`);
@@ -526,10 +555,18 @@ export function assertUnambiguousTomlDocument(document) {
         `Refusing duplicate TOML assignments for ${[...assignment.tablePath, ...assignment.key].join(".")}.`,
       );
     }
+    const currentPath = [...assignment.tablePath, ...assignment.key];
+    if (assignmentPaths.some((existingPath) =>
+      (existingPath.length < currentPath.length && samePath(existingPath, currentPath.slice(0, existingPath.length))) ||
+      (currentPath.length < existingPath.length && samePath(currentPath, existingPath.slice(0, currentPath.length))),
+    )) {
+      throw new Error(`Refusing colliding TOML assignment paths for ${currentPath.join(".")}.`);
+    }
     if (assignment.kind === "other" && !trustedTomlOtherValue(assignment.rawValue)) {
       throw new Error(`Refusing untrusted TOML value at line ${assignment.index + 1}.`);
     }
     assignments.add(key);
+    assignmentPaths.push(currentPath);
   }
 }
 

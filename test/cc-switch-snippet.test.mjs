@@ -3,6 +3,7 @@ import { spawnSync } from "node:child_process";
 import {
   mkdtempSync,
   mkdirSync,
+  existsSync,
   readFileSync,
   readdirSync,
   readlinkSync,
@@ -218,6 +219,7 @@ standalone_web_search = true
     CODEX_ROUTER_PORT: "46192",
     CODEX_BIN: writeCodexStub(isolated),
     CODEX_ROUTER_SERVICE_PLATFORM: "darwin",
+    TASK5_RUNTIME_GUARD_ROOT: isolated,
     NODE_OPTIONS: `${process.env.NODE_OPTIONS || ""} --require=${runtimeGuard}`.trim(),
   };
 
@@ -266,10 +268,13 @@ standalone_web_search = true
 });
 
 test("runtime guard records canonical mutation paths, numeric flags, descriptors, FileHandles, and every CC Switch path position", () => {
-  const isolated = mkdtempSync(path.join(os.tmpdir(), "codex-router-runtime-guard-self-test-"));
+  const container = mkdtempSync(path.join(os.tmpdir(), "codex-router-runtime-guard-self-test-"));
+  const isolated = path.join(container, "guard-root");
   const ccSwitchDatabase = path.join(isolated, ".cc-switch", "cc-switch.db");
-  const outside = path.join(os.tmpdir(), `codex-router-runtime-guard-outside-${process.pid}`, "blocked.txt");
+  const outside = path.join(container, "outside", "blocked.txt");
+  mkdirSync(isolated, { recursive: true, mode: 0o700 });
   mkdirSync(path.dirname(ccSwitchDatabase), { recursive: true, mode: 0o700 });
+  mkdirSync(path.dirname(outside), { recursive: true, mode: 0o700 });
   writeFileSync(ccSwitchDatabase, "do-not-touch", { mode: 0o600 });
   const env = {
     ...process.env,
@@ -320,7 +325,9 @@ test("runtime guard records canonical mutation paths, numeric flags, descriptors
       try { await fs.promises.readFile(".cc-switch/cc-switch.db"); } catch {}
       try { fs.copyFileSync(source, cc); } catch {}
       try { fs.renameSync(cc, path.join(root, "blocked-rename.txt")); } catch {}
-      try { fs.writeFileSync(outside, "outside"); } catch {}
+      try { fs.writeFileSync(outside, "outside"); } catch (error) {
+        if (error.message !== "Task 5 runtime guard blocked mutation outside isolated root.") throw error;
+      }
     })().catch((error) => { console.error(error.stack); process.exitCode = 1; });
   `;
 
@@ -361,10 +368,14 @@ test("runtime guard records canonical mutation paths, numeric flags, descriptors
     }
     assert.ok(events.some((event) => event.kind === "fs.openSync" && event.numericOpenFlags), "numeric flags");
     assert.ok(events.filter((event) => event.ccSwitchAccess && event.blocked).length >= 5, "CC root and descendants");
-    assert.ok(events.some((event) => event.path === path.resolve(outside).replaceAll("\\", "/") && event.outsideIsolation), "outside isolation write");
+    assert.ok(
+      events.some((event) => event.path === path.resolve(outside).replaceAll("\\", "/") && event.outsideIsolation && event.blocked),
+      "outside isolation write",
+    );
+    assert.equal(existsSync(outside), false, "guard blocks the outside write before the original API runs");
     assert.ok(events.every((event) => event.path === undefined || path.isAbsolute(event.path)), "canonical paths");
   } finally {
-    rmSync(isolated, { recursive: true, force: true });
+    rmSync(container, { recursive: true, force: true });
   }
 });
 

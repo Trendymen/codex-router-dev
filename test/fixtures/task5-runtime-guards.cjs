@@ -49,6 +49,25 @@ function blockCcSwitch(kind, value) {
   throw new Error("CC Switch database access is blocked by the Task 5 runtime guard.");
 }
 
+function trackedPath(value) {
+  if (typeof value === "number") return fdPaths.get(value);
+  if (value && typeof value === "object") return fileHandlePaths.get(value);
+  return value;
+}
+
+function blockOutsideMutation(kind, value) {
+  const target = trackedPath(value);
+  if (!outsideIsolation(target)) return false;
+  record(kind, target, { blocked: true });
+  throw new Error("Task 5 runtime guard blocked mutation outside isolated root.");
+}
+
+function blockMutationTarget(kind, value) {
+  const target = trackedPath(value);
+  blockCcSwitch(kind, target);
+  blockOutsideMutation(kind, target);
+}
+
 function blockPathArguments(kind, args, indices) {
   for (const index of indices) blockCcSwitch(kind, args[index]);
 }
@@ -61,15 +80,16 @@ function mutationOpenFlags(flags) {
 }
 
 function recordPathOrDescriptor(kind, value, extra = {}) {
+  const target = trackedPath(value);
   if (typeof value === "number") {
-    record(kind, fdPaths.get(value), { fd: value, ...extra });
+    record(kind, target, { fd: value, ...extra });
     return;
   }
-  if (value && typeof value === "object" && fileHandlePaths.has(value)) {
-    record(kind, fileHandlePaths.get(value), extra);
+  if (value && typeof value === "object" && target !== undefined) {
+    record(kind, target, extra);
     return;
   }
-  record(kind, value, extra);
+  record(kind, target, extra);
 }
 
 function guardFileHandle(handle, target) {
@@ -82,6 +102,7 @@ function guardFileHandle(handle, target) {
     if (typeof handle[name] !== "function") continue;
     const original = handle[name];
     handle[name] = function guardedFileHandleMutation(...args) {
+      blockMutationTarget(`fs.promises.FileHandle.${name}`, target);
       record(`fs.promises.FileHandle.${name}`, target);
       return original.apply(this, args);
     };
@@ -101,7 +122,11 @@ function wrapPathOperation(name, { mutation = false, paths = [0], pathOrDescript
   const original = fs[name];
   if (typeof original !== "function") return;
   fs[name] = function guardedFsOperation(...args) {
-    blockPathArguments(`fs.${name}`, args, paths);
+    if (mutation) {
+      for (const index of paths) blockMutationTarget(`fs.${name}`, args[index]);
+    } else {
+      blockPathArguments(`fs.${name}`, args, paths);
+    }
     if (mutation) {
       for (const index of paths) {
         if (pathOrDescriptor && index === 0) recordPathOrDescriptor(`fs.${name}`, args[index]);
@@ -116,8 +141,9 @@ function wrapOpen(name, sync) {
   const original = fs[name];
   if (typeof original !== "function") return;
   fs[name] = function guardedOpen(...args) {
-    blockCcSwitch(`fs.${name}`, args[0]);
     const writes = mutationOpenFlags(args[1]);
+    if (writes) blockMutationTarget(`fs.${name}`, args[0]);
+    else blockCcSwitch(`fs.${name}`, args[0]);
     if (writes) record(`fs.${name}`, args[0], { ...(typeof args[1] === "number" ? { numericOpenFlags: true } : {}) });
     if (sync) {
       const fd = original.apply(this, args);
@@ -162,6 +188,7 @@ function wrapDescriptorMutation(name) {
   const original = fs[name];
   if (typeof original !== "function") return;
   fs[name] = function guardedDescriptorMutation(...args) {
+    blockMutationTarget(`fs.${name}`, args[0]);
     recordPathOrDescriptor(`fs.${name}`, args[0]);
     return original.apply(this, args);
   };
@@ -195,7 +222,11 @@ function wrapPromisePathOperation(name, { mutation = false, paths = [0], pathOrD
   const original = fs.promises[name];
   if (typeof original !== "function") return;
   fs.promises[name] = function guardedPromiseOperation(...args) {
-    blockPathArguments(`fs.promises.${name}`, args, paths);
+    if (mutation) {
+      for (const index of paths) blockMutationTarget(`fs.promises.${name}`, args[index]);
+    } else {
+      blockPathArguments(`fs.promises.${name}`, args, paths);
+    }
     if (mutation) {
       for (const index of paths) {
         if (pathOrDescriptor && index === 0) recordPathOrDescriptor(`fs.promises.${name}`, args[index]);
@@ -220,8 +251,9 @@ for (const name of ["copyFile", "cp", "rename", "link", "symlink"]) {
 if (typeof fs.promises.open === "function") {
   const originalOpen = fs.promises.open;
   fs.promises.open = function guardedPromiseOpen(...args) {
-    blockCcSwitch("fs.promises.open", args[0]);
     const writes = mutationOpenFlags(args[1]);
+    if (writes) blockMutationTarget("fs.promises.open", args[0]);
+    else blockCcSwitch("fs.promises.open", args[0]);
     if (writes) record("fs.promises.open", args[0], { ...(typeof args[1] === "number" ? { numericOpenFlags: true } : {}) });
     return originalOpen.apply(this, args).then((handle) => guardFileHandle(handle, canonicalPath(args[0])));
   };

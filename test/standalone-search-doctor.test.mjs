@@ -144,6 +144,69 @@ standalone_web_search = true
   }
 });
 
+test("standalone search rejects duplicate and colliding decoded inline-table paths", () => {
+  for (const value of [
+    "{ a = 1, a = 2 }",
+    "{ a.b = 1, a = { b = 2 } }",
+    "{ a = { b = 1 }, a.b = 2 }",
+  ]) {
+    const status = standaloneSearchStatus(`web_search = "live"
+suppress_unstable_features_warning = true
+unrelated = ${value}
+
+[features]
+standalone_web_search = true
+`);
+    assert.equal(status.ok, false, value);
+    assert.match(status.invalid || "", /untrusted TOML value|ambiguous/i, value);
+  }
+});
+
+test("standalone search rejects colliding document assignment paths like inline tables", () => {
+  const status = standaloneSearchStatus(`web_search = "live"
+suppress_unstable_features_warning = true
+unrelated = 1
+unrelated.child = 2
+
+[features]
+standalone_web_search = true
+`);
+
+  assert.equal(status.ok, false);
+  assert.match(status.invalid || "", /colliding TOML assignment paths/i);
+});
+
+test("standalone search enforces TOML signed int64 bounds for decimal and base integers", () => {
+  const valid = standaloneSearchStatus(`web_search = "live"
+suppress_unstable_features_warning = true
+decimal_max = +9_223_372_036_854_775_807
+decimal_min = -9_223_372_036_854_775_808
+hex_max = +0x7fff_ffff_ffff_ffff
+hex_min = -0x8000_0000_0000_0000
+
+[features]
+standalone_web_search = true
+`);
+  assert.equal(valid.ok, true, valid.invalid);
+
+  for (const value of [
+    "+9_223_372_036_854_775_808",
+    "-9_223_372_036_854_775_809",
+    "+0x8000_0000_0000_0000",
+    "-0x8000_0000_0000_0001",
+  ]) {
+    const status = standaloneSearchStatus(`web_search = "live"
+suppress_unstable_features_warning = true
+unrelated = ${value}
+
+[features]
+standalone_web_search = true
+`);
+    assert.equal(status.ok, false, value);
+    assert.match(status.invalid || "", /untrusted TOML value|ambiguous/i, value);
+  }
+});
+
 test("missing standalone search gates return the exact copyable snippet", () => {
   const status = standaloneSearchStatus(`web_search = "live"
 
