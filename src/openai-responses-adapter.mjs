@@ -193,13 +193,13 @@ class SseFramer {
 
 class ResponsesSseToolTransform extends Transform {
   #framer; #toolBuild; #work = 0; #forced; #events = []; #held = [];
-  constructor(toolBuild, { signal, abort, limits } = {}) {
+  constructor(toolBuild, { signal, abort, limits, forcedBuffer } = {}) {
     super(); this.#toolBuild = toolBuild;
     const frameBytes = limits?.maxFrameBytes ?? MAX_SSE_FRAME_BYTES;
     if (!Number.isSafeInteger(frameBytes) || frameBytes <= 0 || frameBytes > MAX_SSE_FRAME_BYTES) fail("forced_tool_buffer_limit");
     this.#framer = new SseFramer(frameBytes);
     if (toolBuild?.forcedRequirement) {
-      this.#forced = createForcedToolBuffer({ build: toolBuild, signal, abort });
+      this.#forced = forcedBuffer ?? createForcedToolBuffer({ build: toolBuild, signal, abort });
     }
   }
   _transform(chunk, _encoding, callback) {

@@ -51,6 +51,7 @@ import {
 import { providerEndpoint } from "./provider-endpoint.mjs";
 import { failedResponseEvent, formatTerminalFrames, routerError, ERROR_DEFINITIONS } from "./public-error.mjs";
 import { ToolDialectError } from "./tool-dialect.mjs";
+import { createForcedToolBuffer } from "./tool-dialect.mjs";
 import { ReasoningProtocolError } from "./reasoning-summary-compat.mjs";
 
 installStableFetchTransport();
@@ -1004,6 +1005,16 @@ async function handleRequest(request, response) {
   response.once("close", () => {
     if (!response.writableEnded) controller.abort();
   });
+  // Start the forced-choice lifetime at dispatch, not at the first body
+  // chunk.  The adapter consumes this same coordinator once the response
+  // arrives, so caller cancellation can never release held bytes.
+  const forcedBuffer = normalized.providerRequest?.toolBuild?.forcedRequirement
+    ? createForcedToolBuffer({
+        build: normalized.providerRequest.toolBuild,
+        signal: controller.signal,
+        abort: () => controller.abort(),
+      })
+    : undefined;
   // Command Code's documented API is an entitlement, not a credential: the
   // same key that runs its CLI is refused by /provider/v1 on the plans most of
   // its customers buy. The CLI's own route serves those plans, so an account
@@ -1138,7 +1149,7 @@ async function handleRequest(request, response) {
     ? adaptOpenAIResponses({
         model: normalized.model,
         upstream,
-        requestContext: { toolBuild: normalized.providerRequest.toolBuild, signal: controller.signal },
+        requestContext: { toolBuild: normalized.providerRequest.toolBuild, signal: controller.signal, forcedBuffer },
       })
     : undefined;
   const transforms = [
