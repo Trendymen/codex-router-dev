@@ -69,10 +69,24 @@ function privateUsageSnapshot(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) fail();
   const copy = safeSnapshot(value);
   if (Object.keys(copy).length > 64) fail();
-  for (const item of Object.values(copy)) {
-    if (item !== null && typeof item !== "string" && typeof item !== "boolean" && !(typeof item === "number" && Number.isFinite(item))) fail();
+  return deepFreezeSnapshot(copy);
+}
+
+function deepFreezeSnapshot(value, seen = new WeakSet()) {
+  if (!value || typeof value !== "object" || seen.has(value)) return value;
+  seen.add(value);
+  for (const item of Object.values(value)) deepFreezeSnapshot(item, seen);
+  return Object.freeze(value);
+}
+
+function publicUsageCopy(value) {
+  if (!value || typeof value !== "object") return value;
+  if (Array.isArray(value)) return value.map((item) => publicUsageCopy(item));
+  const copy = {};
+  for (const [key, item] of Object.entries(value)) {
+    Object.defineProperty(copy, key, { value: publicUsageCopy(item), enumerable: true, writable: true, configurable: true });
   }
-  return Object.freeze({ ...copy });
+  return copy;
 }
 
 function base32(buffer) {
@@ -283,7 +297,7 @@ export function encodeToolDialect(options = {}) {
     // A nullable object root is the one documented provider normalization.
     // Every other unsupported source form must be rejected, not erased by the
     // provider-facing repair before the local strict validator can see it.
-    if (!(Array.isArray(entry.parameters?.type) && entry.parameters.type.includes("object"))) assertStrictSchema(entry.parameters);
+    if (!isExactNullableObjectRoot(entry.parameters)) assertStrictSchema(entry.parameters);
     assertStrictSchema(schema);
     state.strictValidators.set(entry.encodedName, schema);
   }
@@ -291,6 +305,11 @@ export function encodeToolDialect(options = {}) {
   const build = Object.freeze({ tools: builtTools, toolChoice: selected.toolChoice, input: loweredInput, mapping, forcedRequirement: selected.forcedRequirement, strictValidators: Object.freeze([...state.strictValidators.keys()]) });
   MAPPING_STATE.set(mapping, state); BUILD_STATE.set(build, { state, forcedRequirement: selected.forcedRequirement });
   return build;
+}
+
+function isExactNullableObjectRoot(schema) {
+  if (!Array.isArray(schema?.type) || schema.type.length !== 2) return false;
+  return new Set(schema.type).size === 2 && schema.type.includes("object") && schema.type.includes("null");
 }
 
 function restoreItem(item, state) {
@@ -335,7 +354,7 @@ function lifecycleItem(event, state) {
   const existing = state.itemCalls.get(item.id);
   if (event.type === "response.output_item.added") {
     if (existing) fail();
-    state.itemCalls.set(item.id, { entry, callId: item.call_id, added: true, argumentsDone: item.arguments !== "", argumentBytes: typeof item.arguments === "string" ? Buffer.byteLength(item.arguments) : 0 });
+    state.itemCalls.set(item.id, { entry, callId: item.call_id, added: true, argumentsDone: item.arguments !== "", finalArguments: item.arguments !== "" ? item.arguments : undefined, argumentBytes: typeof item.arguments === "string" ? Buffer.byteLength(item.arguments) : 0 });
   } else if (!existing || existing.entry !== entry || existing.callId !== item.call_id) fail();
 }
 
@@ -352,70 +371,109 @@ export function restoreToolEvent(event, mapping) {
       if (typeof safeEvent.delta !== "string") fail();
       tracked.argumentBytes += Buffer.byteLength(safeEvent.delta);
       if (!Number.isSafeInteger(tracked.argumentBytes) || tracked.argumentBytes > FORCED_MAX_BYTES) fail();
-      return undefined;
+      return tracked.entry.kind === "custom" ? undefined : { ...safeEvent };
     }
     if (typeof safeEvent.arguments !== "string" || Buffer.byteLength(safeEvent.arguments) > FORCED_MAX_BYTES) fail();
     tracked.argumentsDone = true; tracked.finalArguments = safeEvent.arguments;
     const strictSchema = state.strictValidators.get(tracked.entry.encodedName);
     if (strictSchema && !schemaAccepts(parseArguments(safeEvent.arguments), strictSchema)) fail();
-    if (tracked.entry.kind !== "custom") return safeEvent;
+    if (tracked.entry.kind !== "custom") return { ...safeEvent };
     const { arguments: _arguments, ...metadata } = safeEvent;
     return { ...metadata, type: "response.custom_tool_call_input.done", input: exactInput(tracked.finalArguments) };
   }
   if (type === "response.output_item.done" && safeEvent.item?.type === "function_call") {
     const tracked = state.itemCalls.get(safeEvent.item.id);
-    // Non-streaming responses carry only a completed item. A streamed item
-    // has already registered an id and must obey the complete lifecycle.
-    if (tracked) {
-      if (!tracked.added || tracked.done || (safeEvent.item.arguments === "" && !tracked.argumentsDone)) fail();
-      tracked.done = true;
-      if (tracked.finalArguments !== undefined) safeEvent.item.arguments = tracked.finalArguments;
-    }
+    // Non-streaming Responses use response.output. A stream's done event must
+    // always close a prior added event and must repeat its finalized payload.
+    if (!tracked || !tracked.added || tracked.done || !tracked.argumentsDone) fail();
+    if (safeEvent.item.arguments !== tracked.finalArguments) fail();
+    tracked.done = true;
   }
   const restored = restoreValue(safeEvent, state);
   if (safeEvent?.type === "response.output_item.added" && safeEvent.item?.type === "function_call") lifecycleItem(safeEvent, state);
   return restored;
 }
 
-function callsFrom(value, found = [], state = { nodes: 0 }, seen = new WeakSet(), depth = 0) {
-  if (value === null || value === undefined) return found;
-  if (typeof value !== "object" || depth > MAX_GRAPH_DEPTH || state.nodes++ >= MAX_GRAPH_NODES || seen.has(value)) fail();
-  seen.add(value);
-  if (Array.isArray(value)) { for (const item of value) callsFrom(item, found, state, seen, depth + 1); return found; }
-  if (value.type === "function_call") found.push(value);
-  if (value.item !== undefined) callsFrom(value.item, found, state, seen, depth + 1);
-  if (value.output !== undefined) callsFrom(value.output, found, state, seen, depth + 1);
-  if (value.response?.output !== undefined) callsFrom(value.response.output, found, state, seen, depth + 1);
-  return found;
+function forcedBufferHeader(buffer) {
+  const bytes = ownData(buffer, "bytes", "forced_tool_buffer_limit");
+  const elapsedMs = ownData(buffer, "elapsedMs", "forced_tool_buffer_timeout");
+  const events = ownData(buffer, "events", "forced_tool_buffer_limit");
+  if (!Number.isSafeInteger(bytes) || bytes < 0 || bytes > FORCED_MAX_BYTES) fail("forced_tool_buffer_limit");
+  if (!Number.isSafeInteger(elapsedMs) || elapsedMs < 0 || elapsedMs > FORCED_MAX_MS) fail("forced_tool_buffer_timeout");
+  if (!Array.isArray(events)) fail("required_tool_not_called");
+  const length = ownData(events, "length", "required_tool_not_called");
+  if (!Number.isSafeInteger(length) || length < 0 || length > FORCED_MAX_BYTES) fail("required_tool_not_called");
+  return { events, length };
+}
+
+function eventFunctionCalls(event) {
+  const calls = [];
+  if (event.item?.type === "function_call") calls.push(event.item);
+  for (const item of event.output ?? []) if (item?.type === "function_call") calls.push(item);
+  for (const item of event.response?.output ?? []) if (item?.type === "function_call") calls.push(item);
+  return calls;
+}
+
+function validateInvocation(invocation, state) {
+  if (!invocation.completed || typeof invocation.arguments !== "string") fail("required_tool_not_called");
+  if (invocation.entry.kind === "custom") exactInput(invocation.arguments);
+  const strictSchema = state.strictValidators.get(invocation.entry.encodedName);
+  if (strictSchema && !schemaAccepts(parseArguments(invocation.arguments), strictSchema)) fail("required_tool_not_called");
 }
 
 export function validateForcedToolResult(buffer, build) {
   const buildState = buildStateFor(build);
   if (!buildState.forcedRequirement) return;
-  const safeBuffer = safeSnapshot(buffer, { nodes: 0 }, new WeakSet(), 0, "forced_tool_buffer_limit", false);
-  if (!Number.isSafeInteger(safeBuffer?.bytes) || safeBuffer.bytes < 0 || safeBuffer.bytes > FORCED_MAX_BYTES) fail("forced_tool_buffer_limit");
-  if (!Number.isSafeInteger(safeBuffer.elapsedMs) || safeBuffer.elapsedMs < 0 || safeBuffer.elapsedMs > FORCED_MAX_MS) fail("forced_tool_buffer_timeout");
-  const calls = callsFrom(safeBuffer.events);
-  if (!calls.length) fail("required_tool_not_called");
-  const seen = new Set();
-  for (const call of calls) {
-    if (typeof call.call_id !== "string" || !call.call_id || seen.has(call.call_id) || buildState.state.callIds.has(call.call_id)) fail("required_tool_not_called");
-    seen.add(call.call_id);
-    const entry = buildState.state.byEncodedName.get(call.name);
-    if (!entry || typeof call.arguments !== "string") fail("required_tool_not_called");
-    if (entry.kind === "custom") exactInput(call.arguments);
-    const strictSchema = buildState.state.strictValidators.get(entry.encodedName);
-    if (strictSchema && !schemaAccepts(parseArguments(call.arguments), strictSchema)) fail("required_tool_not_called");
+  const { events, length } = forcedBufferHeader(buffer);
+  const byCallId = new Map();
+  const byItemId = new Map();
+  for (let index = 0; index < length; index += 1) {
+    const descriptor = ownData(events, String(index), "required_tool_not_called");
+    if (descriptor === undefined) fail("required_tool_not_called");
+    const event = safeSnapshot(descriptor, { nodes: 0 }, new WeakSet(), 0, "required_tool_not_called");
+    const type = event.type;
+    if (type === "response.function_call_arguments.delta" || type === "response.function_call_arguments.done") {
+      const invocation = byItemId.get(event.item_id);
+      if (!invocation || invocation.completed || invocation.argumentsDone || (type.endsWith("delta") && typeof event.delta !== "string")) fail("required_tool_not_called");
+      if (type.endsWith("done")) {
+        if (typeof event.arguments !== "string") fail("required_tool_not_called");
+        invocation.argumentsDone = true;
+        invocation.arguments = event.arguments;
+      }
+      continue;
+    }
+    for (const call of eventFunctionCalls(event)) {
+      if (typeof call.call_id !== "string" || !call.call_id || typeof call.name !== "string" || buildState.state.callIds.has(call.call_id)) fail("required_tool_not_called");
+      const entry = buildState.state.byEncodedName.get(call.name);
+      if (!entry) fail("required_tool_not_called");
+      const existing = byCallId.get(call.call_id);
+      if (type === "response.output_item.added") {
+        if (existing || typeof call.id !== "string" || !call.id || byItemId.has(call.id)) fail("required_tool_not_called");
+        const invocation = { entry, callId: call.call_id, itemId: call.id, arguments: call.arguments === "" ? undefined : call.arguments, argumentsDone: call.arguments !== "", completed: false };
+        byCallId.set(call.call_id, invocation); byItemId.set(call.id, invocation);
+      } else if (type === "response.output_item.done") {
+        const invocation = byItemId.get(call.id);
+        if (!invocation || invocation !== existing || invocation.entry !== entry || invocation.completed || !invocation.argumentsDone || call.arguments !== invocation.arguments) fail("required_tool_not_called");
+        invocation.completed = true;
+      } else {
+        if (existing) fail("required_tool_not_called");
+        if (typeof call.arguments !== "string") fail("required_tool_not_called");
+        byCallId.set(call.call_id, { entry, callId: call.call_id, itemId: call.id, arguments: call.arguments, argumentsDone: true, completed: true });
+      }
+    }
   }
+  const invocations = [...byCallId.values()];
+  if (!invocations.length) fail("required_tool_not_called");
+  for (const invocation of invocations) validateInvocation(invocation, buildState.state);
   if (buildState.forcedRequirement.type === "named") {
     const required = buildState.state.byOriginal.get(callKey(buildState.forcedRequirement.kind, buildState.forcedRequirement.namespace, buildState.forcedRequirement.name));
-    if (!calls.some((call) => buildState.state.byEncodedName.get(call.name) === required)) fail("required_tool_mismatch");
+    if (!invocations.some((invocation) => invocation.entry === required)) fail("required_tool_mismatch");
   }
 }
 
 export function createForcedToolBuffer(options = {}) {
   const build = ownData(options, "build");
-  const buildState = buildStateFor(build);
+  buildStateFor(build);
   const abort = ownData(options, "abort") ?? (() => {});
   const byteCounter = ownData(options, "byteCounter") ?? ((chunk) => Buffer.byteLength(chunk));
   const clock = ownData(options, "clock") ?? (() => Date.now());
@@ -426,7 +484,7 @@ export function createForcedToolBuffer(options = {}) {
   // The private snapshot remains frozen; delivery gets an independent copy so
   // an observer cannot mutate buffer state (or break cancellation by throwing
   // on a frozen argument).
-  const deliverUsage = () => { if (usage !== undefined) onUsage?.({ ...usage }); };
+  const deliverUsage = () => { if (usage !== undefined) onUsage?.(publicUsageCopy(usage)); };
   const cleanup = () => {
     if (!listener) return;
     try { signal.removeEventListener("abort", listener); } catch { /* listener cleanup is best effort */ }
@@ -472,7 +530,8 @@ export function createForcedToolBuffer(options = {}) {
     },
     observeUsage(nextUsage) {
       if (terminal) return false;
-      usage = privateUsageSnapshot(nextUsage); return true;
+      try { usage = privateUsageSnapshot(nextUsage); } catch (error) { cancel(); throw error; }
+      return true;
     },
     finish(events) {
       if (terminal) return false;
@@ -481,7 +540,7 @@ export function createForcedToolBuffer(options = {}) {
       terminal = true; cleanup(); deliverUsage(); return true;
     },
     abortFromCaller,
-    get state() { return Object.freeze({ bytes, usage: usage === undefined ? undefined : Object.freeze({ ...usage }), aborted, relayedBytes: 0, retries: 0, failovers: 0 }); },
+    get state() { return Object.freeze({ bytes, usage: usage === undefined ? undefined : deepFreezeSnapshot(publicUsageCopy(usage)), aborted, relayedBytes: 0, retries: 0, failovers: 0 }); },
   });
 }
 

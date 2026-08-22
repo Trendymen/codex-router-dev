@@ -36,6 +36,10 @@ function mappedCall(build, overrides = {}) {
   };
 }
 
+function mappedOutput(build, overrides = {}) {
+  return { type: "response.completed", output: [mappedCall(build, overrides).item] };
+}
+
 function code(thunk) {
   assert.throws(thunk, (error) => error instanceof ToolDialectError && error.code === "tool_mapping_error");
 }
@@ -57,10 +61,7 @@ test("custom declarations round-trip through one required input string", () => {
     required: ["input"],
     additionalProperties: false,
   });
-  assert.deepEqual(restoreToolEvent(mappedCall(build), build.mapping), {
-    type: "response.output_item.done",
-    item: customCall,
-  });
+  assert.deepEqual(restoreToolEvent(mappedOutput(build), build.mapping), { type: "response.completed", output: [customCall] });
 });
 
 test("preserves valid native function names but rejects mapped-name collisions", () => {
@@ -95,10 +96,10 @@ test("lowers namespace and custom continuation history from the declaration map"
 
 test("rejects unknown names, duplicate or foreign call IDs and invalid custom arguments", () => {
   const build = encodeToolDialect({ tools: [customTool], input: [], profile: functionsProfile });
-  code(() => restoreToolEvent(mappedCall(build, { name: "unknown" }), build.mapping));
-  code(() => restoreToolEvent(mappedCall(build, { arguments: JSON.stringify({ input: "x", extra: true }) }), build.mapping));
-  restoreToolEvent(mappedCall(build), build.mapping);
-  code(() => restoreToolEvent(mappedCall(build, { id: "fc_other" }), build.mapping));
+  code(() => restoreToolEvent(mappedOutput(build, { name: "unknown" }), build.mapping));
+  code(() => restoreToolEvent(mappedOutput(build, { arguments: JSON.stringify({ input: "x", extra: true }) }), build.mapping));
+  restoreToolEvent(mappedOutput(build), build.mapping);
+  code(() => restoreToolEvent(mappedOutput(build, { id: "fc_other" }), build.mapping));
   code(() => encodeToolDialect({
     tools: [customTool],
     input: [{ type: "custom_tool_call_output", call_id: "foreign", output: "x" }],
@@ -134,9 +135,9 @@ test("locally rejects strict function arguments that violate the normalized obje
     tools: [{ type: "function", name: "paint", strict: true, parameters: { type: "object", properties: { color: { type: "string" } }, required: ["color"], additionalProperties: false } }],
     input: [], profile: functionsProfile,
   });
-  const valid = mappedCall({ ...build, tools: [{ name: "paint" }] }, { name: "paint", arguments: '{"color":"blue"}' });
-  assert.equal(restoreToolEvent(valid, build.mapping).item.name, "paint");
-  const invalid = mappedCall({ ...build, tools: [{ name: "paint" }] }, { call_id: "call_bad", name: "paint", arguments: '{"color":1}' });
+  const valid = mappedOutput({ ...build, tools: [{ name: "paint" }] }, { name: "paint", arguments: '{"color":"blue"}' });
+  assert.equal(restoreToolEvent(valid, build.mapping).output[0].name, "paint");
+  const invalid = mappedOutput({ ...build, tools: [{ name: "paint" }] }, { call_id: "call_bad", name: "paint", arguments: '{"color":1}' });
   code(() => restoreToolEvent(invalid, build.mapping));
 });
 
@@ -175,7 +176,7 @@ test("streamed custom arguments are restored only when done while strict argumen
   assert.deepEqual(restoreToolEvent({ type: "response.function_call_arguments.done", item_id: "fc_1", output_index: 4, sequence_number: 9, arguments: '{"input":"move pointer"}' }, custom.mapping), {
     type: "response.custom_tool_call_input.done", item_id: "fc_1", output_index: 4, sequence_number: 9, input: "move pointer",
   });
-  assert.equal(restoreToolEvent({ type: "response.output_item.done", item: call }, custom.mapping).item.input, "move pointer");
+  assert.equal(restoreToolEvent({ type: "response.output_item.done", item: { ...call, arguments: '{"input":"move pointer"}' } }, custom.mapping).item.input, "move pointer");
 
   const strict = encodeToolDialect({ tools: [{ type: "function", name: "paint", strict: true, parameters: { type: "object", properties: { color: { type: "string" } }, required: ["color"] } }], input: [], profile: functionsProfile });
   const strictCall = { type: "function_call", id: "fc_strict", call_id: "call_strict", name: "paint", arguments: "" };
@@ -187,7 +188,7 @@ test("mapping is opaque and strict declaration rejects unsupported schema forms"
   const build = encodeToolDialect({ tools: [customTool], input: [], profile: functionsProfile });
   assert.throws(() => { build.mapping.byEncodedName = new Map(); }, TypeError);
   assert.deepEqual(Object.keys(build.mapping), ["entries"]);
-  code(() => restoreToolEvent(mappedCall(build), { entries: build.mapping.entries }));
+  code(() => restoreToolEvent(mappedOutput(build), { entries: build.mapping.entries }));
   for (const schema of [
     { type: "object", minimum: 1 }, { type: "object", properties: { s: { type: "string", pattern: "." } } },
     { type: "array", minItems: 1 }, { type: "object", anyOf: [] }, { type: "object", not: {} },
@@ -199,7 +200,7 @@ test("mapping is opaque and strict declaration rejects unsupported schema forms"
 
 test("forced validation admits exact byte/time limits and rejects their first excess", () => {
   const build = encodeToolDialect({ tools: [customTool], toolChoice: "required", input: [], profile: functionsProfile });
-  validateForcedToolResult({ bytes: 8 * 1024 * 1024, elapsedMs: 30_000, events: [mappedCall(build)] }, build);
+  validateForcedToolResult({ bytes: 8 * 1024 * 1024, elapsedMs: 30_000, events: [mappedOutput(build)] }, build);
   assert.throws(() => validateForcedToolResult({ bytes: 8 * 1024 * 1024 + 1, elapsedMs: 0, events: [] }, build), /forced_tool_buffer_limit/);
   assert.throws(() => validateForcedToolResult({ bytes: 0, elapsedMs: 30_001, events: [] }, build), /forced_tool_buffer_timeout/);
 });
@@ -207,7 +208,7 @@ test("forced validation admits exact byte/time limits and rejects their first ex
 test("forced validation records a matching call and reports no-call or named mismatch", () => {
   const named = encodeToolDialect({ tools: [{ type: "function", name: "paint" }, { type: "function", name: "erase" }], toolChoice: { type: "function", name: "paint" }, input: [], profile: functionsProfile });
   assert.throws(() => validateForcedToolResult({ bytes: 0, elapsedMs: 0, events: [] }, named), /required_tool_not_called/);
-  const other = { type: "response.output_item.done", item: { type: "function_call", call_id: "new", name: "erase", arguments: "{}" } };
+  const other = { type: "response.completed", output: [{ type: "function_call", call_id: "new", name: "erase", arguments: "{}" }] };
   assert.throws(() => validateForcedToolResult({ bytes: 0, elapsedMs: 0, events: [other] }, named), /required_tool_mismatch/);
 });
 
@@ -226,7 +227,7 @@ test("forced buffer uses injected counters and clock at exact limits without rel
   assert.equal(buffer.push({ size: 8 * 1024 * 1024 }), true);
   buffer.observeUsage({ input_tokens: 7 });
   now = 30_000;
-  assert.equal(buffer.finish([mappedCall(build)]), true);
+  assert.equal(buffer.finish([mappedOutput(build)]), true);
   assert.deepEqual(buffer.state, { bytes: 8 * 1024 * 1024, usage: { input_tokens: 7 }, aborted: false, relayedBytes: 0, retries: 0, failovers: 0 });
   assert.equal(aborts, 0);
   assert.equal(buffer.observeUsage({ input_tokens: 8 }), false);
@@ -265,7 +266,7 @@ test("custom stream keeps wrapper private and rejects reversed, duplicate, post-
   const done = restoreToolEvent({ type: "response.function_call_arguments.done", item_id: "fc_1", output_index: 2, sequence_number: 3, arguments: '{"input":"x"}' }, build.mapping);
   assert.deepEqual(done, { type: "response.custom_tool_call_input.done", item_id: "fc_1", output_index: 2, sequence_number: 3, input: "x" });
   code(() => restoreToolEvent({ type: "response.function_call_arguments.delta", item_id: "fc_1", delta: "x" }, build.mapping));
-  assert.equal(restoreToolEvent({ type: "response.output_item.done", item: call }, build.mapping).item.input, "x");
+  assert.equal(restoreToolEvent({ type: "response.output_item.done", item: { ...call, arguments: '{"input":"x"}' } }, build.mapping).item.input, "x");
   code(() => restoreToolEvent({ type: "response.output_item.done", item: call }, build.mapping));
   code(() => restoreToolEvent({ type: "response.output_item.added", item: { ...call, id: "fc_1", call_id: "other", arguments: "" } }, build.mapping));
 });
@@ -275,9 +276,9 @@ test("forced named choice retains exact kind namespace and name privately", () =
   const build = encodeToolDialect({ tools: [namespaceTool, { type: "function", name: "run", parameters: { type: "object" } }], toolChoice: { type: "function", namespace: "mcp__apps", name: "run" }, input: [], profile: functionsProfile });
   assert.ok(Object.isFrozen(build.forcedRequirement));
   assert.deepEqual(build.forcedRequirement, { type: "named", kind: "namespace", namespace: "mcp__apps", name: "run" });
-  const foreign = { type: "response.output_item.done", item: { type: "function_call", call_id: "c", name: "run", arguments: "{}" } };
+  const foreign = { type: "response.completed", output: [{ type: "function_call", call_id: "c", name: "run", arguments: "{}" }] };
   assert.throws(() => validateForcedToolResult({ bytes: 0, elapsedMs: 0, events: [foreign] }, build), /required_tool_mismatch/);
-  const matching = { type: "response.output_item.done", item: { type: "function_call", call_id: "n", name: build.tools[0].name, arguments: "{}" } };
+  const matching = { type: "response.completed", output: [{ type: "function_call", call_id: "n", name: build.tools[0].name, arguments: "{}" }] };
   assert.doesNotThrow(() => validateForcedToolResult({ bytes: 0, elapsedMs: 0, events: [matching] }, build));
   for (const choice of [{ type: "unknown", name: "run" }, { type: "custom", namespace: "mcp__apps", name: "run" }]) {
     code(() => encodeToolDialect({ tools: [namespaceTool], toolChoice: choice, input: [], profile: functionsProfile }));
@@ -292,9 +293,9 @@ test("strict namespace validation normalizes nullable roots and compares bounded
   } }] };
   const build = encodeToolDialect({ tools: [tool], input: [], profile: functionsProfile });
   assert.equal(build.tools[0].parameters.type, "object");
-  const valid = { type: "response.output_item.done", item: { type: "function_call", id: "ok", call_id: "ok", name: build.tools[0].name, arguments: '{"payload":{"lane":"a"}}' } };
-  assert.equal(restoreToolEvent(valid, build.mapping).item.namespace, "mcp");
-  const invalid = { ...valid, item: { ...valid.item, id: "bad", call_id: "bad", arguments: '{"payload":{"lane":"b"}}' } };
+  const valid = { type: "response.completed", output: [{ type: "function_call", id: "ok", call_id: "ok", name: build.tools[0].name, arguments: '{"payload":{"lane":"a"}}' }] };
+  assert.equal(restoreToolEvent(valid, build.mapping).output[0].namespace, "mcp");
+  const invalid = { ...valid, output: valid.output.map((item) => ({ ...item, id: "bad", call_id: "bad", arguments: '{"payload":{"lane":"b"}' })) };
   code(() => restoreToolEvent(invalid, build.mapping));
 });
 
@@ -305,10 +306,10 @@ test("forced direct validation rejects invalid numeric counters and invalid call
     { bytes: Number.MAX_SAFE_INTEGER + 1, elapsedMs: 0, events: [] }, { bytes: 0, elapsedMs: Infinity, events: [] },
     { bytes: 0, elapsedMs: -1, events: [] },
   ]) assert.throws(() => validateForcedToolResult(buffer, build), ToolDialectError);
-  const valid = mappedCall(build);
-  const duplicate = { ...valid, item: { ...valid.item } };
+  const valid = mappedOutput(build);
+  const duplicate = { ...valid, output: valid.output.map((item) => ({ ...item })) };
   assert.throws(() => validateForcedToolResult({ bytes: 0, elapsedMs: 0, events: [valid, duplicate] }, build), /required_tool_not_called/);
-  const unknown = { ...valid, item: { ...valid.item, call_id: "u", name: "not_declared" } };
+  const unknown = { ...valid, output: valid.output.map((item) => ({ ...item, call_id: "u", name: "not_declared" })) };
   assert.throws(() => validateForcedToolResult({ bytes: 0, elapsedMs: 0, events: [unknown] }, build), /required_tool_not_called/);
 });
 
@@ -348,4 +349,54 @@ test("descriptor-only bounded reads turn hostile graphs into ToolDialectError wi
   for (let index = 0; index < 30; index += 1) { cursor.next = {}; cursor = cursor.next; }
   assert.throws(() => restoreToolEvent(deep, build.mapping), ToolDialectError);
   code(() => encodeToolDialect({ tools: [customTool], input: [{ type: "function_call", call_id: "x", name: "unknown", arguments: "{}" }], profile: functionsProfile }));
+});
+
+test("stream lifecycle rejects done without added, conflicts, and keeps ordinary function deltas", () => {
+  const custom = encodeToolDialect({ tools: [customTool], input: [], profile: functionsProfile });
+  const customCall = mappedCall(custom).item;
+  code(() => restoreToolEvent({ type: "response.output_item.done", item: customCall }, custom.mapping));
+  restoreToolEvent({ type: "response.output_item.added", item: { ...customCall, arguments: "" } }, custom.mapping);
+  restoreToolEvent({ type: "response.function_call_arguments.done", item_id: "fc_1", output_index: 1, sequence_number: 2, arguments: '{"input":"final"}' }, custom.mapping);
+  code(() => restoreToolEvent({ type: "response.output_item.done", item: { ...customCall, arguments: '{"input":"conflict"}' } }, custom.mapping));
+
+  const functions = encodeToolDialect({ tools: [{ type: "function", name: "paint", parameters: { type: "object" } }], input: [], profile: functionsProfile });
+  restoreToolEvent({ type: "response.output_item.added", item: { type: "function_call", id: "fn", call_id: "fn_call", name: "paint", arguments: "" } }, functions.mapping);
+  assert.deepEqual(restoreToolEvent({ type: "response.function_call_arguments.delta", item_id: "fn", output_index: 4, sequence_number: 5, delta: '{"color"' }, functions.mapping), {
+    type: "response.function_call_arguments.delta", item_id: "fn", output_index: 4, sequence_number: 5, delta: '{"color"',
+  });
+});
+
+test("strict nullable root accepts only the exact object-null union", () => {
+  for (const type of [["object", "string"], ["null", "object", "null"], ["object"], ["null", "object", "number"]]) {
+    code(() => encodeToolDialect({ tools: [{ type: "function", name: "strict", strict: true, parameters: { type, properties: {} } }], input: [], profile: functionsProfile }));
+  }
+  assert.doesNotThrow(() => encodeToolDialect({ tools: [{ type: "function", name: "strict", strict: true, parameters: { type: ["null", "object"], properties: {} } }], input: [], profile: functionsProfile }));
+});
+
+test("forced result merges one streamed invocation and admits more than 512 bounded events", () => {
+  const build = encodeToolDialect({ tools: [customTool], toolChoice: "required", input: [], profile: functionsProfile });
+  const call = mappedCall(build).item;
+  const events = [{ type: "response.output_item.added", item: { ...call, arguments: "" } }];
+  for (let index = 0; index < 513; index += 1) events.push({ type: "response.function_call_arguments.delta", item_id: "fc_1", delta: index === 512 ? '{"input":"ok"}' : "" });
+  events.push({ type: "response.function_call_arguments.done", item_id: "fc_1", arguments: '{"input":"ok"}' });
+  events.push({ type: "response.output_item.done", item: { ...call, arguments: '{"input":"ok"}' } });
+  assert.doesNotThrow(() => validateForcedToolResult({ bytes: 1, elapsedMs: 1, events }, build));
+  const reused = [...events, { type: "response.output_item.added", item: { ...call, id: "other", arguments: '{"input":"other"}' } }];
+  assert.throws(() => validateForcedToolResult({ bytes: 1, elapsedMs: 1, events: reused }, build), /required_tool_not_called/);
+});
+
+test("nested authoritative usage is isolated and invalid replacement cancels after prior delivery", () => {
+  const build = encodeToolDialect({ tools: [customTool], toolChoice: "required", input: [], profile: functionsProfile });
+  const delivered = []; let aborts = 0;
+  const buffer = createForcedToolBuffer({ build, abort: () => { aborts += 1; }, onUsage: (usage) => delivered.push(usage) });
+  const source = { input_tokens: 3, input_tokens_details: { cached_tokens: 2 }, output_tokens_details: [{ reasoning_tokens: 1 }] };
+  buffer.observeUsage(source);
+  source.input_tokens_details.cached_tokens = 99;
+  assert.equal(buffer.state.usage.input_tokens_details.cached_tokens, 2);
+  const invalid = { get input_tokens() { throw new Error("getter"); } };
+  assert.throws(() => buffer.observeUsage(invalid), ToolDialectError);
+  assert.equal(aborts, 1);
+  assert.equal(delivered.length, 1);
+  assert.equal(delivered[0].input_tokens_details.cached_tokens, 2);
+  assert.equal(buffer.observeUsage(source), false);
 });
