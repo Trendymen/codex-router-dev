@@ -50,8 +50,8 @@ test("builds canonical GLM Messages request with full base path", () => {
   assert.deepEqual(built.json.messages[1].content, [{ type: "text", text: "previous" }]);
   assert.equal(built.json.max_tokens, 9216);
   assert.deepEqual(built.json.thinking, { type: "enabled", budget_tokens: 8192 });
-  assert.deepEqual(built.json.tool_choice, { type: "tool", name: "lookup" });
-  assert.equal(built.json.disable_parallel_tool_use, true);
+  assert.deepEqual(built.json.tool_choice, { type: "tool", name: "lookup", disable_parallel_tool_use: true });
+  assert.equal(built.json.disable_parallel_tool_use, undefined);
   assert.deepEqual(built.json.tools[0].input_schema, payload().tools[0].parameters);
   assert.equal(built.headers["x-api-key"], "provider-secret");
   assert.equal(built.headers["anthropic-version"], "2023-06-01");
@@ -188,6 +188,7 @@ test("restores mapped provider tool calls only after the shared lifecycle mappin
   ].join(""))]);
   assert.match(output, /"type":"function_call"/);
   assert.match(output, /"name":"lookup"/);
+  assert.match(output, /"id":"fc_[A-Za-z0-9_-]{24}","call_id":"call_tool"/);
 });
 
 test("caller abort invokes the upstream abort owner once and closes the transform", async () => {
@@ -260,4 +261,74 @@ test("binds continuation identity to trusted provenance instead of caller respon
   const base = { role: "assistant", content: [{ type: "reasoning", id: itemId, summary, encrypted_content: envelope }] };
   assert.doesNotThrow(() => buildAnthropicMessagesRequest({ model: MODEL, payload: payload({ response_id: "caller_forged", input: [base] }), credential: "k", internalKey: KEY, requestContext: { provenance: { [itemId]: { responseId, outputIndex: 3 } } } }));
   assert.throws(() => buildAnthropicMessagesRequest({ model: MODEL, payload: payload({ input: [{ ...base, content: [{ ...base.content[0], id: reasoningItemId(responseId, 4) }] }] }), credential: "k", internalKey: KEY, requestContext: { provenance: { [reasoningItemId(responseId, 4)]: { responseId, outputIndex: 4 } } } }), /thinking_signature_invalid/);
+});
+
+test("GLM Messages preserves strict schemas and nests parallel choice control", () => {
+  const tools = [{ type: "function", name: "strict_lookup", strict: true, parameters: { type: "object", properties: { q: { type: "string" } }, required: ["q"], additionalProperties: false } }];
+  for (const toolChoice of ["auto", "required", { type: "function", name: "strict_lookup" }]) {
+    const built = buildAnthropicMessagesRequest({ model: MODEL, payload: payload({ tools, tool_choice: toolChoice, parallel_tool_calls: false, reasoning: { effort: "off" }, max_output_tokens: 131072 }), credential: "k", internalKey: KEY });
+    assert.equal(built.json.tools[0].strict, true);
+    assert.equal(built.json.tool_choice.disable_parallel_tool_use, true);
+    assert.equal(built.json.disable_parallel_tool_use, undefined);
+  }
+  const enabled = buildAnthropicMessagesRequest({ model: MODEL, payload: payload({ tools, tool_choice: undefined, parallel_tool_calls: true, reasoning: { effort: "off" }, max_output_tokens: 131072 }), credential: "k", internalKey: KEY });
+  assert.deepEqual(enabled.json.tool_choice, { type: "auto" });
+  const none = buildAnthropicMessagesRequest({ model: MODEL, payload: payload({ tools, tool_choice: "none", parallel_tool_calls: false, reasoning: { effort: "off" }, max_output_tokens: 131072 }), credential: "k", internalKey: KEY });
+  assert.equal(none.json.tools, undefined);
+  assert.equal(none.json.tool_choice, undefined);
+});
+
+test("closes every active block before one canonical failure terminal", async () => {
+  const seen = [];
+  const upstream = { status: 200, headers: new Headers({ "content-type": "text/event-stream" }) };
+  const transform = adaptAnthropicMessages({ model: MODEL, upstream, requestContext: { internalKey: KEY, responseId: "trusted-failure", observeReasoningProtocol: (event) => seen.push(event) } }).transforms[0];
+  const output = await collect(transform, [Buffer.from([
+    frame("message_start", { type: "message_start", message: { id: "msg_failure", model: "glm-5.2" } }),
+    frame("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text" } }),
+    frame("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "wrong" } }),
+  ].join(""))]);
+  const events = output.split("\n\n").filter(Boolean).map((part) => part.split("\n").find((line) => line.startsWith("data:"))).filter((line) => line && !line.includes("[DONE]")).map((line) => JSON.parse(line.slice(5).trim()));
+  assert.equal(events.at(-1).type, "response.failed");
+  assert.equal(events.at(-1).response.created_at, 0);
+  assert.equal(events.at(-1).response.model, MODEL.slug);
+  assert.ok(events.some((event) => event.type === "response.output_text.done"));
+  assert.ok(events.some((event) => event.type === "response.content_part.done"));
+  assert.ok(events.some((event) => event.type === "response.output_item.done"));
+  assert.equal((output.match(/data: \[DONE\]/g) || []).length, 1);
+  assert.equal(seen.length, 0);
+});
+
+test("paused consumers resume a bounded ordered queue without losing terminal output", async () => {
+  const upstream = { status: 200, headers: new Headers({ "content-type": "text/event-stream" }) };
+  const transform = adaptAnthropicMessages({ model: MODEL, upstream, requestContext: { internalKey: KEY } }).transforms[0];
+  const frames = [frame("message_start", { type: "message_start", message: { id: "msg_pause", model: "glm-5.2" } }), frame("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text" } })];
+  for (let index = 0; index < 2000; index += 1) frames.push(frame("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "x" } }));
+  frames.push(frame("content_block_stop", { type: "content_block_stop", index: 0 }), frame("message_delta", { type: "message_delta", delta: { stop_reason: "end_turn" } }), frame("message_stop", { type: "message_stop" }));
+  const source = frames.join("");
+  transform.pause();
+  const output = [];
+  const finished = new Promise((resolve, reject) => { transform.on("data", (chunk) => output.push(Buffer.from(chunk))); transform.on("end", resolve); transform.on("error", reject); });
+  transform.end(Buffer.from(source));
+  transform.resume();
+  await finished;
+  const body = Buffer.concat(output).toString("utf8");
+  assert.equal((body.match(/event: response\.output_text\.delta/g) || []).length, 2000);
+  assert.equal((body.match(/data: \[DONE\]/g) || []).length, 1);
+  assert.ok(body.indexOf("response.completed") < body.lastIndexOf("data: [DONE]"));
+});
+
+test("rejects new blocks after a stop reason and closes max-token items as incomplete", async () => {
+  const upstream = { status: 200, headers: new Headers({ "content-type": "text/event-stream" }) };
+  const transform = adaptAnthropicMessages({ model: MODEL, upstream, requestContext: { internalKey: KEY } }).transforms[0];
+  const output = await collect(transform, [Buffer.from([
+    frame("message_start", { type: "message_start", message: { id: "msg_stage", model: "glm-5.2" } }),
+    frame("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text" } }),
+    frame("message_delta", { type: "message_delta", delta: { stop_reason: "max_tokens" } }),
+    frame("content_block_start", { type: "content_block_start", index: 1, content_block: { type: "text" } }),
+  ].join(""))]);
+  const events = output.split("\n\n").filter(Boolean).map((part) => part.split("\n").find((line) => line.startsWith("data:"))).filter((line) => line && !line.includes("[DONE]")).map((line) => JSON.parse(line.slice(5).trim()));
+  assert.equal(events.at(-1).type, "response.failed");
+  assert.equal(events.at(-1).response.output[0].status, "incomplete");
+  assert.ok(events.some((event) => event.type === "response.output_text.done"));
+  assert.deepEqual(events.at(-1).response.incomplete_details, undefined);
 });

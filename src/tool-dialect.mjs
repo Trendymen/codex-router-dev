@@ -140,7 +140,7 @@ function declarationEntries(tools) {
   return entries;
 }
 
-function outputTool(entry, encodedName) {
+function outputTool(entry, encodedName, preserveStrict = false) {
   if (entry.kind === "custom") {
     return {
       type: "function", name: encodedName,
@@ -149,9 +149,9 @@ function outputTool(entry, encodedName) {
     };
   }
   const parameters = entry.parameters === undefined ? undefined : providerToolSchema(entry.parameters);
-  const result = { ...entry.nested, type: "function", name: encodedName, ...(parameters === undefined ? {} : { parameters }) };
+  const result = { ...entry.nested, type: "function", name: encodedName, ...(parameters === undefined ? {} : { parameters }), ...(preserveStrict && entry.nested.strict === true ? { strict: true } : {}) };
   delete result.inputSchema;
-  delete result.strict;
+  if (!preserveStrict) delete result.strict;
   return result;
 }
 
@@ -288,7 +288,7 @@ export function encodeToolDialect(options = {}) {
     names.add(encodedName);
     const record = Object.freeze({ ...entry, encodedName });
     state.byEncodedName.set(encodedName, record); state.byOriginal.set(callKey(entry.kind, entry.namespace, entry.name), record);
-    return outputTool(record, encodedName);
+    return outputTool(record, encodedName, request.preserveStrict === true);
   });
   const loweredInput = request.input === undefined ? undefined : Array.isArray(request.input) ? request.input.map((item) => lowerInputItem(item, state)) : fail();
   const selected = choiceFor(request.toolChoice, state, true);
