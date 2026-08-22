@@ -1015,6 +1015,13 @@ async function handleRequest(request, response) {
         abort: () => controller.abort(),
       })
     : undefined;
+  // A forced tool choice has a hard wall-clock budget even when the provider
+  // never sends headers or a body. Abort the dispatch controller exactly once;
+  // the shared forced coordinator remains sealed by the same signal.
+  const forcedDeadline = forcedBuffer
+    ? setTimeout(() => controller.abort(), 30_001)
+    : undefined;
+  forcedDeadline?.unref?.();
   // Command Code's documented API is an entitlement, not a credential: the
   // same key that runs its CLI is refused by /provider/v1 on the plans most of
   // its customers buy. The CLI's own route serves those plans, so an account
@@ -1156,7 +1163,11 @@ async function handleRequest(request, response) {
     ...(responseAdapter?.transforms || []),
     zaiCacheUsageTransform(normalized.provider.id, upstream.headers.get("content-type")),
   ].filter(Boolean);
-  await pipeResponse(upstream, response, undefined, transforms.length ? transforms : undefined);
+  try {
+    await pipeResponse(upstream, response, undefined, transforms.length ? transforms : undefined);
+  } finally {
+    if (forcedDeadline) clearTimeout(forcedDeadline);
+  }
   recordUpstreamLimits(normalized, upstream);
   if (!QUIET) {
     console.error(
