@@ -78,6 +78,19 @@ test("trusted public errors cannot be mutated or forged into terminal frames", (
   assertNoDecoys(event);
 });
 
+test("router errors snapshot private details without freezing caller-owned nested objects", () => {
+  const details = { provider: { status: 503, body: DECOYS.providerBody } };
+  const error = routerError("upstream_stream_truncated", details);
+
+  details.provider.status = 504;
+  details.provider.body = DECOYS.cause;
+
+  assert.deepEqual(details, { provider: { status: 504, body: DECOYS.cause } });
+  assert.deepEqual(error.privateDetails, { provider: { status: 503, body: DECOYS.providerBody } });
+  assert.notStrictEqual(error.privateDetails.provider, details.provider);
+  assert.equal(Object.isFrozen(error.privateDetails.provider), true);
+});
+
 test("redactor removes every sensitive diagnostic source while preserving safe fields", () => {
   const value = {
     status: 503,
@@ -183,6 +196,37 @@ test("post-relay failures use one safe terminal frame followed by one done frame
     /trusted terminal event/,
   );
 });
+
+for (const [name, buildEvent] of [
+  ["failed", (context) => failedResponseEvent(context, routerError("upstream_stream_truncated"))],
+  ["incomplete", (context) => incompleteResponseEvent(context, "max_output_tokens")],
+]) {
+  test(`${name} terminal normalizes hostile context before formatter trust`, () => {
+    const output = [{ type: "message", toJSON: () => DECOYS.providerBody }];
+    output.push(output);
+    const usage = { input_tokens: 7, toJSON: () => DECOYS.reasoning };
+    usage.self = usage;
+    const context = {
+      sequenceNumber: { toJSON: () => DECOYS.arguments },
+      responseId: { toJSON: () => DECOYS.callerUrl },
+      createdAt: { toJSON: () => DECOYS.snapshot },
+      model: { toJSON: () => DECOYS.support },
+      output,
+      usage,
+    };
+
+    const event = buildEvent(context);
+    const frames = formatTerminalFrames(event);
+    assert.equal(typeof event.sequence_number, "number");
+    assert.equal(typeof event.response.id, "string");
+    assert.equal(typeof event.response.created_at, "number");
+    assert.equal(typeof event.response.model, "string");
+    assert.doesNotThrow(() => JSON.parse(frames.split("\n")[0].slice(6)));
+    assert.equal((frames.match(/data: \[DONE\]/g) || []).length, 1);
+    assert.ok(frames.indexOf(`\"type\":\"response.${name}\"`) < frames.indexOf("data: [DONE]"));
+    assertNoDecoys(frames);
+  });
+}
 
 test("incomplete terminal retains only the authoritative reason", () => {
   const event = incompleteResponseEvent(
