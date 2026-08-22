@@ -470,7 +470,28 @@ test("anonymous closed terminal items use the same safe extra-part comparison", 
   assert.equal(JSON.stringify(seen).includes("two"), false);
 });
 
-test("nonstream output indexes are globally unique and anonymous reasoning cannot claim an occupied array index", () => {
+test("implicit message index cannot collide with explicit reasoning index", () => {
+  assert.throws(() => normalizeReasoningResponse({ output: [
+    { type: "message" },
+    { type: "reasoning", output_index: 0, summary: [], content: [] },
+  ] }, model()), { code: "reasoning_index_mismatch" });
+});
+
+test("explicit reasoning index cannot collide with a later implicit message index", () => {
+  assert.throws(() => normalizeReasoningResponse({ output: [
+    { type: "reasoning", output_index: 1, summary: [], content: [] },
+    { type: "message" },
+  ] }, model()), { code: "reasoning_index_mismatch" });
+});
+
+test("implicit message index cannot collide with an explicit message index", () => {
+  assert.throws(() => normalizeReasoningResponse({ output: [
+    { type: "message" },
+    { type: "message", output_index: 0 },
+  ] }, model()), { code: "reasoning_index_mismatch" });
+});
+
+test("nonstream output indexes validate every explicit value and reject duplicate explicit indexes", () => {
   assert.throws(() => normalizeReasoningResponse({ output: [
     { type: "message", output_index: 1 },
     { type: "reasoning", summary: [], content: [] },
@@ -485,16 +506,19 @@ test("nonstream output indexes are globally unique and anonymous reasoning canno
 });
 
 test("normal mixed nonstream output preserves nonreasoning identity and canonical anonymous reasoning indexes", () => {
-  const message = { type: "message", output_index: 1_000_001, content: [{ type: "output_text", text: "answer" }] };
+  const message = { type: "message", content: [{ type: "output_text", text: "answer" }] };
   const normalized = normalizeReasoningResponse({ id: "resp_nonstream_index", output: [
     message,
     { type: "reasoning", summary: [], content: [] },
     { type: "reasoning", output_index: 9, summary: [], content: [] },
+    { type: "reasoning", summary: [], content: [] },
   ] }, model());
   assert.equal(normalized.output[0], message);
+  assert.equal("output_index" in normalized.output[0], false);
   assert.deepEqual(normalized.output.slice(1).map((item) => [item.output_index, item.id]), [
     [1, "rsn_PEn3VNOjst90jzvJWan-hGJE"],
     [9, "rsn_-b0JgioJ0XNLX_5IwU35q-FI"],
+    [3, "rsn_R69-PjOLPmico3QUtPh67wsW"],
   ]);
 });
 

@@ -328,19 +328,15 @@ export function normalizeReasoningResponse(json, model, { maxReasoningBytes = MA
   if (!json || typeof json !== "object" || !Array.isArray(json.output)) return json;
   if (!validLimit(maxReasoningBytes)) fail("reasoning_protocol_error");
   const indexes = new Set(); const ids = new Set(); let bytes = 0;
-  for (const item of json.output) {
-    if (!item || typeof item !== "object" || item.output_index === undefined) continue;
-    const outputIndex = indexOf(item.output_index);
+  const outputIndexes = json.output.map((item, arrayIndex) => {
+    const outputIndex = item?.output_index === undefined ? arrayIndex : indexOf(item.output_index);
     if (indexes.has(outputIndex)) fail("reasoning_index_mismatch");
     indexes.add(outputIndex);
-  }
+    return outputIndex;
+  });
   return { ...json, output: json.output.map((item, arrayIndex) => {
     if (item?.type !== "reasoning") return item;
-    const outputIndex = item.output_index === undefined ? arrayIndex : item.output_index;
-    if (item.output_index === undefined) {
-      if (indexes.has(outputIndex)) fail("reasoning_index_mismatch");
-      indexes.add(outputIndex);
-    }
+    const outputIndex = outputIndexes[arrayIndex];
     const id = item.id === undefined || item.id === null ? generatedId(String(json.id || "resp_unknown"), outputIndex) : nonempty(item.id);
     if (ids.has(id)) fail("reasoning_duplicate_item"); ids.add(id);
     const parts = selectedFinalParts(sourceKind, item);
