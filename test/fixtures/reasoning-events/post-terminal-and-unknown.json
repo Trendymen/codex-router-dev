@@ -1,0 +1,1 @@
+{"finalShape":"provider-summary","prefix":": keepalive\n\nevent: non_reasoning\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"unchanged\"}\n\n","suffix":"","events":[{"type":"response.completed","response":{"output":[]}},{"type":"response.completed","response":{"output":[]}},{"type":"response.output_text.delta","delta":"post terminal"}]}

@@ -1,0 +1,1 @@
+{"finalShape":"provider-summary","events":[{"type":"response.output_item.added","output_index":0,"item":{"id":"rs","type":"reasoning"}},{"type":"response.reasoning_summary_part.added","item_id":"rs","summary_index":0,"part":{"type":"summary_text","text":""}},{"type":"response.output_item.done","output_index":0,"item":{"id":"rs","type":"reasoning","summary":[],"content":[]}}]}
