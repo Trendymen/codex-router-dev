@@ -139,6 +139,22 @@ function tokenCount(value) {
   return Number.isFinite(number) && number >= 0 ? Math.round(number) : undefined;
 }
 
+function immutableUsageSnapshot(usage) {
+  const copy = structuredClone(usage);
+  const stack = [copy];
+  const seen = new WeakSet();
+  let work = 0;
+  while (stack.length) {
+    const value = stack.pop();
+    if (!value || typeof value !== "object" || seen.has(value)) continue;
+    if (++work > 1_024) throw new TypeError("authoritative usage snapshot exceeds its telemetry bound");
+    seen.add(value);
+    for (const child of Object.values(value)) stack.push(child);
+    Object.freeze(value);
+  }
+  return copy;
+}
+
 export function normalizeTokenUsage(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
   const inputTokens = tokenCount(value.input_tokens ?? value.prompt_tokens);
@@ -430,6 +446,17 @@ export class ResponseUsageTransform extends Transform {
 
   tokenUsage() {
     return this.#usage;
+  }
+
+  // Forced-tool validation can fail before its held response is public, but
+  // the provider may already have reported authoritative usage. Feed that
+  // private value through the same accumulator used by ordinary response
+  // bytes, and snapshot it first so later source mutation cannot change what
+  // the meter records.
+  observeAuthoritativeUsage(usage) {
+    const snapshot = immutableUsageSnapshot(usage);
+    this.#observe({ usage: snapshot });
+    return snapshot;
   }
 
   // The estimate written into the response, or undefined when the upstream

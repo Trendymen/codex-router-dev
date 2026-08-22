@@ -20,7 +20,7 @@ export function createResponsesRelayContext() {
   const context = {
     responseId: "resp_unknown",
     model: "unknown",
-    sequenceNumber: 0,
+    sequenceNumber: undefined,
     output: [],
     usage: undefined,
     relayedBytes: 0,
@@ -38,8 +38,7 @@ function observeResponseContext(context, event, { terminal = true } = {}) {
   if (terminalEvent && !terminal) return;
   const response = event.response && typeof event.response === "object" ? event.response : undefined;
   const sequence = event.sequence_number;
-  const repeatedOrRegressed = Number.isSafeInteger(sequence) && sequence >= 0 && sequence <= context.sequenceNumber;
-  if (Number.isSafeInteger(sequence) && sequence >= 0 && sequence > context.sequenceNumber) context.sequenceNumber = sequence;
+  if (Number.isSafeInteger(sequence) && sequence >= 0) context.sequenceNumber = sequence;
   const id = response?.id ?? event.response_id;
   if (typeof id === "string" && id) context.responseId = id;
   const model = response?.model ?? event.model;
@@ -52,13 +51,26 @@ function observeResponseContext(context, event, { terminal = true } = {}) {
     state?.output.set(index, event.item);
     if (state) context.output = [...state.output.entries()].sort((left, right) => left[0] - right[0]).map((entry) => entry[1]);
   }
-  if (!repeatedOrRegressed || terminalEvent) {
-    if (Array.isArray(response?.output)) context.output = response.output;
-    else if (Array.isArray(event.output)) context.output = event.output;
-  }
+  if (Array.isArray(response?.output)) context.output = response.output;
+  else if (Array.isArray(event.output)) context.output = event.output;
   const usage = event.usage ?? response?.usage;
   if (usage && typeof usage === "object" && !Array.isArray(usage)) context.usage = usage;
   if (terminal && terminalEvent) context.terminalSeen = true;
+}
+
+function commitResponseContext(context, event) {
+  if (!context || !event || typeof event !== "object") return;
+  if (Object.hasOwn(event, "sequence_number")) {
+    const sequence = event.sequence_number;
+    const prior = context.sequenceNumber;
+    const terminalEvent = ["response.completed", "response.incomplete", "response.failed"].includes(event.type);
+    if (!Number.isSafeInteger(sequence) || sequence < 0
+      || (Number.isSafeInteger(prior) && sequence <= prior)
+      || (!terminalEvent && sequence === Number.MAX_SAFE_INTEGER)) {
+      fail("reasoning_protocol_error");
+    }
+  }
+  observeResponseContext(context, event);
 }
 
 function semanticJsonEqual(left, right, state = { work: 0 }, depth = 0) {
@@ -308,10 +320,13 @@ class SseFramer {
 class ResponsesSseToolTransform extends Transform {
   #framer; #toolBuild; #work = 0; #forced; #events; #held = []; #context;
   #backpressured = false; #pendingCallback; #validated = false;
+  #onForcedValidated;
   #outputQueue = []; #queuedBytes = 0;
-  constructor(toolBuild, { signal, abort, limits, forcedBuffer, relayContext } = {}) {
+  constructor(toolBuild, { signal, abort, limits, forcedBuffer, relayContext, onForcedValidated } = {}) {
     super(); this.#toolBuild = toolBuild;
     this.#context = relayContext;
+    if (onForcedValidated !== undefined && typeof onForcedValidated !== "function") throw new TypeError("invalid forced validation callback");
+    this.#onForcedValidated = onForcedValidated;
     const frameBytes = limits?.maxFrameBytes ?? MAX_SSE_FRAME_BYTES;
     if (!Number.isSafeInteger(frameBytes) || frameBytes <= 0 || frameBytes > MAX_SSE_FRAME_BYTES) fail("forced_tool_buffer_limit");
     this.#framer = new SseFramer(frameBytes);
@@ -386,7 +401,9 @@ class ResponsesSseToolTransform extends Transform {
   }
   #finishForced() {
     if (!this.#forced || this.#validated) return this.#validated;
-    this.#validated = this.#forced.finish(this.#events) === true;
+    const validated = this.#forced.finish(this.#events) === true;
+    if (validated) this.#onForcedValidated?.();
+    this.#validated = validated;
     return this.#validated;
   }
   #rewrite(raw) {
@@ -413,7 +430,6 @@ class ResponsesSseToolTransform extends Transform {
     // exact input is known. A suppressed event is a suppressed frame; JSON
     // stringifying it would manufacture the invalid `data: undefined` event.
     if (restored === undefined) return;
-    observeResponseContext(this.#context, restored, { terminal: false });
     if (restored === event || semanticJsonEqual(restored, event)) { this.#output(raw); return; }
     const lines = [...data.lines];
     lines[data.index] = `data: ${JSON.stringify(restored)}`;
@@ -432,7 +448,14 @@ class ResponsesSseContextTransform extends Transform {
     } catch (error) { callback(error); }
   }
   _flush(callback) {
-    try { if (this.#framer.finish((raw) => this.#observe(raw))) fail("upstream_stream_truncated"); callback(); }
+    try {
+      if (this.#framer.finish((raw) => this.#observe(raw))) fail("upstream_stream_truncated");
+      if (this.#context.terminalSeen && !this.#context.doneSeen) {
+        this.#context.doneSeen = true;
+        this.push(Buffer.from("data: [DONE]\n\n", "utf8"));
+      }
+      callback();
+    }
     catch (error) { callback(error); }
   }
   #observe(raw) {
@@ -440,7 +463,7 @@ class ResponsesSseContextTransform extends Transform {
     if (data?.data === "[DONE]") this.#context.doneSeen = true;
     else if (data?.data) {
       let event; try { event = JSON.parse(data.data); } catch { fail("provider_response_malformed"); }
-      observeResponseContext(this.#context, event);
+      commitResponseContext(this.#context, event);
     }
     this.push(raw);
   }
@@ -448,9 +471,11 @@ class ResponsesSseContextTransform extends Transform {
 
 class ResponsesJsonTransform extends Transform {
   #chunks = []; #bytes = 0;
-  #model; #toolBuild; #forced; #context;
-  constructor(model, toolBuild, { forcedBuffer, signal, abort, relayContext } = {}) {
+  #model; #toolBuild; #forced; #context; #onForcedValidated;
+  constructor(model, toolBuild, { forcedBuffer, signal, abort, relayContext, onForcedValidated } = {}) {
     super(); this.#model = model; this.#toolBuild = toolBuild; this.#context = relayContext;
+    if (onForcedValidated !== undefined && typeof onForcedValidated !== "function") throw new TypeError("invalid forced validation callback");
+    this.#onForcedValidated = onForcedValidated;
     if (toolBuild?.forcedRequirement) this.#forced = forcedBuffer ?? createForcedToolBuffer({ build: toolBuild, signal, abort });
   }
   _transform(chunk, _encoding, callback) {
@@ -470,16 +495,18 @@ class ResponsesJsonTransform extends Transform {
       // A JSON terminal is not committed merely because it parsed: forced
       // validation still has to succeed before this context suppresses the
       // safe pre-relay error response.
-      observeResponseContext(this.#context, json, { terminal: false });
       const usage = json.usage ?? json.response?.usage;
       if (usage && typeof usage === "object") this.#forced?.observeUsage(usage);
       // A single JSON response is the complete forced lifecycle.  Validate it
       // before creating the transformed output, so validation failure writes
       // exactly zero provider bytes to the caller.
-      if (this.#forced && !this.#forced.finish([json])) { callback(); return; }
+      if (this.#forced) {
+        if (!this.#forced.finish([json])) { callback(); return; }
+        this.#onForcedValidated?.();
+      }
       json = restoreOpenAIResponsesEvent(json, this.#toolBuild);
       json = normalizeReasoningResponse(json, responseReasoningModel(this.#model));
-      observeResponseContext(this.#context, json);
+      commitResponseContext(this.#context, json);
       const output = Buffer.from(JSON.stringify(json), "utf8");
       this.#context.relayedBytes += output.length;
       this.push(output);

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import http from "node:http";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import os from "node:os";
@@ -17,6 +18,7 @@ import {
 } from "../src/openai-responses-adapter.mjs";
 import { providerEndpoint } from "../src/provider-endpoint.mjs";
 import { createForcedDispatchDeadline } from "../src/forced-dispatch-deadline.mjs";
+import { ResponseUsageTransform } from "../src/response-usage.mjs";
 import { openPort } from "./port-pool.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -64,11 +66,13 @@ async function directServer(handler) {
   return { server, port: server.address().port };
 }
 function directForwarder(port, base, { env = {}, importFile } = {}) {
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), "task4-direct-"));
   const child = spawn(process.execPath, [...(importFile ? ["--import", pathToFileURL(importFile).href] : []), path.join(root, "src", "api-forwarder.mjs")], {
     cwd: root,
-    env: { ...process.env, ...env, MODEL_ROUTER_STATE_DIR: mkdtempSync(path.join(os.tmpdir(), "task4-direct-")), CODEX_ROUTER_INTERNAL_KEY: INTERNAL_KEY, CODEX_ROUTER_API_PORT: String(port), DEEPSEEK_API_BASE_URL: base, DEEPSEEK_API_KEY: "DIRECT_SECRET_MUST_NOT_LEAK", CODEX_ROUTER_QUIET: "1" },
+    env: { ...process.env, ...env, MODEL_ROUTER_STATE_DIR: stateDir, CODEX_ROUTER_INTERNAL_KEY: INTERNAL_KEY, CODEX_ROUTER_API_PORT: String(port), DEEPSEEK_API_BASE_URL: base, DEEPSEEK_API_KEY: "DIRECT_SECRET_MUST_NOT_LEAK", CODEX_ROUTER_QUIET: "1" },
     stdio: "ignore",
   });
+  child.stateDir = stateDir;
   return child;
 }
 
@@ -79,7 +83,14 @@ function abortTracePreload({ accelerateDeadline = false } = {}) {
   writeFileSync(preload, `
 import { appendFileSync } from "node:fs";
 import http from "node:http";
+import { ResponseUsageTransform as ProductionUsageTransform } from ${JSON.stringify(pathToFileURL(path.join(root, "src", "response-usage.mjs")).href)};
 const trace = ${JSON.stringify(trace)};
+const nativeObserveAuthoritativeUsage = ProductionUsageTransform.prototype.observeAuthoritativeUsage;
+ProductionUsageTransform.prototype.observeAuthoritativeUsage = function (usage) {
+  const snapshot = nativeObserveAuthoritativeUsage.call(this, usage);
+  appendFileSync(trace, JSON.stringify({ type: "consumer-usage", frozen: Object.isFrozen(snapshot) && Object.isFrozen(snapshot.input_tokens_details), value: snapshot }) + "\\n");
+  return snapshot;
+};
 const NativeAbortController = globalThis.AbortController;
 globalThis.AbortController = class extends NativeAbortController {
   constructor() { super(); this.traceOwner = new Error().stack?.split("\\n")[2]?.includes("handleRequest") === true; }
@@ -90,9 +101,43 @@ http.ServerResponse.prototype.end = function (...args) {
   if (this._codexRouterRequestTelemetry?.forcedUsage) appendFileSync(trace, JSON.stringify({ type: "usage", frozen: Object.isFrozen(this._codexRouterRequestTelemetry.forcedUsage) && Object.isFrozen(this._codexRouterRequestTelemetry.forcedUsage.input_tokens_details), value: this._codexRouterRequestTelemetry.forcedUsage }) + "\\n");
   return nativeEnd.apply(this, args);
 };
-${accelerateDeadline ? `const nativeSetTimeout = globalThis.setTimeout; globalThis.setTimeout = (fn, delay, ...args) => nativeSetTimeout(fn, delay === 30_001 ? 20 : delay, ...args);` : ""}
+${accelerateDeadline ? `const nativeSetTimeout = globalThis.setTimeout;
+const nativeClearTimeout = globalThis.clearTimeout;
+const accelerated = new Set();
+globalThis.setTimeout = (fn, delay, ...args) => {
+  const handle = nativeSetTimeout(fn, delay === 30_001 ? 20 : delay, ...args);
+  if (delay === 30_001) accelerated.add(handle);
+  return handle;
+};
+globalThis.clearTimeout = (handle) => {
+  if (accelerated.has(handle)) appendFileSync(trace, JSON.stringify({ type: "deadline-clear" }) + "\\n");
+  return nativeClearTimeout(handle);
+};` : ""}
 `, "utf8");
   return { preload, trace, events() { try { return readFileSync(trace, "utf8").trim().split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line)); } catch { return []; } } };
+}
+
+function recordedUsage(child) {
+  try {
+    return readFileSync(path.join(child.stateDir, "usage-events.jsonl"), "utf8")
+      .trim()
+      .split(/\r?\n/)
+      .filter(Boolean)
+      .map((line) => JSON.parse(line));
+  } catch {
+    return [];
+  }
+}
+
+function responseEvents(body) {
+  return body
+    .split(/\r?\n/)
+    .filter((line) => line.startsWith("data: ") && line !== "data: [DONE]")
+    .map((line) => JSON.parse(line.slice(6)));
+}
+
+function sha256(value) {
+  return createHash("sha256").update(value).digest("hex");
 }
 async function waitForwarder(port) {
   for (let i = 0; i < 100; i += 1) {
@@ -142,6 +187,33 @@ test("injected dispatch deadline admits 30000 and aborts once at 30001 without w
   assert.equal(deadline.fired, true);
   assert.equal(cancels, 1);
   assert.equal(reason, "forced_tool_buffer_timeout");
+});
+
+test("production response usage accumulator snapshots authoritative nested usage before source mutation", () => {
+  const source = {
+    input_tokens: 19,
+    output_tokens: 3,
+    total_tokens: 22,
+    input_tokens_details: { cached_tokens: 11 },
+  };
+  const observer = new ResponseUsageTransform("application/json");
+  const snapshot = observer.observeAuthoritativeUsage(source);
+  source.input_tokens = 999;
+  source.input_tokens_details.cached_tokens = 998;
+  assert.deepEqual(snapshot, {
+    input_tokens: 19,
+    output_tokens: 3,
+    total_tokens: 22,
+    input_tokens_details: { cached_tokens: 11 },
+  });
+  assert.equal(Object.isFrozen(snapshot), true);
+  assert.equal(Object.isFrozen(snapshot.input_tokens_details), true);
+  assert.deepEqual(observer.tokenUsage(), {
+    inputTokens: 19,
+    outputTokens: 3,
+    totalTokens: 22,
+    cachedInputTokens: 11,
+  });
 });
 
 test("DeepSeek Responses preserves nested reasoning and never emits chat-only thinking fields", () => {
@@ -545,8 +617,20 @@ test("real forwarder coordinator failure aborts once after privately snapshottin
     const body = await response.text();
     const events = trace.events();
     assert.equal(events.filter((event) => event.type === "abort" && event.reason === "forced_tool_coordinator").length, 1);
-    assert.equal(events.find((event) => event.type === "usage")?.frozen, true);
-    assert.deepEqual(events.find((event) => event.type === "usage")?.value, { input_tokens: 9, output_tokens: 2, input_tokens_details: { cached_tokens: 4 } });
+    const usageCallbacks = events.filter((event) => event.type === "consumer-usage");
+    assert.equal(usageCallbacks.length, 1);
+    assert.equal(usageCallbacks[0].frozen, true);
+    assert.deepEqual(usageCallbacks[0].value, { input_tokens: 9, output_tokens: 2, input_tokens_details: { cached_tokens: 4 } });
+    assert.equal(events.filter((event) => event.type === "usage").length, 1);
+    const metered = recordedUsage(forwarder);
+    assert.equal(metered.length, 1);
+    assert.equal(metered[0].model, "deepseek/deepseek-v4-flash");
+    assert.equal(metered[0].provider, "deepseek");
+    assert.equal(metered[0].status, response.status);
+    assert.equal(metered[0].inputTokens, 9);
+    assert.equal(metered[0].outputTokens, 2);
+    assert.equal(metered[0].totalTokens, 11);
+    assert.equal(metered[0].cachedInputTokens, 4);
     assert.doesNotMatch(body, /input_tokens|cached_tokens|resp_usage_abort/);
   } finally { await stop(forwarder, upstream.server); }
 });
@@ -564,6 +648,46 @@ test("real forwarder deadline aborts once and classifies only that owner reason"
     assert.equal(response.status, 504);
     assert.match(await response.text(), /forced_tool_buffer_timeout/);
     assert.equal(trace.events().filter((event) => event.type === "abort" && event.reason === "forced_tool_buffer_timeout").length, 1);
+  } finally { await stop(forwarder, upstream.server); }
+});
+
+test("forced validation clears its dispatch deadline before releasing 3 MiB to a delayed client", async () => {
+  const padding = `: ${"x".repeat(3 * 1024 * 1024)}\n\n`;
+  const completed = `data: ${JSON.stringify({
+    type: "response.completed",
+    sequence_number: 1,
+    response: {
+      id: "resp_forced_slow_client",
+      model: "deepseek-v4-flash",
+      output: [{ id: "item_slow", type: "function_call", name: "run", call_id: "call_slow", arguments: "{}" }],
+      usage: { input_tokens: 5, output_tokens: 1, input_tokens_details: { cached_tokens: 2 } },
+    },
+  })}\n\n`;
+  const raw = `${padding}${completed}data: [DONE]\n\n`;
+  const upstream = await directServer((_request, response) => {
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.end(raw);
+  });
+  const trace = abortTracePreload({ accelerateDeadline: true });
+  const port = await openPort(); const forwarder = directForwarder(port, `http://127.0.0.1:${upstream.port}/v1`, { importFile: trace.preload });
+  try {
+    await waitForwarder(port);
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: "POST", headers: { Authorization: `Bearer ${INTERNAL_KEY}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "deepseek-v4-flash", input: "hello",
+        tools: [{ type: "function", name: "run", parameters: { type: "object", properties: {} } }],
+        tool_choice: "required",
+      }),
+    });
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    const body = await response.text();
+    assert.equal(Buffer.byteLength(body), Buffer.byteLength(raw));
+    assert.equal(sha256(body), sha256(raw));
+    assert.equal((body.match(/response\.completed/g) || []).length, 1);
+    assert.equal((body.match(/data: \[DONE\]/g) || []).length, 1);
+    assert.equal(trace.events().filter((event) => event.type === "deadline-clear").length, 1);
+    assert.equal(trace.events().filter((event) => event.type === "abort").length, 0);
   } finally { await stop(forwarder, upstream.server); }
 });
 
@@ -648,7 +772,93 @@ test("slow consumer demand-drains 100 and 600 ordinary SSE frames with O(frames)
   }
 });
 
-test("invalid completed reasoning is not committed and becomes one failed terminal with real monotonic context", async () => {
+test("direct Responses rejects duplicate, regressed, and non-safe sequence numbers before relaying the offending frame", async (t) => {
+  const cases = [
+    ["duplicate", 7],
+    ["regressed", 5],
+    ["fractional", 7.5],
+    ["negative", -1],
+    ["unsafe", Number.MAX_SAFE_INTEGER + 1],
+  ];
+  for (const [name, offending] of cases) {
+    await t.test(name, async () => {
+      const upstream = await directServer((_request, response) => {
+        response.writeHead(200, { "content-type": "text/event-stream" });
+        response.end(
+          `data: ${JSON.stringify({ type: "response.created", sequence_number: 7, response: { id: `resp_sequence_${name}`, model: "deepseek-actual", output: [] } })}\n\n` +
+          `data: ${JSON.stringify({ type: "response.output_text.delta", sequence_number: offending, delta: `must-not-relay-${name}` })}\n\n` +
+          `data: ${JSON.stringify({ type: "response.completed", sequence_number: 9, response: { id: `resp_sequence_${name}`, model: "deepseek-actual", output: [] } })}\n\n` +
+          "data: [DONE]\n\n",
+        );
+      });
+      const port = await openPort(); const forwarder = directForwarder(port, `http://127.0.0.1:${upstream.port}/v1`);
+      try {
+        await waitForwarder(port);
+        const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+          method: "POST", headers: { Authorization: `Bearer ${INTERNAL_KEY}`, "content-type": "application/json" },
+          body: JSON.stringify({ model: "deepseek-v4-flash", input: "hello" }),
+        });
+        const body = await response.text();
+        const events = responseEvents(body);
+        assert.deepEqual(events.map((event) => event.sequence_number), [7, 8]);
+        assert.deepEqual(events.map((event) => event.type), ["response.created", "response.failed"]);
+        assert.doesNotMatch(body, new RegExp(`must-not-relay-${name}`));
+        assert.equal((body.match(/data: \[DONE\]/g) || []).length, 1);
+      } finally { await stop(forwarder, upstream.server); }
+    });
+  }
+});
+
+test("direct Responses relays a globally increasing sequence unchanged", async () => {
+  const raw =
+    `data: ${JSON.stringify({ type: "response.created", sequence_number: 0, response: { id: "resp_sequence_valid", model: "deepseek-actual", output: [] } })}\n\n` +
+    `data: ${JSON.stringify({ type: "response.output_text.delta", sequence_number: 1, delta: "valid" })}\n\n` +
+    `data: ${JSON.stringify({ type: "response.completed", sequence_number: 2, response: { id: "resp_sequence_valid", model: "deepseek-actual", output: [] } })}\n\n` +
+    "data: [DONE]\n\n";
+  const upstream = await directServer((_request, response) => {
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.end(raw);
+  });
+  const port = await openPort(); const forwarder = directForwarder(port, `http://127.0.0.1:${upstream.port}/v1`);
+  try {
+    await waitForwarder(port);
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: "POST", headers: { Authorization: `Bearer ${INTERNAL_KEY}`, "content-type": "application/json" },
+      body: JSON.stringify({ model: "deepseek-v4-flash", input: "hello" }),
+    });
+    const body = await response.text();
+    assert.equal(body, raw);
+    assert.deepEqual(responseEvents(body).map((event) => event.sequence_number), [0, 1, 2]);
+  } finally { await stop(forwarder, upstream.server); }
+});
+
+test("direct Responses reserves the final safe sequence number for a failure terminal on overflow", async () => {
+  const prior = Number.MAX_SAFE_INTEGER - 1;
+  const upstream = await directServer((_request, response) => {
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.end(
+      `data: ${JSON.stringify({ type: "response.created", sequence_number: prior, response: { id: "resp_sequence_overflow", model: "deepseek-actual", output: [] } })}\n\n` +
+      `data: ${JSON.stringify({ type: "response.output_text.delta", sequence_number: Number.MAX_SAFE_INTEGER, delta: "must-not-overflow" })}\n\n` +
+      "data: [DONE]\n\n",
+    );
+  });
+  const port = await openPort(); const forwarder = directForwarder(port, `http://127.0.0.1:${upstream.port}/v1`);
+  try {
+    await waitForwarder(port);
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: "POST", headers: { Authorization: `Bearer ${INTERNAL_KEY}`, "content-type": "application/json" },
+      body: JSON.stringify({ model: "deepseek-v4-flash", input: "hello" }),
+    });
+    const body = await response.text();
+    const events = responseEvents(body);
+    assert.deepEqual(events.map((event) => event.sequence_number), [prior, Number.MAX_SAFE_INTEGER]);
+    assert.deepEqual(events.map((event) => event.type), ["response.created", "response.failed"]);
+    assert.doesNotMatch(body, /must-not-overflow/);
+    assert.equal((body.match(/data: \[DONE\]/g) || []).length, 1);
+  } finally { await stop(forwarder, upstream.server); }
+});
+
+test("regressed output state is not committed to the failed terminal context", async () => {
   const upstream = await directServer((_request, response) => {
     response.writeHead(200, { "content-type": "text/event-stream" });
     response.end(
@@ -669,7 +879,7 @@ test("invalid completed reasoning is not committed and becomes one failed termin
     assert.equal((body.match(/response\.failed/g) || []).length, 1);
     assert.equal((body.match(/data: \[DONE\]/g) || []).length, 1);
     assert.match(body, /"sequence_number":8/);
-    assert.match(body, /message_1/);
+    assert.doesNotMatch(body, /message_1|reasoning_missing/);
   } finally { await stop(forwarder, upstream.server); }
 });
 

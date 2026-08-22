@@ -55,6 +55,8 @@ import { ToolDialectError } from "./tool-dialect.mjs";
 import { createForcedToolBuffer } from "./tool-dialect.mjs";
 import { ReasoningProtocolError } from "./reasoning-summary-compat.mjs";
 import { createForcedDispatchDeadline } from "./forced-dispatch-deadline.mjs";
+import { ResponseUsageTransform } from "./response-usage.mjs";
+import { recordUsageEvent } from "./usage-events.mjs";
 
 installStableFetchTransport();
 
@@ -947,18 +949,18 @@ function localModels(response) {
   });
 }
 
-function immutableUsageSnapshot(usage) {
-  const copy = structuredClone(usage);
-  const stack = [copy]; const seen = new WeakSet(); let work = 0;
-  while (stack.length) {
-    const value = stack.pop();
-    if (!value || typeof value !== "object" || seen.has(value)) continue;
-    if (++work > 1_024) throw new TypeError("forced usage snapshot exceeds its private telemetry bound");
-    seen.add(value);
-    for (const child of Object.values(value)) stack.push(child);
-    Object.freeze(value);
-  }
-  return copy;
+function recordForcedFailureUsage(response, status) {
+  const telemetry = response._codexRouterRequestTelemetry;
+  if (!telemetry || telemetry.forcedValidated || telemetry.usageRecorded || !telemetry.forcedMetering) return;
+  telemetry.usageRecorded = true;
+  recordUsageEvent({
+    model: telemetry.model,
+    provider: telemetry.provider,
+    status,
+    durationMs: Date.now() - telemetry.startedAt,
+    responseStartMs: telemetry.responseStartMs,
+    ...telemetry.forcedMetering,
+  });
 }
 
 async function handleRequest(request, response) {
@@ -1017,7 +1019,17 @@ async function handleRequest(request, response) {
   }
 
   const controller = new AbortController();
-  const requestTelemetry = Object.seal({ forcedUsage: undefined });
+  const forcedUsageObserver = new ResponseUsageTransform("application/json");
+  const requestTelemetry = Object.seal({
+    forcedUsage: undefined,
+    forcedMetering: undefined,
+    forcedValidated: false,
+    usageRecorded: false,
+    model: normalized.model.slug,
+    provider: canonicalProviderId(normalized.provider.id),
+    startedAt,
+    responseStartMs: undefined,
+  });
   Object.defineProperty(response, "_codexRouterRequestTelemetry", { value: requestTelemetry });
   const abortDispatch = (reason) => {
     if (controller.signal.aborted) return false;
@@ -1105,6 +1117,7 @@ async function handleRequest(request, response) {
     body: upstreamBody,
     signal: controller.signal,
   });
+  requestTelemetry.responseStartMs = Date.now() - startedAt;
   // Account routing can change with plan or policy. Re-resolve and replay once
   // before any response byte reaches the caller; every other status is relayed.
   if (normalized.provider.authProfile === "github-copilot" && upstream.status === 401) {
@@ -1132,6 +1145,7 @@ async function handleRequest(request, response) {
       body: upstreamBody,
       signal: controller.signal,
     });
+    requestTelemetry.responseStartMs = Date.now() - startedAt;
   }
   // A provider error owns its body from the moment its headers arrive. Stop
   // the forced-success lifetime before waiting for that body; it is not a tool
@@ -1187,7 +1201,9 @@ async function handleRequest(request, response) {
           return Date.now();
         },
         onUsage: (usage) => {
-          requestTelemetry.forcedUsage = immutableUsageSnapshot(usage);
+          if (requestTelemetry.forcedUsage !== undefined) return;
+          requestTelemetry.forcedUsage = forcedUsageObserver.observeAuthoritativeUsage(usage);
+          requestTelemetry.forcedMetering = forcedUsageObserver.tokenUsage();
         },
       })
     : undefined;
@@ -1208,6 +1224,12 @@ async function handleRequest(request, response) {
           signal: controller.signal,
           forcedBuffer,
           relayContext,
+          onForcedValidated: () => {
+            if (requestTelemetry.forcedValidated) return;
+            requestTelemetry.forcedValidated = true;
+            forcedDeadline?.clear();
+            forcedDeadline = undefined;
+          },
         },
       })
     : undefined;
@@ -1246,6 +1268,10 @@ const server = http.createServer((request, response) => {
     const publicCode = ERROR_DEFINITIONS[candidate]
       ? candidate
       : candidate ? "reasoning_protocol_error" : undefined;
+    const meteringStatus = publicCode
+      ? routerError(publicCode).status
+      : response.headersSent ? 502 : status;
+    recordForcedFailureUsage(response, meteringStatus);
     const context = response._codexRouterRelayContext;
     if (context?.terminalSeen && !response.writableEnded && !response.destroyed) {
       // The provider terminal was already committed.  A later malformed frame
