@@ -148,14 +148,23 @@ function dataLine(block) {
 // legal LF/CRLF/CR blank-line combinations across arbitrary chunks and hands
 // unmodified frames downstream as their original bytes.
 class SseFramer {
-  #chunks = []; #bytes = 0; #tail = ""; #limit;
+  #chunks = []; #bytes = 0; #tail = ""; #limit; #deferred = false;
   constructor(limit = MAX_SSE_FRAME_BYTES) { this.#limit = limit; }
   push(chunk, emit) {
     let start = 0;
     for (let offset = 0; offset < chunk.length; offset += 1) {
+      // `\r\r` is either a CR-only blank line or the prefix of `\r\r\n`.
+      // Hold the decision for one byte so the latter remains one frame.
+      if (this.#deferred && chunk[offset] !== 0x0a) {
+        this.#append(chunk.subarray(start, offset));
+        emit(Buffer.concat(this.#chunks));
+        this.#chunks = []; this.#bytes = 0; this.#tail = ""; this.#deferred = false; start = offset;
+      }
       const next = (this.#tail + String.fromCharCode(chunk[offset])).slice(-4);
-      const boundary = next.endsWith("\n\n") || next.endsWith("\r\n\r\n") || next.endsWith("\n\r\n") || next.endsWith("\r\n\n") || next.endsWith("\r\r\n");
+      const deferred = next.endsWith("\r\r");
+      const boundary = !deferred && (next.endsWith("\n\n") || next.endsWith("\r\n\r\n") || next.endsWith("\n\r\n") || next.endsWith("\r\n\n") || next.endsWith("\r\r\n"));
       this.#tail = next;
+      this.#deferred = deferred;
       if (!boundary) continue;
       this.#append(chunk.subarray(start, offset + 1));
       emit(Buffer.concat(this.#chunks));
@@ -168,7 +177,14 @@ class SseFramer {
     if (!Number.isSafeInteger(this.#bytes) || this.#bytes > this.#limit) fail("forced_tool_buffer_limit");
     this.#chunks.push(chunk);
   }
-  finish() { return this.#bytes > 0; }
+  finish(emit) {
+    if (this.#deferred) {
+      emit(Buffer.concat(this.#chunks));
+      this.#chunks = []; this.#bytes = 0; this.#tail = ""; this.#deferred = false;
+      return false;
+    }
+    return this.#bytes > 0;
+  }
 }
 
 class ResponsesSseToolTransform extends Transform {
@@ -190,7 +206,7 @@ class ResponsesSseToolTransform extends Transform {
   }
   _flush(callback) {
     try {
-      if (this.#framer.finish()) fail("upstream_stream_truncated");
+      if (this.#framer.finish((frame) => this.#rewrite(frame))) fail("upstream_stream_truncated");
       if (this.#forced?.state.aborted === false) this.#forced.finish(this.#events);
       this.#release();
       callback();
@@ -206,8 +222,12 @@ class ResponsesSseToolTransform extends Transform {
     this.#forced?.push(raw);
     const data = dataLine(raw.toString("utf8"));
     if (!data || !data.data || data.data === "[DONE]") {
-      if (data?.data === "[DONE]" && this.#forced) this.#forced.finish(this.#events);
-      this.#release();
+      // Forced turns release exactly once, after their terminal validation.
+      // Heartbeats/comments are valid SSE but cannot open the relay early.
+      if (data?.data === "[DONE]" && this.#forced) {
+        this.#forced.finish(this.#events);
+        this.#release();
+      }
       this.#output(raw);
       return;
     }

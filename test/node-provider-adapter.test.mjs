@@ -234,6 +234,21 @@ test("custom argument delta frames are dropped instead of serializing data undef
   assert.match(output, /response\.custom_tool_call_input\.done/);
 });
 
+test("byte framer accepts CR-only and split mixed SSE delimiters without changing untouched frames", async () => {
+  const frames = [
+    "event: note\rdata: {\"type\":\"response.created\",\"label\":\"月\"}\r\r",
+    ": heartbeat\r\r",
+    "data: [DONE]\r\r",
+  ];
+  const adapter = adaptOpenAIResponses({
+    model: { ...deepseek, reasoningDisplayMode: "raw-preserve" },
+    upstream: new Response("", { headers: { "content-type": "text/event-stream" } }),
+  });
+  const bytes = Buffer.from(frames.join(""));
+  const split = bytes.indexOf(Buffer.from("月")) + 1;
+  assert.equal(await through(adapter.transforms, [bytes.subarray(0, split), bytes.subarray(split)]), frames.join(""));
+});
+
 test("standalone completed responses reject duplicate item IDs before relay even when call IDs differ", () => {
   const request = buildOpenAIResponsesRequest({
     model: deepseek,
