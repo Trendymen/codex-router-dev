@@ -230,19 +230,52 @@ test("status/activity/usage polling is cancellable and host observation rechecks
   assert.match(swiftSource, /activeRequestCount = activity\.activeCount/);
   assert.doesNotMatch(swiftSource, /presenceModeKey/);
   assert.match(swiftSource, /serviceIntent == \.stoppedByTray/);
-  assert.match(swiftSource, /runServiceCommand\("start"\)/);
-  assert.match(swiftSource, /recordServiceOutcome\(for: command\.name\)/);
-  assert.match(swiftSource, /case "lifecycle\.stop": serviceIntent = \.stoppedByTray/);
-  assert.match(swiftSource, /case "lifecycle\.start", "lifecycle\.restart": serviceIntent = \.running/);
-  assert.match(swiftSource, /let restore = serviceIntent == \.stoppedByTray/);
+  assert.match(swiftSource, /enqueueServiceAction\(\.start\)/);
+  assert.match(swiftSource, /performServiceAction\(_ action: ServiceAction\)/);
+  assert.match(swiftSource, /executeCanonicalCommand\(action\.commandName, recordResult: true\)/);
+  assert.doesNotMatch(swiftSource, /recordServiceOutcome/);
+  assert.match(swiftSource, /var shouldRestoreServiceOnTermination: Bool/);
   assert.match(swiftSource, /serviceRunning = direct/);
-  assert.match(swiftSource, /if effectivePresenceMode == \.followCodex, processRunning, serviceIntent == \.stoppedByTray/);
+  assert.match(swiftSource, /if effectivePresenceMode == \.followCodex, processRunning, serviceRestoreOwnership, serviceIntent != \.running/);
   assert.match(swiftSource, /await self\.refreshHostAppRunning\(\)/);
   assert.match(swiftSource, /guard !Task\.isCancelled, effectivePresenceMode == \.followCodex, !hostAppRunning/);
-  assert.match(swiftSource, /restoreServiceOnQuit\(\)/);
+  assert.match(swiftSource, /prepareForTermination\(\)/);
   assert.match(swiftSource, /stoppedByTray/);
   assert.doesNotMatch(swiftSource, /serviceIntent = serviceRunning \? \.running : \.stopped/);
   assert.doesNotMatch(swiftSource, /private func clearCapabilityState\(\)[\s\S]*?serviceIntent = \.unknown/);
+});
+
+test("service reconciliation serializes host reappearance and uses AppKit termination handshake", () => {
+  assert.match(swiftSource, /startingByTray/);
+  assert.match(swiftSource, /stoppingByTray/);
+  assert.match(swiftSource, /serviceOperationTask/);
+  assert.match(swiftSource, /serviceRequestedAction/);
+  assert.match(swiftSource, /serviceIntent = action\.isStarting \? \.startingByTray : \.stoppingByTray/);
+  assert.ok(swiftSource.indexOf("serviceIntent = action.isStarting") < swiftSource.indexOf("serviceOperationTask = operation"));
+  assert.match(swiftSource, /applicationShouldTerminate\(_ sender: NSApplication\) -> NSApplication\.TerminateReply/);
+  assert.match(swiftSource, /\.terminateLater/);
+  assert.match(swiftSource, /NSApp\.reply\(toApplicationShouldTerminate:/);
+  assert.doesNotMatch(swiftSource, /func applicationWillTerminate\([^)]*\)[\s\S]*?Task \{/);
+  assert.match(swiftSource, /terminationRestoreTimeout = Duration\.seconds\(10\)/);
+
+  // Keep a small independent transition oracle here so the source assertions
+  // are paired with the behavior the tray state machine promises. Repeated
+  // host-present events while a start is in flight must be idempotent, and a
+  // failed restore keeps ownership so the next termination can retry.
+  const transition = (state, event) => {
+    if (event === "host-present" && state === "stoppedByTray") return "startingByTray";
+    if (event === "host-present" && state === "startingByTray") return "startingByTray";
+    if (event === "start-succeeded") return "running";
+    if (event === "start-failed" && state === "startingByTray") return "stoppedByTray";
+    if (event === "host-absent" && state === "running") return "stoppingByTray";
+    if (event === "stop-succeeded") return "stoppedByTray";
+    if (event === "stop-failed" && state === "stoppingByTray") return "unknown";
+    return state;
+  };
+  assert.equal(transition(transition("stoppedByTray", "host-present"), "host-present"), "startingByTray");
+  assert.equal(transition(transition("stoppedByTray", "host-present"), "start-succeeded"), "running");
+  assert.equal(transition(transition("stoppedByTray", "host-present"), "start-failed"), "stoppedByTray");
+  assert.equal(transition(transition("running", "host-absent"), "stop-succeeded"), "stoppedByTray");
 });
 
 test("all localized capability literals keep exact key parity across language tables", () => {

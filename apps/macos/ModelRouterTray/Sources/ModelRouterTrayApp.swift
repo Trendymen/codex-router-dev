@@ -1256,7 +1256,26 @@ final class RouterStore: ObservableObject {
   // `stoppedByTray` is ownership, not an observation. A service that another
   // process stopped must not be started on tray quit as if this tray had
   // borrowed it, while a follow-mode stop initiated here must be restored.
-  private enum ServiceIntent { case unknown, running, stoppedByTray }
+  // The in-flight states are also the duplicate-dispatch guard for the 5s
+  // host poll: a second observation queues intent instead of spawning a second
+  // service command.
+  private enum ServiceIntent: Equatable { case unknown, running, startingByTray, stoppingByTray, stoppedByTray }
+
+  private enum ServiceAction: Equatable {
+    case start
+    case stop
+    case restart
+
+    var isStarting: Bool { self != .stop }
+    var commandName: String {
+      switch self {
+      case .start: return "lifecycle.start"
+      case .stop: return "lifecycle.stop"
+      case .restart: return "lifecycle.restart"
+      }
+    }
+    var intent: ServiceIntent { isStarting ? .startingByTray : .stoppingByTray }
+  }
 
   @Published private(set) var snapshot = RouterSnapshot.empty
   @Published private(set) var capabilitySnapshot = CapabilitySnapshotV1.empty
@@ -1297,6 +1316,7 @@ final class RouterStore: ObservableObject {
   private let menuBarCustomIconPathKey = "ModelRouterTray.menuBarCustomIconPath"
   private let hostAppAbsenceGrace = Duration.seconds(30)
   private let hostAppRecheckInterval = Duration.seconds(5)
+  private let terminationRestoreTimeout = Duration.seconds(10)
   private var pendingServiceStop: Task<Void, Never>?
   private var bridge = DesktopCommandBridge()
   private var polling = false
@@ -1308,6 +1328,10 @@ final class RouterStore: ObservableObject {
   private var surfaceVisibilityTask: Task<Void, Never>?
   private var workspaceObservers: [NSObjectProtocol] = []
   private var serviceIntent: ServiceIntent = .unknown
+  private var serviceOperationTask: Task<Bool, Never>?
+  private var serviceOperationAction: ServiceAction?
+  private var serviceRequestedAction: ServiceAction?
+  private var serviceRestoreOwnership = false
   private let hostAppBundleIDs = ["com.openai.codex", "com.openai.chat"]
   nonisolated static let hostProcessNames = ["codex"]
 
@@ -1561,11 +1585,42 @@ final class RouterStore: ObservableObject {
 
   func retireLoginItem() {}
 
-  func restoreServiceOnQuit() {
-    let restore = serviceIntent == .stoppedByTray
+  var shouldRestoreServiceOnTermination: Bool {
+    effectivePresenceMode == .followCodex && serviceRestoreOwnership && serviceIntent != .running
+  }
+
+  func prepareForTermination() {
     stopPolling()
-    if restore {
-      Task { @MainActor [weak self] in await self?.runServiceCommand("start") }
+  }
+
+  // AppKit gives the delegate a synchronous termination decision. Keep the
+  // restore operation in the same serialized service task as host presence,
+  // race it against a bounded deadline, and preserve ownership on failure so
+  // a later termination request can retry. The failure policy intentionally
+  // keeps the tray open: silently quitting with a stopped Router violates the
+  // follow-mode contract and leaves the user no way to retry from this UI.
+  func restoreServiceBeforeTermination() async -> Bool {
+    guard shouldRestoreServiceOnTermination else {
+      prepareForTermination()
+      return true
+    }
+    prepareForTermination()
+    let operation = enqueueServiceAction(.start)
+    let timeout = terminationRestoreTimeout
+    return await withTaskGroup(of: Bool.self) { group in
+      group.addTask { await operation.value }
+      group.addTask {
+        do {
+          try await Task.sleep(for: timeout)
+          return false
+        } catch {
+          return true
+        }
+      }
+      let result = await group.next() ?? false
+      group.cancelAll()
+      if !result { operation.cancel() }
+      return result
     }
   }
 
@@ -1643,8 +1698,10 @@ final class RouterStore: ObservableObject {
       }
     }
     hostAppRunning = processRunning
-    if effectivePresenceMode == .followCodex, processRunning, serviceIntent == .stoppedByTray {
-      Task { @MainActor [weak self] in await self?.runServiceCommand("start") }
+    if effectivePresenceMode == .followCodex, processRunning, serviceRestoreOwnership, serviceIntent != .running {
+      // `enqueueServiceAction` changes the intent before creating the Task,
+      // so a notification plus the next 5s poll can observe only one start.
+      _ = enqueueServiceAction(.start)
     }
     refreshSurfacesVisible()
     if effectivePresenceMode == .followCodex, !hostAppRunning { schedulePresenceStop() }
@@ -1674,15 +1731,75 @@ final class RouterStore: ObservableObject {
     }
   }
 
-  private func runServiceCommand(_ action: String) async {
-    let command = action == "stop" ? "lifecycle.stop" : "lifecycle.start"
-    do {
-      _ = try await executeCanonicalCommand(command)
-      serviceIntent = action == "stop" ? .stoppedByTray : .running
-    } catch {
-      serviceIntent = .unknown
-      message = error.localizedDescription
+  private func enqueueServiceAction(_ action: ServiceAction) -> Task<Bool, Never> {
+    if let operation = serviceOperationTask {
+      if serviceOperationAction == action || serviceRequestedAction == action { return operation }
+      // A host can return while the delayed stop is still unwinding. Record the
+      // newer user/host intent and let the one worker perform it next.
+      serviceRequestedAction = action
+      serviceIntent = action.intent
+      if action == .start { serviceRestoreOwnership = true }
+      return operation
     }
+    if action == .start, serviceIntent == .running { return Task { true } }
+    if action == .stop, serviceIntent == .stoppedByTray { return Task { true } }
+
+    // This transition is deliberately before Task construction. Swift's
+    // unstructured Task may run immediately on the main actor; setting it here
+    // makes the in-flight state atomic with the enqueue operation itself.
+    if action == .stop { serviceRestoreOwnership = true }
+    if action.isStarting, serviceIntent == .stoppedByTray { serviceRestoreOwnership = true }
+    serviceIntent = action.isStarting ? .startingByTray : .stoppingByTray
+    serviceOperationAction = action
+    serviceRequestedAction = nil
+    let operation = Task { @MainActor [weak self] in
+      guard let self else { return false }
+      var current = action
+      var result = true
+      while true {
+        result = await self.performServiceAction(current)
+        guard let next = self.serviceRequestedAction else { break }
+        self.serviceRequestedAction = nil
+        current = next
+        self.serviceOperationAction = current
+        self.serviceIntent = current.intent
+      }
+      self.serviceOperationAction = nil
+      self.serviceOperationTask = nil
+      return result
+    }
+    serviceOperationTask = operation
+    return operation
+  }
+
+  private func performServiceAction(_ action: ServiceAction) async -> Bool {
+    do {
+      _ = try await executeCanonicalCommand(action.commandName, recordResult: true)
+      if !action.isStarting {
+        serviceIntent = .stoppedByTray
+        serviceRestoreOwnership = true
+      } else {
+        serviceIntent = .running
+        serviceRestoreOwnership = false
+      }
+      return true
+    } catch {
+      if action.isStarting, serviceRestoreOwnership {
+        serviceIntent = .stoppedByTray
+      } else {
+        serviceIntent = .unknown
+        // The stop was still tray-owned even though its command failed. Keep
+        // the ownership bit so host reappearance and termination can issue an
+        // idempotent start; a later observed running snapshot clears it.
+      }
+      message = error.localizedDescription
+      return false
+    }
+  }
+
+  private func runServiceCommand(_ action: String) async {
+    let requested: ServiceAction = action == "stop" ? .stop : .start
+    _ = await enqueueServiceAction(requested).value
   }
 
   func setPresenceMode(_ mode: TrayPresenceMode) {
@@ -1810,7 +1927,10 @@ final class RouterStore: ObservableObject {
       let decoded = try JSONDecoder().decode(RouterSnapshot.self, from: data)
       snapshot = decoded
       if let activity = decoded.activity { applyActivity(activity) }
-      if decoded.serviceRunning == true { serviceIntent = .running }
+      if decoded.serviceRunning == true {
+        serviceIntent = .running
+        serviceRestoreOwnership = false
+      }
       if let presence = decoded.presence {
         presenceMode = TrayPresenceMode.fromNode(presence.effectiveMode) ?? TrayPresenceMode.fromNode(presence.mode) ?? .always
         routerPinsServiceOn = presence.harnessPublished || presence.terminalCodex
@@ -1905,9 +2025,19 @@ final class RouterStore: ObservableObject {
     }
     var result: CapabilityCommandResult?
     do {
-      _ = try await executeCanonicalCommand(command.name, arguments: arguments, protectedInput: protectedInput, recordResult: true)
+      let serviceAction: ServiceAction? = switch command.name {
+      case "lifecycle.start": .start
+      case "lifecycle.stop": .stop
+      case "lifecycle.restart": .restart
+      default: nil
+      }
+      if let serviceAction {
+        let succeeded = await enqueueServiceAction(serviceAction).value
+        guard succeeded else { throw RouterError(message ?? "The Router service command failed.") }
+      } else {
+        _ = try await executeCanonicalCommand(command.name, arguments: arguments, protectedInput: protectedInput, recordResult: true)
+      }
       result = commandResult
-      recordServiceOutcome(for: command.name)
       message = "\(command.name) applied."
       if command.name == "credential.set" { await refreshProviderUsage() }
       _ = await refresh()
@@ -1917,14 +2047,6 @@ final class RouterStore: ObservableObject {
       message = error.localizedDescription
       _ = await refresh()
       commandResult = result
-    }
-  }
-
-  private func recordServiceOutcome(for command: String) {
-    switch command {
-    case "lifecycle.stop": serviceIntent = .stoppedByTray
-    case "lifecycle.start", "lifecycle.restart": serviceIntent = .running
-    default: break
     }
   }
 
@@ -2283,6 +2405,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
   private var islandController: IslandWindowController?
   private var desktopPanelController: DesktopPanelWindowController?
   private var surfaceVisibility: AnyCancellable?
+  private var terminationRestoreTask: Task<Void, Never>?
 
   func applicationDidFinishLaunching(_ notification: Notification) {
     NSApp.setActivationPolicy(.accessory)
@@ -2307,7 +2430,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     return true
   }
 
-  func applicationWillTerminate(_ notification: Notification) { store.restoreServiceOnQuit() }
+  func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+    guard store.shouldRestoreServiceOnTermination else {
+      store.prepareForTermination()
+      return .terminateNow
+    }
+    guard terminationRestoreTask == nil else { return .terminateLater }
+    terminationRestoreTask = Task { @MainActor [weak self] in
+      guard let self else { return }
+      let restored = await self.store.restoreServiceBeforeTermination()
+      self.terminationRestoreTask = nil
+      // Failure keeps the app open so the user can retry; success is the only
+      // path that allows the app to exit after restoring the Router.
+      NSApp.reply(toApplicationShouldTerminate: restored)
+    }
+    return .terminateLater
+  }
+
+  func applicationWillTerminate(_ notification: Notification) {
+    // AppKit has already received the termination reply. No asynchronous work
+    // may be launched from this final callback.
+    store.prepareForTermination()
+  }
 }
 
 // Keep a small catalogue of presentation literals in this source so the
