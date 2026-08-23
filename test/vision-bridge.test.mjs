@@ -1,5 +1,18 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+  rmSync,
+  rmdirSync,
+  statSync,
+  unlinkSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { readFile } from "node:fs/promises";
 import { spawn, spawnSync } from "node:child_process";
 import os from "node:os";
@@ -24,6 +37,7 @@ const {
   applyVisionBridge,
   createEvidenceCache,
   requestVisionCachePurge,
+  releaseVisionCachePurgeLock,
   describeImage,
   DEFAULT_LOCAL_VISION_MODEL,
   evidenceBlock,
@@ -238,6 +252,232 @@ test("vision purge stress leaves no lock at default and bounded higher pressure"
       // live Windows temp tree is the race this test is meant to expose.
       rmSync(state, { recursive: true, force: true });
     }
+  }
+});
+
+function transientFsError(code, message = `transient ${code}`) {
+  const error = new Error(message);
+  error.code = code;
+  return error;
+}
+
+test("purge lock readDirectory retries Windows transient errors and recovers", () => {
+  const state = mkdtempSync(path.join(os.tmpdir(), "vision-purge-read-directory-retry-"));
+  const purgePath = path.join(state, "vision-cache-purge.json");
+  const lockPath = `${purgePath}.lock`;
+  const ownerPath = path.join(lockPath, "owner.json");
+  const waits = [];
+  let directoryReads = 0;
+  try {
+    mkdirSync(lockPath);
+    writeFileSync(ownerPath, `${JSON.stringify({ pid: 999_999, token: "stale-owner-token" })}\n`);
+    const staleAt = new Date(Date.now() - 60_000);
+    utimesSync(lockPath, staleAt, staleAt);
+    const result = requestVisionCachePurge(purgePath, {
+      platform: "win32",
+      staleMs: 1,
+      wait(milliseconds) {
+        waits.push(milliseconds);
+      },
+      fs: {
+        readDirectory(target) {
+          directoryReads += 1;
+          if (directoryReads === 1) throw transientFsError("EPERM", "directory sharing violation");
+          return readdirSync(target);
+        },
+      },
+    });
+    assert.equal(result.requested, true);
+    assert.equal(directoryReads, 4, "the directory read was retried in place, not by polling the lock acquisition loop");
+    assert.deepEqual(waits, [10]);
+    assert.equal(existsSync(lockPath), false);
+  } finally {
+    rmSync(state, { recursive: true, force: true });
+  }
+});
+
+test("purge lock readFile retries Windows transient errors and recovers", () => {
+  const state = mkdtempSync(path.join(os.tmpdir(), "vision-purge-read-file-retry-"));
+  const purgePath = path.join(state, "vision-cache-purge.json");
+  const lockPath = `${purgePath}.lock`;
+  const ownerPath = path.join(lockPath, "owner.json");
+  const waits = [];
+  let fileReads = 0;
+  try {
+    mkdirSync(lockPath);
+    writeFileSync(ownerPath, `${JSON.stringify({ pid: 999_999, token: "stale-owner-token" })}\n`);
+    const staleAt = new Date(Date.now() - 60_000);
+    utimesSync(lockPath, staleAt, staleAt);
+    const result = requestVisionCachePurge(purgePath, {
+      platform: "win32",
+      staleMs: 1,
+      wait(milliseconds) {
+        waits.push(milliseconds);
+      },
+      fs: {
+        readFile(target, encoding) {
+          fileReads += 1;
+          if (fileReads === 1) throw transientFsError("EBUSY", "owner file busy");
+          return readFileSync(target, encoding);
+        },
+      },
+    });
+    assert.equal(result.requested, true);
+    assert.equal(fileReads, 4, "the owner read was retried in place, not by polling the lock acquisition loop");
+    assert.deepEqual(waits, [10]);
+    assert.equal(existsSync(lockPath), false);
+  } finally {
+    rmSync(state, { recursive: true, force: true });
+  }
+});
+
+test("purge lock readDirectory exhaustion throws its first Windows error and does not request", () => {
+  const state = mkdtempSync(path.join(os.tmpdir(), "vision-purge-read-directory-exhausted-"));
+  const purgePath = path.join(state, "vision-cache-purge.json");
+  const lockPath = `${purgePath}.lock`;
+  const first = transientFsError("EPERM", "first directory sharing violation");
+  let attempts = 0;
+  try {
+    mkdirSync(lockPath);
+    writeFileSync(path.join(lockPath, "owner.json"), `${JSON.stringify({ pid: 999_999 })}\n`);
+    const staleAt = new Date(Date.now() - 60_000);
+    utimesSync(lockPath, staleAt, staleAt);
+    assert.throws(
+      () => requestVisionCachePurge(purgePath, {
+        platform: "win32",
+        staleMs: 1,
+        wait() {},
+        fs: {
+          readDirectory() {
+            attempts += 1;
+            throw attempts === 1 ? first : transientFsError("EBUSY", "later directory sharing violation");
+          },
+        },
+      }),
+      (error) => error === first,
+    );
+    assert.equal(attempts, 4);
+    assert.equal(existsSync(purgePath), false);
+  } finally {
+    rmSync(state, { recursive: true, force: true });
+  }
+});
+
+test("purge lock readFile exhaustion throws its first Windows error and does not request", () => {
+  const state = mkdtempSync(path.join(os.tmpdir(), "vision-purge-read-file-exhausted-"));
+  const purgePath = path.join(state, "vision-cache-purge.json");
+  const lockPath = `${purgePath}.lock`;
+  const first = transientFsError("EBUSY", "first owner-file sharing violation");
+  let attempts = 0;
+  try {
+    mkdirSync(lockPath);
+    writeFileSync(path.join(lockPath, "owner.json"), `${JSON.stringify({ pid: 999_999 })}\n`);
+    const staleAt = new Date(Date.now() - 60_000);
+    utimesSync(lockPath, staleAt, staleAt);
+    assert.throws(
+      () => requestVisionCachePurge(purgePath, {
+        platform: "win32",
+        staleMs: 1,
+        wait() {},
+        fs: {
+          readFile() {
+            attempts += 1;
+            throw attempts === 1 ? first : transientFsError("EPERM", "later owner-file sharing violation");
+          },
+        },
+      }),
+      (error) => error === first,
+    );
+    assert.equal(attempts, 4);
+    assert.equal(existsSync(purgePath), false);
+  } finally {
+    rmSync(state, { recursive: true, force: true });
+  }
+});
+
+test("two stale reclaimers cannot remove a successor while its owner is publishing", () => {
+  const state = mkdtempSync(path.join(os.tmpdir(), "vision-purge-owner-publication-race-"));
+  const purgePath = path.join(state, "vision-cache-purge.json");
+  const lockPath = `${purgePath}.lock`;
+  const oldOwnerPath = path.join(lockPath, "owner.json");
+  const oldOwnerToken = "stale-owner-token";
+  const oldOwnerText = `${JSON.stringify({ pid: 999_999, token: oldOwnerToken })}\n`;
+  const events = [];
+  let staleReclaimers = 0;
+  let successorOwnerWrite = false;
+  try {
+    mkdirSync(lockPath);
+    writeFileSync(oldOwnerPath, oldOwnerText);
+    const staleAt = new Date(Date.now() - 60_000);
+    utimesSync(lockPath, staleAt, staleAt);
+
+    const fsOverrides = {
+      mkdir(target, options) {
+        events.push(["mkdir", target]);
+        return mkdirSync(target, options);
+      },
+      writeFile(target, data, options) {
+        events.push(["write", target]);
+        if (!successorOwnerWrite && target !== oldOwnerPath && path.basename(target).startsWith("owner-")) {
+          successorOwnerWrite = true;
+          const staleSnapshotFs = {
+            ...fsOverrides,
+            readDirectory(targetPath) {
+              if (targetPath === lockPath) return [path.basename(oldOwnerPath)];
+              return readdirSync(targetPath);
+            },
+            readFile(targetPath, encoding) {
+              if (targetPath === oldOwnerPath) return oldOwnerText;
+              return readFileSync(targetPath, encoding);
+            },
+          };
+          for (let index = 0; index < 2; index += 1) {
+            staleReclaimers += 1;
+            assert.equal(
+              releaseVisionCachePurgeLock(lockPath, {
+                fs: staleSnapshotFs,
+                platform: "win32",
+                ownerPath: oldOwnerPath,
+                ownerToken: oldOwnerToken,
+                wait() {},
+              }),
+              true,
+            );
+          }
+        }
+        return writeFileSync(target, data, options);
+      },
+      rename(source, target) {
+        events.push(["rename", source, target]);
+        return renameSync(source, target);
+      },
+      removeDirectory(target) {
+        events.push(["rmdir", target]);
+        return rmdirSync(target);
+      },
+      removeFile(target) {
+        events.push(["unlink", target]);
+        return unlinkSync(target);
+      },
+    };
+
+    const result = requestVisionCachePurge(purgePath, {
+      staleMs: 1,
+      fs: fsOverrides,
+      wait() {},
+    });
+    assert.equal(result.requested, true);
+    assert.equal(successorOwnerWrite, true);
+    assert.equal(staleReclaimers, 2);
+    const stageMkdir = events.findIndex(([kind, target]) => kind === "mkdir" && target.includes(".staging-"));
+    const stageWrite = events.findIndex(([kind, target]) => kind === "write" && target.includes(".staging-"));
+    const publish = events.findIndex(([kind, source, target]) => kind === "rename" && source.includes(".staging-") && target === lockPath);
+    assert.ok(stageMkdir >= 0, "the successor did not reserve a unique staging directory");
+    assert.ok(stageWrite > stageMkdir, "the owner was not written into staging");
+    assert.ok(publish > stageWrite, "the complete owner was not atomically published");
+    assert.equal(existsSync(lockPath), false);
+  } finally {
+    rmSync(state, { recursive: true, force: true });
   }
 });
 
