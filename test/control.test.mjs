@@ -878,6 +878,7 @@ signedRoutingRollbackTest("signed routing rolls back catalog and config after a 
         display_name: "GPT-5.6-Sol",
         visibility: "list",
         priority: 10,
+        model_messages: { instructions_template: "fixture original instructions" },
       },
     ],
   };
@@ -889,6 +890,7 @@ signedRoutingRollbackTest("signed routing rolls back catalog and config after a 
         display_name: "DeepSeek V4 Flash",
         visibility: "list",
         priority: 6,
+        model_messages: { instructions_template: "fixture stale instructions" },
       },
     ],
   };

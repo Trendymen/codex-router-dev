@@ -574,6 +574,208 @@ test("purge lock release treats an already removed lock as success", () => {
   }
 });
 
+test("owner release treats ENOTEMPTY from one validated successor as contention", () => {
+  const state = mkdtempSync(path.join(os.tmpdir(), "vision-purge-successor-race-"));
+  const purgePath = path.join(state, "vision-cache-purge.json");
+  const lockPath = `${purgePath}.lock`;
+  const ownerToken = "owner-a-token";
+  const successorToken = "owner-b-token";
+  const ownerPath = path.join(lockPath, `owner-${ownerToken}.json`);
+  const successorPath = path.join(lockPath, `owner-${successorToken}.json`);
+  const stagingPath = `${lockPath}.successor-test`;
+  try {
+    mkdirSync(lockPath);
+    writeFileSync(ownerPath, `${JSON.stringify({ pid: process.pid, token: ownerToken })}\n`);
+    const result = releaseVisionCachePurgeLock(lockPath, {
+      platform: "darwin",
+      ownerPath,
+      ownerToken,
+      fs: {
+        removeFile(target) {
+          assert.equal(target, ownerPath);
+          unlinkSync(target);
+          rmdirSync(lockPath);
+          mkdirSync(stagingPath);
+          writeFileSync(
+            path.join(stagingPath, `owner-${successorToken}.json`),
+            `${JSON.stringify({ pid: process.pid, token: successorToken })}\n`,
+          );
+          renameSync(stagingPath, lockPath);
+        },
+        removeDirectory(target) {
+          assert.equal(target, lockPath);
+          return rmdirSync(target);
+        },
+      },
+    });
+    assert.equal(result, false);
+    assert.equal(existsSync(successorPath), true, "the successor owner was removed by A");
+    assert.equal(JSON.parse(readFileSync(successorPath, "utf8")).token, successorToken);
+  } finally {
+    rmSync(state, { recursive: true, force: true });
+  }
+});
+
+test("own generation succeeds when its release confirms a successor", () => {
+  const state = mkdtempSync(path.join(os.tmpdir(), "vision-purge-generation-successor-"));
+  const purgePath = path.join(state, "vision-cache-purge.json");
+  const lockPath = `${purgePath}.lock`;
+  const successorToken = "owner-b-token";
+  const stagingPath = `${lockPath}.successor-test`;
+  let successorPath;
+  try {
+    const result = requestVisionCachePurge(purgePath, {
+      platform: "darwin",
+      wait() {},
+      fs: {
+        removeFile(target) {
+          unlinkSync(target);
+          rmdirSync(lockPath);
+          mkdirSync(stagingPath);
+          successorPath = path.join(stagingPath, `owner-${successorToken}.json`);
+          writeFileSync(
+            successorPath,
+            `${JSON.stringify({ pid: process.pid, token: successorToken })}\n`,
+          );
+          const publishedPath = path.join(lockPath, `owner-${successorToken}.json`);
+          renameSync(stagingPath, lockPath);
+          successorPath = publishedPath;
+        },
+        removeDirectory(target) {
+          return rmdirSync(target);
+        },
+      },
+    });
+    assert.equal(result.requested, true);
+    assert.equal(existsSync(purgePath), true, "the generation was lost during release contention");
+    assert.equal(existsSync(successorPath), true, "the confirmed successor was removed");
+  } finally {
+    rmSync(state, { recursive: true, force: true });
+  }
+});
+
+test("owner release preserves ENOTEMPTY when the successor is not provably legal", () => {
+  const ownerToken = "owner-a-token";
+  const successorToken = "owner-b-token";
+  const lockPath = path.join(os.tmpdir(), "vision-purge-negative-lock");
+  const ownerPath = path.join(lockPath, `owner-${ownerToken}.json`);
+  const ownerText = `${JSON.stringify({ pid: process.pid, token: ownerToken })}\n`;
+  const releaseCases = [
+    {
+      name: "unknown file",
+      names: ["mystery.json"],
+      readFile(target) {
+        if (target === ownerPath) return ownerText;
+        const error = new Error("missing owner marker");
+        error.code = "ENOENT";
+        throw error;
+      },
+    },
+    {
+      name: "ambiguous owners",
+      names: [`owner-${successorToken}.json`, "owner-c-token.json"],
+      readFile(target) {
+        if (target === ownerPath) return ownerText;
+        return `${JSON.stringify({ pid: process.pid, token: successorToken })}\n`;
+      },
+    },
+    {
+      name: "malformed owner",
+      names: [`owner-${successorToken}.json`],
+      readFile(target) {
+        if (target === ownerPath) return ownerText;
+        return "{not-json\n";
+      },
+    },
+    {
+      name: "owner inspection read error",
+      names: undefined,
+      readDirectory(target) {
+        if (target === lockPath) {
+          const error = new Error("owner directory read failed");
+          error.code = "EIO";
+          throw error;
+        }
+        return [];
+      },
+      readFile: () => ownerText,
+    },
+  ];
+  for (const scenario of releaseCases) {
+    const rmdirError = new Error(`successor contention: ${scenario.name}`);
+    rmdirError.code = "ENOTEMPTY";
+    let directoryReads = 0;
+    assert.throws(
+      () => releaseVisionCachePurgeLock(lockPath, {
+        platform: "darwin",
+        ownerPath,
+        ownerToken,
+        fs: {
+          readDirectory(target) {
+            directoryReads += 1;
+            if (directoryReads === 1) return [path.basename(ownerPath)];
+            if (scenario.readDirectory) return scenario.readDirectory(target);
+            return scenario.names;
+          },
+          readFile: scenario.readFile,
+          removeFile() {},
+          removeDirectory() {
+            throw rmdirError;
+          },
+        },
+      }),
+      (error) => error === rmdirError,
+      scenario.name,
+    );
+  }
+});
+
+test("stale recovery treats a successor as contention and keeps waiting", () => {
+  const state = mkdtempSync(path.join(os.tmpdir(), "vision-purge-stale-successor-"));
+  const purgePath = path.join(state, "vision-cache-purge.json");
+  const lockPath = `${purgePath}.lock`;
+  const oldOwnerToken = "owner-a-token";
+  const successorToken = "owner-b-token";
+  const oldOwnerPath = path.join(lockPath, `owner-${oldOwnerToken}.json`);
+  const stagingPath = `${lockPath}.successor-test`;
+  const waitError = new Error("successor is still active");
+  try {
+    mkdirSync(lockPath);
+    writeFileSync(oldOwnerPath, `${JSON.stringify({ pid: 999_999, token: oldOwnerToken })}\n`);
+    const staleAt = new Date(Date.now() - 60_000);
+    utimesSync(lockPath, staleAt, staleAt);
+    assert.throws(
+      () => requestVisionCachePurge(purgePath, {
+        platform: "win32",
+        staleMs: 1,
+        wait() {
+          throw waitError;
+        },
+        fs: {
+          removeFile(target) {
+            if (target !== oldOwnerPath) return unlinkSync(target);
+            unlinkSync(target);
+            rmdirSync(lockPath);
+            mkdirSync(stagingPath);
+            writeFileSync(
+              path.join(stagingPath, `owner-${successorToken}.json`),
+              `${JSON.stringify({ pid: process.pid, token: successorToken })}\n`,
+            );
+            renameSync(stagingPath, lockPath);
+          },
+          removeDirectory(target) {
+            return rmdirSync(target);
+          },
+        },
+      }),
+      (error) => error === waitError,
+    );
+    assert.equal(existsSync(path.join(lockPath, `owner-${successorToken}.json`)), true);
+  } finally {
+    rmSync(state, { recursive: true, force: true });
+  }
+});
+
 test("a purge generation already written by this process is safely coalesced", () => {
   const state = mkdtempSync(path.join(os.tmpdir(), "vision-purge-coalesce-"));
   const purgePath = path.join(state, "vision-cache-purge.json");

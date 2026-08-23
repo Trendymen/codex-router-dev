@@ -355,7 +355,15 @@ test("every canonical mapping spawns the actual control child inside a fail-clos
   writeFileSync(path.join(state, "caller-secret"), `${callerSecret}\n`);
   writeFileSync(path.join(state, "internal-secret"), `${"i".repeat(48)}\n`);
   writeFileSync(path.join(state, "routed-models.json"), `${JSON.stringify({ models: [] })}\n`);
-  writeFileSync(path.join(state, "enabled-providers.json"), "[]\n");
+  writeFileSync(
+    path.join(state, "enabled-providers.json"),
+    `${JSON.stringify({ version: 1, providers: [] })}\n`,
+  );
+  assert.deepEqual(
+    JSON.parse(readFileSync(path.join(state, "enabled-providers.json"), "utf8")),
+    { version: 1, providers: [] },
+    "the canonical child fixture must use the versioned provider-selection document",
+  );
   writeFileSync(path.join(codexHome, "config.toml"), "");
   writeFileSync(purgePath, `${JSON.stringify({ version: 1, generation: 1 })}\n`);
   writeFileSync(tracePath, "");
@@ -475,6 +483,11 @@ test("every canonical mapping spawns the actual control child inside a fail-clos
     const trace = traceRaw.split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line));
     assert.ok(trace.some((event) => event.type === "preload"), "real control children did not load the safety preload");
     assert.equal(trace.filter((event) => event.type === "network").length, 0, traceRaw);
+    assert.equal(
+      trace.filter((event) => event.owner === "usage.provider" && event.type === "network").length,
+      0,
+      `usage.provider made a network request:\n${traceRaw}`,
+    );
     assert.ok(trace.filter((event) => event.type === "child").every((event) => event.stubbed === true), "an inner child was not stubbed");
     assert.ok(
       trace.some((event) => event.owner === "maintenance.rollback" && event.category === "git" && event.stubbed === true),

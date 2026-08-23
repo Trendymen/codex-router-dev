@@ -211,6 +211,41 @@ function removeWithRetry(remove, target, {
   }
 }
 
+function isConfirmedPurgeSuccessor(lockPath, previousOwnerToken, owner) {
+  if (!previousOwnerToken || !owner || owner.ambiguous || !owner.path || !owner.record) return false;
+  const successorToken = owner.record.token;
+  if (successorToken === previousOwnerToken || !validPurgeOwnerToken(successorToken)) return false;
+  if (!Number.isSafeInteger(owner.record.pid) || owner.record.pid <= 0) return false;
+  return owner.path === purgeOwnerPath(lockPath, successorToken);
+}
+
+function removePurgeLockDirectory(lockPath, fs, {
+  platform,
+  wait,
+  ownerToken,
+} = {}) {
+  try {
+    removeWithRetry(fs.removeDirectory, lockPath, { platform, wait });
+    return true;
+  } catch (error) {
+    if (error?.code !== "ENOTEMPTY") throw error;
+    // A owns the marker path but another process may have removed the empty
+    // directory and atomically published a complete successor before A's
+    // fixed-path rmdir.  Inspect only after that contention error, and never
+    // let an unreadable or ambiguous directory turn into permission to delete
+    // an unknown owner.  Keep the original OS error for every inconclusive
+    // result so callers still fail closed.
+    let successor;
+    try {
+      successor = readPurgeLockOwner(lockPath, fs, { platform, wait });
+    } catch {
+      throw error;
+    }
+    if (isConfirmedPurgeSuccessor(lockPath, ownerToken, successor)) return false;
+    throw error;
+  }
+}
+
 /**
  * Release is deliberately idempotent: another process may have recovered an
  * abandoned directory between our final write and this cleanup.  Windows can
@@ -237,8 +272,11 @@ export function releaseVisionCachePurgeLock(lockPath, options = {}) {
   if (ownerPath) {
     removeWithRetry(fs.removeFile, ownerPath, { platform: lockPlatform, wait: lockWait });
   }
-  removeWithRetry(fs.removeDirectory, lockPath, { platform: lockPlatform, wait: lockWait });
-  return true;
+  return removePurgeLockDirectory(lockPath, fs, {
+    platform: lockPlatform,
+    wait: lockWait,
+    ownerToken,
+  });
 }
 
 function processIsAlive(pid) {
