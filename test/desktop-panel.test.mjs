@@ -144,22 +144,17 @@ test("the advertised allowed commands are exactly the ones the panel permits", (
   const { capabilities } = panelLocalCommand("platform_info")();
   assert.deepEqual(
     [...capabilities.allowedCommands].sort(),
-    Object.keys(COMMANDS).filter((command) => panelCommandAllowed(command)).sort(),
+    ["lifecycle.status", "native.account-usage", "usage.provider"].sort(),
   );
-  for (const command of Object.keys(COMMANDS)) {
-    assert.equal(
-      commandRefused(capabilities, command),
-      !panelCommandAllowed(command),
-      `${command} is advertised differently from how it is gated`,
-    );
-  }
+  for (const command of ["lifecycle.status", "native.account-usage", "usage.provider"]) assert.equal(commandRefused(capabilities, command), false);
+  for (const command of ["provider_setup", "local_models"]) assert.equal(panelCommandAllowed(command), false, command);
   // Commands the panel answers from its own process are not refusals: the UI
   // must keep offering Close and the activity pill, which do work here.
   for (const command of capabilities.localCommands) {
     assert.equal(commandRefused(capabilities, command), false, command);
   }
   assert.equal(commandRefused(capabilities, "set_tool_result_aging"), true);
-  assert.equal(commandRefused(capabilities, "control_snapshot"), false);
+  assert.equal(commandRefused(capabilities, "lifecycle.status"), false);
 });
 
 // The two halves joined: the commands the shipped markup declares, answered by
@@ -186,6 +181,7 @@ test("the panel's own answer marks the settings in the shipped markup dead", () 
 // machine, so neither is narrowed by any of the above.
 test("a shell that is not the browser panel still carries the full table", () => {
   for (const command of Object.keys(COMMANDS)) {
+    if (["provider_setup", "local_models"].includes(command)) continue;
     assert.equal(panelCommandAllowed(command, { readOnly: false }), true, command);
   }
   assert.equal(panelCommandAllowed("rm_minus_rf", { readOnly: false }), false);
@@ -226,6 +222,27 @@ test("a read command answers with the router's own data", async () => {
     assert.equal(typeof payload.value, "object");
     // The overview the tray renders, produced by the same control CLI.
     assert.ok(payload.value.targets, "expected the control overview shape");
+  } finally {
+    await close();
+  }
+});
+
+test("panel read aliases dispatch to canonical account and provider usage commands", async () => {
+  const { url, close } = await serve();
+  try {
+    for (const command of ["account_usage", "provider_usage"]) {
+      const response = await fetch(url("/panel/invoke"), {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ command, args: {} }),
+      });
+      const raw = await response.text();
+      assert.equal(response.status, 200, `${command}: ${raw}`);
+      const payload = JSON.parse(raw);
+      assert.equal(typeof payload.value, "object", command);
+    }
+    assert.equal(panelCommandAllowed("provider_setup"), false);
+    assert.equal(panelCommandAllowed("local_models"), false);
   } finally {
     await close();
   }

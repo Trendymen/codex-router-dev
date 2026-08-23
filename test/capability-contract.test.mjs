@@ -56,7 +56,7 @@ test("command execution returns the stable envelope and validates arguments in N
       return { changed: true, secret: "must not be snapshotted" };
     },
   });
-  assert.deepEqual(result, { ok: true, value: { changed: true } });
+  assert.deepEqual({ ...result.value }, { changed: true });
   assert.deepEqual(calls, [["model.visibility", { slug: "deepseek/v4", visible: false }]]);
 
   const invalid = await runDesktopCommand("model.visibility", { slug: "bad slug", visible: false }, {
@@ -81,7 +81,7 @@ test("credentials require protected input and are never accepted in command argu
       return { provider: args.provider, configured: true };
     },
   });
-  assert.deepEqual(saved, { ok: true, value: { provider: "deepseek", configured: true } });
+  assert.deepEqual({ ...saved.value }, { provider: "deepseek", configured: true });
   assert.deepEqual(seen, [["credential.set", { provider: "deepseek" }, "one-time-secret"]]);
 });
 
@@ -118,7 +118,7 @@ test("every schema version except exactly one is read-only for mutations", async
     manifest: { capabilitySchemaVersion: 99 },
     execute: async () => ({ state: "running" }),
   });
-  assert.deepEqual(read, { ok: true, value: { state: "running" } });
+  assert.deepEqual({ ...read.value }, { state: "running" });
 });
 
 test("command definitions and schemas are deeply immutable", () => {
@@ -201,13 +201,55 @@ test("every canonical command has a real control-bridge invocation and result ki
     const definition = desktopCommandDefinitions().get(name);
     const result = await runDesktopCommand(name, argsByCommand[name], {
       protectedInput: name === "credential.set" ? "protected" : undefined,
+      protectedChannel: definition.resultKind === "protected-text",
       runControl: async (_root, argv) => {
         invoked.push([name, argv]);
-        return definition.resultKind === "text" ? "text-result\n" : "{}\n";
+        return definition.resultKind === "text" || definition.resultKind === "protected-text"
+          ? "model_provider = \"custom\"\nbase_url = \"http://127.0.0.1:4200/_codex-router/caller/v1\"\n"
+          : "{}\n";
       },
     });
     assert.equal(result.ok, true, name);
     assert.ok(Array.isArray(invoked.at(-1)[1]), name);
   }
   assert.equal(invoked.length, fixture.nodeCommands.length);
+});
+
+test("hostile executor errors use own-data extraction and never trigger getters", async () => {
+  const hostile = Object.create(null);
+  Object.defineProperty(hostile, "code", { get() { throw new Error("error-secret"); }, enumerable: true });
+  const result = await runDesktopCommand("lifecycle.status", {}, {
+    execute: async () => { throw hostile; },
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.error.code, "invalid_command_arguments");
+  assert.doesNotMatch(JSON.stringify(result), /error-secret/);
+});
+
+test("result sanitizer protects bearer/caller values in arrays and neutralizes prototype keys", async () => {
+  const value = "caller-secret-value";
+  const result = await runDesktopCommand("credential.set", { provider: "deepseek" }, {
+    protectedInput: value,
+    execute: async () => ({
+      authorization: `Bearer ${value}`,
+      values: [value, `http://127.0.0.1:4200/_codex-router/${value}/v1`],
+      __proto__: { polluted: true },
+      constructor: value,
+      prototype: value,
+    }),
+  });
+  assert.equal(result.ok, true);
+  assert.doesNotMatch(JSON.stringify(result), /caller-secret-value|polluted/);
+  assert.equal(Object.getPrototypeOf(result.value), null);
+});
+
+test("snippet output requires an authorized channel and preserves deterministic redacted URL shape", async () => {
+  const execute = async () => "base_url = \"http://127.0.0.1:4200/_codex-router/caller-secret/v1\"\n";
+  const refused = await runDesktopCommand("cc-switch.snippet", {}, { execute });
+  assert.equal(refused.ok, false);
+  assert.equal(refused.error.code, "protected_output_required");
+  const allowed = await runDesktopCommand("cc-switch.snippet", {}, { execute, protectedChannel: true });
+  assert.equal(allowed.ok, true);
+  assert.match(allowed.value, /_codex-router\/\[REDACTED\]\/v1/);
+  assert.doesNotMatch(allowed.value, /caller-secret/);
 });

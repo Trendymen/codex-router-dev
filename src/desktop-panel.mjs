@@ -10,7 +10,7 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { COMMANDS, runDesktopCommand, sourceRoot } from "./desktop-commands.mjs";
+import { COMMANDS, desktopCommandDefinitions, runDesktopCommand, sourceRoot } from "./desktop-commands.mjs";
 
 const UI_DIR = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -71,17 +71,17 @@ export function isPanelRoute(route) {
 // and "save this API key" is not something to expose on that assumption. The
 // tray and the Electron shell keep the full table because reaching them means
 // already running code on the machine.
-const READ_ONLY = new Set([
-  "control_snapshot",
-  "account_usage",
-  "provider_usage",
-  "provider_setup",
-  "local_models",
-]);
+const PANEL_COMMANDS = Object.freeze({
+  control_snapshot: "lifecycle.status",
+  account_usage: "native.account-usage",
+  provider_usage: "usage.provider",
+});
+const CANONICAL_PANEL_COMMANDS = new Set(Object.values(PANEL_COMMANDS));
 
 export function panelCommandAllowed(command, { readOnly = true } = {}) {
-  if (!Object.hasOwn(COMMANDS, command)) return false;
-  return readOnly ? READ_ONLY.has(command) : true;
+  if (command === "provider_setup" || command === "local_models") return false;
+  if (readOnly) return Object.hasOwn(PANEL_COMMANDS, command);
+  return Object.hasOwn(COMMANDS, command) || CANONICAL_PANEL_COMMANDS.has(command);
 }
 
 // Commands the shells answer from their own process rather than the CLI. A
@@ -103,7 +103,7 @@ const LOCAL = {
     // table, which is why this field is additive rather than a mode switch.
     capabilities: {
       readOnly: true,
-      allowedCommands: [...READ_ONLY],
+      allowedCommands: [...CANONICAL_PANEL_COMMANDS],
       localCommands: Object.keys(LOCAL),
     },
   }),
@@ -218,8 +218,13 @@ export async function handlePanelRequest(request, response, route, { writeJson }
   try {
     // The panel keeps its historical wire id for the current UI, but the
     // dispatcher receives only the Phase3 canonical command table.
-    const canonicalCommand = command === "control_snapshot" ? "lifecycle.status" : command;
-    const result = await runDesktopCommand(canonicalCommand, args ?? {}, { root: sourceRoot() });
+    const canonicalCommand = PANEL_COMMANDS[command] || command;
+    const canonicalArgs = canonicalCommand === "usage.provider" && !args?.provider ? {} : args ?? {};
+    if (!desktopCommandDefinitions().has(canonicalCommand)) {
+      writeJson(response, 403, { error: { type: "invalid_request", message: `${command} is not available from the browser panel.` } });
+      return true;
+    }
+    const result = await runDesktopCommand(canonicalCommand, canonicalArgs, { root: sourceRoot() });
     if (result?.ok === false) {
       writeJson(response, 502, { error: result.error });
       return true;

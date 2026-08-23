@@ -274,7 +274,7 @@ const ARGUMENTS = {
   "tool-result-aging.status": noArgs, "tool-result-aging.on": noArgs, "tool-result-aging.off": noArgs,
   "tool-result-aging.ttl": objectSchema({ days: { type: ["integer", "null"] } }, ["days"]),
   "tool-result-aging.purge": objectSchema({ expiredOnly: boolean }, ["expiredOnly"]),
-  "usage.router": noArgs, "usage.provider": objectSchema({ provider }, ["provider"]), "usage.model": objectSchema({ slug }, ["slug"]),
+  "usage.router": noArgs, "usage.provider": objectSchema({ provider }), "usage.model": objectSchema({ slug }, ["slug"]),
   "vision.status": noArgs, "vision.on": noArgs, "vision.off": noArgs,
   "vision.engine": objectSchema({ engine: string(), effort: string() }, ["engine"]),
   "vision.effort": objectSchema({ effort: string() }, ["effort"]), "vision.probe": noArgs,
@@ -302,19 +302,25 @@ const CONTROL_ARGS = {
   "presence.status": () => ["presence", "status"], "presence.mode": ({ mode }) => ["presence", "set", mode], "cc-switch.status": () => ["catalog", "status"], "cc-switch.snippet": () => ["catalog", "render-snippet"],
 };
 
-const secretKey = /^(?:credential|apiKey|api_key|token|secret|password|authorization)$/i;
+const secretKey = /(?:credential|caller.?key|access.?token|api.?key|token|secret|password|authorization|auth)$/i;
+const DANGEROUS_KEY = /^(?:__proto__|constructor|prototype)$/;
 const CAPABILITY_URL = /https?:\/\/(?:127\.0\.0\.1|localhost|\[::1\]):\d+\/_codex-router\/[^/\s]+(?:\/v1)?/gi;
+const CAPABILITY_URL_WITH_SECRET = /(https?:\/\/(?:127\.0\.0\.1|localhost|\[::1\]):\d+\/_codex-router\/)([^/\s]+)(\/v1)?/gi;
+const BEARER = /\bBearer\s+[A-Za-z0-9._~+/=-]+/gi;
 const MAX_ARGUMENT_DEPTH = 16;
 const MAX_ARGUMENT_KEYS = 256;
 const MAX_ARGUMENT_WORK = 4096;
 const MAX_RESULT_DEPTH = 16;
 const MAX_RESULT_KEYS = 256;
 const MAX_RESULT_ARRAY = 1024;
+const MAX_RESULT_NODES = 4096;
+const MAX_RESULT_STRING = 64 * 1024;
 const COMMAND_ERROR_CODES = Object.freeze({
   command_not_supported: true,
   invalid_command_arguments: true,
   protected_input_required: true,
   capability_schema_unsupported: true,
+  protected_output_required: true,
 });
 function errorEnvelope(code) {
   const messages = {
@@ -322,6 +328,7 @@ function errorEnvelope(code) {
     invalid_command_arguments: "The desktop command arguments are invalid.",
     protected_input_required: "This credential operation requires protected input.",
     capability_schema_unsupported: "This capability schema is not supported for mutations.",
+    protected_output_required: "This command requires an authorized protected output channel.",
   };
   const safeCode = Object.hasOwn(messages, code) || Object.hasOwn(ERROR_DEFINITIONS, code) ? code : "invalid_command_arguments";
   return {
@@ -367,7 +374,7 @@ const COMMAND_DEFINITIONS_MAP = new Map(CAPABILITY_COMMANDS.map((metadata) => {
 }));
 
 const COMMAND_DEFINITIONS = (() => {
-  const entries = Object.freeze([...COMMAND_DEFINITIONS_MAP.entries()]);
+  const entries = Object.freeze([...COMMAND_DEFINITIONS_MAP.entries()].map(([name, value]) => Object.freeze([name, value])));
   const values = Object.freeze(entries.map(([, value]) => value));
   const byName = new Map(entries);
   return Object.freeze({
@@ -396,10 +403,11 @@ function majorVersion(manifest, supplied = false) {
   return descriptor && Object.hasOwn(descriptor, "value") ? descriptor.value : undefined;
 }
 
-function scrubResult(value, sensitiveValues = [], state = { seen: new WeakSet() }, depth = 0) {
-  if (depth > MAX_RESULT_DEPTH) return undefined;
+function scrubResult(value, sensitiveValues = [], state = { seen: new WeakSet(), nodes: 0, keys: 0 }, depth = 0) {
+  if (depth > MAX_RESULT_DEPTH || state.nodes++ >= MAX_RESULT_NODES) return undefined;
   if (typeof value === "string") {
-    let clean = value.replace(CAPABILITY_URL, "[REDACTED]");
+    if (value.length > MAX_RESULT_STRING) return undefined;
+    let clean = value.replace(CAPABILITY_URL, "[REDACTED]").replace(BEARER, "Bearer [REDACTED]");
     for (const sensitive of sensitiveValues) if (sensitive) clean = clean.split(sensitive).join("[REDACTED]");
     return clean;
   }
@@ -412,17 +420,39 @@ function scrubResult(value, sensitiveValues = [], state = { seen: new WeakSet() 
     if (!Number.isSafeInteger(length) || length > MAX_RESULT_ARRAY) return undefined;
     return Array.from({ length }, (_, index) => scrubResult(Object.getOwnPropertyDescriptor(value, String(index))?.value, sensitiveValues, state, depth + 1));
   }
-  const output = {};
+  const output = Object.create(null);
   const keys = Object.getOwnPropertyNames(value);
-  if (keys.length > MAX_RESULT_KEYS) return undefined;
+  if (keys.length > MAX_RESULT_KEYS || state.keys + keys.length > MAX_RESULT_KEYS) return undefined;
+  state.keys += keys.length;
   for (const key of keys) {
-    if (secretKey.test(key)) continue;
+    if (secretKey.test(key) || DANGEROUS_KEY.test(key)) continue;
     const descriptor = Object.getOwnPropertyDescriptor(value, key);
     if (!descriptor || !Object.hasOwn(descriptor, "value")) continue;
     const item = scrubResult(descriptor.value, sensitiveValues, state, depth + 1);
-    if (item !== undefined) output[key] = item;
+    if (item !== undefined) Object.defineProperty(output, key, { value: item, enumerable: true, writable: false, configurable: false });
   }
   return deepFreeze(output);
+}
+
+function scrubProtectedText(value) {
+  if (typeof value !== "string" || value.length > MAX_RESULT_STRING) return undefined;
+  return value.replace(CAPABILITY_URL_WITH_SECRET, "$1[REDACTED]$3").replace(BEARER, "Bearer [REDACTED]");
+}
+
+function safeErrorCode(error) {
+  if (!error || typeof error !== "object" || util.types.isProxy(error)) return undefined;
+  const codeDescriptor = Object.getOwnPropertyDescriptor(error, "code");
+  if (codeDescriptor && Object.hasOwn(codeDescriptor, "value") && typeof codeDescriptor.value === "string") return codeDescriptor.value;
+  const bodyDescriptor = Object.getOwnPropertyDescriptor(error, "body");
+  if (!bodyDescriptor || !Object.hasOwn(bodyDescriptor, "value")) return undefined;
+  const body = bodyDescriptor.value;
+  if (!body || typeof body !== "object" || util.types.isProxy(body)) return undefined;
+  const errorDescriptor = Object.getOwnPropertyDescriptor(body, "error");
+  if (!errorDescriptor || !Object.hasOwn(errorDescriptor, "value")) return undefined;
+  const nested = errorDescriptor.value;
+  if (!nested || typeof nested !== "object" || util.types.isProxy(nested)) return undefined;
+  const nestedCode = Object.getOwnPropertyDescriptor(nested, "code");
+  return nestedCode && Object.hasOwn(nestedCode, "value") && typeof nestedCode.value === "string" ? nestedCode.value : undefined;
 }
 
 /** Run one canonical Node command. The protected input callback is ephemeral. */
@@ -450,6 +480,9 @@ export async function runDesktopCommand(command, args = {}, context = {}) {
       protectedValue = typeof input === "function" ? await input() : input;
       if (typeof protectedValue !== "string" || !protectedValue) return errorEnvelope("protected_input_required");
     }
+    const protectedChannelDescriptor = Object.getOwnPropertyDescriptor(safeContext, "protectedChannel");
+    const protectedChannel = protectedChannelDescriptor && Object.hasOwn(protectedChannelDescriptor, "value") && protectedChannelDescriptor.value === true;
+    if (definition.resultKind === "protected-text" && !protectedChannel) return errorEnvelope("protected_output_required");
     let value;
     const executeDescriptor = Object.getOwnPropertyDescriptor(safeContext, "execute");
     const execute = executeDescriptor && Object.hasOwn(executeDescriptor, "value") ? executeDescriptor.value : undefined;
@@ -467,11 +500,12 @@ export async function runDesktopCommand(command, args = {}, context = {}) {
         stdin: protectedValue,
         timeoutMs: definition.protectedInput ? CATALOG_MUTATION_TIMEOUT_MS : CONTROL_TIMEOUT_MS,
       });
-      value = definition.resultKind === "text" ? String(value).trim() : value.trim() ? parseJson(value) : null;
+      value = definition.resultKind === "text" || definition.resultKind === "protected-text" ? String(value).trim() : value.trim() ? parseJson(value) : null;
     }
+    if (definition.resultKind === "protected-text") return { ok: true, value: scrubProtectedText(value) };
     return { ok: true, value: scrubResult(value, protectedValue ? [protectedValue] : []) };
   } catch (error) {
-    const code = typeof error?.code === "string" ? error.code : error?.body?.error?.code;
+    const code = safeErrorCode(error);
     if (definition.protectedInput && protectedValue === undefined) return errorEnvelope("protected_input_required");
     if (code && (Object.hasOwn(ERROR_DEFINITIONS, code) || Object.hasOwn(COMMAND_ERROR_CODES, code)) && code !== "invalid_command_arguments" && code !== "command_not_supported") {
       return errorEnvelope(code);

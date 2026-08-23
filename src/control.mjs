@@ -1,5 +1,5 @@
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, readFileSync, unlinkSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -563,7 +563,7 @@ async function printProviderUsage(provider) {
   const snapshot = await providerUsageSnapshot();
   if (provider) {
     const entry = Array.isArray(snapshot?.providers)
-      ? snapshot.providers.find((item) => item.provider === provider)
+      ? snapshot.providers.find((item) => item.id === provider || item.provider === provider)
       : undefined;
     process.stdout.write(`${JSON.stringify({ provider, usage: entry || null })}\n`);
     return;
@@ -604,7 +604,11 @@ async function printRouterLogs() {
     return;
   }
   const lines = readFileSync(LOG_PATH, "utf8").split(/\r?\n/).filter(Boolean).slice(-200);
-  process.stdout.write(`${lines.map(() => "[REDACTED]").join("\n")}\n`);
+  const redactLogLine = (line) => String(line)
+    .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+/gi, "Bearer [REDACTED]")
+    .replace(/https?:\/\/(?:127\.0\.0\.1|localhost|\[::1\]):\d+\/_codex-router\/[^/\s]+(?:\/v1)?/gi, "http://127.0.0.1:[PORT]/_codex-router/[REDACTED]/v1")
+    .replace(/((?:api[_-]?key|access[_-]?token|refresh[_-]?token|password|secret)\s*[=:]\s*)[^\s,;]+/gi, "$1[REDACTED]");
+  process.stdout.write(`${lines.map(redactLogLine).join("\n")}\n`);
 }
 
 async function setCanary(slug, enabled) {
@@ -615,11 +619,8 @@ async function setCanary(slug, enabled) {
 }
 
 async function purgeVisionCache() {
-  const { VISION_DOWNLOAD_STATE_PATH, VISION_DOWNLOAD_CLAIM_PATH } = await import("./vision-download.mjs");
-  for (const file of [VISION_DOWNLOAD_STATE_PATH, VISION_DOWNLOAD_CLAIM_PATH]) {
-    try { unlinkSync(file); } catch (error) { if (error?.code !== "ENOENT") throw error; }
-  }
-  process.stdout.write(`${JSON.stringify({ purged: true })}\n`);
+  const { evidenceCache } = await import("./vision-bridge.mjs");
+  process.stdout.write(`${JSON.stringify({ purged: true, ...evidenceCache.purge() })}\n`);
 }
 
 async function printProviderOnboarding() {

@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
+import { spawnSync } from "node:child_process";
+import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -72,6 +74,42 @@ function imageInput(url = "data:image/png;base64,AAAA") {
     { type: "input_image", image_url: url },
   ]);
 }
+
+test("vision cache purge uses the evidence owner and leaves an active download untouched", () => {
+  const cache = createEvidenceCache();
+  cache.set("data:image/png;base64,abc", "question", "answer");
+  assert.equal(cache.size, 1);
+  assert.deepEqual(cache.purge(), { removed: 1 });
+  assert.equal(cache.size, 0);
+
+  const state = mkdtempSync(path.join(os.tmpdir(), "vision-purge-active-"));
+  const download = path.join(state, "vision-download.json");
+  const claim = path.join(state, "vision-download.claim");
+  writeFileSync(download, JSON.stringify({ version: 1, status: "downloading", tag: "qwen2.5vl:3b" }));
+  writeFileSync(claim, "active");
+  try {
+    const result = spawnSync(process.execPath, ["src/control.mjs", "vision-purge-cache"], {
+      cwd: repoRoot,
+      encoding: "utf8",
+      env: { ...process.env, MODEL_ROUTER_VISION_DOWNLOAD_STATE: download, MODEL_ROUTER_VISION_DOWNLOAD_CLAIM: claim },
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(existsSync(download), true);
+    assert.equal(existsSync(claim), true);
+    const log = path.join(state, "router.log");
+    writeFileSync(log, "healthy router started\napi_key=log-secret\n");
+    const logs = spawnSync(process.execPath, ["src/control.mjs", "logs"], {
+      cwd: repoRoot,
+      encoding: "utf8",
+      env: { ...process.env, MODEL_ROUTER_STATE_DIR: state, CODEX_HOME: state },
+    });
+    assert.equal(logs.status, 0, logs.stderr);
+    assert.match(logs.stdout, /healthy router started/);
+    assert.doesNotMatch(logs.stdout, /log-secret/);
+  } finally {
+    rmSync(state, { recursive: true, force: true });
+  }
+});
 
 test("a cheap vision tier outranks a higher-priority flagship", () => {
   const ranked = rankVisionEngines([TEXT_ONLY, FLAGSHIP_VISION, FLASH_VISION]);

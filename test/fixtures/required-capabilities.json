@@ -75,7 +75,7 @@
     "protectedInput": ["credential.set"],
     "confirmation": ["lifecycle.stop", "lifecycle.restart", "doctor.fix", "maintenance.update", "maintenance.rollback", "credential.remove", "protocol-proof.verify", "protocol-proof.revoke", "subagents.verify", "failover.reset", "tool-result-aging.purge", "vision.pull", "vision.purge-cache"],
     "quotaWarning": ["protocol-proof.verify", "subagents.verify", "vision.probe"],
-    "resultKind": {"lifecycle.logs": "text", "catalog.render-snippet": "text", "cc-switch.snippet": "text"}
+    "resultKind": {"lifecycle.logs": "text", "catalog.render-snippet": "protected-text", "cc-switch.snippet": "protected-text"}
   },
   "forbiddenCommands": [
     "provider.python",

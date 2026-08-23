@@ -37,14 +37,14 @@ const commandRows = [
   command("credential.status"), command("credential.set", { mutating: true, protectedInput: true }), command("credential.remove", { mutating: true, confirmation: true }),
   command("provider.enable", { mutating: true }), command("model.visibility", { mutating: true }), command("model.canary", { mutating: true }),
   command("protocol-proof.status"), command("protocol-proof.verify", { mutating: true, confirmation: true, quotaWarning: true }), command("protocol-proof.revoke", { mutating: true, confirmation: true }),
-  command("picker.status"), command("picker.set", { mutating: true }), command("picker.show-all", { mutating: true }), command("catalog.status"), command("catalog.render-snippet", { resultKind: "text" }),
+  command("picker.status"), command("picker.set", { mutating: true }), command("picker.show-all", { mutating: true }), command("catalog.status"), command("catalog.render-snippet", { resultKind: "protected-text" }),
   command("subagents.status"), command("subagents.mode", { mutating: true }), command("subagents.model", { mutating: true }), command("subagents.selection", { mutating: true }), command("subagents.verify", { mutating: true, confirmation: true, quotaWarning: true }),
   command("failover.status"), command("failover.reset", { mutating: true, confirmation: true }),
   command("tool-result-aging.status"), command("tool-result-aging.on", { mutating: true }), command("tool-result-aging.off", { mutating: true }), command("tool-result-aging.ttl", { mutating: true }), command("tool-result-aging.purge", { mutating: true, confirmation: true }),
   command("usage.router"), command("usage.provider"), command("usage.model"),
   command("vision.status"), command("vision.on", { mutating: true }), command("vision.off", { mutating: true }), command("vision.engine", { mutating: true }), command("vision.effort", { mutating: true }), command("vision.probe", { mutating: true, quotaWarning: true }), command("vision.pull", { mutating: true, confirmation: true }), command("vision.purge-cache", { mutating: true, confirmation: true }),
   command("presence.status"), command("presence.mode", { mutating: true }),
-  command("cc-switch.status"), command("cc-switch.snippet", { resultKind: "text" }),
+  command("cc-switch.status"), command("cc-switch.snippet", { resultKind: "protected-text" }),
 ];
 
 const capabilities = [
@@ -85,19 +85,22 @@ export function isMutationCommand(name) {
   return Boolean(commandByName.get(name)?.mutating);
 }
 
-const SECRET_KEY = /credential|api.?key|token|secret|password|authorization|caller.?url/i;
+const SECRET_KEY = /credential|caller.?key|access.?token|api.?key|token|secret|password|authorization|caller.?url|auth/i;
 const CAPABILITY_URL = /https?:\/\/(?:127\.0\.0\.1|localhost|\[::1\]):\d+\/_codex-router\/[^/\s]+(?:\/v1)?/gi;
+const BEARER = /\bBearer\s+[A-Za-z0-9._~+/=-]+/gi;
 const SNAPSHOT_MAX_DEPTH = 16;
 const SNAPSHOT_MAX_KEYS = 256;
 const SNAPSHOT_MAX_ARRAY = 1024;
 const SNAPSHOT_MAX_WORK = 8192;
+const SNAPSHOT_MAX_STRING = 64 * 1024;
 
 function redactString(value) {
-  return value.replace(CAPABILITY_URL, "[REDACTED]");
+  if (value.length > SNAPSHOT_MAX_STRING) return undefined;
+  return value.replace(CAPABILITY_URL, "[REDACTED]").replace(BEARER, "Bearer [REDACTED]");
 }
 
-function safeSnapshot(value, state = { seen: new WeakSet(), work: SNAPSHOT_MAX_WORK }, depth = 0) {
-  if (state.work-- <= 0 || depth > SNAPSHOT_MAX_DEPTH) return undefined;
+function safeSnapshot(value, state = { seen: new WeakSet(), work: SNAPSHOT_MAX_WORK, keys: 0 }, depth = 0) {
+  if (state.work-- <= 0 || state.keys > SNAPSHOT_MAX_KEYS || depth > SNAPSHOT_MAX_DEPTH) return undefined;
   if (value === null || typeof value === "boolean") return value;
   if (typeof value === "string") return redactString(value);
   if (typeof value === "number") return Number.isFinite(value) ? value : undefined;
@@ -108,6 +111,7 @@ function safeSnapshot(value, state = { seen: new WeakSet(), work: SNAPSHOT_MAX_W
     if (!Number.isSafeInteger(length) || length < 0 || length > SNAPSHOT_MAX_ARRAY) return undefined;
     const result = [];
     for (let index = 0; index < length; index += 1) {
+      if (state.keys++ > SNAPSHOT_MAX_KEYS) return undefined;
       const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
       if (!descriptor || !Object.hasOwn(descriptor, "value")) continue;
       const item = safeSnapshot(descriptor.value, state, depth + 1);
@@ -115,15 +119,16 @@ function safeSnapshot(value, state = { seen: new WeakSet(), work: SNAPSHOT_MAX_W
     }
     return result;
   }
-  const result = {};
+  const result = Object.create(null);
   const keys = Object.getOwnPropertyNames(value);
   if (keys.length > SNAPSHOT_MAX_KEYS) return undefined;
   for (const key of keys) {
+    if (state.keys++ > SNAPSHOT_MAX_KEYS) return undefined;
     if (SECRET_KEY.test(key)) continue;
     const descriptor = Object.getOwnPropertyDescriptor(value, key);
     if (!descriptor || !Object.hasOwn(descriptor, "value")) continue;
     const item = safeSnapshot(descriptor.value, state, depth + 1);
-    if (item !== undefined) result[key] = item;
+    if (item !== undefined) Object.defineProperty(result, key, { value: item, enumerable: true, writable: false, configurable: false });
   }
   return result;
 }

@@ -30,6 +30,7 @@ const definitions = [
   ["invalid_command_arguments", 400, "The desktop command arguments are invalid."],
   ["protected_input_required", 400, "This credential operation requires protected input."],
   ["capability_schema_unsupported", 409, "This capability schema is not supported for mutations."],
+  ["protected_output_required", 403, "This command requires an authorized protected output channel."],
 ];
 
 export const ERROR_DEFINITIONS = Object.freeze(

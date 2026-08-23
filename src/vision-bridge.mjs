@@ -757,6 +757,12 @@ function createEvidenceCache() {
     get size() {
       return entries.size;
     },
+    purge() {
+      const removed = entries.size;
+      entries.clear();
+      bytes = 0;
+      return { removed };
+    },
   };
 }
 
