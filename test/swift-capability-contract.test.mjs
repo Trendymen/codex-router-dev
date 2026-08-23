@@ -9,8 +9,16 @@ import fixture from "./fixtures/required-capabilities.json" with { type: "json" 
 import { buildCapabilityManifest } from "../src/capability-manifest.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const swiftSource = readFileSync(path.join(root, "apps/macos/ModelRouterTray/Sources/ModelRouterTrayApp.swift"), "utf8");
-const quotaResetTests = readFileSync(path.join(root, "apps/macos/ModelRouterTray/Tests/QuotaResetLabelTests.swift"), "utf8");
+function normalizeSwiftSource(source) {
+  return source.replace(/\r\n?/g, "\n");
+}
+
+function readSwiftSource(filePath) {
+  return normalizeSwiftSource(readFileSync(filePath, "utf8"));
+}
+
+const swiftSource = readSwiftSource(path.join(root, "apps/macos/ModelRouterTray/Sources/ModelRouterTrayApp.swift"));
+const quotaResetTests = readSwiftSource(path.join(root, "apps/macos/ModelRouterTray/Tests/QuotaResetLabelTests.swift"));
 const bridgeSource = readFileSync(path.join(root, "src", "desktop-command-bridge.mjs"), "utf8");
 const controlSource = readFileSync(path.join(root, "src", "control.mjs"), "utf8");
 const localizationSources = [
@@ -19,7 +27,11 @@ const localizationSources = [
   "RouterHindiText.swift",
   "RouterJapaneseText.swift",
   "RouterKoreanText.swift",
-].map((name) => readFileSync(path.join(root, "apps/macos/ModelRouterTray/Sources", name), "utf8"));
+].map((name) => readSwiftSource(path.join(root, "apps/macos/ModelRouterTray/Sources", name)));
+
+test("Swift source contract normalizes all supported line endings before matching", () => {
+  assert.equal(normalizeSwiftSource("first\r\nsecond\rthird\nfourth"), "first\nsecond\nthird\nfourth");
+});
 
 function runBridge(command, payload, extraEnv = {}) {
   const bridge = path.join(root, "src", "desktop-command-bridge.mjs");
@@ -360,7 +372,7 @@ test("all localized capability literals keep exact key parity across language ta
 });
 
 test("host process source contract keeps the executable-name helper used by Swift tests", () => {
-  const source = readFileSync(path.join(root, "apps/macos/ModelRouterTray/Tests/HostProcessDetectionTests.swift"), "utf8");
+  const source = readSwiftSource(path.join(root, "apps/macos/ModelRouterTray/Tests/HostProcessDetectionTests.swift"));
   assert.match(source, /anyProcessRunning/);
   assert.match(source, /hostProcessNames/);
   assert.match(swiftSource, /nonisolated static func anyProcessRunning/);

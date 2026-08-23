@@ -397,6 +397,7 @@ export function requestVisionCachePurge(
     platform,
     wait,
     now = () => Date.now(),
+    monotonicNow = () => performance.now(),
     staleMs = PURGE_LOCK_STALE_MS,
     processIdentity = defaultPurgeProcessIdentity,
   } = {},
@@ -408,8 +409,11 @@ export function requestVisionCachePurge(
   const lockWait = wait || fs.wait || waitForPurgeLockRetry;
   const lockPath = `${purgePath}.lock`;
   fs.mkdir(path.dirname(purgePath), { recursive: true, mode: 0o700 });
-  const startedAt = performance.now();
   const ownerRecord = purgeOwnerRecord(now, processIdentity);
+  // Process identity can be a synchronous OS probe on Windows.  Prepare it
+  // before starting the bounded lock-wait budget so normal contention cannot
+  // spend that budget while the owner record is still being built.
+  const startedAt = monotonicNow();
   const ownerPath = purgeOwnerPath(lockPath, ownerRecord.pathToken);
   for (;;) {
     const stagingPath = purgeLockStagingPath(lockPath, ownerRecord.pathToken);
@@ -470,7 +474,7 @@ export function requestVisionCachePurge(
     } catch (lockError) {
       if (!["ENOENT", "ENOTEMPTY"].includes(lockError?.code)) throw lockError;
     }
-    if (performance.now() - startedAt >= PURGE_LOCK_WAIT_MS) {
+    if (monotonicNow() - startedAt >= PURGE_LOCK_WAIT_MS) {
       const timeout = new Error("Timed out waiting to request a vision cache purge.");
       timeout.code = "vision_cache_purge_locked";
       throw timeout;

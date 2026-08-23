@@ -268,6 +268,49 @@ test("vision purge stress leaves no lock at default and bounded higher pressure"
   }
 });
 
+test("purge lock wait budget starts after owner identity preparation", () => {
+  const state = mkdtempSync(path.join(os.tmpdir(), "vision-purge-lock-budget-"));
+  const purgePath = path.join(state, "vision-cache-purge.json");
+  const lockPath = `${purgePath}.lock`;
+  let renameAttempts = 0;
+  let clock = 0;
+  const monotonicReadings = [];
+  try {
+    mkdirSync(lockPath);
+    const result = requestVisionCachePurge(purgePath, {
+      platform: "win32",
+      processIdentity() {
+        clock = 20_000;
+        return "identity-after-expensive-probe";
+      },
+      monotonicNow: () => {
+        monotonicReadings.push(clock);
+        return clock;
+      },
+      wait() {
+        rmSync(lockPath, { recursive: true, force: true });
+      },
+      fs: {
+        rename(stagingPath, targetPath) {
+          renameAttempts += 1;
+          if (renameAttempts === 1) {
+            const error = new Error("the lock is already held");
+            error.code = "EEXIST";
+            throw error;
+          }
+          renameSync(stagingPath, targetPath);
+        },
+      },
+    });
+    assert.equal(result.requested, true);
+    assert.equal(renameAttempts, 2, "identity preparation must not consume the entire lock wait budget");
+    assert.deepEqual(monotonicReadings, [20_000, 20_000], "the monotonic budget must begin after identity preparation");
+    assert.equal(existsSync(lockPath), false);
+  } finally {
+    rmSync(state, { recursive: true, force: true });
+  }
+});
+
 function transientFsError(code, message = `transient ${code}`) {
   const error = new Error(message);
   error.code = code;
