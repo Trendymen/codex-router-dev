@@ -76,7 +76,7 @@ function directForwarder(port, base, { env = {}, importFile } = {}) {
   return child;
 }
 
-function abortTracePreload({ accelerateDeadline = false } = {}) {
+function abortTracePreload({ accelerateDeadline = false, acceleratedDeadlineMs = 20 } = {}) {
   const directory = mkdtempSync(path.join(os.tmpdir(), "task4-abort-trace-"));
   const trace = path.join(directory, "trace.jsonl");
   const preload = path.join(directory, "preload.mjs");
@@ -105,7 +105,7 @@ ${accelerateDeadline ? `const nativeSetTimeout = globalThis.setTimeout;
 const nativeClearTimeout = globalThis.clearTimeout;
 const accelerated = new Set();
 globalThis.setTimeout = (fn, delay, ...args) => {
-  const handle = nativeSetTimeout(fn, delay === 30_001 ? 20 : delay, ...args);
+  const handle = nativeSetTimeout(fn, delay === 30_001 ? ${acceleratedDeadlineMs} : delay, ...args);
   if (delay === 30_001) accelerated.add(handle);
   return handle;
 };
@@ -668,7 +668,10 @@ test("forced validation clears its dispatch deadline before releasing 3 MiB to a
     response.writeHead(200, { "content-type": "text/event-stream" });
     response.end(raw);
   });
-  const trace = abortTracePreload({ accelerateDeadline: true });
+  // The 3 MiB body needs a load-tolerant synthetic deadline. Under the full
+  // 48-worker suite a 20 ms timer can fire before the event loop drains the
+  // body, which tests scheduler contention rather than deadline ownership.
+  const trace = abortTracePreload({ accelerateDeadline: true, acceleratedDeadlineMs: 1_000 });
   const port = await openPort(); const forwarder = directForwarder(port, `http://127.0.0.1:${upstream.port}/v1`, { importFile: trace.preload });
   try {
     await waitForwarder(port);
