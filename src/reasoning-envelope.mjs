@@ -10,6 +10,14 @@ export function reasoningItemId(responseId, outputIndex) {
   if (typeof responseId !== "string" || !responseId || !Number.isSafeInteger(outputIndex) || outputIndex < 0) throw new TypeError("reasoning identity is invalid");
   return `rsn_${createHash("sha256").update(`${responseId}:${outputIndex}`, "utf8").digest("base64url").slice(0, 24)}`;
 }
+export function reasoningOutputIndex(responseId, itemId, maxItems) {
+  if (typeof responseId !== "string" || !responseId || typeof itemId !== "string" || !itemId) return undefined;
+  if (!Number.isSafeInteger(maxItems) || maxItems <= 0) throw new TypeError("reasoning item limit is invalid");
+  for (let outputIndex = 0; outputIndex < maxItems; outputIndex += 1) {
+    if (reasoningItemId(responseId, outputIndex) === itemId) return outputIndex;
+  }
+  return undefined;
+}
 export function reasoningTextHash(summaryParts) {
   if (!Array.isArray(summaryParts) || summaryParts.some((part) => typeof part !== "string")) throw new TypeError("summaryParts must be strings");
   return hashBytes(jcsBytes(summaryParts));
@@ -44,7 +52,7 @@ function expectedMatches(payload, expected) {
   return { status: payload.textSha256 === expectedHash ? "valid" : "invalid" };
 }
 
-export function verifyReasoningEnvelope(value, expected, internalKey) {
+export function authenticateReasoningEnvelope(value, internalKey) {
   if (typeof value !== "string" || typeof internalKey !== "string" || !internalKey) return verdict("unknown", { code: "thinking_provenance_unknown" });
   if (!value.startsWith("cr.reasoning.")) return verdict("unknown", { code: "thinking_provenance_unknown" });
   if (!value.startsWith(PREFIX)) return verdict("invalid", { code: "thinking_signature_invalid" });
@@ -54,6 +62,15 @@ export function verifyReasoningEnvelope(value, expected, internalKey) {
   try { bytes = Buffer.from(encoded[0], "base64url"); if (bytes.toString("base64url") !== encoded[0]) return verdict("invalid", { code: "thinking_signature_invalid" }); const payload = JSON.parse(bytes.toString("utf8")); payloadShape(payload); if (!jcsBytes(payload).equals(bytes)) return verdict("invalid", { code: "thinking_signature_invalid" }); const provided = Buffer.from(encoded[1], "base64url"); if (provided.toString("base64url") !== encoded[1] || provided.length !== 32) return verdict("invalid", { code: "thinking_signature_invalid" });
     const actual = createHmac("sha256", internalKey).update(DOMAIN).update(bytes).digest();
     if (!timingSafeEqual(actual, provided)) return verdict("invalid", { code: "thinking_signature_invalid" });
+    return verdict("valid", { payload });
+  } catch { return verdict("invalid", { code: "thinking_signature_invalid" }); }
+}
+
+export function verifyReasoningEnvelope(value, expected, internalKey) {
+  const authenticated = authenticateReasoningEnvelope(value, internalKey);
+  if (authenticated.status !== "valid") return authenticated;
+  try {
+    const { payload } = authenticated;
     const match = expectedMatches(payload, expected);
     if (match.status === "unknown") return verdict("unknown", { code: "thinking_provenance_unknown" });
     if (match.status === "foreign") return verdict("foreign", { code: "thinking_provenance_foreign", payload });

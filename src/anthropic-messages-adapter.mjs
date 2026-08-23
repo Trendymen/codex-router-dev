@@ -1,7 +1,7 @@
 import { Transform } from "node:stream";
 import { createHash } from "node:crypto";
 import { providerEndpoint } from "./provider-endpoint.mjs";
-import { reasoningItemId, sealReasoningEnvelope, verifyReasoningEnvelope, reasoningTextHash } from "./reasoning-envelope.mjs";
+import { authenticateReasoningEnvelope, reasoningItemId, reasoningOutputIndex, sealReasoningEnvelope, reasoningTextHash } from "./reasoning-envelope.mjs";
 import { encodeToolDialect, restoreToolEvent } from "./tool-dialect.mjs";
 import { ERROR_DEFINITIONS, failedResponseEvent, formatTerminalFrames, incompleteResponseEvent, routerError } from "./public-error.mjs";
 
@@ -31,17 +31,7 @@ function imageBlock(value) {
   return { type: "image", source: { type: "base64", media_type: match[1], data: match[2] } };
 }
 
-function provenanceEntry(requestContext, blockId) {
-  const source = requestContext?.provenance ?? requestContext?.provenanceMap;
-  if (!source) return undefined;
-  let entry;
-  try { entry = typeof source === "function" ? source(blockId) : source instanceof Map ? source.get(blockId) : source[blockId]; }
-  catch { fail("thinking_provenance_unknown"); }
-  if (!entry || typeof entry !== "object") fail("thinking_provenance_unknown");
-  return entry;
-}
-
-function thinkingFromHistory(block, model, internalKey, requestContext) {
+function thinkingFromHistory(block, model, internalKey) {
   if (!internalKey) fail("thinking_provenance_unknown");
   if (!block || typeof block.id !== "string" || !block.id) {
     if (typeof block?.encrypted_content === "string" && block.encrypted_content.startsWith("cr.reasoning.")) fail("thinking_signature_invalid");
@@ -51,18 +41,14 @@ function thinkingFromHistory(block, model, internalKey, requestContext) {
   const parts = Array.isArray(block.summary)
     ? block.summary.map((part) => typeof part === "string" ? part : part?.text).filter((part) => typeof part === "string")
     : typeof block.text === "string" ? [block.text] : [];
-  const entry = provenanceEntry(requestContext, block.id);
-  const responseId = entry?.responseId ?? requestContext?.responseId;
-  if (typeof responseId !== "string" || !responseId) fail("thinking_provenance_unknown");
-  if (entry && Number.isSafeInteger(entry.outputIndex) && block.id !== reasoningItemId(responseId, entry.outputIndex)) fail("thinking_signature_invalid");
-  const verdict = verifyReasoningEnvelope(block.encrypted_content, {
-    provider: model.provider, model: model.upstreamModel, transport: "anthropic-messages",
-    responseId, itemId: block.id, summaryParts: parts,
-  }, internalKey);
-  if (verdict.status === "foreign") return undefined;
-  if (verdict.status !== "valid") fail(verdict.code || "thinking_provenance_unknown");
-  if (!parts.length || typeof verdict.payload.signature !== "string" || !verdict.payload.signature) fail("thinking_signature_missing");
-  return { type: "thinking", thinking: parts.join(""), signature: verdict.payload.signature };
+  const authenticated = authenticateReasoningEnvelope(block.encrypted_content, internalKey);
+  if (authenticated.status !== "valid") fail(authenticated.code || "thinking_provenance_unknown");
+  const signed = authenticated.payload;
+  if (signed.provider !== model.provider || signed.model !== model.upstreamModel || signed.transport !== "anthropic-messages") return undefined;
+  const outputIndex = reasoningOutputIndex(signed.responseId, signed.itemId, MAX_ITEMS);
+  if (signed.itemId !== block.id || outputIndex === undefined || signed.textSha256 !== reasoningTextHash(parts)) fail("thinking_signature_invalid");
+  if (!parts.length || typeof signed.signature !== "string" || !signed.signature) fail("thinking_signature_missing");
+  return { type: "thinking", thinking: parts.join(""), signature: signed.signature };
 }
 
 function parseObject(value) {
@@ -72,30 +58,30 @@ function parseObject(value) {
   catch (error) { if (error instanceof AnthropicMessagesAdapterError) throw error; fail("invalid_tool_arguments"); }
 }
 
-function inputContent(content, model, internalKey, requestContext) {
+function inputContent(content, model, internalKey) {
   if (typeof content === "string") return [{ type: "text", text: content }];
   if (!Array.isArray(content)) fail("provider_request_malformed");
   return content.map((block) => {
     if (!block || typeof block !== "object") fail("provider_request_malformed");
     if (["input_text", "output_text", "text"].includes(block.type)) return { type: "text", text: String(block.text ?? "") };
     if (block.type === "input_image") return imageBlock(block);
-    if (block.type === "reasoning") return thinkingFromHistory(block, model, internalKey, requestContext);
+    if (block.type === "reasoning") return thinkingFromHistory(block, model, internalKey);
     if (block.type === "function_call") return { type: "tool_use", id: block.call_id ?? block.id, name: block.name, input: parseObject(block.arguments) };
     if (block.type === "function_call_output") return { type: "tool_result", tool_use_id: block.call_id ?? block.id, content: typeof block.output === "string" ? block.output : JSON.stringify(block.output) };
     fail("unsupported_anthropic_block");
   }).filter(Boolean);
 }
 
-function messagesFromInput(input, model, internalKey, requestContext) {
+function messagesFromInput(input, model, internalKey) {
   if (typeof input === "string") input = [{ role: "user", content: input }];
   if (!Array.isArray(input)) fail("provider_request_malformed");
   const out = [];
   for (const item of input) {
     if (!item || typeof item !== "object") fail("provider_request_malformed");
-    if (["function_call", "custom_tool_call"].includes(item.type)) { out.push({ role: "assistant", content: inputContent([item], model, internalKey, requestContext) }); continue; }
-    if (["function_call_output", "custom_tool_call_output"].includes(item.type)) { out.push({ role: "user", content: inputContent([item], model, internalKey, requestContext) }); continue; }
+    if (["reasoning", "function_call", "custom_tool_call"].includes(item.type)) { out.push({ role: "assistant", content: inputContent([item], model, internalKey) }); continue; }
+    if (["function_call_output", "custom_tool_call_output"].includes(item.type)) { out.push({ role: "user", content: inputContent([item], model, internalKey) }); continue; }
     if (!["user", "assistant", "tool"].includes(item.role)) fail("provider_request_malformed");
-    out.push({ role: item.role === "tool" ? "user" : item.role, content: inputContent(item.content ?? item.output ?? "", model, internalKey, requestContext) });
+    out.push({ role: item.role === "tool" ? "user" : item.role, content: inputContent(item.content ?? item.output ?? "", model, internalKey) });
   }
   return out;
 }
@@ -127,7 +113,7 @@ export function buildAnthropicMessagesRequest({ model, payload, credential, inte
     ? source.instructions.map((block) => typeof block === "string" ? { type: "text", text: block } : block?.type === "input_text" ? { type: "text", text: String(block.text ?? "") } : block)
     : [{ type: "text", text: String(source.instructions) }];
   const input = toolBuild.input ?? normalizedInput ?? [];
-  const json = { model: model.upstreamModel, messages: messagesFromInput(input, model, internalKey, requestContext), max_tokens: maxTokens, stream: true };
+  const json = { model: model.upstreamModel, messages: messagesFromInput(input, model, internalKey), max_tokens: maxTokens, stream: true };
   if (system?.length) json.system = system;
   if (reasoning.enabled) json.thinking = { type: "enabled", budget_tokens: reasoning.budget };
   const tools = source.tool_choice === "none" ? undefined : toolBuild.tools?.map((tool) => ({ name: tool.name, description: tool.description ?? "", input_schema: plainJson(tool.parameters ?? { type: "object", properties: {} }), ...(tool.strict === true ? { strict: true } : {}) }));

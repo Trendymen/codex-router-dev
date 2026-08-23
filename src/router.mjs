@@ -131,6 +131,8 @@ import {
   readDispatchBody,
   parseRetryAfter,
 } from "./provider-dispatch.mjs";
+import { proofMatchesModel } from "./model-contract.mjs";
+import { readProtocolProof } from "./protocol-proof.mjs";
 import { resolveProviderCredential } from "./provider-credentials.mjs";
 import { createForcedDispatchDeadline } from "./forced-dispatch-deadline.mjs";
 import { createForcedToolBuffer } from "./tool-dialect.mjs";
@@ -2315,6 +2317,37 @@ function readResolvedNodeRoute(slug) {
   }
 }
 
+const NODE_ROUTE_BINDING_FIELDS = Object.freeze([
+  "slug",
+  "provider",
+  "upstreamModel",
+  "effectiveTransport",
+  "toolDialect",
+  "requestProfile",
+  "reasoningDisplayMode",
+  "purpose",
+]);
+
+function resolvedNodeRouteMatchesRegistered(resolved, registered) {
+  return Boolean(
+    resolved &&
+    registered &&
+    NODE_ROUTE_BINDING_FIELDS.every((field) => resolved[field] === registered[field]),
+  );
+}
+
+function nodeRouteAuthorizationError(registered, resolved) {
+  if (registered?.rolloutState !== "experimental") return undefined;
+  if (!resolvedNodeRouteMatchesRegistered(resolved, registered)) return "model_not_enabled";
+  const proof = readProtocolProof(registered.slug);
+  const measuredShape = proof?.measuredFinalReasoningShape ?? proof?.finalReasoningShape;
+  return proofMatchesModel(proof, registered) &&
+    proofMatchesModel(proof, resolved) &&
+    resolved.effectiveFinalReasoningShape === measuredShape
+    ? undefined
+    : "model_not_enabled";
+}
+
 // A resolved node-routes snapshot selects the direct path by default. A
 // registered third-party slug without that protected resolution must fail
 // closed instead of falling through to the legacy gateway. `=0` remains the
@@ -2601,7 +2634,9 @@ async function handleResponses(request, response, requestUrl) {
     route = registeredRoute && readProviderSelection().includes(registeredRoute.provider)
       ? registeredRoute
       : undefined;
+    const registeredNodeRoute = route;
     const resolvedNodeRoute = route && readResolvedNodeRoute(route.slug);
+    const nodeAuthorizationError = nodeRouteAuthorizationError(registeredNodeRoute, resolvedNodeRoute);
     if (resolvedNodeRoute) route = resolvedNodeRoute;
     if (registeredRoute && !route) {
       writeJson(response, 409, {
@@ -2644,6 +2679,21 @@ async function handleResponses(request, response, requestUrl) {
         controller.abort();
       }
     });
+
+    if (route && nodeAuthorizationError) {
+      const safe = routerError(nodeAuthorizationError);
+      writeJson(response, safe.status, safe.body);
+      recordUsageEvent({
+        model: route.slug,
+        provider: canonicalProviderId(route.provider),
+        status: safe.status,
+        durationMs: Date.now() - startedAt,
+      });
+      finalStatus = safe.status;
+      activityStatus = safe.status;
+      usageRecorded = true;
+      return;
+    }
 
     if (route && !resolvedNodeRoute && process.env.CODEX_ROUTER_DIRECT_DISPATCH !== "0") {
       const safe = routerError("provider_not_available_in_node_build");

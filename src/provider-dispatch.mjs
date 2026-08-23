@@ -16,6 +16,7 @@ import { flattenNamespaceTools } from "./namespace-relay.mjs";
 import { collaborationToolAvailable } from "./subagent-completion.mjs";
 
 const PROTOCOL_PROBE_BYPASS = Symbol("protocol-probe-bypass");
+const RAW_RESPONSE_ADAPTER_MODE = Symbol("raw-response-adapter-mode");
 
 // Appendix D is intentionally independent of the native ChatGPT retry knobs.
 // A routed request is cheap only until its first response byte is committed;
@@ -359,11 +360,15 @@ export async function dispatchRoutedRequest(built, options = {}) {
       throw new Error("routed provider returned no response");
     }
     if (upstream.ok || (upstream.status >= 200 && upstream.status < 300)) {
-      const adapter = adapterFor(currentBuilt, upstream, { ...options, signal });
+      // Only this module can select the raw diagnostic mode. In particular,
+      // do not instantiate an adapter and then ignore it: Messages adapters
+      // own AbortSignal listeners and must have a real pipeline lifecycle.
+      const rawResponse = options.adapterMode === RAW_RESPONSE_ADAPTER_MODE;
+      const adapter = rawResponse ? undefined : adapterFor(currentBuilt, upstream, { ...options, signal });
       return Object.freeze({
         response: upstream,
         adapter,
-        transforms: adapter.transforms,
+        transforms: adapter?.transforms || [],
         model: currentModel,
         built: currentBuilt,
         retries,
@@ -657,6 +662,7 @@ async function rawProbeRequest(model, payload, runtime) {
     signal: runtime.signal,
     retries: 0,
     failoverCandidates: [],
+    adapterMode: RAW_RESPONSE_ADAPTER_MODE,
   }));
   const contentType = result.response.headers.get("content-type") || "application/json";
   const raw = await readRawProbeBody(result.response, runtime.resources);

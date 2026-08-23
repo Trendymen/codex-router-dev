@@ -215,14 +215,16 @@ test("maps all reasoning budgets and exact output boundaries", () => {
 
 test("accepts a valid current thinking continuation, omits foreign, and rejects unknown provenance", () => {
   const summary = ["previous thought"];
-  const envelope = sealReasoningEnvelope({ v: 1, provider: MODEL.provider, model: MODEL.upstreamModel, transport: "anthropic-messages", responseId: "msg_old", itemId: "rsn_old", textSha256: reasoningTextHash(summary), signature: "sig" }, KEY);
-  const valid = buildAnthropicMessagesRequest({ model: MODEL, payload: payload({ input: [{ role: "assistant", content: [{ type: "reasoning", id: "rsn_old", summary: [{ type: "summary_text", text: summary[0] }], encrypted_content: envelope }] }] }), credential: "k", internalKey: KEY, requestContext: { responseId: "msg_old" } });
+  const responseId = "msg_old";
+  const itemId = reasoningItemId(responseId, 0);
+  const envelope = sealReasoningEnvelope({ v: 1, provider: MODEL.provider, model: MODEL.upstreamModel, transport: "anthropic-messages", responseId, itemId, textSha256: reasoningTextHash(summary), signature: "sig" }, KEY);
+  const valid = buildAnthropicMessagesRequest({ model: MODEL, payload: payload({ input: [{ role: "assistant", content: [{ type: "reasoning", id: itemId, summary: [{ type: "summary_text", text: summary[0] }], encrypted_content: envelope }] }] }), credential: "k", internalKey: KEY });
   assert.deepEqual(valid.json.messages[0].content[0], { type: "thinking", thinking: summary[0], signature: "sig" });
-  const foreign = sealReasoningEnvelope({ v: 1, provider: "other", model: MODEL.upstreamModel, transport: "anthropic-messages", responseId: "msg_old", itemId: "rsn_old", textSha256: reasoningTextHash(summary), signature: "sig" }, KEY);
-  const omitted = buildAnthropicMessagesRequest({ model: MODEL, payload: payload({ input: [{ role: "assistant", content: [{ type: "reasoning", id: "rsn_old", summary, encrypted_content: foreign }] }] }), credential: "k", internalKey: KEY, requestContext: { responseId: "msg_old" } });
+  const foreign = sealReasoningEnvelope({ v: 1, provider: "other", model: MODEL.upstreamModel, transport: "anthropic-messages", responseId, itemId, textSha256: reasoningTextHash(summary), signature: "sig" }, KEY);
+  const omitted = buildAnthropicMessagesRequest({ model: MODEL, payload: payload({ input: [{ role: "assistant", content: [{ type: "reasoning", id: itemId, summary, encrypted_content: foreign }] }] }), credential: "k", internalKey: KEY });
   assert.deepEqual(omitted.json.messages[0].content, []);
-  const missingSignature = sealReasoningEnvelope({ v: 1, provider: MODEL.provider, model: MODEL.upstreamModel, transport: "anthropic-messages", responseId: "msg_old", itemId: "rsn_old", textSha256: reasoningTextHash(summary), signature: null }, KEY);
-  assert.throws(() => buildAnthropicMessagesRequest({ model: MODEL, payload: payload({ input: [{ role: "assistant", content: [{ type: "reasoning", id: "rsn_old", summary, encrypted_content: missingSignature }] }] }), credential: "k", internalKey: KEY, requestContext: { responseId: "msg_old" } }), /thinking_signature_missing/);
+  const missingSignature = sealReasoningEnvelope({ v: 1, provider: MODEL.provider, model: MODEL.upstreamModel, transport: "anthropic-messages", responseId, itemId, textSha256: reasoningTextHash(summary), signature: null }, KEY);
+  assert.throws(() => buildAnthropicMessagesRequest({ model: MODEL, payload: payload({ input: [{ role: "assistant", content: [{ type: "reasoning", id: itemId, summary, encrypted_content: missingSignature }] }] }), credential: "k", internalKey: KEY }), /thinking_signature_missing/);
   assert.throws(() => buildAnthropicMessagesRequest({ model: MODEL, payload: payload({ input: [{ role: "assistant", content: [{ type: "reasoning", summary }] }] }), credential: "k", internalKey: KEY }), /thinking_provenance_unknown/);
   assert.throws(() => buildAnthropicMessagesRequest({ model: MODEL, payload: payload({ input: [{ role: "assistant", content: [{ type: "reasoning", summary, encrypted_content: "cr.reasoning.v2.bad.bad" }] }] }), credential: "k", internalKey: KEY }), /thinking_signature_invalid/);
 });
@@ -450,9 +452,10 @@ test("binds continuation identity to trusted provenance instead of caller respon
   const responseId = "trusted_response";
   const itemId = reasoningItemId(responseId, 3);
   const envelope = sealReasoningEnvelope({ v: 1, provider: MODEL.provider, model: MODEL.upstreamModel, transport: "anthropic-messages", responseId, itemId, textSha256: reasoningTextHash(summary), signature: "sig" }, KEY);
-  const base = { role: "assistant", content: [{ type: "reasoning", id: itemId, summary, encrypted_content: envelope }] };
-  assert.doesNotThrow(() => buildAnthropicMessagesRequest({ model: MODEL, payload: payload({ response_id: "caller_forged", input: [base] }), credential: "k", internalKey: KEY, requestContext: { provenance: { [itemId]: { responseId, outputIndex: 3 } } } }));
-  assert.throws(() => buildAnthropicMessagesRequest({ model: MODEL, payload: payload({ input: [{ ...base, content: [{ ...base.content[0], id: reasoningItemId(responseId, 4) }] }] }), credential: "k", internalKey: KEY, requestContext: { provenance: { [reasoningItemId(responseId, 4)]: { responseId, outputIndex: 4 } } } }), /thinking_signature_invalid/);
+  const base = { type: "reasoning", id: itemId, summary, encrypted_content: envelope };
+  const built = buildAnthropicMessagesRequest({ model: MODEL, payload: payload({ response_id: "caller_forged", input: [base] }), credential: "k", internalKey: KEY });
+  assert.deepEqual(built.json.messages[0], { role: "assistant", content: [{ type: "thinking", thinking: summary[0], signature: "sig" }] });
+  assert.throws(() => buildAnthropicMessagesRequest({ model: MODEL, payload: payload({ input: [{ ...base, id: reasoningItemId(responseId, 4) }] }), credential: "k", internalKey: KEY }), /thinking_signature_invalid/);
 });
 
 test("GLM Messages preserves strict schemas and nests parallel choice control", () => {
@@ -619,10 +622,10 @@ test("continuation provenance crosses every bound field and distinguishes foreig
   const responseId = "msg_bound";
   const itemId = reasoningItemId(responseId, 2);
   const basePayload = { v: 1, provider: MODEL.provider, model: MODEL.upstreamModel, transport: "anthropic-messages", responseId, itemId, textSha256: reasoningTextHash(summary), signature: "sig" };
-  const build = (encrypted_content, block = {}, provenance = { [itemId]: { responseId, outputIndex: 2 } }, model = MODEL) => buildAnthropicMessagesRequest({
+  const build = (encrypted_content, block = {}, model = MODEL) => buildAnthropicMessagesRequest({
     model,
     payload: payload({ input: [{ role: "assistant", content: [{ type: "reasoning", id: itemId, summary, encrypted_content, ...block }] }] }),
-    credential: "k", internalKey: KEY, requestContext: { provenance },
+    credential: "k", internalKey: KEY,
   });
   assert.deepEqual(build(sealReasoningEnvelope(basePayload, KEY)).json.messages[0].content, [{ type: "thinking", thinking: summary[0], signature: "sig" }]);
   for (const mutation of [

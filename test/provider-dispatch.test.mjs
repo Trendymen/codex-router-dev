@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -276,6 +277,35 @@ test("protocol proof shared deadline cancels a stalled raw body exactly once", {
   assert.equal(cancels, 1);
   assert.match(JSON.stringify(evidence), /protocol_probe_timeout/);
   assert.doesNotMatch(JSON.stringify(evidence), /BODY_SECRET_MUST_NOT_LEAK/);
+});
+
+test("raw Anthropic proof survives a later shared-deadline body stall without adapter leaks", { timeout: 5_000 }, async () => {
+  const child = spawn(process.execPath, [path.join(process.cwd(), "test", "fixtures", "protocol-proof-anthropic-abort-child.mjs")], {
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      MODEL_ROUTER_STATE_DIR: path.join(scratch, "raw-anthropic-child-state"),
+      CODEX_HOME: path.join(scratch, "raw-anthropic-child-codex-home"),
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => { stdout += chunk; });
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  const exit = await new Promise((resolve) => child.once("exit", (code, signal) => resolve({ code, signal })));
+  assert.deepEqual(exit, { code: 0, signal: null }, stderr);
+  const result = JSON.parse(stdout.trim());
+  assert.deepEqual(result, {
+    survived: true,
+    verdict: "failed",
+    cancels: 1,
+    fetches: 2,
+    errorCode: "protocol_probe_timeout",
+  });
+  assert.doesNotMatch(stderr, /Unhandled|uncaught|AnthropicMessagesAdapterError|request_aborted/i);
 });
 
 for (const failed of ["nonstream", "stream-reasoning", "auto-tool", "continuation", "usage"]) {

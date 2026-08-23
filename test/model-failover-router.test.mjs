@@ -690,6 +690,197 @@ test("default direct router covers summary/raw/compaction, exact Retry-After, tr
   }
 });
 
+test("experimental authorization is proof-gated before the direct-dispatch transport switch", async () => {
+  const seen = [];
+  const gw = await gateway(async (request, response) => {
+    const body = await bodyJson(request);
+    seen.push({ url: request.url, body });
+    response.writeHead(200, { "Content-Type": "application/json" });
+    response.end(JSON.stringify({
+      id: "authorized-canary",
+      output_text: "AUTHORIZED_CANARY_OK",
+      output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "AUTHORIZED_CANARY_OK" }] }],
+      usage: { input_tokens: 2, output_tokens: 1, total_tokens: 3 },
+    }));
+  });
+  const canary = MODEL_BY_SLUG.get("qwen-plan/qwen3.7-max");
+  const resolved = { ...canary, effectiveFinalReasoningShape: "hybrid-summary", routable: true, visible: true };
+  const validProof = {
+    slug: canary.slug,
+    provider: canary.provider,
+    upstreamModel: canary.upstreamModel,
+    transport: canary.effectiveTransport,
+    toolDialect: canary.toolDialect,
+    requestProfile: canary.requestProfile,
+    verdict: "passing",
+    verifierVersion: PROTOCOL_PROOF_VERIFIER_VERSION,
+    fingerprint: registryFingerprint(canary, PROTOCOL_PROOF_VERIFIER_VERSION),
+    measuredFinalReasoningShape: "hybrid-summary",
+    verifiedAt: "2026-08-23T00:00:00.000Z",
+  };
+  const mismatchedProof = { ...validProof, transport: "anthropic-messages" };
+
+  const exercise = async ({ name, legacyKillSwitch, nodeRoutes, protocolProofs, expectedStatus, expectedPath }) => {
+    const before = seen.length;
+    const routerPort = await openPort();
+    const child = run({
+      ...routerEnv(gw.port, routerPort, { legacyKillSwitch }),
+      QWEN_PLAN_BASE_URL: `http://127.0.0.1:${gw.port}/qwen`,
+      QWEN_PLAN_API_KEY: "direct-qwen-key",
+    }, { chain: [], nodeRoutes, protocolProofs });
+    try {
+      await waitFor(`http://127.0.0.1:${routerPort}/health`, child);
+      for (const [suffix, input] of [
+        ["/responses", "authorization ordinary"],
+        ["/responses/compact", [{ type: "message", role: "user", content: [{ type: "input_text", text: "authorization compact" }] }]],
+      ]) {
+        const result = await readRouted(routerPort, { model: canary.slug, stream: false, input }, suffix);
+        assert.equal(result.status, expectedStatus, `${name} ${suffix}: ${result.body}`);
+        if (expectedStatus === 404) assert.equal(JSON.parse(result.body).error.code, "model_not_enabled", `${name} ${suffix}`);
+      }
+      const requests = seen.slice(before);
+      if (expectedPath === undefined) assert.deepEqual(requests, [], `${name} contacted an upstream`);
+      else assert.deepEqual(requests.map((entry) => entry.url), [expectedPath, expectedPath], name);
+    } finally {
+      await stopChild(child);
+    }
+  };
+
+  try {
+    await exercise({
+      name: "kill switch with no resolved route or proof",
+      legacyKillSwitch: true,
+      nodeRoutes: [],
+      expectedStatus: 404,
+    });
+    await exercise({
+      name: "kill switch with stale route and mismatched proof",
+      legacyKillSwitch: true,
+      nodeRoutes: [resolved],
+      protocolProofs: { [canary.slug]: mismatchedProof },
+      expectedStatus: 404,
+    });
+    await exercise({
+      name: "default transport with stale route and mismatched proof",
+      legacyKillSwitch: false,
+      nodeRoutes: [resolved],
+      protocolProofs: { [canary.slug]: mismatchedProof },
+      expectedStatus: 404,
+    });
+    await exercise({
+      name: "default transport with an authorized route",
+      legacyKillSwitch: false,
+      nodeRoutes: [resolved],
+      protocolProofs: { [canary.slug]: validProof },
+      expectedStatus: 200,
+      expectedPath: "/qwen/responses",
+    });
+    await exercise({
+      name: "kill switch with an authorized route",
+      legacyKillSwitch: true,
+      nodeRoutes: [resolved],
+      protocolProofs: { [canary.slug]: validProof },
+      expectedStatus: 200,
+      expectedPath: "/v1/responses",
+    });
+  } finally {
+    await closeServer(gw.server);
+  }
+});
+
+test("ordinary direct GLM continuation derives trusted provenance from its first-turn envelope", async () => {
+  const requests = [];
+  let continuationAttempts = 0;
+  const messagesSse = (id, content) => {
+    const events = [{ type: "message_start", message: { id, model: "glm-5.2", usage: { input_tokens: 4 } } }];
+    for (const [index, block] of content.entries()) {
+      events.push({ type: "content_block_start", index, content_block: { type: block.type, ...(block.type === "tool_use" ? { id: block.id, name: block.name, input: block.input } : {}) } });
+      if (block.type === "thinking") {
+        events.push({ type: "content_block_delta", index, delta: { type: "thinking_delta", thinking: block.thinking } });
+        events.push({ type: "content_block_delta", index, delta: { type: "signature_delta", signature: block.signature } });
+      } else if (block.type === "text") {
+        events.push({ type: "content_block_delta", index, delta: { type: "text_delta", text: block.text } });
+      }
+      events.push({ type: "content_block_stop", index });
+    }
+    events.push({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 3 } });
+    events.push({ type: "message_stop" });
+    return `${events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("")}data: [DONE]\n\n`;
+  };
+  const gw = await gateway(async (request, response) => {
+    const body = await bodyJson(request);
+    requests.push({ url: request.url, body });
+    assert.equal(request.url, "/qwen/messages");
+    const text = JSON.stringify(body.messages);
+    if (text.includes("GLM_FIRST_TURN")) {
+      response.writeHead(200, { "Content-Type": "text/event-stream" });
+      response.end(messagesSse("msg_glm_first", [
+        { type: "thinking", thinking: "trusted private thought", signature: "provider-signature" },
+        { type: "text", text: "FIRST_OK" },
+      ]));
+      return;
+    }
+    const thinking = body.messages.flatMap((message) => message.content || []).find((block) => block.type === "thinking");
+    assert.deepEqual(thinking, { type: "thinking", thinking: "trusted private thought", signature: "provider-signature" });
+    if (text.includes("CONTEXT CHECKPOINT COMPACTION")) {
+      response.writeHead(200, { "Content-Type": "text/event-stream" });
+      response.end(messagesSse("msg_glm_compact", [{ type: "text", text: "GLM_COMPACT_OK" }]));
+      return;
+    }
+    if (text.includes("GLM_CONTINUE_TURN")) {
+      continuationAttempts += 1;
+      if (continuationAttempts === 1) {
+        response.writeHead(503, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ error: { type: "overloaded_error" } }));
+        return;
+      }
+      response.writeHead(200, { "Content-Type": "text/event-stream" });
+      response.end(messagesSse("msg_glm_second", [{ type: "text", text: "SECOND_OK" }]));
+      return;
+    }
+    assert.fail(`unexpected GLM request: ${text}`);
+  });
+  const glm = MODEL_BY_SLUG.get("qwen-plan/glm-5.2");
+  const resolved = { ...glm, effectiveFinalReasoningShape: "anthropic-thinking", routable: true, visible: true };
+  const routerPort = await openPort();
+  const child = run({
+    ...routerEnv(gw.port, routerPort, { legacyKillSwitch: false }),
+    QWEN_PLAN_BASE_URL: `http://127.0.0.1:${gw.port}/qwen`,
+    QWEN_PLAN_API_KEY: "direct-qwen-key",
+  }, { chain: [], nodeRoutes: [resolved] });
+  const responseEvents = (body) => body.split(/\r\n\r\n|\n\n|\r\r/).flatMap((block) => {
+    const data = block.split(/\r\n|\n|\r/).filter((line) => line.startsWith("data:")).map((line) => line.slice(5).trim()).join("\n");
+    if (!data || data === "[DONE]") return [];
+    return [JSON.parse(data)];
+  });
+  try {
+    await waitFor(`http://127.0.0.1:${routerPort}/health`, child);
+    const first = await readRouted(routerPort, { model: glm.slug, stream: true, input: "GLM_FIRST_TURN" });
+    assert.equal(first.status, 200, first.body);
+    const completed = responseEvents(first.body).find((event) => event.type === "response.completed");
+    const reasoning = completed?.response?.output?.find((item) => item.type === "reasoning");
+    assert.ok(reasoning, first.body);
+    assert.match(reasoning.encrypted_content, /^cr\.reasoning\.v1\./);
+
+    const continuationInput = [
+      reasoning,
+      { role: "user", content: [{ type: "input_text", text: "GLM_CONTINUE_TURN" }] },
+    ];
+    const second = await readRouted(routerPort, { model: glm.slug, stream: true, input: continuationInput });
+    assert.equal(second.status, 200, second.body);
+    assert.match(second.body, /SECOND_OK/);
+    assert.equal(continuationAttempts, 2, "the signed continuation was not preserved across retry");
+
+    const compact = await readRouted(routerPort, { model: glm.slug, stream: false, input: continuationInput }, "/responses/compact");
+    assert.equal(compact.status, 200, compact.body);
+    assert.match(compact.body, /GLM_COMPACT_OK/);
+    assert.equal(requests.length, 4);
+  } finally {
+    await stopChild(child);
+    await closeServer(gw.server);
+  }
+});
+
 test("an operator who turned failover off keeps the plain error", async () => {
   const seen = [];
   const gw = await gateway(async (request, response) => {
