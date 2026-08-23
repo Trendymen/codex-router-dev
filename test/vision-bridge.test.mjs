@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { spawn, spawnSync } from "node:child_process";
 import os from "node:os";
@@ -188,9 +188,16 @@ test("purge generations stay atomic and monotonic across same-ms concurrent chil
     const rolledBack = await requestPurgeFromChild(purgePath, 1000);
     assert.equal(rolledBack.generation, 9001);
 
-    const sameMillisecond = await Promise.all(
+    const sameMillisecondResults = await Promise.allSettled(
       Array.from({ length: 8 }, () => requestPurgeFromChild(purgePath, 1000)),
     );
+    const firstFailure = sameMillisecondResults.find((result) => result.status === "rejected");
+    assert.equal(
+      firstFailure,
+      undefined,
+      firstFailure ? `vision purge child failed: ${firstFailure.reason?.stack || firstFailure.reason}` : undefined,
+    );
+    const sameMillisecond = sameMillisecondResults.map((result) => result.value);
     const generations = sameMillisecond.map(({ generation }) => generation).sort((a, b) => a - b);
     assert.deepEqual(generations, [9002, 9003, 9004, 9005, 9006, 9007, 9008, 9009]);
     assert.deepEqual(JSON.parse(readFileSync(purgePath, "utf8")), { version: 1, generation: 9009 });
@@ -205,6 +212,176 @@ test("purge generations stay atomic and monotonic across same-ms concurrent chil
       0,
       "purge ownership leaked an fs watcher",
     );
+  } finally {
+    rmSync(state, { recursive: true, force: true });
+  }
+});
+
+test("vision purge stress leaves no lock at default and bounded higher pressure", async () => {
+  for (const concurrency of [8, 24]) {
+    const state = mkdtempSync(path.join(os.tmpdir(), `vision-purge-stress-${concurrency}-`));
+    const purgePath = path.join(state, "vision-cache-purge.json");
+    try {
+      const results = await Promise.allSettled(
+        Array.from({ length: concurrency }, () => requestPurgeFromChild(purgePath, 1000)),
+      );
+      const firstFailure = results.find((result) => result.status === "rejected");
+      assert.equal(
+        firstFailure,
+        undefined,
+        firstFailure ? `vision purge stress failed (${concurrency}): ${firstFailure.reason?.stack || firstFailure.reason}` : undefined,
+      );
+      assert.equal(existsSync(`${purgePath}.lock`), false, `lock left after ${concurrency} purge requests`);
+      assert.ok(JSON.parse(readFileSync(purgePath, "utf8")).generation > 0);
+    } finally {
+      // The finally block is deliberately after allSettled above: removing a
+      // live Windows temp tree is the race this test is meant to expose.
+      rmSync(state, { recursive: true, force: true });
+    }
+  }
+});
+
+test("purge lock release retries transient Windows errors without releasing twice", () => {
+  const state = mkdtempSync(path.join(os.tmpdir(), "vision-purge-release-"));
+  const purgePath = path.join(state, "vision-cache-purge.json");
+  const first = new Error("sharing violation while releasing the vision purge lock");
+  first.code = "EPERM";
+  const second = new Error("busy vision purge lock");
+  second.code = "EBUSY";
+  let attempts = 0;
+  const waits = [];
+  try {
+    const result = requestVisionCachePurge(purgePath, {
+      platform: "win32",
+      wait(milliseconds) {
+        waits.push(milliseconds);
+      },
+      fs: {
+        removeDirectory(target) {
+          assert.equal(target, `${purgePath}.lock`);
+          attempts += 1;
+          if (attempts === 1) throw first;
+          if (attempts === 2) throw second;
+        },
+      },
+    });
+    assert.equal(result.requested, true);
+    assert.equal(attempts, 3, "the lock was released more than once");
+    assert.deepEqual(waits, [10, 20]);
+  } finally {
+    rmSync(state, { recursive: true, force: true });
+  }
+});
+
+test("purge lock release preserves the first transient error after its bounded retries", () => {
+  const state = mkdtempSync(path.join(os.tmpdir(), "vision-purge-release-failure-"));
+  const purgePath = path.join(state, "vision-cache-purge.json");
+  const first = new Error("named EPERM from the lock owner");
+  first.code = "EPERM";
+  const second = new Error("named EBUSY from the lock owner");
+  second.code = "EBUSY";
+  let attempts = 0;
+  const waits = [];
+  try {
+    assert.throws(
+      () => requestVisionCachePurge(purgePath, {
+        platform: "win32",
+        wait(milliseconds) {
+          waits.push(milliseconds);
+        },
+        fs: {
+          removeDirectory() {
+            attempts += 1;
+            throw attempts === 1 ? first : second;
+          },
+        },
+      }),
+      (error) => error === first,
+    );
+    assert.equal(attempts, 4);
+    assert.deepEqual(waits, [10, 20, 40]);
+  } finally {
+    rmSync(state, { recursive: true, force: true });
+  }
+});
+
+test("purge lock release treats an already removed lock as success", () => {
+  const state = mkdtempSync(path.join(os.tmpdir(), "vision-purge-release-missing-"));
+  const purgePath = path.join(state, "vision-cache-purge.json");
+  let attempts = 0;
+  try {
+    const result = requestVisionCachePurge(purgePath, {
+      platform: "win32",
+      fs: {
+        removeDirectory() {
+          attempts += 1;
+          const error = new Error("lock already removed");
+          error.code = "ENOENT";
+          throw error;
+        },
+      },
+    });
+    assert.equal(result.requested, true);
+    assert.equal(attempts, 1);
+  } finally {
+    rmSync(state, { recursive: true, force: true });
+  }
+});
+
+test("a purge generation already written by this process is safely coalesced", () => {
+  const state = mkdtempSync(path.join(os.tmpdir(), "vision-purge-coalesce-"));
+  const purgePath = path.join(state, "vision-cache-purge.json");
+  try {
+    const first = requestVisionCachePurge(purgePath);
+    const before = readFileSync(purgePath);
+    const second = requestVisionCachePurge(purgePath);
+    assert.deepEqual(second, first);
+    assert.deepEqual(readFileSync(purgePath), before);
+    assert.equal(existsSync(`${purgePath}.lock`), false);
+  } finally {
+    rmSync(state, { recursive: true, force: true });
+  }
+});
+
+test("a live owner is not removed merely because its lock mtime is stale", () => {
+  const state = mkdtempSync(path.join(os.tmpdir(), "vision-purge-live-owner-"));
+  const purgePath = path.join(state, "vision-cache-purge.json");
+  const lockPath = `${purgePath}.lock`;
+  const ownerPath = path.join(lockPath, "owner.json");
+  const waitError = new Error("the live owner is still in its critical section");
+  try {
+    mkdirSync(lockPath);
+    writeFileSync(ownerPath, `${JSON.stringify({ pid: process.pid, startedAt: Date.now() })}\n`);
+    const staleAt = new Date(Date.now() - 60_000);
+    utimesSync(lockPath, staleAt, staleAt);
+    assert.throws(
+      () => requestVisionCachePurge(purgePath, {
+        staleMs: 1,
+        wait() {
+          throw waitError;
+        },
+      }),
+      (error) => error === waitError,
+    );
+    assert.equal(existsSync(lockPath), true);
+    assert.equal(existsSync(ownerPath), true);
+  } finally {
+    rmSync(state, { recursive: true, force: true });
+  }
+});
+
+test("an abandoned stale owner is recovered before acquiring the purge lock", () => {
+  const state = mkdtempSync(path.join(os.tmpdir(), "vision-purge-stale-owner-"));
+  const purgePath = path.join(state, "vision-cache-purge.json");
+  const lockPath = `${purgePath}.lock`;
+  try {
+    mkdirSync(lockPath);
+    writeFileSync(path.join(lockPath, "owner.json"), `${JSON.stringify({ pid: 999_999 })}\n`);
+    const staleAt = new Date(Date.now() - 60_000);
+    utimesSync(lockPath, staleAt, staleAt);
+    const result = requestVisionCachePurge(purgePath, { staleMs: 1 });
+    assert.equal(result.requested, true);
+    assert.equal(existsSync(lockPath), false);
   } finally {
     rmSync(state, { recursive: true, force: true });
   }

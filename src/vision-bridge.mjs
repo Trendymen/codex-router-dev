@@ -3,21 +3,75 @@ import path from "node:path";
 import { performance } from "node:perf_hooks";
 
 import { PROVIDERS } from "./model-registry.mjs";
-import { existsSync, mkdirSync, readFileSync, rmdirSync, statSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  rmdirSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { writePrivateJson } from "./file-security.mjs";
 import { STATE_DIR } from "./paths.mjs";
 
 export const VISION_CACHE_PURGE_PATH = process.env.MODEL_ROUTER_VISION_CACHE_PURGE || `${STATE_DIR}/vision-cache-purge.json`;
 let purgeGeneration = 0;
+const purgeGenerationByPath = new Map();
 const PURGE_LOCK_STALE_MS = 30_000;
 const PURGE_LOCK_WAIT_MS = 10_000;
 const PURGE_LOCK_POLL_MS = 10;
+const PURGE_LOCK_RELEASE_ATTEMPTS = 4;
+const PURGE_LOCK_RELEASE_RETRY_MS = 10;
+const PURGE_LOCK_RELEASE_MAX_RETRY_MS = 80;
+const PURGE_LOCK_OWNER_FILE = "owner.json";
+const WINDOWS_TRANSIENT_LOCK_CODES = new Set(["EPERM", "EBUSY"]);
 const purgeLockWaiter = new Int32Array(new SharedArrayBuffer(4));
 
-function purgeRequestGeneration(purgePath = VISION_CACHE_PURGE_PATH) {
-  if (!existsSync(purgePath)) return 0;
+function waitForPurgeLockRetry(milliseconds) {
+  Atomics.wait(purgeLockWaiter, 0, 0, milliseconds);
+}
+
+/**
+ * The purge command is synchronous, so the filesystem and sleep boundaries
+ * stay injectable for the Windows sharing-violation cases.  Production uses
+ * the native calls; focused tests can exercise the retry contract without
+ * changing the process-wide test scheduler.
+ */
+export function createVisionCachePurgeFileSystem({
+  platform = process.platform,
+  mkdirSystemCall = mkdirSync,
+  existsSystemCall = existsSync,
+  readFileSystemCall = readFileSync,
+  statSystemCall = statSync,
+  removeDirectorySystemCall = rmdirSync,
+  removeFileSystemCall = unlinkSync,
+  writeFileSystemCall = writeFileSync,
+  writeJsonSystemCall = writePrivateJson,
+  wait = waitForPurgeLockRetry,
+} = {}) {
+  return {
+    platform,
+    mkdir: mkdirSystemCall,
+    exists: existsSystemCall,
+    readFile: readFileSystemCall,
+    stat: statSystemCall,
+    removeDirectory: removeDirectorySystemCall,
+    removeFile: removeFileSystemCall,
+    writeFile: writeFileSystemCall,
+    writeJson: writeJsonSystemCall,
+    wait,
+  };
+}
+
+function defaultPurgeFileSystem() {
+  return createVisionCachePurgeFileSystem();
+}
+
+function purgeRequestGeneration(purgePath = VISION_CACHE_PURGE_PATH, fs = defaultPurgeFileSystem()) {
+  if (!fs.exists(purgePath)) return 0;
   try {
-    const parsed = JSON.parse(readFileSync(purgePath, "utf8"));
+    const parsed = JSON.parse(fs.readFile(purgePath, "utf8"));
     return parsed?.version === 1 && Number.isSafeInteger(parsed.generation) && parsed.generation > 0
       ? parsed.generation
       : 0;
@@ -26,19 +80,146 @@ function purgeRequestGeneration(purgePath = VISION_CACHE_PURGE_PATH) {
   }
 }
 
-export function requestVisionCachePurge(purgePath = VISION_CACHE_PURGE_PATH) {
+function isTransientPurgeLockError(error, platform) {
+  return platform === "win32" && WINDOWS_TRANSIENT_LOCK_CODES.has(error?.code);
+}
+
+function removeWithRetry(remove, target, {
+  platform,
+  wait,
+  attempts = PURGE_LOCK_RELEASE_ATTEMPTS,
+  retryMs = PURGE_LOCK_RELEASE_RETRY_MS,
+  maxRetryMs = PURGE_LOCK_RELEASE_MAX_RETRY_MS,
+} = {}) {
+  let firstTransientError;
+  let delay = retryMs;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      remove(target);
+      return;
+    } catch (error) {
+      if (error?.code === "ENOENT") return;
+      if (!isTransientPurgeLockError(error, platform)) throw error;
+      firstTransientError ||= error;
+      if (attempt === attempts - 1) throw firstTransientError;
+      wait(delay);
+      delay = Math.min(maxRetryMs, delay * 2);
+    }
+  }
+}
+
+/**
+ * Release is deliberately idempotent: another process may have recovered an
+ * abandoned directory between our final write and this cleanup.  Windows can
+ * transiently keep either the marker or its directory open, so only the
+ * sharing-violation pair is retried, and the first error survives exhaustion.
+ */
+export function releaseVisionCachePurgeLock(lockPath, options = {}) {
+  const { fs: fsOverrides, platform, wait } = options;
+  const fs = fsOverrides
+    ? { ...defaultPurgeFileSystem(), ...fsOverrides }
+    : defaultPurgeFileSystem();
+  const lockPlatform = platform || fs.platform || process.platform;
+  const lockWait = wait || fs.wait || waitForPurgeLockRetry;
+  const ownerPath = path.join(lockPath, PURGE_LOCK_OWNER_FILE);
+  removeWithRetry(fs.removeFile, ownerPath, { platform: lockPlatform, wait: lockWait });
+  removeWithRetry(fs.removeDirectory, lockPath, { platform: lockPlatform, wait: lockWait });
+}
+
+function processIsAlive(pid) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return undefined;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    if (error?.code === "EPERM") return true;
+    if (error?.code === "ESRCH") return false;
+    return undefined;
+  }
+}
+
+function lockOwnerIsAlive(lockPath, fs) {
+  let owner;
+  try {
+    owner = JSON.parse(fs.readFile(path.join(lockPath, PURGE_LOCK_OWNER_FILE), "utf8"));
+  } catch (error) {
+    if (error?.code !== "ENOENT" && !(error instanceof SyntaxError)) return null;
+    // A missing or half-written owner marker is not evidence that a live
+    // holder is gone.  The mtime horizon remains the conservative fallback.
+    return undefined;
+  }
+  if (!Number.isSafeInteger(owner?.pid) || owner.pid <= 0) return undefined;
+  const alive = processIsAlive(owner.pid);
+  // An OS-level liveness probe that is itself inconclusive is not permission
+  // to delete a stale-looking lock; only a confirmed-dead owner is removable.
+  return alive === undefined ? null : alive;
+}
+
+function stalePurgeLock(lockPath, {
+  fs,
+  now,
+  staleMs,
+  platform,
+  wait,
+} = {}) {
+  let lockStat;
+  try {
+    lockStat = fs.stat(lockPath);
+  } catch (error) {
+    if (error?.code === "ENOENT") return false;
+    throw error;
+  }
+  if (now() - lockStat.mtimeMs <= staleMs) return false;
+  const ownerAlive = lockOwnerIsAlive(lockPath, fs);
+  if (ownerAlive === true || ownerAlive === null) return false;
+  try {
+    releaseVisionCachePurgeLock(lockPath, { fs, platform, wait });
+    return true;
+  } catch (error) {
+    // A racing owner can repopulate the marker after the stat.  ENOTEMPTY is
+    // therefore contention, not permission to fail the caller; other errors
+    // retain their original identity and fail closed.
+    if (error?.code === "ENOENT" || error?.code === "ENOTEMPTY") return false;
+    throw error;
+  }
+}
+
+function purgeOwnerRecord(now = () => Date.now()) {
+  return `${JSON.stringify({ pid: process.pid, startedAt: now() })}\n`;
+}
+
+export function requestVisionCachePurge(
+  purgePath = VISION_CACHE_PURGE_PATH,
+  {
+    fs: fsOverrides,
+    platform,
+    wait,
+    now = () => Date.now(),
+    staleMs = PURGE_LOCK_STALE_MS,
+  } = {},
+) {
+  const fs = fsOverrides
+    ? { ...defaultPurgeFileSystem(), ...fsOverrides }
+    : defaultPurgeFileSystem();
+  const lockPlatform = platform || fs.platform || process.platform;
+  const lockWait = wait || fs.wait || waitForPurgeLockRetry;
   const lockPath = `${purgePath}.lock`;
-  mkdirSync(path.dirname(purgePath), { recursive: true, mode: 0o700 });
+  fs.mkdir(path.dirname(purgePath), { recursive: true, mode: 0o700 });
   const startedAt = performance.now();
   for (;;) {
     try {
-      mkdirSync(lockPath);
+      fs.mkdir(lockPath);
       break;
     } catch (error) {
       if (error?.code !== "EEXIST") throw error;
       try {
-        if (new Date().getTime() - statSync(lockPath).mtimeMs > PURGE_LOCK_STALE_MS) {
-          rmdirSync(lockPath);
+        if (stalePurgeLock(lockPath, {
+          fs,
+          now,
+          staleMs,
+          platform: lockPlatform,
+          wait: lockWait,
+        })) {
           continue;
         }
       } catch (lockError) {
@@ -49,25 +230,56 @@ export function requestVisionCachePurge(purgePath = VISION_CACHE_PURGE_PATH) {
         timeout.code = "vision_cache_purge_locked";
         throw timeout;
       }
-      Atomics.wait(purgeLockWaiter, 0, 0, PURGE_LOCK_POLL_MS);
+      lockWait(PURGE_LOCK_POLL_MS);
     }
   }
 
+  let result;
+  let operationError;
   try {
-    const diskGeneration = purgeRequestGeneration(purgePath);
-    if (diskGeneration >= Number.MAX_SAFE_INTEGER || purgeGeneration >= Number.MAX_SAFE_INTEGER) {
-      throw new Error("Vision cache purge generation exhausted the safe integer range.");
+    fs.writeFile(
+      path.join(lockPath, PURGE_LOCK_OWNER_FILE),
+      purgeOwnerRecord(now),
+      { encoding: "utf8", flag: "wx", mode: 0o600 },
+    );
+    const diskGeneration = purgeRequestGeneration(purgePath, fs);
+    const knownGeneration = purgeGenerationByPath.get(purgePath);
+    // Coalesce only after owning the lock.  A pre-lock disk check has a TOCTOU
+    // gap in which another process can begin a fresh purge after this process
+    // already consumed the old generation.
+    if (diskGeneration > 0 && diskGeneration === knownGeneration) {
+      result = { requested: true, generation: diskGeneration };
+    } else {
+      if (diskGeneration >= Number.MAX_SAFE_INTEGER || purgeGeneration >= Number.MAX_SAFE_INTEGER) {
+        throw new Error("Vision cache purge generation exhausted the safe integer range.");
+      }
+      const generation = Math.max(now(), diskGeneration + 1, purgeGeneration + 1);
+      if (!Number.isSafeInteger(generation) || generation <= 0) {
+        throw new Error("Could not allocate a safe vision cache purge generation.");
+      }
+      fs.writeJson(purgePath, { version: 1, generation }, { space: 0, directoryMode: 0o700 });
+      purgeGeneration = generation;
+      purgeGenerationByPath.set(purgePath, generation);
+      result = { requested: true, generation };
     }
-    const generation = Math.max(Date.now(), diskGeneration + 1, purgeGeneration + 1);
-    if (!Number.isSafeInteger(generation) || generation <= 0) {
-      throw new Error("Could not allocate a safe vision cache purge generation.");
-    }
-    purgeGeneration = generation;
-    writePrivateJson(purgePath, { version: 1, generation }, { space: 0, directoryMode: 0o700 });
-    return { requested: true, generation };
-  } finally {
-    rmdirSync(lockPath);
+  } catch (error) {
+    operationError = error;
   }
+
+  let releaseError;
+  try {
+    releaseVisionCachePurgeLock(lockPath, {
+      fs,
+      platform: lockPlatform,
+      wait: lockWait,
+    });
+  } catch (error) {
+    releaseError = error;
+  }
+  if (operationError) throw operationError;
+  if (releaseError) throw releaseError;
+
+  return result;
 }
 
 // A text-only model cannot read a pasted screenshot, so the router reads it on
