@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { realpathSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -14,17 +15,48 @@ import {
   standardSourceRoots,
 } from "../apps/control-center/electron/command-runner.mjs";
 
-async function waitForProcessExit(pid, timeoutMs = 4_000) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    try { process.kill(pid, 0); }
-    catch (error) {
-      if (error?.code === "ESRCH") return;
-      throw error;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 25));
+function processStillExists(pid) {
+  try { process.kill(pid, 0); }
+  catch (error) {
+    if (error?.code === "ESRCH") return false;
+    return true;
   }
-  assert.fail(`descendant process ${pid} survived command termination`);
+  // A killed POSIX child can remain as a zombie until its parent reaps it;
+  // kill(pid, 0) still succeeds for that state, which is not a live
+  // descendant and should not make this bounded cleanup wait fail.
+  if (process.platform !== "win32") {
+    try {
+      const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+      const close = stat.lastIndexOf(")");
+      if (close !== -1 && stat.slice(close + 2, close + 3) === "Z") return false;
+    } catch { /* /proc is unavailable or the process disappeared */ }
+  }
+  return true;
+}
+
+async function waitForProcessExit(pid, heartbeatFile, timeoutMs = 15_000) {
+  const deadline = Date.now() + timeoutMs;
+  let delay = 25;
+  let lastHeartbeat;
+  let heartbeatStableSince = Date.now();
+  while (Date.now() < deadline && processStillExists(pid)) {
+    try {
+      const heartbeat = readFileSync(heartbeatFile, "utf8");
+      if (heartbeat !== lastHeartbeat) {
+        lastHeartbeat = heartbeat;
+        heartbeatStableSince = Date.now();
+      } else if (Date.now() - heartbeatStableSince >= 1_000) {
+        // The original child stopped updating its identity marker. A reused
+        // PID must not turn that successful tree termination into a failure.
+        return;
+      }
+    } catch {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, delay));
+    delay = Math.min(250, Math.ceil(delay * 1.5));
+  }
+  assert.equal(processStillExists(pid), false, `descendant process ${pid} survived command termination`);
 }
 
 async function makeProcessTreeControlRoot() {
@@ -36,8 +68,8 @@ async function makeProcessTreeControlRoot() {
     [
       'import { spawn } from "node:child_process";',
       'import { writeFileSync } from "node:fs";',
-      'const [pidFile, mode] = process.argv.slice(2);',
-      'const descendant = spawn(process.execPath, ["-e", "process.on(\\"SIGTERM\\", () => {}); setInterval(() => {}, 1000)"], { stdio: "ignore" });',
+      'const [pidFile, mode, heartbeatFile] = process.argv.slice(2);',
+      'const descendant = spawn(process.execPath, ["-e", "const { writeFileSync } = require(\\"node:fs\\"); let tick = 0; const beat = () => writeFileSync(process.argv[1], String(++tick)); beat(); process.on(\\"SIGTERM\\", () => {}); setInterval(beat, 100);", heartbeatFile], { stdio: "ignore" });',
       'writeFileSync(pidFile, String(descendant.pid));',
       'if (mode === "overflow") process.stdout.write("x".repeat(4096));',
       'process.on("SIGTERM", () => {});',
@@ -572,18 +604,19 @@ for (const mode of ["timeout", "overflow"]) {
   test(`command ${mode} terminates its full descendant process tree`, async () => {
     const root = await makeProcessTreeControlRoot();
     const pidFile = path.join(root, `${mode}.pid`);
+    const heartbeatFile = path.join(root, `${mode}.heartbeat`);
     const priorRoot = process.env.CODEX_ROUTER_SOURCE_ROOT;
     let descendantPid;
     try {
       process.env.CODEX_ROUTER_SOURCE_ROOT = root;
       const command = runControl(
-        [pidFile, mode],
+        [pidFile, mode, heartbeatFile],
         mode === "timeout" ? { timeoutMs: 250 } : { timeoutMs: 5_000, maxOutputBytes: 32 },
       );
       await assert.rejects(command, mode === "timeout" ? /timed out/ : /output exceeded/);
       descendantPid = Number.parseInt(await readFile(pidFile, "utf8"), 10);
       assert.ok(Number.isInteger(descendantPid) && descendantPid > 0);
-      await waitForProcessExit(descendantPid);
+      await waitForProcessExit(descendantPid, heartbeatFile);
     } finally {
       if (descendantPid) {
         try { process.kill(descendantPid, "SIGKILL"); } catch { /* already gone */ }

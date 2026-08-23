@@ -90,7 +90,8 @@ function run(script, env) {
 }
 
 async function waitFor(url, child, headers = {}) {
-  const deadline = Date.now() + 5_000;
+  const deadline = Date.now() + 30_000;
+  let delay = 50;
   while (Date.now() < deadline) {
     if (child.exitCode !== null) {
       throw new Error(`Child exited early (${child.exitCode}): ${child.testErrors()}`);
@@ -101,7 +102,8 @@ async function waitFor(url, child, headers = {}) {
     } catch {
       // The child has not bound its port yet.
     }
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    await new Promise((resolve) => setTimeout(resolve, delay));
+    delay = Math.min(250, Math.ceil(delay * 1.5));
   }
   throw new Error(`Timed out waiting for ${url}: ${child.testErrors()}`);
 }

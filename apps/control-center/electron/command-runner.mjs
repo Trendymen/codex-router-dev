@@ -8,6 +8,8 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_TIMEOUT_MS = 30_000;
 const MAX_TIMEOUT_MS = 11 * 60_000;
 const MAX_OUTPUT_BYTES = 2 * 1024 * 1024;
+const PROCESS_TREE_KILL_TIMEOUT_MS = 30_000;
+const PROCESS_TREE_KILL_ATTEMPTS = 3;
 const SECRET_WORD = /(api[_ -]?key|access[_ -]?token|refresh[_ -]?token|password|secret|credential)/i;
 const APP_CONTRACT_LIMIT = 1024 * 1024;
 
@@ -235,36 +237,50 @@ async function terminateProcessTree(child) {
     return;
   }
   if (process.platform === "win32") {
-    await new Promise((resolve) => {
-      const systemRoot = process.env.SystemRoot;
-      const systemTaskkill = systemRoot ? path.join(systemRoot, "System32", "taskkill.exe") : undefined;
-      const command = systemTaskkill && existsSync(systemTaskkill) ? systemTaskkill : "taskkill.exe";
-      let settled = false;
-      let killer;
-      const finish = (successful) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        if (!successful) killChildFallback(child);
-        resolve();
-      };
-      const timer = setTimeout(() => {
-        try { killer?.kill("SIGKILL"); } catch { /* best effort */ }
-        finish(false);
-      }, 5_000);
-      timer.unref();
-      try {
-        killer = spawn(command, ["/PID", String(child.pid), "/T", "/F"], {
-          shell: false,
-          windowsHide: true,
-          stdio: "ignore",
-        });
-        killer.once("error", () => finish(false));
-        killer.once("close", (code) => finish(code === 0));
-      } catch {
-        finish(false);
+    const systemRoot = process.env.SystemRoot;
+    const systemTaskkill = systemRoot ? path.join(systemRoot, "System32", "taskkill.exe") : undefined;
+    const command = systemTaskkill && existsSync(systemTaskkill) ? systemTaskkill : "taskkill.exe";
+    const deadline = Date.now() + PROCESS_TREE_KILL_TIMEOUT_MS;
+    for (let attempt = 0; attempt < PROCESS_TREE_KILL_ATTEMPTS && Date.now() < deadline; attempt += 1) {
+      const remaining = Math.max(250, deadline - Date.now());
+      const successful = await new Promise((resolve) => {
+        let settled = false;
+        let killer;
+        const finish = (value) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          resolve(value);
+        };
+        const timer = setTimeout(() => {
+          try { killer?.kill("SIGKILL"); } catch { /* best effort */ }
+          finish(false);
+        }, Math.min(10_000, remaining));
+        timer.unref();
+        try {
+          killer = spawn(command, ["/PID", String(child.pid), "/T", "/F"], {
+            shell: false,
+            windowsHide: true,
+            stdio: "ignore",
+          });
+          killer.once("error", () => finish(false));
+          killer.once("close", (code) => finish(code === 0));
+        } catch {
+          finish(false);
+        }
+      });
+      if (successful) {
+        // taskkill can report the tree while Windows is still reaping one of
+        // its descendants; a bounded second pass closes that race under a
+        // saturated test runner without changing command timeout semantics.
+        if (attempt + 1 < PROCESS_TREE_KILL_ATTEMPTS) {
+          await new Promise((resolve) => setTimeout(resolve, 100));
+          continue;
+        }
+        return;
       }
-    });
+    }
+    killChildFallback(child);
     return;
   }
 
