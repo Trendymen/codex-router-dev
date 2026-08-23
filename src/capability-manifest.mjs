@@ -1,3 +1,5 @@
+import util from "node:util";
+
 /**
  * The shared UI contract.  This module deliberately does not import the test
  * oracle: the checked-in fixture is an independent assertion about this
@@ -11,6 +13,7 @@ const command = (name, {
   confirmation = false,
   quotaWarning = false,
   protectedInput = false,
+  resultKind = "json",
 } = {}) => Object.freeze({
   name,
   arguments: Object.freeze({ type: "object" }),
@@ -18,6 +21,7 @@ const command = (name, {
   confirmation,
   quotaWarning,
   protectedInput,
+  resultKind,
   // A command result may be returned to a UI, but credential input is never
   // retained in a capability snapshot.
   retainsInput: false,
@@ -26,21 +30,21 @@ const command = (name, {
 const commandRows = [
   command("lifecycle.status"), command("lifecycle.start", { mutating: true }),
   command("lifecycle.stop", { mutating: true, confirmation: true }),
-  command("lifecycle.restart", { mutating: true, confirmation: true }), command("lifecycle.logs"),
+  command("lifecycle.restart", { mutating: true, confirmation: true }), command("lifecycle.logs", { resultKind: "text" }),
   command("doctor.status"), command("doctor.fix", { mutating: true, confirmation: true }),
   command("maintenance.update", { mutating: true, confirmation: true }), command("maintenance.rollback", { mutating: true, confirmation: true }),
   command("native.status"), command("native.account-usage"),
   command("credential.status"), command("credential.set", { mutating: true, protectedInput: true }), command("credential.remove", { mutating: true, confirmation: true }),
   command("provider.enable", { mutating: true }), command("model.visibility", { mutating: true }), command("model.canary", { mutating: true }),
   command("protocol-proof.status"), command("protocol-proof.verify", { mutating: true, confirmation: true, quotaWarning: true }), command("protocol-proof.revoke", { mutating: true, confirmation: true }),
-  command("picker.status"), command("picker.set", { mutating: true }), command("picker.show-all", { mutating: true }), command("catalog.status"), command("catalog.render-snippet"),
+  command("picker.status"), command("picker.set", { mutating: true }), command("picker.show-all", { mutating: true }), command("catalog.status"), command("catalog.render-snippet", { resultKind: "text" }),
   command("subagents.status"), command("subagents.mode", { mutating: true }), command("subagents.model", { mutating: true }), command("subagents.selection", { mutating: true }), command("subagents.verify", { mutating: true, confirmation: true, quotaWarning: true }),
   command("failover.status"), command("failover.reset", { mutating: true, confirmation: true }),
   command("tool-result-aging.status"), command("tool-result-aging.on", { mutating: true }), command("tool-result-aging.off", { mutating: true }), command("tool-result-aging.ttl", { mutating: true }), command("tool-result-aging.purge", { mutating: true, confirmation: true }),
   command("usage.router"), command("usage.provider"), command("usage.model"),
   command("vision.status"), command("vision.on", { mutating: true }), command("vision.off", { mutating: true }), command("vision.engine", { mutating: true }), command("vision.effort", { mutating: true }), command("vision.probe", { mutating: true, quotaWarning: true }), command("vision.pull", { mutating: true, confirmation: true }), command("vision.purge-cache", { mutating: true, confirmation: true }),
   command("presence.status"), command("presence.mode", { mutating: true }),
-  command("cc-switch.status"), command("cc-switch.snippet"),
+  command("cc-switch.status"), command("cc-switch.snippet", { resultKind: "text" }),
 ];
 
 const capabilities = [
@@ -62,53 +66,90 @@ const capabilities = [
   id,
   nodeCommands: Object.freeze(nodeCommands),
   swift: "full",
-  browser: id === "native-session-usage" || id === "picker-catalog" || id === "usage" || id === "presence" || id === "cc-switch" ? "full" : "write-session",
+  browser: id === "provider-credentials" ? "protected" : id === "native-session-usage" || id === "picker-catalog" || id === "usage" || id === "presence" || id === "cc-switch" ? "full" : "write-session",
 }));
 
-export const CAPABILITY_COMMANDS = Object.freeze(commandRows);
-export const CAPABILITY_CAPABILITIES = Object.freeze(capabilities);
+function deepFreeze(value, seen = new WeakSet()) {
+  if (!value || typeof value !== "object" || seen.has(value)) return value;
+  seen.add(value);
+  for (const child of Object.values(value)) deepFreeze(child, seen);
+  return Object.freeze(value);
+}
+
+export const CAPABILITY_COMMANDS = deepFreeze(commandRows);
+export const CAPABILITY_CAPABILITIES = deepFreeze(capabilities);
 
 const commandByName = new Map(commandRows.map((entry) => [entry.name, entry]));
-const MAJOR = (version) => Number.isSafeInteger(version) && version >= 0 ? version : CAPABILITY_SCHEMA_VERSION;
 
 export function isMutationCommand(name) {
   return Boolean(commandByName.get(name)?.mutating);
 }
 
-function safeSnapshot(value) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+const SECRET_KEY = /credential|api.?key|token|secret|password|authorization|caller.?url/i;
+const CAPABILITY_URL = /https?:\/\/(?:127\.0\.0\.1|localhost|\[::1\]):\d+\/_codex-router\/[^/\s]+(?:\/v1)?/gi;
+const SNAPSHOT_MAX_DEPTH = 16;
+const SNAPSHOT_MAX_KEYS = 256;
+const SNAPSHOT_MAX_ARRAY = 1024;
+const SNAPSHOT_MAX_WORK = 8192;
+
+function redactString(value) {
+  return value.replace(CAPABILITY_URL, "[REDACTED]");
+}
+
+function safeSnapshot(value, state = { seen: new WeakSet(), work: SNAPSHOT_MAX_WORK }, depth = 0) {
+  if (state.work-- <= 0 || depth > SNAPSHOT_MAX_DEPTH) return undefined;
+  if (value === null || typeof value === "boolean") return value;
+  if (typeof value === "string") return redactString(value);
+  if (typeof value === "number") return Number.isFinite(value) ? value : undefined;
+  if (!value || typeof value !== "object" || util.types.isProxy(value) || state.seen.has(value)) return undefined;
+  state.seen.add(value);
+  if (Array.isArray(value)) {
+    const length = Object.getOwnPropertyDescriptor(value, "length")?.value;
+    if (!Number.isSafeInteger(length) || length < 0 || length > SNAPSHOT_MAX_ARRAY) return undefined;
+    const result = [];
+    for (let index = 0; index < length; index += 1) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+      if (!descriptor || !Object.hasOwn(descriptor, "value")) continue;
+      const item = safeSnapshot(descriptor.value, state, depth + 1);
+      if (item !== undefined) result.push(item);
+    }
+    return result;
+  }
   const result = {};
-  for (const [key, item] of Object.entries(value)) {
-    if (/credential|api.?key|token|secret|password|authorization/i.test(key)) continue;
-    if (typeof item === "string" || typeof item === "boolean" || (typeof item === "number" && Number.isFinite(item))) result[key] = item;
-    else if (Array.isArray(item)) result[key] = item.slice(0, 1024).map((entry) => {
-      if (entry && typeof entry === "object") return safeSnapshot(entry);
-      return typeof entry === "string" || typeof entry === "boolean" || (typeof entry === "number" && Number.isFinite(entry)) ? entry : undefined;
-    }).filter((entry) => entry !== undefined);
-    else if (item && typeof item === "object") result[key] = safeSnapshot(item) || {};
+  const keys = Object.getOwnPropertyNames(value);
+  if (keys.length > SNAPSHOT_MAX_KEYS) return undefined;
+  for (const key of keys) {
+    if (SECRET_KEY.test(key)) continue;
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (!descriptor || !Object.hasOwn(descriptor, "value")) continue;
+    const item = safeSnapshot(descriptor.value, state, depth + 1);
+    if (item !== undefined) result[key] = item;
   }
   return result;
 }
 
 export function buildCapabilityManifest(snapshot = {}) {
-  const major = MAJOR(snapshot.capabilitySchemaVersion);
-  if (major > CAPABILITY_SCHEMA_VERSION) {
-    return Object.freeze({
-      capabilitySchemaVersion: major,
+  const source = snapshot && typeof snapshot === "object" && !Array.isArray(snapshot) && !util.types.isProxy(snapshot) ? snapshot : {};
+  const versionDescriptor = Object.getOwnPropertyDescriptor(source, "capabilitySchemaVersion");
+  const version = versionDescriptor && Object.hasOwn(versionDescriptor, "value") ? versionDescriptor.value : CAPABILITY_SCHEMA_VERSION;
+  if (version !== CAPABILITY_SCHEMA_VERSION) {
+    const reported = Number.isSafeInteger(version) && version >= 0 ? version : CAPABILITY_SCHEMA_VERSION;
+    return deepFreeze({
+      capabilitySchemaVersion: reported,
       compatibility: Object.freeze({ readOnly: true, reason: "unknown_major_version" }),
       mutationsEnabled: false,
-      commands: Object.freeze([]),
-      capabilities: Object.freeze([]),
-      snapshot: Object.freeze(safeSnapshot(snapshot) || {}),
+      commands: [],
+      capabilities: [],
+      snapshot: safeSnapshot(source) || {},
     });
   }
-  const clean = safeSnapshot(snapshot) || {};
-  return Object.freeze({
+  const clean = safeSnapshot(source) || {};
+  return deepFreeze({
     capabilitySchemaVersion: CAPABILITY_SCHEMA_VERSION,
     compatibility: Object.freeze({ readOnly: false, reason: null }),
     mutationsEnabled: true,
-    commands: Object.freeze(commandRows.map((entry) => ({ ...entry }))),
-    capabilities: Object.freeze(capabilities.map((entry) => ({ ...entry, nodeCommands: [...entry.nodeCommands] }))),
-    snapshot: Object.freeze(clean),
+    commands: commandRows.map((entry) => ({ ...entry, arguments: { ...entry.arguments } })),
+    capabilities: capabilities.map((entry) => ({ ...entry, nodeCommands: [...entry.nodeCommands] })),
+    snapshot: clean,
   });
 }

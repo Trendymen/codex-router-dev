@@ -216,8 +216,15 @@ export async function handlePanelRequest(request, response, route, { writeJson }
   }
 
   try {
-    const value = await runDesktopCommand(command, args ?? {}, { root: sourceRoot() });
-    writeJson(response, 200, { value });
+    // The panel keeps its historical wire id for the current UI, but the
+    // dispatcher receives only the Phase3 canonical command table.
+    const canonicalCommand = command === "control_snapshot" ? "lifecycle.status" : command;
+    const result = await runDesktopCommand(canonicalCommand, args ?? {}, { root: sourceRoot() });
+    if (result?.ok === false) {
+      writeJson(response, 502, { error: result.error });
+      return true;
+    }
+    writeJson(response, 200, { value: result?.ok === true ? result.value : result });
   } catch (error) {
     writeJson(response, 502, {
       error: { type: "upstream_error", message: error?.message || "The router command failed." },

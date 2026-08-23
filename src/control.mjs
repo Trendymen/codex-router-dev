@@ -1,5 +1,5 @@
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, unlinkSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -550,6 +550,7 @@ async function runSetApply(provider, desired) {
       `Applied: ${publication.applied.join(", ") || "none"}. ` +
       `Skipped (not active): ${publication.skipped.join(", ") || "none"}.\n`,
   );
+  process.stdout.write(`${JSON.stringify({ provider, enabled: desired === "on", publication })}\n`);
 }
 
 async function printAccountUsage() {
@@ -557,9 +558,68 @@ async function printAccountUsage() {
   process.stdout.write(`${JSON.stringify(await readCodexAccountUsage(), null, 2)}\n`);
 }
 
-async function printProviderUsage() {
+async function printProviderUsage(provider) {
   const { providerUsageSnapshot } = await import("./provider-usage.mjs");
-  process.stdout.write(`${JSON.stringify(await providerUsageSnapshot(), null, 2)}\n`);
+  const snapshot = await providerUsageSnapshot();
+  if (provider) {
+    const entry = Array.isArray(snapshot?.providers)
+      ? snapshot.providers.find((item) => item.provider === provider)
+      : undefined;
+    process.stdout.write(`${JSON.stringify({ provider, usage: entry || null })}\n`);
+    return;
+  }
+  process.stdout.write(`${JSON.stringify(snapshot, null, 2)}\n`);
+}
+
+async function printCredentialStatus(provider) {
+  if (!provider) throw new Error("Usage: control credential-status <deepseek|qwen-plan>");
+  const { providerOnboardingSnapshot } = await import("./provider-onboarding.mjs");
+  const snapshot = providerOnboardingSnapshot();
+  const entry = Array.isArray(snapshot?.providers)
+    ? snapshot.providers.find((item) => item.id === provider)
+    : undefined;
+  process.stdout.write(`${JSON.stringify({ provider, status: entry || null })}\n`);
+}
+
+async function printNativeStatus() {
+  const { nativeSessionStatus } = await import("./codex-native-session.mjs");
+  process.stdout.write(`${JSON.stringify(nativeSessionStatus())}\n`);
+}
+
+async function printRouterUsage() {
+  const { recentUsageEvents } = await import("./usage-events.mjs");
+  process.stdout.write(`${JSON.stringify({ events: recentUsageEvents() })}\n`);
+}
+
+async function printModelUsage(slug) {
+  if (typeof slug !== "string" || !slug) throw new Error("Usage: control usage model <model-slug>");
+  const { allUsageEvents } = await import("./usage-events.mjs");
+  process.stdout.write(`${JSON.stringify({ slug, events: allUsageEvents().filter((event) => event.model === slug) })}\n`);
+}
+
+async function printRouterLogs() {
+  const { LOG_PATH } = await import("./paths.mjs");
+  if (!existsSync(LOG_PATH)) {
+    process.stdout.write(JSON.stringify({ path: LOG_PATH, lines: [] }) + "\n");
+    return;
+  }
+  const lines = readFileSync(LOG_PATH, "utf8").split(/\r?\n/).filter(Boolean).slice(-200);
+  process.stdout.write(`${lines.map(() => "[REDACTED]").join("\n")}\n`);
+}
+
+async function setCanary(slug, enabled) {
+  const { setExperimentalModel, experimentalModelForSlug } = await import("./experimental-models.mjs");
+  experimentalModelForSlug(slug);
+  await setExperimentalModel(slug, enabled);
+  process.stdout.write(`${JSON.stringify({ slug, enabled })}\n`);
+}
+
+async function purgeVisionCache() {
+  const { VISION_DOWNLOAD_STATE_PATH, VISION_DOWNLOAD_CLAIM_PATH } = await import("./vision-download.mjs");
+  for (const file of [VISION_DOWNLOAD_STATE_PATH, VISION_DOWNLOAD_CLAIM_PATH]) {
+    try { unlinkSync(file); } catch (error) { if (error?.code !== "ENOENT") throw error; }
+  }
+  process.stdout.write(`${JSON.stringify({ purged: true })}\n`);
 }
 
 async function printProviderOnboarding() {
@@ -2327,8 +2387,26 @@ if (args.includes("--probe")) {
   await runApply();
 } else if (args[0] === "account") {
   await printAccountUsage();
+} else if (args[0] === "native-status") {
+  await printNativeStatus();
+} else if (args[0] === "usage") {
+  if (args[1] === "router") await printRouterUsage();
+  else if (args[1] === "model") await printModelUsage(args[2]);
+  else throw new Error("Usage: control usage router|model <model-slug>");
+} else if (args[0] === "logs") {
+  await printRouterLogs();
+} else if (args[0] === "rollback") {
+  const { rollbackCheckout } = await import("./update.mjs");
+  process.stdout.write(`${JSON.stringify(rollbackCheckout({ force: args.includes("--force") }))}\n`);
+} else if (args[0] === "model-canary") {
+  if (!args[1] || !["on", "off"].includes(args[2])) throw new Error("Usage: control model-canary <model-slug> <on|off>");
+  await setCanary(args[1], args[2] === "on");
+} else if (args[0] === "vision-purge-cache") {
+  await purgeVisionCache();
 } else if (args[0] === "provider-usage") {
-  await printProviderUsage();
+  await printProviderUsage(args[2] || args[1]);
+} else if (args[0] === "credential-status") {
+  await printCredentialStatus(args[1]);
 } else if (args[0] === "providers") {
   await printProviderOnboarding();
 } else if (args[0] === "install-cli") {

@@ -6,6 +6,7 @@
 import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
 import path from "node:path";
+import util from "node:util";
 import { fileURLToPath } from "node:url";
 
 import {
@@ -230,29 +231,21 @@ export function parseJson(output) {
   }
 }
 
-// Runs a command from the table end to end. Every surface calls this rather
-// than sequencing runControl itself, so "mutate, then re-read so the caller
-// paints fresh state" cannot be implemented three slightly different ways.
-async function runLegacyDesktopCommand(command, args = {}, { root = sourceRoot() } = {}) {
-  const build = COMMANDS[command];
-  if (!build) throw new Error(`Unknown command: ${command}`);
-  const plan = build(args ?? {});
-  const output = await runControl(root, plan.args, {
-    stdin: plan.stdin,
-    timeoutMs: plan.timeoutMs,
-  });
-  if (plan.then) return parseJson(await runControl(root, plan.then));
-  return output.trim() ? parseJson(output) : null;
+function deepFreeze(value, seen = new WeakSet()) {
+  if (!value || typeof value !== "object" || seen.has(value)) return value;
+  seen.add(value);
+  for (const child of Object.values(value)) deepFreeze(child, seen);
+  return Object.freeze(value);
 }
 
-const objectSchema = (properties = {}, required = []) => ({
+const objectSchema = (properties = {}, required = []) => deepFreeze({
   type: "object",
   additionalProperties: false,
   properties,
   required,
 });
-const string = (pattern = undefined) => ({ type: "string", ...(pattern ? { pattern } : {}) });
-const boolean = { type: "boolean" };
+const string = (pattern = undefined) => deepFreeze({ type: "string", ...(pattern ? { pattern } : {}) });
+const boolean = deepFreeze({ type: "boolean" });
 const slug = string("^[A-Za-z0-9][A-Za-z0-9._/-]{0,255}$");
 const provider = string("^[a-z0-9][a-z0-9-]{0,63}$");
 const credentialProvider = { ...provider, enum: ["deepseek", "qwen-plan"] };
@@ -292,24 +285,37 @@ const ARGUMENTS = {
 };
 
 const CONTROL_ARGS = {
-  "lifecycle.status": () => ["service", "status"], "lifecycle.start": () => ["service", "start"], "lifecycle.stop": () => ["service", "stop"], "lifecycle.restart": () => ["service", "restart"], "lifecycle.logs": () => ["logs"],
+  "lifecycle.status": () => ["--json"], "lifecycle.start": () => ["service", "start"], "lifecycle.stop": () => ["service", "stop"], "lifecycle.restart": () => ["service", "restart"], "lifecycle.logs": () => ["logs"],
   "doctor.status": () => ["doctor", "--json"], "doctor.fix": () => ["doctor", "--fix", "--json"], "maintenance.update": () => ["maintenance"], "maintenance.rollback": () => ["rollback"],
   "native.status": () => ["native-status", "--json"], "native.account-usage": () => ["account", "--json"],
-  "credential.status": ({ provider: id }) => ["providers", "--json", id], "credential.set": ({ provider: id }) => ["credential", id], "credential.remove": ({ provider: id }) => ["credential", id, "--remove"],
+  "credential.status": ({ provider: id }) => ["credential-status", id], "credential.set": ({ provider: id }) => ["credential", id], "credential.remove": ({ provider: id }) => ["credential", id, "--remove"],
   "provider.enable": ({ provider: id, enabled }) => ["set-apply", id, enabled ? "on" : "off", "--targets", "codex", "--activate"],
   "model.visibility": ({ slug: id, visible }) => ["picker", "set", id, visible ? "show" : "hide"], "model.canary": ({ slug: id, enabled }) => ["model-canary", id, enabled ? "on" : "off"],
   "protocol-proof.status": ({ slug: id }) => ["protocol-proof", "status", id], "protocol-proof.verify": ({ slug: id }) => ["protocol-proof", "verify", id, "--yes"], "protocol-proof.revoke": ({ slug: id }) => ["protocol-proof", "revoke", id],
   "picker.status": () => ["picker", "status"], "picker.set": ({ slug: id, visible }) => ["picker", "set", id, visible ? "show" : "hide"], "picker.show-all": ({ visible }) => ["picker", "all", visible ? "show" : "hide"],
   "catalog.status": () => ["catalog", "status"], "catalog.render-snippet": () => ["catalog", "render-snippet"],
-  "subagents.status": () => ["subagents", "status"], "subagents.mode": ({ mode }) => ["subagents", "mode", mode], "subagents.model": ({ slug: id, enabled }) => ["subagents", "set", id, enabled ? "on" : "off"], "subagents.selection": ({ selection }) => ["subagents", selection], "subagents.verify": ({ slug: id }) => ["subagents", "verify", id, "--yes"],
-  "failover.status": () => ["failover", "status"], "failover.reset": () => ["failover", "reset", "--yes"],
+  "subagents.status": () => ["subagents", "status"], "subagents.mode": ({ mode }) => ["subagents", "mode", mode], "subagents.model": ({ slug: id, enabled }) => ["subagents", "set", id, enabled ? "on" : "off"], "subagents.selection": ({ selection }) => ["subagents", selection], "subagents.verify": ({ slug: id }) => ["subagents", "verify", id],
+  "failover.status": () => ["failover", "status"], "failover.reset": () => ["failover", "reset"],
   "tool-result-aging.status": () => ["tool-result-aging", "status"], "tool-result-aging.on": () => ["tool-result-aging", "on"], "tool-result-aging.off": () => ["tool-result-aging", "off"], "tool-result-aging.ttl": ({ days }) => ["tool-result-aging", "ttl", days == null ? "off" : String(days)], "tool-result-aging.purge": ({ expiredOnly }) => ["tool-result-aging", "purge", ...(expiredOnly ? ["--expired"] : []), "--yes"],
-  "usage.router": () => ["usage", "router"], "usage.provider": ({ provider: id }) => ["provider-usage", "--json", id], "usage.model": ({ slug: id }) => ["usage", "model", id],
-  "vision.status": () => ["vision-bridge", "status"], "vision.on": () => ["vision-bridge", "on"], "vision.off": () => ["vision-bridge", "off"], "vision.engine": ({ engine, effort }) => ["vision-bridge", "engine", engine, ...(effort ? [effort] : [])], "vision.effort": ({ effort }) => ["vision-bridge", "effort", effort], "vision.probe": () => ["vision-bridge", "probe"], "vision.pull": ({ tag }) => ["vision-bridge", "pull", tag], "vision.purge-cache": () => ["vision-bridge", "purge-cache", "--yes"],
-  "presence.status": () => ["presence", "status"], "presence.mode": ({ mode }) => ["presence", "set", mode], "cc-switch.status": () => ["cc-switch", "status"], "cc-switch.snippet": () => ["catalog", "render-snippet"],
+  "usage.router": () => ["usage", "router"], "usage.provider": ({ provider: id }) => ["provider-usage", id], "usage.model": ({ slug: id }) => ["usage", "model", id],
+  "vision.status": () => ["vision-bridge", "status"], "vision.on": () => ["vision-bridge", "on"], "vision.off": () => ["vision-bridge", "off"], "vision.engine": ({ engine, effort }) => ["vision-bridge", "engine", engine, ...(effort ? [effort] : [])], "vision.effort": ({ effort }) => ["vision-bridge", "effort", effort], "vision.probe": () => ["vision-bridge", "probe"], "vision.pull": ({ tag }) => ["vision-bridge", "pull", tag], "vision.purge-cache": () => ["vision-purge-cache"],
+  "presence.status": () => ["presence", "status"], "presence.mode": ({ mode }) => ["presence", "set", mode], "cc-switch.status": () => ["catalog", "status"], "cc-switch.snippet": () => ["catalog", "render-snippet"],
 };
 
 const secretKey = /^(?:credential|apiKey|api_key|token|secret|password|authorization)$/i;
+const CAPABILITY_URL = /https?:\/\/(?:127\.0\.0\.1|localhost|\[::1\]):\d+\/_codex-router\/[^/\s]+(?:\/v1)?/gi;
+const MAX_ARGUMENT_DEPTH = 16;
+const MAX_ARGUMENT_KEYS = 256;
+const MAX_ARGUMENT_WORK = 4096;
+const MAX_RESULT_DEPTH = 16;
+const MAX_RESULT_KEYS = 256;
+const MAX_RESULT_ARRAY = 1024;
+const COMMAND_ERROR_CODES = Object.freeze({
+  command_not_supported: true,
+  invalid_command_arguments: true,
+  protected_input_required: true,
+  capability_schema_unsupported: true,
+});
 function errorEnvelope(code) {
   const messages = {
     command_not_supported: "This desktop command is not supported.",
@@ -317,7 +323,7 @@ function errorEnvelope(code) {
     protected_input_required: "This credential operation requires protected input.",
     capability_schema_unsupported: "This capability schema is not supported for mutations.",
   };
-  const safeCode = messages[code] || ERROR_DEFINITIONS[code] ? code : "invalid_command_arguments";
+  const safeCode = Object.hasOwn(messages, code) || Object.hasOwn(ERROR_DEFINITIONS, code) ? code : "invalid_command_arguments";
   return {
     ok: false,
     error: {
@@ -329,91 +335,145 @@ function errorEnvelope(code) {
   };
 }
 
-function validate(schema, value) {
-  if (!value || typeof value !== "object" || Array.isArray(value) || schema.type !== "object") return false;
-  const keys = Object.keys(value);
-  if (schema.additionalProperties === false && keys.some((key) => !Object.hasOwn(schema.properties, key))) return false;
+function validate(schema, value, state = { seen: new WeakSet(), work: MAX_ARGUMENT_WORK }, depth = 0) {
+  if (state.work-- <= 0 || depth > MAX_ARGUMENT_DEPTH || !value || typeof value !== "object" || Array.isArray(value) || util.types.isProxy(value) || schema.type !== "object") return false;
+  if (Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null) return false;
+  if (state.seen.has(value)) return false;
+  state.seen.add(value);
+  const keys = Object.getOwnPropertyNames(value);
+  if (keys.length > MAX_ARGUMENT_KEYS || schema.additionalProperties === false && keys.some((key) => !Object.hasOwn(schema.properties, key))) return false;
   if ((schema.required || []).some((key) => !Object.hasOwn(value, key))) return false;
-  for (const [key, rule] of Object.entries(schema.properties || {})) {
-    if (!Object.hasOwn(value, key)) continue;
-    const item = value[key];
+  for (const key of keys) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (!descriptor || !Object.hasOwn(descriptor, "value")) return false;
+    const rule = schema.properties?.[key];
+    if (!rule) continue;
+    const item = descriptor.value;
     const types = Array.isArray(rule.type) ? rule.type : [rule.type];
     const validType = types.some((type) => type === "null" ? item === null : type === "integer" ? Number.isSafeInteger(item) : typeof item === type);
     if (!validType || rule.pattern && (typeof item !== "string" || !new RegExp(rule.pattern).test(item)) || rule.enum && !rule.enum.includes(item)) return false;
+    if (item && typeof item === "object" && !validate({ type: "object", additionalProperties: true, properties: {} }, item, state, depth + 1)) return false;
   }
   return true;
 }
 
 const COMMAND_DEFINITIONS_MAP = new Map(CAPABILITY_COMMANDS.map((metadata) => {
   const args = ARGUMENTS[metadata.name] || noArgs;
-  return [metadata.name, Object.freeze({
+  return [metadata.name, deepFreeze({
     ...metadata,
-    arguments: Object.freeze(args),
+    arguments: args,
     execute: CONTROL_ARGS[metadata.name],
   })];
 }));
 
-const COMMAND_DEFINITIONS = new Proxy(COMMAND_DEFINITIONS_MAP, {
-  get(target, property) {
-    if (property === "set" || property === "delete" || property === "clear") {
-      return () => { throw new TypeError("desktop command definitions are read-only"); };
-    }
-    const value = Reflect.get(target, property);
-    return typeof value === "function" ? value.bind(target) : value;
-  },
-});
+const COMMAND_DEFINITIONS = (() => {
+  const entries = Object.freeze([...COMMAND_DEFINITIONS_MAP.entries()]);
+  const values = Object.freeze(entries.map(([, value]) => value));
+  const byName = new Map(entries);
+  return Object.freeze({
+    get: (name) => byName.get(name),
+    has: (name) => byName.has(name),
+    set() { throw new TypeError("desktop command definitions are read-only"); },
+    delete() { throw new TypeError("desktop command definitions are read-only"); },
+    clear() { throw new TypeError("desktop command definitions are read-only"); },
+    keys: function* keys() { for (const [name] of entries) yield name; },
+    values: function* valuesIterator() { yield* values; },
+    entries: function* entriesIterator() { yield* entries; },
+    forEach(callback, thisArg) { for (const [name, value] of entries) callback.call(thisArg, value, name, COMMAND_DEFINITIONS); },
+    get size() { return entries.length; },
+    [Symbol.iterator]: function* iterator() { yield* entries; },
+  });
+})();
 
 export function desktopCommandDefinitions() {
   return COMMAND_DEFINITIONS;
 }
 
-function majorVersion(manifest) {
-  return Number.isSafeInteger(manifest?.capabilitySchemaVersion) ? manifest.capabilitySchemaVersion : CAPABILITY_SCHEMA_VERSION;
+function majorVersion(manifest, supplied = false) {
+  if (!supplied) return CAPABILITY_SCHEMA_VERSION;
+  if (!manifest || typeof manifest !== "object" || util.types.isProxy(manifest)) return undefined;
+  const descriptor = Object.getOwnPropertyDescriptor(manifest, "capabilitySchemaVersion");
+  return descriptor && Object.hasOwn(descriptor, "value") ? descriptor.value : undefined;
 }
 
-function scrubResult(value) {
-  if (Array.isArray(value)) return value.map(scrubResult);
-  if (!value || typeof value !== "object") return value;
-  const output = {};
-  for (const [key, item] of Object.entries(value)) {
-    if (secretKey.test(key)) continue;
-    output[key] = scrubResult(item);
+function scrubResult(value, sensitiveValues = [], state = { seen: new WeakSet() }, depth = 0) {
+  if (depth > MAX_RESULT_DEPTH) return undefined;
+  if (typeof value === "string") {
+    let clean = value.replace(CAPABILITY_URL, "[REDACTED]");
+    for (const sensitive of sensitiveValues) if (sensitive) clean = clean.split(sensitive).join("[REDACTED]");
+    return clean;
   }
-  return output;
+  if (value === null || typeof value === "boolean") return value;
+  if (typeof value === "number") return Number.isFinite(value) ? value : undefined;
+  if (!value || typeof value !== "object" || util.types.isProxy(value) || state.seen.has(value)) return undefined;
+  state.seen.add(value);
+  if (Array.isArray(value)) {
+    const length = Object.getOwnPropertyDescriptor(value, "length")?.value;
+    if (!Number.isSafeInteger(length) || length > MAX_RESULT_ARRAY) return undefined;
+    return Array.from({ length }, (_, index) => scrubResult(Object.getOwnPropertyDescriptor(value, String(index))?.value, sensitiveValues, state, depth + 1));
+  }
+  const output = {};
+  const keys = Object.getOwnPropertyNames(value);
+  if (keys.length > MAX_RESULT_KEYS) return undefined;
+  for (const key of keys) {
+    if (secretKey.test(key)) continue;
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (!descriptor || !Object.hasOwn(descriptor, "value")) continue;
+    const item = scrubResult(descriptor.value, sensitiveValues, state, depth + 1);
+    if (item !== undefined) output[key] = item;
+  }
+  return deepFreeze(output);
 }
 
 /** Run one canonical Node command. The protected input callback is ephemeral. */
 export async function runDesktopCommand(command, args = {}, context = {}) {
   if (!COMMAND_DEFINITIONS.has(command)) {
-    if (Object.hasOwn(COMMANDS, command)) return runLegacyDesktopCommand(command, args, context);
     return errorEnvelope("command_not_supported");
   }
   const definition = COMMAND_DEFINITIONS.get(command);
-  if (majorVersion(context.manifest) > CAPABILITY_SCHEMA_VERSION && isMutationCommand(command)) return errorEnvelope("capability_schema_unsupported");
-  if (definition.protectedInput && Object.keys(args || {}).some((key) => secretKey.test(key))) return errorEnvelope("protected_input_required");
-  if (!validate(definition.arguments, args)) return errorEnvelope("invalid_command_arguments");
+  const contextIsPlain = context && typeof context === "object" && !util.types.isProxy(context);
+  const contextManifest = contextIsPlain
+    ? Object.getOwnPropertyDescriptor(context, "manifest")
+    : undefined;
+  const suppliedManifest = Boolean(contextManifest);
+  const manifest = contextManifest && Object.hasOwn(contextManifest, "value") ? contextManifest.value : undefined;
+  const version = majorVersion(manifest, suppliedManifest);
+  if (version !== CAPABILITY_SCHEMA_VERSION && isMutationCommand(command)) return errorEnvelope("capability_schema_unsupported");
+  const safeContext = contextIsPlain ? context : {};
   let protectedValue;
-  if (definition.protectedInput) {
-    if (typeof context.protectedInput === "function") protectedValue = await context.protectedInput();
-    else protectedValue = context.protectedInput;
-    if (typeof protectedValue !== "string" || !protectedValue) return errorEnvelope("protected_input_required");
-  }
   try {
+    if (definition.protectedInput && Object.getOwnPropertyNames(args || {}).some((key) => secretKey.test(key))) return errorEnvelope("protected_input_required");
+    if (!validate(definition.arguments, args)) return errorEnvelope("invalid_command_arguments");
+    if (definition.protectedInput) {
+      const inputDescriptor = Object.getOwnPropertyDescriptor(safeContext, "protectedInput");
+      const input = inputDescriptor && Object.hasOwn(inputDescriptor, "value") ? inputDescriptor.value : undefined;
+      protectedValue = typeof input === "function" ? await input() : input;
+      if (typeof protectedValue !== "string" || !protectedValue) return errorEnvelope("protected_input_required");
+    }
     let value;
-    if (typeof context.execute === "function") value = await context.execute(command, { ...args }, protectedValue);
+    const executeDescriptor = Object.getOwnPropertyDescriptor(safeContext, "execute");
+    const execute = executeDescriptor && Object.hasOwn(executeDescriptor, "value") ? executeDescriptor.value : undefined;
+    if (typeof execute === "function") value = await execute(command, { ...args }, protectedValue);
     else {
       const plan = definition.execute?.(args);
       if (!plan) return errorEnvelope("command_not_supported");
-      value = await runControl(context.root || sourceRoot(), plan, {
+      const runnerDescriptor = Object.getOwnPropertyDescriptor(safeContext, "runControl");
+      const controlRunner = runnerDescriptor && Object.hasOwn(runnerDescriptor, "value") && typeof runnerDescriptor.value === "function"
+        ? runnerDescriptor.value
+        : (root, argv, options) => runControl(root, argv, options);
+      const rootDescriptor = Object.getOwnPropertyDescriptor(safeContext, "root");
+      const root = rootDescriptor && Object.hasOwn(rootDescriptor, "value") ? rootDescriptor.value : sourceRoot();
+      value = await controlRunner(root, plan, {
         stdin: protectedValue,
         timeoutMs: definition.protectedInput ? CATALOG_MUTATION_TIMEOUT_MS : CONTROL_TIMEOUT_MS,
       });
-      value = value.trim() ? parseJson(value) : null;
+      value = definition.resultKind === "text" ? String(value).trim() : value.trim() ? parseJson(value) : null;
     }
-    return { ok: true, value: scrubResult(value) };
+    return { ok: true, value: scrubResult(value, protectedValue ? [protectedValue] : []) };
   } catch (error) {
     const code = typeof error?.code === "string" ? error.code : error?.body?.error?.code;
-    if (code && code !== "invalid_command_arguments" && code !== "command_not_supported") {
+    if (definition.protectedInput && protectedValue === undefined) return errorEnvelope("protected_input_required");
+    if (code && (Object.hasOwn(ERROR_DEFINITIONS, code) || Object.hasOwn(COMMAND_ERROR_CODES, code)) && code !== "invalid_command_arguments" && code !== "command_not_supported") {
       return errorEnvelope(code);
     }
     return errorEnvelope("invalid_command_arguments");
