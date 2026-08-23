@@ -616,6 +616,66 @@ test("owner release treats ENOTEMPTY from one validated successor as contention"
   }
 });
 
+function assertSuccessorExtraEntryPreservesRemovalError(extraEntryName, testName) {
+  test(testName, () => {
+    const state = mkdtempSync(path.join(os.tmpdir(), "vision-purge-successor-extra-entry-"));
+    const purgePath = path.join(state, "vision-cache-purge.json");
+    const lockPath = `${purgePath}.lock`;
+    const ownerToken = "owner-a-token";
+    const successorToken = "owner-b-token";
+    const ownerPath = path.join(lockPath, `owner-${ownerToken}.json`);
+    const stagingPath = `${lockPath}.successor-test`;
+    let removalError;
+    try {
+      mkdirSync(lockPath);
+      writeFileSync(ownerPath, `${JSON.stringify({ pid: process.pid, token: ownerToken })}\n`);
+      assert.throws(
+        () => releaseVisionCachePurgeLock(lockPath, {
+          platform: "darwin",
+          ownerPath,
+          ownerToken,
+          fs: {
+            removeFile(target) {
+              assert.equal(target, ownerPath);
+              unlinkSync(target);
+              rmdirSync(lockPath);
+              mkdirSync(stagingPath);
+              writeFileSync(
+                path.join(stagingPath, `owner-${successorToken}.json`),
+                `${JSON.stringify({ pid: process.pid, token: successorToken })}\n`,
+              );
+              writeFileSync(path.join(stagingPath, extraEntryName), "unexpected successor entry\n");
+              renameSync(stagingPath, lockPath);
+            },
+            removeDirectory(target) {
+              try {
+                return rmdirSync(target);
+              } catch (error) {
+                removalError = error;
+                throw error;
+              }
+            },
+          },
+        }),
+        (error) => error === removalError && error?.code === "ENOTEMPTY",
+      );
+      assert.equal(existsSync(path.join(lockPath, `owner-${successorToken}.json`)), true);
+      assert.equal(existsSync(path.join(lockPath, extraEntryName)), true);
+    } finally {
+      rmSync(state, { recursive: true, force: true });
+    }
+  });
+}
+
+assertSuccessorExtraEntryPreservesRemovalError(
+  "mystery.json",
+  "owner release rejects a successor directory containing an unknown file",
+);
+assertSuccessorExtraEntryPreservesRemovalError(
+  "owner.json",
+  "owner release rejects a successor directory containing a legacy owner marker",
+);
+
 test("own generation succeeds when its release confirms a successor", () => {
   const state = mkdtempSync(path.join(os.tmpdir(), "vision-purge-generation-successor-"));
   const purgePath = path.join(state, "vision-cache-purge.json");

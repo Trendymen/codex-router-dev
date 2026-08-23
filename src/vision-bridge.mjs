@@ -171,7 +171,8 @@ function readPurgeLockOwner(lockPath, fs, { platform, wait } = {}) {
   const tokenizedNames = names
     .filter((name) => name.startsWith(PURGE_LOCK_OWNER_PREFIX) && name.endsWith(PURGE_LOCK_OWNER_SUFFIX))
     .sort();
-  if (tokenizedNames.length > 1) return { ambiguous: true };
+  const directoryEntries = [...names];
+  if (tokenizedNames.length > 1) return { ambiguous: true, directoryEntries };
   const ownerName = tokenizedNames[0] || PURGE_LOCK_OWNER_FILE;
   const ownerPath = path.join(lockPath, ownerName);
   try {
@@ -179,10 +180,10 @@ function readPurgeLockOwner(lockPath, fs, { platform, wait } = {}) {
       platform: platform || fs.platform || process.platform,
       wait: wait || fs.wait || waitForPurgeLockRetry,
     });
-    return { path: ownerPath, record: JSON.parse(String(raw)) };
+    return { path: ownerPath, record: JSON.parse(String(raw)), directoryEntries };
   } catch (error) {
-    if (error?.code === "ENOENT") return { path: ownerPath };
-    if (error instanceof SyntaxError) return { path: ownerPath, record: undefined };
+    if (error?.code === "ENOENT") return { path: ownerPath, directoryEntries };
+    if (error instanceof SyntaxError) return { path: ownerPath, record: undefined, directoryEntries };
     throw error;
   }
 }
@@ -213,10 +214,12 @@ function removeWithRetry(remove, target, {
 
 function isConfirmedPurgeSuccessor(lockPath, previousOwnerToken, owner) {
   if (!previousOwnerToken || !owner || owner.ambiguous || !owner.path || !owner.record) return false;
+  if (!Array.isArray(owner.directoryEntries) || owner.directoryEntries.length !== 1) return false;
   const successorToken = owner.record.token;
   if (successorToken === previousOwnerToken || !validPurgeOwnerToken(successorToken)) return false;
   if (!Number.isSafeInteger(owner.record.pid) || owner.record.pid <= 0) return false;
-  return owner.path === purgeOwnerPath(lockPath, successorToken);
+  const expectedPath = purgeOwnerPath(lockPath, successorToken);
+  return owner.path === expectedPath && owner.directoryEntries[0] === path.basename(expectedPath);
 }
 
 function removePurgeLockDirectory(lockPath, fs, {
