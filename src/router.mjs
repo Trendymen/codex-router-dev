@@ -8,7 +8,7 @@ import {
   zstdCompress,
   zstdDecompressSync,
 } from "node:zlib";
-import { promisify } from "node:util";
+import { isDeepStrictEqual, promisify } from "node:util";
 
 import {
   assertCallerSecret,
@@ -2326,7 +2326,15 @@ function validNodeRouteSnapshot(document, route, slug, registered) {
   if (!["routable", "listed", "visible"].every((field) => Object.hasOwn(route, field) && typeof route[field] === "boolean")) return false;
   if (route.slug !== slug || route.routable !== true || !registered) return false;
   const expectedListed = registered.listed === true;
-  if (route.listed !== expectedListed || route.visible !== expectedListed) return false;
+  if (route.listed !== expectedListed) return false;
+  for (const field of NODE_ROUTE_REQUIRED_FIELDS) {
+    if (field === "effectiveFinalReasoningShape" || field === "reasoningDisplayMode") continue;
+    if (route[field] !== registered[field]) return false;
+  }
+  for (const field of NODE_ROUTE_REGISTRY_ONLY_FIELDS) {
+    if (!Object.hasOwn(route, field)) continue;
+    if (!Object.hasOwn(registered, field) || !isDeepStrictEqual(route[field], registered[field])) return false;
+  }
   return true;
 }
 
@@ -2345,17 +2353,11 @@ function readResolvedNodeRoute(slug) {
     // registry row and never force a false snapshot value to true.
     return {
       ...registered,
-      slug: route.slug,
-      provider: route.provider,
-      upstreamModel: route.upstreamModel,
-      effectiveTransport: route.effectiveTransport,
-      toolDialect: route.toolDialect,
-      requestProfile: route.requestProfile,
-      reasoningDisplayMode: route.reasoningDisplayMode,
-      declaredFinalReasoningShape: route.declaredFinalReasoningShape,
+      // Only runtime authorization facts come from the protected snapshot.
+      // Every provider/model/transport/endpoint/credential/behavior binding
+      // remains the immutable registry value above.
       effectiveFinalReasoningShape: route.effectiveFinalReasoningShape,
-      rolloutState: route.rolloutState,
-      purpose: route.purpose,
+      reasoningDisplayMode: route.reasoningDisplayMode,
       routable: route.routable,
       listed: route.listed,
       visible: route.visible,
@@ -2380,7 +2382,6 @@ const NODE_ROUTE_BINDING_FIELDS = Object.freeze([
   "effectiveTransport",
   "toolDialect",
   "requestProfile",
-  "reasoningDisplayMode",
   "declaredFinalReasoningShape",
   "rolloutState",
   "purpose",

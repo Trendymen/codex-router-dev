@@ -142,7 +142,7 @@ test("logout keeps an idempotent tombstone for the completed request", () => {
   const requestId = "11111111-1111-4111-8111-111111111111";
   const result = { status: 204, payload: {} };
   store.remember(session.sessionId, requestId, result);
-  store.logout(session.sessionId);
+  store.logout(session.sessionId, requestId);
   const replay = store.reserve(session.sessionId, requestId);
   assert.equal(replay.status, "completed");
   assert.deepEqual(replay.result, result);
@@ -153,4 +153,15 @@ test("random token collisions resample and fail closed without deterministic der
   const store = createPanelSessionStore({ randomBytes: (size) => { calls += 1; return Buffer.alloc(size, 0x77); } });
   assert.throws(() => store.consumeNonce(store.mintNonce().nonce), /collision|allocate/i);
   assert.ok(calls >= 17);
+});
+
+test("logout tombstones expire and never replay after a long clock jump", () => {
+  let now = 1_000;
+  const store = createPanelSessionStore({ clock: () => now, randomBytes: sequenceRandomBytes() });
+  const session = store.consumeNonce(store.mintNonce().nonce);
+  const requestId = "55555555-5555-4555-8555-555555555555";
+  store.remember(session.sessionId, requestId, { status: 204, payload: {} });
+  store.logout(session.sessionId);
+  now += 2 * 60 * 60_000;
+  assert.equal(store.reserve(session.sessionId, requestId).status, "invalid");
 });

@@ -485,15 +485,21 @@ test("secured panel bootstrap, CSRF and request replay are enforced before comma
     };
     const first = await fetch(`${base}/panel/invoke`, { method: "POST", headers, body: JSON.stringify({ command: "presence.mode", args: { mode: "always" } }) });
     assert.equal(first.status, 200, await first.text());
-    const second = await fetch(`${base}/panel/invoke`, { method: "POST", headers, body: JSON.stringify({ command: "presence.mode", args: { mode: "never" } }) });
+    const second = await fetch(`${base}/panel/invoke`, { method: "POST", headers, body: JSON.stringify({ command: "presence.mode", args: { mode: "always" } }) });
     assert.equal(second.status, 200);
     assert.equal((await second.json()).value.calls, 1);
     assert.equal(calls, 1);
 
+    const replayMismatch = await fetch(`${base}/panel/invoke`, { method: "POST", headers, body: JSON.stringify({ command: "presence.mode", args: { mode: "never" } }) });
+    assert.equal(replayMismatch.status, 409);
+    assert.equal((await replayMismatch.json()).error.code, "panel_confirmation_required");
+    const crossRouteMismatch = await fetch(`${base}/panel/logout`, { method: "POST", headers, body: "{}" });
+    assert.equal(crossRouteMismatch.status, 409);
+
     const concurrentHeaders = { ...headers, "x-request-id": "22222222-2222-4222-8222-222222222222" };
     const concurrent = await Promise.all([
       fetch(`${base}/panel/invoke`, { method: "POST", headers: concurrentHeaders, body: JSON.stringify({ command: "presence.mode", args: { mode: "always" } }) }),
-      fetch(`${base}/panel/invoke`, { method: "POST", headers: concurrentHeaders, body: JSON.stringify({ command: "presence.mode", args: { mode: "never" } }) }),
+      fetch(`${base}/panel/invoke`, { method: "POST", headers: concurrentHeaders, body: JSON.stringify({ command: "presence.mode", args: { mode: "always" } }) }),
     ]);
     assert.deepEqual(concurrent.map((response) => response.status), [200, 200]);
     assert.equal(calls, 2);

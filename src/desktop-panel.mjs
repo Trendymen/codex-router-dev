@@ -17,6 +17,7 @@ import {
   createPanelSessionStore,
   EXPIRED_PANEL_SESSION_COOKIE,
   PANEL_SESSION_COOKIE,
+  operationFingerprint,
   panelSecurityHeaders,
   parsePanelCookie,
   validatePanelRequest,
@@ -261,9 +262,30 @@ export async function handlePanelRequest(request, response, route, {
   if (secured && (route === "/panel/logout" || route === "/panel/confirmations" || route === "/panel/invoke")) {
     let reservation;
     let commandPhase = false;
+    let logoutSessionId;
     try {
       const context = mutationContext(request, policy, sessionStore);
-      reservation = sessionStore.reserve(context.sessionId, context.requestId);
+      logoutSessionId = route === "/panel/logout" ? context.sessionId : undefined;
+      commandPhase = true;
+      let body;
+      try {
+        body = JSON.parse(await readBody(request) || "{}");
+      } catch {
+        throw Object.assign(new Error("The panel request was not valid JSON."), { code: "invalid_command_arguments" });
+      }
+      const operationCommand = route === "/panel/logout" ? "panel.logout" : body?.command;
+      const operationArgsHash = route === "/panel/confirmations"
+        ? (typeof body.argumentsHash === "string" ? body.argumentsHash : canonicalArgumentsHash(body.args ?? {}))
+        : canonicalArgumentsHash(body?.args ?? {});
+      const fingerprint = operationFingerprint({
+        sessionId: context.sessionId,
+        requestId: context.requestId,
+        method: request.method,
+        route,
+        command: operationCommand,
+        argsHash: operationArgsHash,
+      });
+      reservation = sessionStore.reserve(context.sessionId, context.requestId, fingerprint);
       if (reservation.status === "completed") {
         sendStoredResult(response, writeJson, reservation.result, { logout: route === "/panel/logout" });
         return true;
@@ -272,18 +294,12 @@ export async function handlePanelRequest(request, response, route, {
         sendStoredResult(response, writeJson, await reservation.promise, { logout: route === "/panel/logout" });
         return true;
       }
+      if (reservation.status === "mismatch") throw Object.assign(new Error("The request ID was already used for another operation."), { code: "panel_confirmation_required" });
       if (reservation.status !== "reserved") throw Object.assign(new Error("The panel write session is missing or expired."), { code: "panel_auth_required" });
-      commandPhase = true;
-      let body;
-      try {
-        body = JSON.parse(await readBody(request) || "{}");
-      } catch {
-        throw Object.assign(new Error("The panel request was not valid JSON."), { code: "invalid_command_arguments" });
-      }
       if (route === "/panel/logout") {
         const result = { status: 204, payload: {} };
+        sessionStore.logout(context.sessionId, context.requestId);
         reservation.complete(result);
-        sessionStore.logout(context.sessionId);
         sendStoredResult(response, writeJson, result, { logout: true });
         return true;
       }
@@ -328,6 +344,7 @@ export async function handlePanelRequest(request, response, route, {
       sendStoredResult(response, writeJson, completed);
       return true;
     } catch (error) {
+      if (logoutSessionId && reservation?.status !== "mismatch") sessionStore.logout(logoutSessionId, undefined);
       const safe = publicPanelError(error, commandPhase ? "invalid_command_arguments" : "panel_auth_required");
       const completed = { status: safe.status, payload: safe.body };
       if (reservation?.status === "reserved") reservation.complete(completed);

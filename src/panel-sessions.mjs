@@ -7,6 +7,7 @@ export const SESSION_ABSOLUTE_TTL_MS = 60 * 60_000;
 export const CONFIRMATION_TTL_MS = 60_000;
 export const DEFAULT_MAX_SESSIONS = 8;
 export const MAX_REPLAY_ENTRIES = 64;
+export const TOMBSTONE_TTL_MS = BOOTSTRAP_NONCE_TTL_MS;
 
 const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const TOKEN_PATTERN = /^[A-Za-z0-9_-]{43}$/;
@@ -35,6 +36,10 @@ function sameSecret(actual, expected) {
 
 export function canonicalArgumentsHash(args) {
   return createHash("sha256").update(jcsBytes(args)).digest("base64url");
+}
+
+export function operationFingerprint({ sessionId, requestId, method, route, command, argsHash }) {
+  return createHash("sha256").update(jcsBytes({ sessionId, requestId, method, route, command, argsHash })).digest("base64url");
 }
 
 function error(code, message) {
@@ -85,6 +90,7 @@ export function createPanelSessionStore({
         sessions.delete(id);
       }
     }
+    for (const [id, tombstone] of tombstones) if (tombstone.expiresAt <= at) tombstones.delete(id);
     while (tombstones.size > 64) tombstones.delete(tombstones.keys().next().value);
   }
 
@@ -140,11 +146,14 @@ export function createPanelSessionStore({
     return result.session;
   }
 
-  function logout(sessionId) {
+  function logout(sessionId, requestId) {
     const session = sessions.get(sessionId);
     if (!session) return;
     session.revoked = true;
-    tombstones.set(sessionId, { csrfToken: session.csrfToken, replay: session.replay });
+    const replay = new Map();
+    if (requestId && session.replay.has(requestId)) replay.set(requestId, session.replay.get(requestId));
+    session.replay = replay;
+    tombstones.set(sessionId, { csrfToken: session.csrfToken, replay, expiresAt: now() + TOMBSTONE_TTL_MS });
     sessions.delete(sessionId);
   }
 
@@ -156,26 +165,27 @@ export function createPanelSessionStore({
 
   function replay(sessionId, requestId) {
     const session = getSession(sessionId).session;
-    if (session) return session.replay.get(requestId);
-    return tombstones.get(sessionId)?.replay.get(requestId);
+    const entry = session ? session.replay.get(requestId) : tombstones.get(sessionId)?.replay.get(requestId);
+    return entry?.result ?? entry;
   }
 
   function remember(sessionId, requestId, result) {
     const session = touchSession(sessionId);
-    session.replay.set(requestId, result);
+    session.replay.set(requestId, { result, fingerprint: undefined });
     while (session.replay.size > MAX_REPLAY_ENTRIES) session.replay.delete(session.replay.keys().next().value);
   }
 
-  function reserve(sessionId, requestId) {
+  function reserve(sessionId, requestId, fingerprint) {
     const active = getSession(sessionId, { touch: true }).session;
     if (!active) {
-      const result = tombstones.get(sessionId)?.replay.get(requestId);
-      return result ? { status: "completed", result } : { status: "invalid" };
+      const entry = tombstones.get(sessionId)?.replay.get(requestId);
+      if (!entry) return { status: "invalid" };
+      return entry.fingerprint === fingerprint ? { status: "completed", result: entry.result } : { status: "mismatch" };
     }
     const completed = active.replay.get(requestId);
-    if (completed) return { status: "completed", result: completed };
+    if (completed) return completed.fingerprint === fingerprint ? { status: "completed", result: completed.result } : { status: "mismatch" };
     const running = active.inFlight.get(requestId);
-    if (running) return { status: "in-flight", promise: running.promise };
+    if (running) return running.fingerprint === fingerprint ? { status: "in-flight", promise: running.promise } : { status: "mismatch" };
     let resolve;
     let settled = false;
     const promise = new Promise((done) => { resolve = done; });
@@ -186,12 +196,12 @@ export function createPanelSessionStore({
         if (settled) return;
         settled = true;
         active.inFlight.delete(requestId);
-        active.replay.set(requestId, result);
+        active.replay.set(requestId, { result, fingerprint });
         while (active.replay.size > MAX_REPLAY_ENTRIES) active.replay.delete(active.replay.keys().next().value);
         resolve(result);
       },
     };
-    active.inFlight.set(requestId, { promise, reservation });
+    active.inFlight.set(requestId, { promise, reservation, fingerprint });
     return reservation;
   }
 

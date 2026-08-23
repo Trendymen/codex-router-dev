@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -12,6 +14,7 @@ import {
   redactCallerUrl,
 } from "../src/caller-auth.mjs";
 import { isPanelRoute } from "../src/desktop-panel.mjs";
+import { openPort } from "./port-pool.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const CALLER_KEY = "test-caller-auth-capability-with-sufficient-length";
@@ -92,4 +95,80 @@ test("browser launcher mints a caller-authenticated nonce and opens only the cle
   assert.match(source, /panelBootstrapUrl\(PORTS\.router, payload\.nonce\)/);
   assert.doesNotMatch(source, /openInBrowser\(panelUrl/);
   assert.match(source, /Opened the companion in a clean browser session/);
+});
+
+test("real router and launcher keep the caller key out of clean browser bootstrap", async () => {
+  const state = mkdtempSync(path.join(os.tmpdir(), "panel-round2-router-"));
+  const caller = "panel-round2-caller-capability-with-sufficient-length";
+  const internal = "panel-round2-internal-key-with-sufficient-length";
+  const port = await openPort();
+  const env = {
+    ...process.env,
+    MODEL_ROUTER_STATE_DIR: state,
+    CODEX_ROUTER_STATE_DIR: state,
+    CODEX_ROUTER_PORT: String(port),
+    CODEX_ROUTER_CALLER_KEY: caller,
+    CODEX_ROUTER_INTERNAL_KEY: internal,
+    CODEX_ROUTER_QUIET: "1",
+    CODEX_ROUTER_DIRECT_DISPATCH: "0",
+  };
+  writeFileSync(path.join(state, "caller-secret"), `${caller}\n`, { mode: 0o600 });
+  const router = spawn(process.execPath, [path.join(root, "src", "router.mjs")], { cwd: root, env, stdio: ["ignore", "ignore", "pipe"] });
+  let routerErrors = "";
+  router.stderr.setEncoding("utf8");
+  router.stderr.on("data", (chunk) => { routerErrors += chunk; });
+  const stop = async () => {
+    if (router.exitCode === null) {
+      router.kill("SIGTERM");
+      await new Promise((resolve) => router.once("exit", resolve));
+    }
+  };
+  try {
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      try {
+        const health = await fetch(`http://127.0.0.1:${port}/health`);
+        if (health.status === 200 || health.status === 503) break;
+      } catch {
+        if (attempt === 99) throw new Error(`router did not listen: ${routerErrors}`);
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+    }
+    const launcher = spawn(process.execPath, [path.join(root, "src", "panel.mjs"), "--print"], { cwd: root, env, stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    launcher.stdout.setEncoding("utf8");
+    launcher.stderr.setEncoding("utf8");
+    launcher.stdout.on("data", (chunk) => { stdout += chunk; });
+    launcher.stderr.on("data", (chunk) => { stderr += chunk; });
+    const [exitCode] = await new Promise((resolve) => launcher.once("exit", (code) => resolve([code])));
+    assert.equal(exitCode, 0, stderr);
+    const cleanUrl = stdout.trim();
+    assert.match(cleanUrl, new RegExp(`^http://127\\.0\\.0\\.1:${port}/panel-bootstrap/[A-Za-z0-9_-]{43}$`));
+    assert.equal(cleanUrl.includes(caller), false);
+
+    const bootstrap = await fetch(cleanUrl, { redirect: "manual" });
+    assert.equal(bootstrap.status, 303);
+    assert.equal(bootstrap.headers.get("location"), "/panel/");
+    assert.match(bootstrap.headers.get("set-cookie"), /HttpOnly; SameSite=Strict; Path=\/panel$/);
+    const cookie = bootstrap.headers.get("set-cookie").split(";", 1)[0];
+    const session = await fetch(`http://127.0.0.1:${port}/panel/session`, { headers: { cookie } });
+    assert.equal(session.status, 200);
+    const { csrfToken } = await session.json();
+    const invoke = await fetch(`http://127.0.0.1:${port}/panel/invoke`, {
+      method: "POST",
+      headers: { cookie, origin: `http://127.0.0.1:${port}`, "content-type": "application/json", "x-csrf-token": csrfToken, "x-request-id": "66666666-6666-4666-8666-666666666666" },
+      body: JSON.stringify({ command: "does.not.exist", args: {} }),
+    });
+    assert.equal(invoke.status, 404);
+    const logout = await fetch(`http://127.0.0.1:${port}/panel/logout`, {
+      method: "POST",
+      headers: { cookie, origin: `http://127.0.0.1:${port}`, "content-type": "application/json", "x-csrf-token": csrfToken, "x-request-id": "77777777-7777-4777-8777-777777777777" },
+      body: "{}",
+    });
+    assert.equal(logout.status, 204);
+    assert.match(logout.headers.get("set-cookie"), /Max-Age=0; HttpOnly; SameSite=Strict; Path=\/panel/);
+  } finally {
+    await stop();
+    rmSync(state, { recursive: true, force: true });
+  }
 });

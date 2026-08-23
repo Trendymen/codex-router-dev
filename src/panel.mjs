@@ -24,9 +24,9 @@ if (help) {
 
 Opens the Model Router companion in your default browser.
 
-  --print   Write the address instead of opening it. It contains this
-            machine's router capability: treat it like a password, and do
-            not paste it into chat, an issue, or a screen share.
+  --print   Write the address instead of opening it. It contains a one-use
+            browser bootstrap nonce that expires after 30 seconds; do not
+            reuse or share it.
 `,
   );
   process.exit(0);
@@ -52,7 +52,9 @@ async function routerIsRunning() {
     const response = await fetch(`http://127.0.0.1:${PORTS.router}/health`, {
       signal: AbortSignal.timeout(2000),
     });
-    return response.ok;
+    // A degraded dependency still means the Node router is listening and can
+    // mint the browser session; the panel itself will show the health state.
+    return response.ok || response.status === 503;
   } catch {
     return false;
   }
