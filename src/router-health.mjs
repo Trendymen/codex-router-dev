@@ -1,5 +1,26 @@
 import { PORTS, ROUTER_PLANE_TARGET, TARGET, loopback } from "./paths.mjs";
 
+// Only these local Node dependencies can make the service degraded. The list
+// is closed so stale health payloads cannot resurrect a retired runtime row.
+export const NODE_HEALTH_DEPENDENCIES = Object.freeze([
+  "oauth",
+  "api",
+  "grokOauth",
+  "devinCli",
+]);
+const NODE_HEALTH_DEPENDENCY_SET = new Set(NODE_HEALTH_DEPENDENCIES);
+
+function currentNodeHealth(payload) {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return {};
+  const { gateway: _retiredGateway, ...current } = payload;
+  return {
+    ...current,
+    degraded: Array.isArray(current.degraded)
+      ? current.degraded.filter((name) => NODE_HEALTH_DEPENDENCY_SET.has(name))
+      : [],
+  };
+}
+
 // The name the router reports on `/health`. It identifies the *service*, which
 // is one process shared by every client integration, so it is keyed on the
 // router plane rather than on whichever client this command was invoked for.
@@ -29,10 +50,9 @@ export async function waitForRouterHealth({
 
   const deadline = Date.now() + Math.max(0, timeoutMs);
   let lastError = "service unavailable";
-  // A router that answers but reports a dependency down is a different failure
-  // from a router that is not listening, and only the first one is survivable
-  // (the gateway is restarted in place). Keep the last such payload so the
-  // caller can say which of the two happened instead of "not ready".
+  // A router that answers but reports a current dependency down is a different
+  // failure from a router that is not listening. Keep the last such payload so
+  // the caller can say which of the two happened instead of "not ready".
   let lastPayload;
   do {
     try {
@@ -46,14 +66,24 @@ export async function waitForRouterHealth({
       } catch {
         lastError = "health response was not JSON";
       }
-      if (response.ok && payload.service === expectedService) {
-        return { ok: true, payload };
+      const currentPayload = currentNodeHealth(payload);
+      const currentDegraded = currentPayload.degraded;
+      const retiredOnlyPayload =
+        response.status === 503 &&
+        payload.service === expectedService &&
+        Array.isArray(payload.degraded) &&
+        payload.degraded.length === 1 &&
+        payload.degraded[0] === "gateway" &&
+        Object.hasOwn(payload, "gateway") &&
+        payload.gateway?.reachable === false;
+      if (payload.service === expectedService && (response.ok || retiredOnlyPayload)) {
+        return { ok: true, payload: currentPayload };
       }
-      if (payload.service && payload.service !== expectedService) {
-        lastError = `a different service (${payload.service}) is listening on the router port`;
-      } else if (payload.service === expectedService) {
-        lastPayload = payload;
-        const down = Array.isArray(payload.degraded) ? payload.degraded : [];
+      if (currentPayload.service && currentPayload.service !== expectedService) {
+        lastError = `a different service (${currentPayload.service}) is listening on the router port`;
+      } else if (currentPayload.service === expectedService) {
+        lastPayload = currentPayload;
+        const down = currentDegraded;
         lastError = down.length
           ? `it is listening but reports ${down.join(", ")} unreachable (HTTP ${response.status})`
           : `it is listening but answered HTTP ${response.status}`;

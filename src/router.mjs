@@ -170,10 +170,9 @@ const API_HEALTH =
   process.env.CODEX_ROUTER_API_HEALTH_URL ||
   process.env.KIMI_API_HEALTH_URL ||
   loopback(PORTS.api, "/health");
-const GATEWAY_HEALTH =
-  process.env.CODEX_ROUTER_GATEWAY_HEALTH_URL ||
-  process.env.KIMI_GATEWAY_HEALTH_URL ||
-  loopback(PORTS.gateway, "/health/liveliness");
+const GROK_OAUTH_HEALTH = process.env.CODEX_ROUTER_GROK_OAUTH_HEALTH_URL;
+const DEVIN_CLI_HEALTH = process.env.CODEX_ROUTER_DEVIN_CLI_HEALTH_URL;
+const DEVIN_CLI_HEALTH_ENABLED = process.env.CODEX_ROUTER_DEVIN_CLI_HEALTH_ENABLED === "1";
 const CATALOG_PATH =
   process.env.CODEX_ROUTER_CATALOG || process.env.KIMI_ROUTER_CATALOG || MERGED_CATALOG_PATH;
 const INTERNAL_KEY =
@@ -811,22 +810,25 @@ async function healthPayload() {
   const apiEnabled = [...PROVIDERS.values()].some(
     (provider) => enabled.has(provider.id) && provider.kind === "openai-compatible",
   );
-  const [oauth, api, gateway] = await Promise.all([
+  const [oauth, api, grokOauth, devinCli] = await Promise.all([
     enabled.has("kimi-oauth")
       ? serviceHealth(OAUTH_HEALTH)
       : { reachable: true, enabled: false },
     apiEnabled ? serviceHealth(API_HEALTH) : { reachable: true, enabled: false },
-    serviceHealth(GATEWAY_HEALTH),
+    GROK_OAUTH_HEALTH
+      ? serviceHealth(GROK_OAUTH_HEALTH)
+      : { reachable: true, enabled: false },
+    DEVIN_CLI_HEALTH && DEVIN_CLI_HEALTH_ENABLED
+      ? serviceHealth(DEVIN_CLI_HEALTH)
+      : { reachable: true, enabled: false },
   ]);
-  // Naming the unreachable dependency is the difference between "the router is
-  // broken" and "the gateway is restarting". It costs nothing to carry: these
-  // are three fixed local service names, so it is safe on the unauthenticated
-  // leaf too, which is the only one `waitForRouterHealth` and therefore doctor
-  // can read.
+  // Keep the public list to local Node forwarders. The old Python gateway is no
+  // longer part of this service's readiness contract.
   const degraded = [
     ["oauth", oauth],
     ["api", api],
-    ["gateway", gateway],
+    ["grokOauth", grokOauth],
+    ["devinCli", devinCli],
   ]
     .filter(([, service]) => !service.reachable)
     .map(([name]) => name);
@@ -839,7 +841,8 @@ async function healthPayload() {
     activity: activityPayload(),
     oauth,
     api,
-    gateway,
+    grokOauth,
+    devinCli,
   };
 }
 
@@ -1239,6 +1242,35 @@ async function visionEvidenceFor(url, engine, request, effort, question = "", re
 // leave no trace at all. Token counts are not available here (`describeImage`
 // returns the transcript, not the envelope), so the event carries what it
 // honestly has.
+async function dispatchVisionNodeProvider({ engine, request, signal }) {
+  const route = MODEL_BY_SLUG.get(engine.slug) || engine;
+  const endpoint = endpointForModel(route);
+  const credential = resolveProviderCredential(endpoint);
+  if (!credential && endpoint?.authMode !== "anonymous" && !endpoint?.keyless) {
+    return new Response(JSON.stringify({ error: { message: "The selected provider credential is not configured." } }), {
+      status: 503,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+  const built = buildDirectRoutedRequest(request.body, route, {
+    baseUrl: resolveProviderBaseUrl(endpoint).baseUrl,
+    credential,
+    internalKey: INTERNAL_KEY,
+    signal,
+  });
+  const result = await dispatchRoutedRequest(built, {
+    signal,
+    failoverCandidates: [],
+  });
+  const body = result.model.effectiveTransport === "anthropic-messages"
+    ? await readDispatchBody(result)
+    : Buffer.from(await result.response.arrayBuffer());
+  return new Response(body, {
+    status: result.response.status,
+    headers: result.response.headers,
+  });
+}
+
 async function readVisionEvidence({ url, engine, nativeCall, effort, question, key, retryDelaysMs }) {
   const startedAt = Date.now();
   let status = 0;
@@ -1248,6 +1280,7 @@ async function readVisionEvidence({ url, engine, nativeCall, effort, question, k
       imageUrl: url,
       gatewayBase: GATEWAY_BASE,
       headers: routedHeaders(),
+      dispatch: dispatchVisionNodeProvider,
       nativeCall,
       effort,
       question,
@@ -2454,6 +2487,9 @@ async function handleDirectRoutedRequest(request, response, payload, route, cont
   }
   const base = resolveProviderBaseUrl(endpoint).baseUrl;
   const pristine = { ...payload };
+  if (Array.isArray(payload.input)) {
+    pristine.input = await bridgeVisionInput(payload.input, route, request);
+  }
   let built;
   try {
     built = buildDirectRoutedRequest(pristine, route, {

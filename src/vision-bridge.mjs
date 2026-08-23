@@ -1634,6 +1634,7 @@ export async function describeImage({
   imageUrl,
   gatewayBase,
   headers,
+  dispatch,
   nativeCall,
   effort,
   signal,
@@ -1655,6 +1656,7 @@ export async function describeImage({
         imageUrl,
         gatewayBase,
         headers,
+        dispatch,
         nativeCall,
         effort,
         signal,
@@ -1675,6 +1677,7 @@ async function attemptDescribe({
   imageUrl,
   gatewayBase,
   headers,
+  dispatch,
   nativeCall,
   effort,
   signal,
@@ -1686,12 +1689,14 @@ async function attemptDescribe({
   const timeout = AbortSignal.timeout(timeoutMs);
   let upstream;
   try {
-    upstream = await fetchImpl(request.url, {
-      method: "POST",
-      headers: request.headers,
-      body: JSON.stringify(request.body),
-      signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
-    });
+    upstream = typeof dispatch === "function" && !engine.native && !engine.local
+      ? await dispatch({ engine, request, signal: signal ? AbortSignal.any([signal, timeout]) : timeout })
+      : await fetchImpl(request.url, {
+        method: "POST",
+        headers: request.headers,
+        body: JSON.stringify(request.body),
+        signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
+      });
   } catch (error) {
     // The transport's own wording is kept: "fetch failed" against a loopback
     // engine is how an operator learns their own server is down, and replacing

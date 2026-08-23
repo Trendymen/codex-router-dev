@@ -22,12 +22,9 @@ const command = process.argv[2] || "status";
 const mutatingCommands = new Set(["install", "uninstall", "start", "stop", "restart"]);
 const readinessCommands = new Set(["install", "start", "restart"]);
 const shutdownCommands = new Set(["stop", "uninstall"]);
-// start.mjs allows the LiteLLM gateway 300s to cold start, so the readiness
-// wait has to cover at least that. A shorter wait reports failure while the
-// service is still booting, and the installer's rollback then uninstalls the
-// service and reverts the app config out from under a router that goes on to
-// come up healthy seconds later.
-const READINESS_TIMEOUT_MS = 300_000;
+// The Node runtime has no third-party gateway cold start. Keep service
+// readiness bounded by the local Router health window.
+const READINESS_TIMEOUT_MS = 30_000;
 
 async function runServiceCommand() {
   // The wrapper below is a separate Node process, so a direct

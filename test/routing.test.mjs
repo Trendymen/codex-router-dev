@@ -16,6 +16,9 @@ import { fileURLToPath } from "node:url";
 import { zstdCompressSync, zstdDecompressSync } from "node:zlib";
 
 import { callerBaseUrl } from "../src/caller-auth.mjs";
+import { MODEL_BY_SLUG } from "../src/model-registry.mjs";
+import { registryFingerprint } from "../src/protocol-proof.mjs";
+import { PROTOCOL_PROOF_VERIFIER_VERSION } from "../src/protocol-proof-verifier.mjs";
 import { openPort } from "./port-pool.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -263,6 +266,132 @@ test("router health waits for enabled dependencies and ignores disabled forwarde
     await stopChild(router);
     await closeServer(healthy.server);
     rmSync(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("router health reports the runtime Grok and enabled Devin forwarders", async () => {
+  const healthUpstream = await mockServer((request, response) => {
+    if (request.url === "/grok-health" || request.url === "/devin-health") {
+      json(response, 503, { ok: false });
+      return;
+    }
+    json(response, 200, { ok: true });
+  });
+  const routerPort = await openPort();
+  const router = run("router.mjs", {
+    CODEX_ROUTER_PORT: String(routerPort),
+    CODEX_ROUTER_OAUTH_HEALTH_URL: `http://127.0.0.1:${healthUpstream.port}/oauth-health`,
+    CODEX_ROUTER_API_HEALTH_URL: `http://127.0.0.1:${healthUpstream.port}/api-health`,
+    CODEX_ROUTER_GROK_OAUTH_HEALTH_URL: `http://127.0.0.1:${healthUpstream.port}/grok-health`,
+    CODEX_ROUTER_DEVIN_CLI_HEALTH_URL: `http://127.0.0.1:${healthUpstream.port}/devin-health`,
+    CODEX_ROUTER_DEVIN_CLI_HEALTH_ENABLED: "1",
+    CODEX_ROUTER_QUIET: "1",
+  });
+  try {
+    await waitFor(`${routerBase(routerPort)}/models`, router);
+    const response = await fetch(`${routerBase(routerPort)}/health`);
+    const payload = await response.json();
+    assert.equal(response.status, 503);
+    assert.deepEqual(new Set(payload.degraded), new Set(["grokOauth", "devinCli"]));
+    assert.equal(payload.grokOauth.reachable, false);
+    assert.equal(payload.devinCli.reachable, false);
+    assert.equal("gateway" in payload, false);
+  } finally {
+    await stopChild(router);
+    await closeServer(healthUpstream.server);
+  }
+});
+
+test("provider vision reads use Node dispatch and never the retired gateway", async () => {
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), "router-provider-vision-node-"));
+  const deepseek = MODEL_BY_SLUG.get("deepseek/deepseek-v4-pro");
+  const qwen = MODEL_BY_SLUG.get("qwen-plan/qwen3.6-flash");
+  const qwenProof = {
+    slug: qwen.slug,
+    provider: qwen.provider,
+    upstreamModel: qwen.upstreamModel,
+    transport: qwen.effectiveTransport,
+    toolDialect: qwen.toolDialect,
+    requestProfile: qwen.requestProfile,
+    verdict: "passing",
+    verifierVersion: PROTOCOL_PROOF_VERIFIER_VERSION,
+    fingerprint: registryFingerprint(qwen, PROTOCOL_PROOF_VERIFIER_VERSION),
+    measuredFinalReasoningShape: "hybrid-summary",
+    verifiedAt: "2026-08-24T00:00:00.000Z",
+  };
+  const route = (model, shape) => ({
+    ...model,
+    effectiveFinalReasoningShape: shape,
+    routable: true,
+    listed: true,
+    visible: true,
+  });
+  writeFileSync(path.join(stateDir, "enabled-providers.json"), `${JSON.stringify({ version: 1, providers: ["deepseek", "qwen-plan"] })}\n`, { mode: 0o600 });
+  writeFileSync(path.join(stateDir, "deepseek-api-key.secret"), "TEST_DEEPSEEK_KEY\n", { mode: 0o600 });
+  writeFileSync(path.join(stateDir, "qwen-plan-api-key.secret"), "TEST_QWEN_KEY\n", { mode: 0o600 });
+  writeFileSync(path.join(stateDir, "experimental-models.json"), `${JSON.stringify({ version: 1, models: [qwen.slug] })}\n`, { mode: 0o600 });
+  writeFileSync(path.join(stateDir, "protocol-proofs.json"), `${JSON.stringify({ version: 1, revision: 1, revisions: {}, proofs: { [qwen.slug]: qwenProof } })}\n`, { mode: 0o600 });
+  writeFileSync(path.join(stateDir, "node-routes.json"), `${JSON.stringify({ version: 1, routes: [route(deepseek, "raw-content"), route(qwen, "hybrid-summary")] })}\n`, { mode: 0o600 });
+  writeFileSync(path.join(stateDir, "vision-bridge.json"), `${JSON.stringify({ version: 1, enabled: true, engine: qwen.slug, effort: null, defaulted: false })}\n`, { mode: 0o600 });
+  const providerRequests = [];
+  const provider = await mockServer(async (request, response) => {
+    if (request.url === "/v1/responses") {
+      const body = await bodyJson(request);
+      providerRequests.push(body);
+      const text = body.model === qwen.upstreamModel ? "## Vision\nNode path." : "## Answer\nDone.";
+      json(response, 200, {
+        id: `resp_${body.model}`,
+        output_text: text,
+        output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text }] }],
+        usage: { input_tokens: 2, output_tokens: 2 },
+      });
+      return;
+    }
+    json(response, 404, {});
+  });
+  let gatewayRequests = 0;
+  const gateway = await mockServer(async (_request, response) => {
+    gatewayRequests += 1;
+    json(response, 500, { error: "retired gateway must not receive vision" });
+  });
+  const routerPort = await openPort();
+  const router = run("router.mjs", {
+    CODEX_ROUTER_PORT: String(routerPort),
+    CODEX_ROUTER_STATE_DIR: stateDir,
+    CODEX_ROUTER_DIRECT_DISPATCH: "1",
+    CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${gateway.port}/v1`,
+    MODEL_ROUTER_VISION_BRIDGE_STATE: path.join(stateDir, "vision-bridge.json"),
+    DEEPSEEK_API_BASE_URL: `http://127.0.0.1:${provider.port}/v1`,
+    DEEPSEEK_API_KEY: "TEST_DEEPSEEK_KEY",
+    QWEN_PLAN_BASE_URL: `http://127.0.0.1:${provider.port}/v1`,
+    QWEN_PLAN_API_KEY: "TEST_QWEN_KEY",
+    CODEX_ROUTER_QUIET: "1",
+  });
+  try {
+    await waitFor(`${routerBase(routerPort)}/models`, router);
+    const response = await fetch(`${routerBase(routerPort)}/responses`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${CALLER_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: deepseek.slug,
+        stream: false,
+        input: [{ type: "message", role: "user", content: [
+          { type: "input_text", text: "what does this say?" },
+          { type: "input_image", image_url: "data:image/png;base64,AAAA" },
+        ] }],
+      }),
+    });
+    assert.equal(response.status, 200, await response.text());
+    assert.equal(gatewayRequests, 0);
+    assert.ok(providerRequests.some((body) => body.model === qwen.upstreamModel), JSON.stringify(providerRequests));
+    const answer = providerRequests.find((body) => body.model === deepseek.upstreamModel);
+    assert.ok(answer, JSON.stringify(providerRequests));
+    assert.match(JSON.stringify(answer.input), /Node path/, JSON.stringify(providerRequests));
+  } finally {
+    await stopChild(router);
+    await closeServer(gateway.server);
+    await closeServer(provider.server);
+    rmSync(stateDir, { recursive: true, force: true });
   }
 });
 
@@ -5658,7 +5787,10 @@ test("a subagent effort reaches child turns and leaves parent turns alone", asyn
   // imported: paths.mjs resolves it once at import time, so importing first
   // and pointing afterwards writes to the real user config instead.
   const previousStateDir = process.env.MODEL_ROUTER_STATE_DIR;
+  const effortStatePath = path.join(stateDir, "multi-agent-settings.json");
+  const previousEffortPath = process.env.MODEL_ROUTER_MULTI_AGENT_STATE;
   process.env.MODEL_ROUTER_STATE_DIR = stateDir;
+  process.env.MODEL_ROUTER_MULTI_AGENT_STATE = effortStatePath;
   try {
     const { setSubagentEffort } = await import(
       `../src/multi-agent-state.mjs?e2e=${Date.now()}`
@@ -5667,6 +5799,8 @@ test("a subagent effort reaches child turns and leaves parent turns alone", asyn
   } finally {
     if (previousStateDir === undefined) delete process.env.MODEL_ROUTER_STATE_DIR;
     else process.env.MODEL_ROUTER_STATE_DIR = previousStateDir;
+    if (previousEffortPath === undefined) delete process.env.MODEL_ROUTER_MULTI_AGENT_STATE;
+    else process.env.MODEL_ROUTER_MULTI_AGENT_STATE = previousEffortPath;
   }
 
   const seen = [];
@@ -5686,6 +5820,7 @@ test("a subagent effort reaches child turns and leaves parent turns alone", asyn
   const routerPort = await openPort();
   const router = run("router.mjs", {
     MODEL_ROUTER_STATE_DIR: stateDir,
+    MODEL_ROUTER_MULTI_AGENT_STATE: effortStatePath,
     CODEX_ROUTER_PORT: String(routerPort),
     CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${gateway.port}/v1`,
     CODEX_ROUTER_OAUTH_HEALTH_URL: `http://127.0.0.1:${gateway.port}/health`,

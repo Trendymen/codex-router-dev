@@ -2422,6 +2422,31 @@ test("describeImage sends the image to the engine's gateway model", async () => 
   assert.equal(text, "## Summary\nA chart.");
 });
 
+test("describeImage uses the supplied Node provider dispatch instead of the gateway", async () => {
+  let dispatched;
+  let gatewayCalled = false;
+  const text = await describeImage({
+    engine: FLASH_VISION,
+    imageUrl: "data:image/png;base64,AAAA",
+    gatewayBase: "http://127.0.0.1:4200/v1",
+    headers: { Authorization: "Bearer internal" },
+    dispatch: async ({ request }) => {
+      dispatched = request;
+      return new Response(JSON.stringify({ output_text: "## Summary\nNode provider." }), {
+        status: 200,
+      });
+    },
+    fetchImpl: async () => {
+      gatewayCalled = true;
+      throw new Error("gateway must not be contacted");
+    },
+  });
+  assert.equal(gatewayCalled, false);
+  assert.equal(dispatched.url, "http://127.0.0.1:4200/v1/responses");
+  assert.equal(dispatched.body.model, "qwen3.6-flash");
+  assert.equal(text, "## Summary\nNode provider.");
+});
+
 test("a gateway failure names the engine without echoing the upstream body", async () => {
   await assert.rejects(
     describeImage({
