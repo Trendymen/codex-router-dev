@@ -79,6 +79,29 @@ test("schema-driven browser controls expose typed fields without command-name br
   assert.doesNotMatch(model, /name === "(?:vision\.engine|presence\.mode|tool-result-aging\.ttl)"/);
 });
 
+test("nullable integer controls keep the number field open and expose null as a separate off choice", () => {
+  const manifest = buildCapabilityManifest();
+  const markup = renderCapabilitySurface(manifest);
+  assert.match(markup, /data-command="tool-result-aging\.ttl"[\s\S]*data-argument="days"[\s\S]*type="number"[\s\S]*min="0"[\s\S]*max="3650"/);
+  assert.match(markup, /data-argument-null="days"[^>]*type="checkbox"/);
+  assert.doesNotMatch(markup, /<select[^>]*data-argument="days"/);
+  const source = readFileSync(path.join(root, "apps", "desktop", "ui", "app.js"), "utf8");
+  assert.match(source, /field\.dataset\.argumentNull/);
+  assert.match(source, /Number\(field\.value\)/);
+});
+
+test("tool-result-aging TTL accepts safe integer/default and null/off, rejects fraction and bounds", async () => {
+  const definition = desktopCommandDefinitions().get("tool-result-aging.ttl");
+  const run = (days) => runDesktopCommand("tool-result-aging.ttl", { days }, { execute: async (_command, args) => args });
+  assert.deepEqual({ ...(await run(7)).value }, { days: 7 });
+  assert.deepEqual({ ...(await run(null)).value }, { days: null });
+  assert.equal((await run(1.5)).error.code, "invalid_command_arguments");
+  assert.equal((await run(-1)).error.code, "invalid_command_arguments");
+  assert.equal((await run(3651)).error.code, "invalid_command_arguments");
+  assert.equal(definition.arguments.properties.days.minimum, 0);
+  assert.equal(definition.arguments.properties.days.maximum, 3650);
+});
+
 test("every browser command generates schema-valid arguments for the canonical dispatcher", async () => {
   const manifest = buildCapabilityManifest();
   for (const command of browserCommandIds(manifest)) {

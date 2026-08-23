@@ -188,7 +188,7 @@ function validate(schema, value, state = { seen: new WeakSet(), work: MAX_ARGUME
     const item = descriptor.value;
     const types = Array.isArray(rule.type) ? rule.type : [rule.type];
     const validType = types.some((type) => type === "null" ? item === null : type === "integer" ? Number.isSafeInteger(item) : typeof item === type);
-    if (!validType || rule.pattern && (typeof item !== "string" || !new RegExp(rule.pattern).test(item)) || rule.enum && !rule.enum.includes(item)) return false;
+    if (!validType || rule.pattern && (typeof item !== "string" || !new RegExp(rule.pattern).test(item)) || rule.enum && !rule.enum.includes(item) || rule.minimum !== undefined && item !== null && (typeof item !== "number" || item < rule.minimum) || rule.maximum !== undefined && item !== null && (typeof item !== "number" || item > rule.maximum)) return false;
     if (item && typeof item === "object" && !validate({ type: "object", additionalProperties: true, properties: {} }, item, state, depth + 1)) return false;
   }
   return true;

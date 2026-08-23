@@ -53,7 +53,7 @@ export const CAPABILITY_ARGUMENTS = deepFreeze({
   "subagents.verify": objectSchema({ slug }, ["slug"]),
   "failover.status": noArgs, "failover.reset": noArgs,
   "tool-result-aging.status": noArgs, "tool-result-aging.on": noArgs, "tool-result-aging.off": noArgs,
-  "tool-result-aging.ttl": objectSchema({ days: { type: ["integer", "null"] } }, ["days"]),
+  "tool-result-aging.ttl": objectSchema({ days: { type: ["integer", "null"], minimum: 0, maximum: 3650 } }, ["days"]),
   "tool-result-aging.purge": objectSchema({ expiredOnly: boolean }, ["expiredOnly"]),
   "usage.router": noArgs, "usage.provider": objectSchema({ provider }), "usage.model": objectSchema({ slug }, ["slug"]),
   "vision.status": noArgs, "vision.on": noArgs, "vision.off": noArgs,

@@ -379,7 +379,13 @@ function argumentMarkup(command) {
     } else if (types.includes("boolean")) {
       fields.push(`<label><input ${metadata} type="checkbox"${required.has(key) ? " checked" : ""} /> ${label}</label>`);
     } else if (types.includes("integer") && types.includes("null")) {
-      fields.push(`<select ${metadata}><option value="0">0</option><option value="null">null</option></select>`);
+      const bounds = [
+        property.minimum !== undefined ? `min="${html(property.minimum)}"` : "",
+        property.maximum !== undefined ? `max="${html(property.maximum)}"` : "",
+      ].filter(Boolean).join(" ");
+      const initial = property.minimum !== undefined ? property.minimum : 0;
+      fields.push(`<input ${metadata} type="number" ${bounds} step="1" value="${html(initial)}" />`);
+      fields.push(`<label><input data-argument-null="${html(key)}" type="checkbox" aria-label="Turn ${label} off" /> Off</label>`);
     } else if (types.includes("integer")) {
       fields.push(`<input ${metadata} type="number" min="0" step="1" value="0" />`);
     } else {

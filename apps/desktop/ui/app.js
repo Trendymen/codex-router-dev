@@ -233,6 +233,9 @@ function collectBrowserArguments(action, command) {
     else if (types.includes("integer")) args[key] = Number(field.value);
     else if (field.value !== "") args[key] = field.value;
   }
+  for (const field of action?.querySelectorAll("[data-argument-null]") || []) {
+    if (field.checked) args[field.dataset.argumentNull] = null;
+  }
   const secret = action?.querySelector("[data-protected-field=apiKey]");
   if (secret) {
     args.apiKey = secret.value;
