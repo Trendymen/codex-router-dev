@@ -439,13 +439,14 @@ private struct RouterError: LocalizedError {
 private struct DesktopCommandBridge {
   private static let outputLimit = 256 * 1024
   private static let commandTimeout = Duration.seconds(120)
-  private static let terminationGrace = Duration.seconds(2)
+  private static let terminationGraceSeconds = 2.0
   private let root: URL?
 
-  private enum BridgeFailure: LocalizedError {
+  private enum BridgeFailure: LocalizedError, Sendable {
     case missingRoot
     case missingNode
     case missingBridge
+    case cancelled
     case timedOut
     case outputLimit
     case invalidOutput
@@ -455,10 +456,65 @@ private struct DesktopCommandBridge {
       case .missingRoot: return "Cannot find the signed Router checkout."
       case .missingNode: return "Cannot find the validated Node runtime."
       case .missingBridge: return "The Router command bridge is unavailable."
+      case .cancelled: return "The Router command was cancelled."
       case .timedOut: return "The Router command timed out."
       case .outputLimit: return "The Router command returned too much output."
       case .invalidOutput: return "The Router command returned an unreadable response."
       }
+    }
+  }
+
+  // Process termination, timeout, cancellation, and the "already exited"
+  // check can all race.  Keep the continuation behind one lock so that a
+  // child which exits before Foundation invokes terminationHandler cannot
+  // resume the wait twice, and a timeout cannot turn a successful exit into a
+  // second result.
+  private final class ProcessCompletion: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Int32, Error>?
+    private var pending: Result<Int32, Error>?
+    private var completed = false
+
+    var isCompleted: Bool {
+      lock.lock()
+      defer { lock.unlock() }
+      return completed
+    }
+
+    func install(_ continuation: CheckedContinuation<Int32, Error>) {
+      lock.lock()
+      if let pending {
+        lock.unlock()
+        continuation.resume(with: pending)
+        return
+      }
+      self.continuation = continuation
+      lock.unlock()
+    }
+
+    @discardableResult
+    func succeed(_ status: Int32) -> Bool {
+      complete(.success(status))
+    }
+
+    @discardableResult
+    func fail(_ error: BridgeFailure) -> Bool {
+      complete(.failure(error))
+    }
+
+    @discardableResult
+    private func complete(_ result: Result<Int32, Error>) -> Bool {
+      lock.lock()
+      guard !completed else {
+        lock.unlock()
+        return false
+      }
+      completed = true
+      let continuation = self.continuation
+      if continuation == nil { pending = result }
+      lock.unlock()
+      continuation?.resume(with: result)
+      return true
     }
   }
 
@@ -546,18 +602,35 @@ private struct DesktopCommandBridge {
     return object["ok"] is Bool && (object["value"] != nil || object["error"] != nil)
   }
 
-  private static func waitForProcess(_ process: Process) async -> Int32 {
-    await withTaskCancellationHandler {
-      await withCheckedContinuation { continuation in
-        process.terminationHandler = { child in
-          continuation.resume(returning: child.terminationStatus)
-        }
-        if !process.isRunning {
-          continuation.resume(returning: process.terminationStatus)
-        }
+  // Escalation runs outside the caller's cancellation state. Once TERM has
+  // been sent, cancellation must still leave a bounded grace period before
+  // the final KILL and must not strand a child that ignores TERM.
+  private static func terminateProcess(_ process: Process) async {
+    let worker = Task.detached(priority: .userInitiated) { [process] in
+      if process.isRunning { process.terminate() }
+      Thread.sleep(forTimeInterval: Self.terminationGraceSeconds)
+      if process.isRunning { Darwin.kill(process.processIdentifier, SIGKILL) }
+    }
+    await worker.value
+  }
+
+  private static func waitForProcess(_ process: Process, completion: ProcessCompletion) async throws -> Int32 {
+    try await withTaskCancellationHandler {
+      try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Int32, Error>) in
+        completion.install(continuation)
+        // A very short-lived helper can finish between run() and installing
+        // the continuation. The completion lock makes this check harmless
+        // when terminationHandler won the race.
+        if !process.isRunning { completion.succeed(process.terminationStatus) }
       }
     } onCancel: {
-      if process.isRunning { process.terminate() }
+      guard !completion.isCompleted else { return }
+      // Mark the result first so the waiter resumes once. The caller's catch
+      // path owns the bounded TERM/grace/KILL escalation below; doing it here
+      // would race the timeout task and leave two independent killers.
+      guard completion.fail(.cancelled) else { return }
+      guard process.isRunning else { return }
+      process.terminate()
     }
   }
 
@@ -594,6 +667,10 @@ private struct DesktopCommandBridge {
     process.standardInput = stdin
     process.standardOutput = stdout
     process.standardError = stderr
+    let completion = ProcessCompletion()
+    process.terminationHandler = { child in
+      completion.succeed(child.terminationStatus)
+    }
     do {
       try process.run()
     } catch {
@@ -612,39 +689,47 @@ private struct DesktopCommandBridge {
     stdin.fileHandleForWriting.closeFile()
     Self.zeroize(&input)
 
-    let statusTask = Task { await Self.waitForProcess(process) }
+    // Timeout owns termination itself. It does not wait in a task group for a
+    // child task whose continuation might be cancelled only after the process
+    // exits; this keeps TERM/grace/KILL bounded even for a SIGTERM-resistant
+    // helper. ProcessCompletion makes the normal-exit and timeout paths
+    // single-completion by construction.
+    let timeoutTask = Task {
+      try? await Task.sleep(for: Self.commandTimeout)
+      guard !Task.isCancelled, !completion.isCompleted else { return }
+      if !process.isRunning {
+        completion.succeed(process.terminationStatus)
+        return
+      }
+      guard completion.fail(.timedOut) else { return }
+      await Self.terminateProcess(process)
+    }
+
     let status: Int32
     do {
-      status = try await withThrowingTaskGroup(of: Int32.self) { group in
-        group.addTask { await statusTask.value }
-        group.addTask {
-          try await Task.sleep(for: Self.commandTimeout)
-          throw BridgeFailure.timedOut
-        }
-        defer { group.cancelAll() }
-        return try await group.next()!
-      }
+      status = try await Self.waitForProcess(process, completion: completion)
     } catch {
-      stopProcess()
-      let terminated = await withTaskGroup(of: Bool.self) { group in
-        group.addTask { _ = await statusTask.value; return true }
-        group.addTask {
-          try? await Task.sleep(for: Self.terminationGrace)
-          return false
-        }
-        let first = await group.next() ?? false
-        group.cancelAll()
-        return first
+      if case BridgeFailure.timedOut = error {
+        // The timeout task performs the bounded grace period and escalation;
+        // wait for it before draining pipes so a resistant child cannot leave
+        // the collectors blocked forever.
+        _ = await timeoutTask.value
+      } else if case BridgeFailure.cancelled = error {
+        timeoutTask.cancel()
+        await Self.terminateProcess(process)
+        _ = await timeoutTask.value
+      } else {
+        timeoutTask.cancel()
+        await Self.terminateProcess(process)
+        _ = await timeoutTask.value
       }
-      if !terminated, process.isRunning {
-        Darwin.kill(process.processIdentifier, SIGKILL)
-      }
-      _ = await statusTask.value
       _ = await stdoutReader.value
       _ = await stderrReader.value
       throw (error as? BridgeFailure) ?? BridgeFailure.timedOut
     }
 
+    timeoutTask.cancel()
+    _ = await timeoutTask.value
     let output = await stdoutReader.value
     _ = await stderrReader.value
     if output.count >= Self.outputLimit {
@@ -968,16 +1053,18 @@ struct RouterSnapshot: Decodable {
   let targets: [String: RouterTarget]
   let presence: RouterPresence?
   let activity: RouterActivitySnapshot?
+  let serviceRunning: Bool?
   let capabilities: CapabilitySnapshotV1?
   let accountUsage: CodexAccountUsage?
   let providerUsage: ProviderUsageSnapshot?
 
-  static let empty = RouterSnapshot(targets: [:], presence: nil, activity: nil, capabilities: nil, accountUsage: nil, providerUsage: nil)
+  static let empty = RouterSnapshot(targets: [:], presence: nil, activity: nil, serviceRunning: nil, capabilities: nil, accountUsage: nil, providerUsage: nil)
 
-  init(targets: [String: RouterTarget], presence: RouterPresence?, activity: RouterActivitySnapshot?, capabilities: CapabilitySnapshotV1?, accountUsage: CodexAccountUsage?, providerUsage: ProviderUsageSnapshot?) {
+  init(targets: [String: RouterTarget], presence: RouterPresence?, activity: RouterActivitySnapshot?, serviceRunning: Bool?, capabilities: CapabilitySnapshotV1?, accountUsage: CodexAccountUsage?, providerUsage: ProviderUsageSnapshot?) {
     self.targets = targets
     self.presence = presence
     self.activity = activity
+    self.serviceRunning = serviceRunning
     self.capabilities = capabilities
     self.accountUsage = accountUsage
     self.providerUsage = providerUsage
@@ -988,12 +1075,21 @@ struct RouterSnapshot: Decodable {
     targets = (try? values.decode([String: RouterTarget].self, forKey: .targets)) ?? [:]
     presence = try? values.decode(RouterPresence.self, forKey: .presence)
     activity = try? values.decode(RouterActivitySnapshot.self, forKey: .activity)
+    if let direct = try? values.decode(Bool.self, forKey: .serviceRunning) {
+      serviceRunning = direct
+    } else if let service = try? values.nestedContainer(keyedBy: ServiceCodingKeys.self, forKey: .service),
+      let running = try? service.decode(Bool.self, forKey: .running) {
+      serviceRunning = running
+    } else {
+      serviceRunning = nil
+    }
     capabilities = try? values.decode(CapabilitySnapshotV1.self, forKey: .capabilities)
     accountUsage = try? values.decode(CodexAccountUsage.self, forKey: .accountUsage)
     providerUsage = try? values.decode(ProviderUsageSnapshot.self, forKey: .providerUsage)
   }
 
-  private enum CodingKeys: String, CodingKey { case targets, presence, activity, capabilities, accountUsage, providerUsage }
+  private enum CodingKeys: String, CodingKey { case targets, presence, activity, serviceRunning, service, capabilities, accountUsage, providerUsage }
+  private enum ServiceCodingKeys: String, CodingKey { case running, active, isRunning }
 }
 
 struct DailyUsagePoint: Identifiable, Equatable {
@@ -1157,7 +1253,10 @@ enum MenuBarLayoutMetrics {
 final class RouterStore: ObservableObject {
   static let shared = RouterStore()
 
-  private enum ServiceIntent { case unknown, running, stopped }
+  // `stoppedByTray` is ownership, not an observation. A service that another
+  // process stopped must not be started on tray quit as if this tray had
+  // borrowed it, while a follow-mode stop initiated here must be restored.
+  private enum ServiceIntent { case unknown, running, stoppedByTray }
 
   @Published private(set) var snapshot = RouterSnapshot.empty
   @Published private(set) var capabilitySnapshot = CapabilitySnapshotV1.empty
@@ -1462,7 +1561,13 @@ final class RouterStore: ObservableObject {
 
   func retireLoginItem() {}
 
-  func restoreServiceOnQuit() { stopPolling() }
+  func restoreServiceOnQuit() {
+    let restore = serviceIntent == .stoppedByTray
+    stopPolling()
+    if restore {
+      Task { @MainActor [weak self] in await self?.runServiceCommand("start") }
+    }
+  }
 
   func startHostAppObservation() {
     let center = NSWorkspace.shared.notificationCenter
@@ -1538,8 +1643,7 @@ final class RouterStore: ObservableObject {
       }
     }
     hostAppRunning = processRunning
-    if effectivePresenceMode == .followCodex, processRunning, serviceIntent == .stopped {
-      serviceIntent = .unknown
+    if effectivePresenceMode == .followCodex, processRunning, serviceIntent == .stoppedByTray {
       Task { @MainActor [weak self] in await self?.runServiceCommand("start") }
     }
     refreshSurfacesVisible()
@@ -1574,7 +1678,7 @@ final class RouterStore: ObservableObject {
     let command = action == "stop" ? "lifecycle.stop" : "lifecycle.start"
     do {
       _ = try await executeCanonicalCommand(command)
-      serviceIntent = action == "stop" ? .stopped : .running
+      serviceIntent = action == "stop" ? .stoppedByTray : .running
     } catch {
       serviceIntent = .unknown
       message = error.localizedDescription
@@ -1648,10 +1752,21 @@ final class RouterStore: ObservableObject {
   private func refreshActivity() async {
     do {
       guard let value = try await executeCanonicalCommand("lifecycle.status"), case .object(let object) = value else { return }
-      if case let .some(.string(state)) = object["state"], let next = RouterActivityState(rawValue: state) { activityState = next }
+      guard case let .some(.object(activityValue)) = object["activity"] else { return }
+      let data = try JSONEncoder().encode(JSONValue.object(activityValue))
+      let activity = try JSONDecoder().decode(RouterActivitySnapshot.self, from: data)
+      applyActivity(activity)
     } catch {
       // Status polling is best-effort; the main snapshot owns the user-facing error.
     }
+  }
+
+  private func applyActivity(_ activity: RouterActivitySnapshot) {
+    activityState = activity.state
+    activeRequests = activity.active
+    activeRequestCount = activity.activeCount
+    activeModel = activity.model
+    activitySessionName = activity.sessionName
   }
 
   private func refreshAccountUsage() async {
@@ -1694,13 +1809,8 @@ final class RouterStore: ObservableObject {
       }
       let decoded = try JSONDecoder().decode(RouterSnapshot.self, from: data)
       snapshot = decoded
-      if let activity = decoded.activity {
-        activityState = activity.state
-        activeRequests = activity.active
-        activeRequestCount = activity.activeCount
-        activeModel = activity.model
-        activitySessionName = activity.sessionName
-      }
+      if let activity = decoded.activity { applyActivity(activity) }
+      if decoded.serviceRunning == true { serviceIntent = .running }
       if let presence = decoded.presence {
         presenceMode = TrayPresenceMode.fromNode(presence.effectiveMode) ?? TrayPresenceMode.fromNode(presence.mode) ?? .always
         routerPinsServiceOn = presence.harnessPublished || presence.terminalCodex
@@ -1737,7 +1847,6 @@ final class RouterStore: ObservableObject {
     activeModel = nil
     activitySessionName = nil
     activityState = .idle
-    serviceIntent = .unknown
   }
 
   func clearCommandResult() { commandResult = nil }
@@ -1798,6 +1907,7 @@ final class RouterStore: ObservableObject {
     do {
       _ = try await executeCanonicalCommand(command.name, arguments: arguments, protectedInput: protectedInput, recordResult: true)
       result = commandResult
+      recordServiceOutcome(for: command.name)
       message = "\(command.name) applied."
       if command.name == "credential.set" { await refreshProviderUsage() }
       _ = await refresh()
@@ -1807,6 +1917,14 @@ final class RouterStore: ObservableObject {
       message = error.localizedDescription
       _ = await refresh()
       commandResult = result
+    }
+  }
+
+  private func recordServiceOutcome(for command: String) {
+    switch command {
+    case "lifecycle.stop": serviceIntent = .stoppedByTray
+    case "lifecycle.start", "lifecycle.restart": serviceIntent = .running
+    default: break
     }
   }
 

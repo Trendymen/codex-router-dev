@@ -77,10 +77,9 @@ function uiMetadata(name, args, {
     .split(".")
     .map((part) => part.replaceAll("-", " ").replace(/\b\w/g, (letter) => letter.toUpperCase()))
     .join(" · ");
-  const namespace = name.split(".", 1)[0];
   return deepFreeze({
     title,
-    localizationKey: `capability.${namespace}`,
+    localizationKey: `command.${name}`,
     control: resultKind === "protected-text" ? "protected-output" : protectedInput ? "protected-input" : mutating ? "mutation" : "read",
     confirmation: confirmation ? "server" : "none",
     quotaWarning: quotaWarning ? "cost-warning" : "none",

@@ -286,7 +286,7 @@ function scrubResult(value, sensitiveValues = [], state = { seen: new WeakSet(),
 function scrubLifecycleStatus(value, sensitiveValues = []) {
   if (!value || typeof value !== "object" || Array.isArray(value) || util.types.isProxy(value)) return scrubResult(value, sensitiveValues);
   const output = Object.create(null);
-  for (const key of ["targets", "presence", "harness", "capabilities", "health", "version", "state", "activity"]) {
+  for (const key of ["targets", "service", "presence", "harness", "capabilities", "health", "version", "state", "activity"]) {
     const descriptor = Object.getOwnPropertyDescriptor(value, key);
     if (!descriptor || !Object.hasOwn(descriptor, "value")) continue;
     const item = scrubResult(descriptor.value, sensitiveValues, undefined, 0, LIFECYCLE_RESULT_LIMITS);

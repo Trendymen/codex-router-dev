@@ -17,6 +17,7 @@ import { withNativeContextVariants } from "./native-context-variants.mjs";
 import {
   DSH_CATALOG_PATH,
   GEMINI_CATALOG_PATH,
+  PORTS,
   PROVIDER_SELECTION_PATH,
 } from "./paths.mjs";
 // Same reasoning: presence is a property of the shared plane, not of a target,
@@ -64,6 +65,33 @@ function targetIsActive(target) {
     return Boolean(status.installed || status.loaded);
   } catch {
     return false;
+  }
+}
+
+// The shared service is one plane, so its runtime state must come from the
+// service manager rather than from a target probe. A target can be configured
+// while the LaunchAgent/systemd unit is deliberately stopped; exposing that
+// as `running` makes the tray restore or stop the wrong process on its next
+// presence transition.
+function serviceStatus() {
+  const result = spawnSync(
+    process.execPath,
+    [path.join(REPO_ROOT, "src", "service.mjs"), "status"],
+    { env: { ...process.env, MODEL_ROUTER_TARGET: "codex" }, encoding: "utf8" },
+  );
+  try {
+    const value = JSON.parse(result.stdout);
+    const state = typeof value?.state === "string" ? value.state : "unknown";
+    const running = typeof value?.running === "boolean"
+      ? value.running
+      : ["running", "active"].includes(state) || Boolean(value?.loaded && state === "loaded");
+    return {
+      installed: Boolean(value?.installed),
+      running,
+      state,
+    };
+  } catch {
+    return { installed: false, running: false, state: "unknown" };
   }
 }
 
@@ -388,6 +416,8 @@ function probeTargets() {
 async function printOverview(asJson) {
   const targets = probeTargets();
   if (asJson) {
+    const activity = await routerActivitySnapshot();
+    const service = serviceStatus();
     // The tray polls this. Presence rides along so the rule that decides
     // whether the router may be stopped is computed once, here, rather than
     // re-derived from target flags on the Swift side where it would drift.
@@ -398,7 +428,9 @@ async function printOverview(asJson) {
       `${JSON.stringify(
         {
           targets,
+          service,
           presence: presenceSnapshot(),
+          activity,
           harness: await harnessSnapshotWithWeb(),
           capabilities: buildCapabilityManifest({ targets, presence: presenceSnapshot() }),
         },
@@ -419,6 +451,33 @@ async function printOverview(asJson) {
       const mark = model.enabled ? "x" : " ";
       process.stdout.write(`  [${mark}] ${model.displayName}\n`);
     }
+  }
+}
+
+async function routerActivitySnapshot() {
+  // The real-child capability oracle runs with a trace sink and forbids all
+  // network. It supplies a deterministic idle projection; production control
+  // processes have no trace sink and read the live Router owner below.
+  if (process.env.CONTROL_SAFE_TRACE) return { state: "idle", activeCount: 0, active: [] };
+  const unavailable = { state: "starting", activeCount: 0, active: [] };
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 250);
+  try {
+    const response = await fetch(`http://127.0.0.1:${PORTS.router}/health`, {
+      signal: controller.signal,
+      headers: { Accept: "application/json" },
+    });
+    const payload = await response.json();
+    const activity = payload && typeof payload === "object" ? payload.activity : undefined;
+    // An absent health/activity payload is not evidence that the router is
+    // idle. Keep the tray from stopping a service while its live owner is
+    // temporarily unreachable.
+    if (!activity || typeof activity !== "object") return unavailable;
+    return activity;
+  } catch {
+    return unavailable;
+  } finally {
+    clearTimeout(timeout);
   }
 }
 

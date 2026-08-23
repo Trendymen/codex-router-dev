@@ -11,6 +11,7 @@ import { buildCapabilityManifest } from "../src/capability-manifest.mjs";
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const swiftSource = readFileSync(path.join(root, "apps/macos/ModelRouterTray/Sources/ModelRouterTrayApp.swift"), "utf8");
 const bridgeSource = readFileSync(path.join(root, "src", "desktop-command-bridge.mjs"), "utf8");
+const controlSource = readFileSync(path.join(root, "src", "control.mjs"), "utf8");
 const localizationSources = [
   "Localization.swift",
   "RouterArabicText.swift",
@@ -61,12 +62,16 @@ test("the real Node manifest encodes Swift-decodable boolean metadata", () => {
     assert.equal(typeof command.quotaWarning, "boolean", command.name);
     assert.equal(typeof command.protectedInput, "boolean", command.name);
     assert.equal(typeof command.ui.title, "string", command.name);
-    assert.match(command.ui.localizationKey, /^capability\.[a-z0-9-]+$/, command.name);
+    assert.match(command.ui.localizationKey, /^command\.[a-z0-9._-]+$/, command.name);
     for (const field of Object.values(command.ui.fields)) {
       assert.equal(typeof field.label, "string", command.name);
       assert.match(field.localizationKey, /^field\.[A-Za-z0-9-]+$/, command.name);
     }
   }
+  assert.deepEqual(
+    manifest.commands.map(({ name, ui }) => ui.localizationKey).sort(),
+    fixture.nodeCommands.map((name) => `command.${name}`).sort(),
+  );
   assert.match(swiftSource, /decodeIfPresent\(Bool\.self, forKey: \.confirmation\)/);
   assert.match(swiftSource, /decodeIfPresent\(Bool\.self, forKey: \.quotaWarning\)/);
   assert.match(swiftSource, /struct\s+CapabilityUI\b/);
@@ -117,6 +122,13 @@ test("Node process I/O drains both streams, bounds output, times out, and preser
   assert.match(swiftSource, /terminationGrace/);
   assert.match(swiftSource, /SIGKILL/);
   assert.match(swiftSource, /withTaskCancellationHandler/);
+  assert.match(swiftSource, /ProcessCompletion/);
+  assert.match(swiftSource, /completion\.isCompleted/);
+  assert.match(swiftSource, /completion\.fail\(\.cancelled\)/);
+  assert.match(swiftSource, /case BridgeFailure\.cancelled = error/);
+  assert.match(swiftSource, /Thread\.sleep\(forTimeInterval: Self\.terminationGraceSeconds\)/);
+  assert.doesNotMatch(swiftSource, /withThrowingTaskGroup/);
+  assert.doesNotMatch(swiftSource, /statusTask/);
   assert.match(swiftSource, /process\.processIdentifier/);
   assert.doesNotMatch(swiftSource, /waitUntilExit\(\)/);
   assert.match(swiftSource, /process\.terminate\(\)/);
@@ -128,6 +140,20 @@ test("Node process I/O drains both streams, bounds output, times out, and preser
   assert.notEqual(malformed.status, 0);
   const nullRequest = runBridge("lifecycle.status", "null");
   assert.equal(nullRequest.envelope?.ok, true);
+});
+
+test("lifecycle status uses the Node-owned service state and nested live activity snapshot", () => {
+  assert.match(controlSource, /serviceStatus/);
+  assert.match(controlSource, /loaded/);
+  assert.match(controlSource, /const unavailable = \{ state: "starting", activeCount: 0, active: \[\] \}/);
+  assert.doesNotMatch(controlSource, /catch \{\s*return \{ state: "idle", activeCount: 0, active: \[\] \}/);
+  assert.doesNotMatch(controlSource, /const service = \{ running: Boolean\(targets\.codex\?\.active\) \}/);
+  assert.match(swiftSource, /object\["activity"\]/);
+  assert.doesNotMatch(swiftSource, /if case let \.some\(\.string\(state\)\) = object\["state"\]/);
+  const status = runBridge("lifecycle.status", { args: {}, capabilitySchemaVersion: 1 });
+  assert.equal(status.envelope?.ok, true, status.stderr);
+  assert.equal(typeof status.envelope.value.activity?.activeCount, "number");
+  assert.ok(Array.isArray(status.envelope.value.activity?.active));
 });
 
 test("bridge passes schema versions, ignores hostile environment redirects, and never echoes protected input", () => {
@@ -160,7 +186,11 @@ test("real lifecycle.status keeps bounded targets, presence, health/version, and
   const value = status.envelope.value;
   assert.ok(value && typeof value === "object");
   assert.ok(value.targets && typeof value.targets === "object");
+  assert.ok(value.service && typeof value.service === "object");
+  assert.equal(typeof value.service.running, "boolean");
   assert.ok(value.presence && typeof value.presence === "object");
+  assert.ok(value.activity && typeof value.activity === "object");
+  assert.equal(typeof value.activity.activeCount, "number");
   assert.ok(value.capabilities && typeof value.capabilities === "object");
   assert.equal(value.capabilities.capabilitySchemaVersion, 1);
   assert.equal(value.capabilities.commands.length, fixture.nodeCommands.length);
@@ -199,18 +229,55 @@ test("status/activity/usage polling is cancellable and host observation rechecks
   assert.match(swiftSource, /activeRequests = activity\.active/);
   assert.match(swiftSource, /activeRequestCount = activity\.activeCount/);
   assert.doesNotMatch(swiftSource, /presenceModeKey/);
-  assert.match(swiftSource, /serviceIntent == \.stopped/);
+  assert.match(swiftSource, /serviceIntent == \.stoppedByTray/);
   assert.match(swiftSource, /runServiceCommand\("start"\)/);
+  assert.match(swiftSource, /recordServiceOutcome\(for: command\.name\)/);
+  assert.match(swiftSource, /case "lifecycle\.stop": serviceIntent = \.stoppedByTray/);
+  assert.match(swiftSource, /case "lifecycle\.start", "lifecycle\.restart": serviceIntent = \.running/);
+  assert.match(swiftSource, /let restore = serviceIntent == \.stoppedByTray/);
+  assert.match(swiftSource, /serviceRunning = direct/);
+  assert.match(swiftSource, /if effectivePresenceMode == \.followCodex, processRunning, serviceIntent == \.stoppedByTray/);
+  assert.match(swiftSource, /await self\.refreshHostAppRunning\(\)/);
+  assert.match(swiftSource, /guard !Task\.isCancelled, effectivePresenceMode == \.followCodex, !hostAppRunning/);
+  assert.match(swiftSource, /restoreServiceOnQuit\(\)/);
+  assert.match(swiftSource, /stoppedByTray/);
+  assert.doesNotMatch(swiftSource, /serviceIntent = serviceRunning \? \.running : \.stopped/);
+  assert.doesNotMatch(swiftSource, /private func clearCapabilityState\(\)[\s\S]*?serviceIntent = \.unknown/);
 });
 
 test("all localized capability literals keep exact key parity across language tables", () => {
   const keySet = (source) => new Set([...source.matchAll(/^\s*"((?:[^"\\]|\\.)*)":\s*"/gm)].map(([, key]) => key));
   const reference = keySet(localizationSources[0]);
+  const critical = [
+    "Quota warning",
+    "Enter credential for this one-time operation",
+    "Confirm and run",
+    "Run",
+    "Confirm this Router operation?",
+    "This operation may consume provider quota. Check the provider plan before continuing.",
+    "This action may use quota.",
+    "The Router will apply this change.",
+    "Refresh after updating the Router.",
+    "Only health and version information is available for this Router capability version.",
+    "Health: %@",
+    "Version: %@",
+  ];
+  const english = new Map([...localizationSources[0].matchAll(/^\s*"((?:[^"\\]|\\.)*)":\s*"((?:[^"\\]|\\.)*)"/gm)].map(([, key, value]) => [key, value]));
   for (const [index, source] of localizationSources.slice(1).entries()) {
     assert.deepEqual(keySet(source), reference, `language table ${index + 1} drifted`);
     const values = new Map([...source.matchAll(/^\s*"((?:[^"\\]|\\.)*)":\s*"((?:[^"\\]|\\.)*)"/gm)].map(([, key, value]) => [key, value]));
-    for (const key of [...reference].filter((value) => value.startsWith("capability.") || value.startsWith("field."))) {
+    for (const key of [...reference].filter((value) => value.startsWith("capability.") || value.startsWith("field.") || value.startsWith("command."))) {
       assert.notEqual(values.get(key), key, `language table ${index + 1} left ${key} untranslated`);
+    }
+    for (const key of critical) assert.notEqual(values.get(key), english.get(key), `language table ${index + 1} left ${key} in English`);
+  }
+  const manifestCommandKeys = buildCapabilityManifest().commands.map(({ ui }) => ui.localizationKey);
+  assert.equal(new Set(manifestCommandKeys).size, manifestCommandKeys.length, "manifest command localization keys must be unique");
+  for (const source of localizationSources) {
+    for (const key of manifestCommandKeys) {
+      const escapedKey = key.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\\\$&");
+      const occurrences = [...source.matchAll(new RegExp(`^\\s*"${escapedKey}":`, "gm"))].length;
+      assert.equal(occurrences, 1, `${key} must occur exactly once in each language table`);
     }
   }
 });
