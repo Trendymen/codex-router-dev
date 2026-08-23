@@ -13,10 +13,15 @@ import { NATIVE_CATALOG_PATH } from "./paths.mjs";
 import { nativeSessionAvailable } from "./codex-native-session.mjs";
 import { readHiddenModels } from "./model-picker-state.mjs";
 import { readMultiAgentSettings } from "./multi-agent-state.mjs";
-import { selectedConfiguredListedModels } from "./provider-selection.mjs";
+import {
+  configuredProviderIds,
+  readProviderSelection,
+  selectedConfiguredListedModels,
+} from "./provider-selection.mjs";
 import { applySubagentProofs, subagentProofSnapshot } from "./subagent-proofs.mjs";
 import { applyVisionBridge, resolveVisionEngine } from "./vision-bridge.mjs";
 import { readVisionBridgeSettings } from "./vision-bridge-state.mjs";
+import { nodeRoutableModels } from "./model-contract.mjs";
 
 // The native catalog Codex itself published, captured by `catalog.mjs`. Read
 // rather than re-derived: it is the same document the Codex picker is built
@@ -78,11 +83,27 @@ export function routedClientModels() {
   // brought nothing (see `codex-native-session.mjs`). So they are publishable
   // exactly while that fallback can supply one, and withheld the moment it
   // cannot.
-  const native = nativeSessionAvailable() ? nativeClientModels(readNativeCatalogModels()) : [];
+  const nativeUsable = nativeSessionAvailable();
+  const native = nativeUsable ? nativeClientModels(readNativeCatalogModels()) : [];
   // The vision engine still resolves over routed candidates only. A native
   // engine is spent per-caller, and `vision-engines` wants each call site to
   // name its evidence; this one's is that a bridge read is issued by the router
   // on the caller's behalf, which is not the same as relaying their turn.
-  const engine = resolveVisionEngine(() => selected, readVisionBridgeSettings());
+  const enabledProviders = new Set(readProviderSelection());
+  const credentialedProviders = new Set(configuredProviderIds());
+  const selectedVision = nodeRoutableModels({
+    enabledProviders,
+    hiddenModels: hidden,
+  }).filter((model) => credentialedProviders.has(model.provider));
+  const engine = resolveVisionEngine(
+    () => selectedVision,
+    readVisionBridgeSettings(),
+    {
+      strict: true,
+      callerSession: { usable: nativeUsable },
+      enabledProviders,
+      credentialedProviders,
+    },
+  );
   return { models: [...applyVisionBridge(selected, engine), ...native], engine };
 }

@@ -316,3 +316,20 @@ test("the write path still rejects an unknown provider id", () => {
     rmSync(testRoot, { recursive: true, force: true });
   }
 });
+
+test("retired local-only selection never reopens every chat provider", () => {
+  try {
+    stageSelectionFile(`${JSON.stringify({ version: 1, providers: ["local", "lmstudio"] })}\n`);
+    assert.deepEqual(readProviderSelection(), []);
+    assert.deepEqual(readProviderSelectionDetail().ignored.sort(), ["lmstudio", "local"]);
+
+    stageSelectionFile(`${JSON.stringify({ version: 1, providers: ["local", "deepseek"] })}\n`);
+    assert.deepEqual(readProviderSelection(), ["deepseek"]);
+    assert.deepEqual(readProviderSelectionDetail().ignored, ["local"]);
+
+    stageSelectionFile(`${JSON.stringify({ version: 1, providers: ["provider-from-a-newer-build"] })}\n`);
+    assert.ok(readProviderSelection().length > 0, "true unknown-version drift keeps compatibility fallback");
+  } finally {
+    rmSync(PROVIDER_SELECTION_PATH, { force: true });
+  }
+});

@@ -31,10 +31,12 @@ function imageReader(reader) {
   );
 }
 
-function loopbackUrl(value) {
+export function isLoopbackBaseUrl(value) {
   if (typeof value !== "string" || !value) return false;
   try {
-    return LOOPBACK_HOSTS.has(new URL(value).hostname.toLowerCase());
+    const url = new URL(value);
+    if (!['http:', 'https:'].includes(url.protocol)) return false;
+    return LOOPBACK_HOSTS.has(url.hostname.toLowerCase());
   } catch {
     return false;
   }
@@ -45,9 +47,9 @@ export function isLoopbackVisionReader(reader, { providers } = {}) {
   const providerId = String(reader?.provider || "");
   const provider = providerFor(reader, providers);
   return Boolean(
-    LOOPBACK_PROVIDER_IDS.has(providerId) ||
+      LOOPBACK_PROVIDER_IDS.has(providerId) ||
       provider?.keyless === true ||
-      loopbackUrl(reader?.baseUrl),
+      isLoopbackBaseUrl(reader?.baseUrl),
   );
 }
 
@@ -101,8 +103,9 @@ function explicitLocalReader(reader) {
     reader &&
       typeof reader === "object" &&
       reader.local === true &&
+      reader.invalidBaseUrl !== true &&
       imageReader(reader) &&
-      loopbackUrl(reader.baseUrl),
+      isLoopbackBaseUrl(reader.baseUrl),
   );
 }
 
@@ -167,6 +170,10 @@ export function visionEngineNotSupportedError(selection) {
   error.code = "vision_engine_not_supported";
   error.status = 400;
   return error;
+}
+
+export function isReservedVisionOnlySlug(value) {
+  return /^(?:local|lmstudio)(?:\/|$)/i.test(String(value || "").trim());
 }
 
 export { imageReader as supportsVisionImageInput };

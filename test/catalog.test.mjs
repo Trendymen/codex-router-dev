@@ -815,6 +815,7 @@ test("native catalog merge never loses non-empty bundled metadata", () => {
   const merged = mergeNativeModel(
     {
       slug: "gpt-5.6-luna",
+      native: true,
       additional_speed_tiers: [],
       service_tiers: [],
       input_modalities: [],
@@ -1082,6 +1083,7 @@ test("a ChatGPT-plan model drives the same advertisement as a routed engine", as
   const capture = [
     {
       slug: "gpt-5.6-luna",
+      native: true,
       display_name: "GPT-5.6-Luna",
       visibility: "list",
       priority: 3,
@@ -1170,6 +1172,14 @@ test("Control Center local surface is Vision-only and cannot publish chat models
   const ipc = readFileSync(new URL("../apps/control-center/electron/ipc.mjs", import.meta.url), "utf8");
   assert.doesNotMatch(page, /availableExplore|For coding|Enable .*Codex|Remove local model|uninstallLocalModel/);
   assert.doesNotMatch(ipc, /handleAction\("uninstallLocalModel"|handleAction\("benchmarkLocalModel"/);
+});
+
+test("catalog Vision candidates distinguish selection from credential state", async () => {
+  const { readFileSync } = await import("node:fs");
+  const source = readFileSync(new URL("../src/catalog.mjs", import.meta.url), "utf8");
+  assert.match(source, /const enabledProviders = new Set\(readProviderSelection\(\)\)/);
+  assert.match(source, /enabledProviders,\s*\n\s*hiddenModels/);
+  assert.match(source, /credentialedProviders: configuredProviders/);
 });
 
 

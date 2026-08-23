@@ -21,6 +21,7 @@ import {
   allowedVisionReaders,
   isLoopbackVisionReader,
   resolveVisionReader,
+  visionEngineNotSupportedError,
 } from "./vision-reader-policy.mjs";
 
 export const VISION_CACHE_PURGE_PATH = process.env.MODEL_ROUTER_VISION_CACHE_PURGE || `${STATE_DIR}/vision-cache-purge.json`;
@@ -713,6 +714,7 @@ export function localVisionEngine(settings) {
     local: true,
     protocol: "openai-chat",
     baseUrl,
+    ...(local.invalidBaseUrl === true ? { invalidBaseUrl: true } : {}),
   };
 }
 
@@ -786,6 +788,7 @@ export function nativeVisionEngine(model) {
 // a signed-out or login-free install has none.
 export function nativeVisionCandidates(models, hidden = new Set()) {
   return (Array.isArray(models) ? models : [])
+    .filter((model) => model?.native === true || model?.__nativeProvenance === "codex-native-catalog")
     .filter((model) => model?.visibility === "list")
     .filter((model) => !hidden.has(String(model?.slug)))
     .map(nativeVisionEngine)
@@ -843,7 +846,11 @@ export function resolveVisionEngine(listCandidates, settings, context = {}) {
       localPin,
       strict: context.strict === true ? true : false,
     });
-    return local || localPin;
+    if (!local) {
+      if (context.strict === true) throw visionEngineNotSupportedError(LOCAL_ENGINE_SLUG);
+      return undefined;
+    }
+    return local;
   }
   const candidates = listCandidates();
   const policyReaders = allowedVisionReaders({
@@ -868,7 +875,11 @@ export function resolveVisionEngine(listCandidates, settings, context = {}) {
     // reason to silently describe images with a different model. A *default*
     // that does not resolve is different: nobody chose it, so an install
     // without the default engine available still reads images.
-    if (pinned || !settings.defaulted) return pinned || undefined;
+    if (pinned) return pinned;
+    if (!settings.defaulted) {
+      if (context.strict === true) throw visionEngineNotSupportedError(settings.engine);
+      return undefined;
+    }
   }
   return ranked.find((model) => !isLoopbackEngine(model));
 }

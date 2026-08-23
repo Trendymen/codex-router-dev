@@ -18,13 +18,16 @@ import {
 import { renderProviderChoices, stepHeader, toggleSelection } from "./setup-ui.mjs";
 import {
   defaultProviderIds,
-  selectedConfiguredListedModels,
+  configuredProviderIds,
+  readProviderSelection,
   validateProviderIds,
   writeProviderSelection,
 } from "./provider-selection.mjs";
 import { writeDiscoveryMode } from "./discovery-mode.mjs";
 import { trayBundleDir, trayDecision } from "./tray-install.mjs";
 import { resolveVisionEngine } from "./vision-bridge.mjs";
+import { nodeRoutableModels } from "./model-contract.mjs";
+import { nativeSessionAvailable } from "./codex-native-session.mjs";
 import {
   readVisionBridgeSettings,
   visionBridgeConfigured,
@@ -425,8 +428,19 @@ async function main() {
         enabled: readVisionBridgeSettings().enabled,
         engine:
           resolveVisionEngine(
-            () => selectedConfiguredListedModels(),
+            () => {
+              const enabledProviders = new Set(readProviderSelection());
+              const credentialedProviders = new Set(configuredProviderIds());
+              return nodeRoutableModels({ enabledProviders, hiddenModels: new Set() })
+                .filter((model) => credentialedProviders.has(model.provider));
+            },
             readVisionBridgeSettings(),
+            {
+              strict: true,
+              callerSession: { usable: nativeSessionAvailable() },
+              enabledProviders: new Set(readProviderSelection()),
+              credentialedProviders: new Set(configuredProviderIds()),
+            },
           )?.slug || null,
       };
 

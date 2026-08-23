@@ -81,11 +81,17 @@ export function validateProviderIds(values) {
 function filterKnownProviderIds(values) {
   const known = [];
   const unknown = [];
+  const retired = [];
   for (const id of resolveProviderIds(values)) {
     if (PROVIDERS.has(id) && isChatProvider(PROVIDERS.get(id))) known.push(canonicalProviderId(id));
+    else if (PROVIDERS.has(id)) retired.push(id);
     else unknown.push(id);
   }
-  return { known: [...new Set(known)], unknown: [...new Set(unknown)] };
+  return {
+    known: [...new Set(known)],
+    unknown: [...new Set(unknown)],
+    retired: [...new Set(retired)],
+  };
 }
 
 export function configuredProviderIds() {
@@ -165,7 +171,7 @@ export function readProviderSelectionDetail() {
       degraded: `Invalid provider selection ${PROVIDER_SELECTION_PATH}: version/providers are invalid`,
     };
   }
-  const { known, unknown } = filterKnownProviderIds(parsed.providers);
+  const { known, unknown, retired } = filterKnownProviderIds(parsed.providers);
   // An explicitly empty list is a real choice -- disabling the last provider
   // writes `[]`, and hiding everything is supported -- so it stays empty.
   // A non-empty list that filters down to nothing is different: this build
@@ -177,17 +183,27 @@ export function readProviderSelectionDetail() {
   if (known.length === 0 && unknown.length > 0) {
     return {
       providers: providerIds(),
-      ignored: unknown,
+      ignored: [...retired, ...unknown],
       degraded: `Provider selection ${PROVIDER_SELECTION_PATH} names no provider this build knows (${
-        unknown.join(", ")
+        [...retired, ...unknown].join(", ")
       }); showing all providers until it is rewritten.`,
+    };
+  }
+  // A file containing only providers that this build deliberately retired as
+  // Vision-only is an explicit empty chat selection, not version drift. The
+  // old compatibility fallback would reopen every provider here.
+  if (known.length === 0 && retired.length > 0) {
+    return {
+      providers: [],
+      ignored: retired,
+      degraded: `Provider selection ${PROVIDER_SELECTION_PATH} contains only retired Vision-only providers: ${retired.join(", ")}`,
     };
   }
   return {
     providers: expandProviderIds(known),
-    ignored: unknown,
-    degraded: unknown.length
-      ? `Provider selection ${PROVIDER_SELECTION_PATH} names unknown providers: ${unknown.join(", ")}`
+    ignored: [...retired, ...unknown],
+    degraded: unknown.length || retired.length
+      ? `Provider selection ${PROVIDER_SELECTION_PATH} names unsupported providers: ${[...retired, ...unknown].join(", ")}`
       : undefined,
   };
 }

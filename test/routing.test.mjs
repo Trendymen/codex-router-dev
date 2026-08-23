@@ -175,6 +175,61 @@ test("API forwarder rejects stale local and LM Studio user-model routes", async 
   }
 });
 
+test("Router rejects reserved local namespaces before the native branch", async () => {
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), "router-retired-local-slugs-"));
+  writeFileSync(
+    path.join(stateDir, "native-aliases.json"),
+    `${JSON.stringify({ version: 1, aliases: { "gpt-old-local": "local/qwen2.5vl" } })}\n`,
+    { mode: 0o600 },
+  );
+  let upstreamRequests = 0;
+  const upstream = await mockServer(async (request, response) => {
+    if (request.url === "/health") {
+      json(response, 200, { ok: true, credential_present: true });
+      return;
+    }
+    upstreamRequests += 1;
+    json(response, 200, { id: "unexpected-upstream", output: [] });
+  });
+  const routerPort = await openPort();
+  const router = run("router.mjs", {
+    CODEX_ROUTER_PORT: String(routerPort),
+    CODEX_ROUTER_STATE_DIR: stateDir,
+    CODEX_NATIVE_BASE_URL: `http://127.0.0.1:${upstream.port}/backend-api/codex`,
+    CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${upstream.port}/v1`,
+    CODEX_ROUTER_OAUTH_HEALTH_URL: `http://127.0.0.1:${upstream.port}/health`,
+    CODEX_ROUTER_API_HEALTH_URL: `http://127.0.0.1:${upstream.port}/health`,
+    CODEX_ROUTER_GATEWAY_HEALTH_URL: `http://127.0.0.1:${upstream.port}/health`,
+  });
+  try {
+    await waitFor(`${routerBase(routerPort)}/models`, router);
+    const cases = [
+      ["/responses", "local/qwen2.5vl", false],
+      ["/responses", "lmstudio/qwen2.5vl", true],
+      ["/responses/compact", "local/qwen2.5vl", false],
+      ["/responses", "gpt-old-local", false],
+    ];
+    for (const [route, model, stream] of cases) {
+      const response = await fetch(`${routerBase(routerPort)}${route}`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${CALLER_KEY}`, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model,
+          stream,
+          input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "hello" }] }],
+        }),
+      });
+      assert.equal(response.status, 404, `${route} ${model}`);
+      assert.equal((await response.json()).error.code, "provider_not_available_in_node_build");
+    }
+    assert.equal(upstreamRequests, 0);
+  } finally {
+    await stopChild(router);
+    await closeServer(upstream.server);
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
 test("router health waits for enabled dependencies and ignores disabled forwarders", async () => {
   const testRoot = mkdtempSync(path.join(os.tmpdir(), "router-health-selection-"));
   writeFileSync(

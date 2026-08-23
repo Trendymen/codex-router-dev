@@ -180,3 +180,51 @@ test("a stale legacy reader pin fails closed instead of becoming a chat provider
     null,
   );
 });
+
+test("local Vision state accepts loopback URL forms and rejects remote URLs", () => {
+  const accepted = [
+    "http://localhost:11434/v1",
+    "http://127.0.0.1:11434/v1",
+    "https://127.0.0.1:11434/v1",
+    "http://[::1]:11434/v1",
+  ];
+  for (const baseUrl of accepted) {
+    const state = setVisionBridgeLocal({ model: "reader", baseUrl });
+    assert.equal(state.local.baseUrl, baseUrl);
+  }
+  for (const baseUrl of [
+    "https://example.invalid/v1",
+    "http://192.0.2.1:11434/v1",
+    "http://[2001:db8::1]:11434/v1",
+    "file:///tmp/reader",
+  ]) {
+    assert.throws(
+      () => setVisionBridgeLocal({ model: "reader", baseUrl }),
+      (error) => error?.code === "vision_engine_not_supported",
+      baseUrl,
+    );
+  }
+});
+
+test("a hand-edited remote local pin stays marked invalid and cannot resolve", () => {
+  writeFileSync(
+    VISION_BRIDGE_STATE_PATH,
+    `${JSON.stringify({
+      version: 1,
+      enabled: true,
+      engine: "local",
+      effort: null,
+      local: { model: "reader", baseUrl: "https://example.invalid/v1" },
+    })}\n`,
+    "utf8",
+  );
+  assert.equal(readVisionBridgeSettings().local.invalidBaseUrl, true);
+  assert.throws(
+    () => resolveVisionEngine(
+      () => [],
+      readVisionBridgeSettings(),
+      { strict: true },
+    ),
+    (error) => error?.code === "vision_engine_not_supported",
+  );
+});

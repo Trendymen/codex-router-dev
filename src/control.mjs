@@ -216,7 +216,7 @@ async function emitProbe() {
   const { localOllamaRuntimeSnapshot } = await import("./ollama-runtime.mjs");
   const { selectedConfiguredListedModels, configuredProviderIds } = await import("./provider-selection.mjs");
   const { nodeRoutableModels } = await import("./model-contract.mjs");
-  const { codexAuthStatus } = await import("./codex-binary.mjs");
+  const { nativeSessionStatus } = await import("./codex-native-session.mjs");
   // Bounded and weekly: the tray reads this snapshot constantly, so a fresh
   // cache costs nothing and a stale one costs one short, failure-tolerant pass.
   if (TARGET === "codex") await refreshVisionModelSizesIfStale();
@@ -344,13 +344,15 @@ async function emitProbe() {
                 // helper, so the tray can never advertise an engine the setter
                 // or the router would then refuse.
                 const natives = installedNativeVisionEngines({ hidden: hiddenModels });
+                const nativeUsable = nativeSessionStatus().usable === true && !codexConfig?.login_free;
+                const visibleNatives = nativeUsable ? natives : [];
                 const resolved = resolveVisionEngine(
-                  () => [...candidates, ...natives],
+                  () => [...candidates, ...visibleNatives],
                   readVisionBridgeSettings(),
                   {
                     strict: true,
                     callerSession: {
-                      usable: codexAuthStatus().authenticated === true && !codexConfig?.login_free,
+                      usable: nativeUsable,
                     },
                     enabledProviders: new Set(enabledProviders),
                     credentialedProviders: configured,
@@ -372,7 +374,7 @@ async function emitProbe() {
                   // key, nothing to download: the plan is already being paid
                   // for. Kept apart from the paid list so the operator can see
                   // which bill a choice lands on.
-                  nativeEngines: rankVisionEngines(natives).map((model) => ({
+                  nativeEngines: rankVisionEngines(visibleNatives).map((model) => ({
                     slug: model.slug,
                     displayName: model.displayName,
                     efforts: visionEngineEfforts(model),
@@ -1458,25 +1460,35 @@ async function handleVisionBridge(action, value, extra) {
   } = await import("./vision-bridge.mjs");
   const { configuredProviderIds, readProviderSelection } = await import("./provider-selection.mjs");
   const { nodeRoutableModels } = await import("./model-contract.mjs");
-  const { codexAuthStatus } = await import("./codex-binary.mjs");
-  const { visionEngineNotSupportedError } = await import("./vision-reader-policy.mjs");
+  const { nativeSessionStatus } = await import("./codex-native-session.mjs");
+  const { resolveVisionReader, visionEngineNotSupportedError } = await import("./vision-reader-policy.mjs");
   const nativeEngines = await shippedNativeVisionEngines();
+  const codexConfig = codexConfigSnapshot();
+  const strictVisionCandidates = () => {
+    const enabledProviders = new Set(readProviderSelection());
+    const credentialedProviders = new Set(configuredProviderIds());
+    const nodeModels = nodeRoutableModels({
+      enabledProviders,
+      hiddenModels: new Set(),
+    }).filter((model) => credentialedProviders.has(model.provider));
+    const nativeUsable = nativeSessionStatus().usable === true && !codexConfig?.login_free;
+    const nativeModels = nativeUsable ? nativeEngines : [];
+    return {
+      nodeModels,
+      nativeModels,
+      candidates: [...nodeModels, ...nativeModels],
+      context: {
+        strict: true,
+        callerSession: { usable: nativeUsable },
+        enabledProviders,
+        credentialedProviders,
+      },
+    };
+  };
   const snapshot = () => {
-    const configured = new Set(configuredProviderIds());
-    const candidates = [
-      ...nodeRoutableModels({
-        enabledProviders: new Set(readProviderSelection()),
-        hiddenModels: new Set(),
-      }).filter((model) => configured.has(model.provider)),
-      ...(codexAuthStatus().authenticated === true ? nativeEngines : []),
-    ];
+    const { candidates, context } = strictVisionCandidates();
     const settings = readVisionBridgeSettings();
-    const resolved = resolveVisionEngine(() => candidates, settings, {
-      strict: true,
-      callerSession: { usable: codexAuthStatus().authenticated === true },
-      enabledProviders: new Set(readProviderSelection()),
-      credentialedProviders: configured,
-    });
+    const resolved = resolveVisionEngine(() => candidates, settings, context);
     return {
       ...visionBridgeSnapshot(),
       // The local engine is a real answer even when no paid vision model is
@@ -1662,17 +1674,13 @@ async function handleVisionBridge(action, value, extra) {
   } else if (action === "engine") {
     const slug = String(value || "").trim();
     if (slug && slug !== "auto" && slug !== LOCAL_ENGINE_SLUG) {
-      const configured = new Set(configuredProviderIds());
-      const available = rankVisionEngines(
-        nodeRoutableModels({
-          enabledProviders: new Set(readProviderSelection()),
-          hiddenModels: new Set(),
-        }).filter((model) => configured.has(model.provider)),
-      );
-      if (codexAuthStatus().authenticated === true) {
-        available.push(...rankVisionEngines(nativeEngines));
-      }
-      if (!available.some((model) => model.slug === slug)) {
+      const { nodeModels, nativeModels, context } = strictVisionCandidates();
+      const selected = resolveVisionReader(slug, {
+        ...context,
+        selectedNodeModels: nodeModels,
+        nativeReaders: nativeModels,
+      });
+      if (!selected) {
         throw visionEngineNotSupportedError(slug);
       }
     }

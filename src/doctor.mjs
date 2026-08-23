@@ -51,10 +51,14 @@ import { credentialLabel, credentialStatus } from "./provider-credentials.mjs";
 import { providerNeedsCuration } from "./provider-onboarding.mjs";
 import { stateOwnershipStatus } from "./state-owner.mjs";
 import {
+  configuredProviderIds,
   providerSelectionStatus,
+  readProviderSelection,
   selectedConfiguredListedModels,
 } from "./provider-selection.mjs";
 import { resolveVisionEngine } from "./vision-bridge.mjs";
+import { nodeRoutableModels } from "./model-contract.mjs";
+import { nativeSessionAvailable } from "./codex-native-session.mjs";
 import {
   readVisionBridgeSettings,
   visionBridgeConfigured,
@@ -518,14 +522,39 @@ add(
 // invisible to it and a signed-in install may well read images fine while this
 // says nothing resolves.
 const visionSettings = readVisionBridgeSettings();
-const visionEngine = resolveVisionEngine(() => requiredRoutedModels, visionSettings);
+let visionEngine;
+let visionPolicyError;
+try {
+  visionEngine = resolveVisionEngine(
+    () => {
+      const enabledProviders = new Set(readProviderSelection());
+      const credentialedProviders = new Set(configuredProviderIds());
+      return nodeRoutableModels({
+        enabledProviders,
+        hiddenModels: readHiddenModels(),
+      }).filter((model) => credentialedProviders.has(model.provider));
+    },
+    visionSettings,
+    {
+      strict: true,
+      callerSession: { usable: nativeSessionAvailable() },
+      enabledProviders: new Set(readProviderSelection()),
+      credentialedProviders: new Set(configuredProviderIds()),
+    },
+  );
+} catch (error) {
+  if (error?.code !== "vision_engine_not_supported") throw error;
+  visionPolicyError = error;
+}
 if (visionSettings.enabled && !visionEngine) {
   const asked = visionBridgeConfigured();
   add(
     asked ? "warn" : "ok",
     "Vision bridge",
-    visionSettings.engine
-      ? `pinned engine ${visionSettings.engine} is not an enabled model that reads images`
+    visionPolicyError
+      ? `pinned engine ${visionSettings.engine || "local"} is not supported by the Vision reader policy`
+      : visionSettings.engine
+        ? `pinned engine ${visionSettings.engine} is not an enabled model that reads images`
       : asked
         ? "enabled, but no enabled provider offers a model that reads images"
         : "on by default, but no enabled provider offers a model that reads images yet",

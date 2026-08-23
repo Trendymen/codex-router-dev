@@ -116,6 +116,7 @@ import {
   substituteImages,
   supportsImageInput,
 } from "./vision-bridge.mjs";
+import { isReservedVisionOnlySlug } from "./vision-reader-policy.mjs";
 import { readHiddenModels } from "./model-picker-state.mjs";
 import { readVisionBridgeSettings } from "./vision-bridge-state.mjs";
 import { installedNativeVisionEngines } from "./vision-engines.mjs";
@@ -2702,9 +2703,19 @@ async function handleResponses(request, response, requestUrl) {
     const body = decodeBody(encoded, request.headers["content-encoding"]);
     const payload = parseBody(body);
     requestedModel = typeof payload.model === "string" ? payload.model : "";
+    const aliases = readNativeAliases();
+    const aliasedModel = aliases[requestedModel];
+    if (isReservedVisionOnlySlug(requestedModel) || isReservedVisionOnlySlug(aliasedModel)) {
+      const safe = routerError("provider_not_available_in_node_build");
+      writeJson(response, safe.status, safe.body);
+      finalStatus = safe.status;
+      activityStatus = safe.status;
+      usageRecorded = true;
+      return;
+    }
     let registeredRoute =
       MODEL_BY_SLUG.get(requestedModel) ??
-      MODEL_BY_SLUG.get(readNativeAliases()[requestedModel]);
+      MODEL_BY_SLUG.get(aliasedModel);
     // An unregistered model on this endpoint is native GPT traffic -- Codex's
     // background agent sessions arrive here hardwired to a native slug no
     // matter which model the user picked. With the redirect opted in, send
@@ -3401,6 +3412,14 @@ async function handleResponses(request, response, requestUrl) {
     }
   } catch (error) {
     upstreamLatencyMs ??= Date.now() - startedAt;
+    if (!response.headersSent && error?.code === "vision_engine_not_supported") {
+      const safe = routerError("vision_engine_not_supported");
+      writeJson(response, safe.status, safe.body);
+      finalStatus = safe.status;
+      activityStatus = safe.status;
+      usageRecorded = true;
+      return;
+    }
     if (retryEmptyCompletionGuard?.hasContent()) emptyCompletion = false;
     if (!clientGone) {
       // A pipeline can fail after either guard has released its held bytes but

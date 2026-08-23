@@ -1642,6 +1642,7 @@ test("evidence block labels which image it belongs to", () => {
 // not the camelCase the registry uses.
 const NATIVE_LUNA = {
   slug: "gpt-5.6-luna",
+  native: true,
   display_name: "GPT-5.6 Luna",
   visibility: "list",
   priority: 3,
@@ -1649,6 +1650,7 @@ const NATIVE_LUNA = {
 };
 const NATIVE_TEXT_ONLY = {
   slug: "gpt-5.6-nano",
+  native: true,
   display_name: "GPT-5.6 Nano",
   visibility: "list",
   priority: 1,
@@ -1677,6 +1679,14 @@ test("native candidates skip text-only, hidden, and unlisted models", () => {
     candidates.map((engine) => engine.slug),
     ["gpt-5.6-luna"],
   );
+});
+
+test("foreign or merged entries cannot be rewrapped as native vision readers", () => {
+  assert.deepEqual(
+    nativeVisionCandidates([{ ...NATIVE_LUNA, native: false }]),
+    [],
+  );
+  assert.equal(nativeVisionCandidates([NATIVE_LUNA]).length, 1);
 });
 
 test("a native engine can be pinned and outranks nothing by accident", () => {
@@ -2290,6 +2300,46 @@ test("Appendix H rejects loopback auto candidates and legacy cloud pins", () => 
   assert.deepEqual(allowedVisionReaders(context), []);
   assert.equal(resolveVisionReader(loopback.slug, context), null);
   assert.equal(resolveVisionReader(legacy.slug, context), null);
+});
+
+test("strict local reader resolution rejects every non-loopback pin without fallback", () => {
+  const remote = {
+    slug: "local",
+    local: true,
+    inputModalities: ["text", "image"],
+    baseUrl: "https://example.invalid/v1",
+  };
+  assert.deepEqual(
+    allowedVisionReaders({ strict: true, localPin: remote }),
+    [],
+  );
+  assert.equal(
+    resolveVisionReader("local", { strict: true, localPin: remote }),
+    null,
+  );
+  assert.throws(
+    () => resolveVisionEngine(
+      () => [],
+      { enabled: true, engine: "local", local: remote },
+      { strict: true },
+    ),
+    (error) => error?.code === "vision_engine_not_supported",
+  );
+});
+
+test("production vision callers all pass a strict registry/session context", async () => {
+  for (const file of [
+    "src/routed-client-models.mjs",
+    "src/setup.mjs",
+    "src/doctor.mjs",
+    "src/catalog.mjs",
+    "src/control.mjs",
+    "src/router.mjs",
+  ]) {
+    const source = await readFile(path.join(repoRoot, file), "utf8");
+    assert.match(source, /resolveVisionEngine(?:s)?\([\s\S]{0,1200}strict:\s*true/,
+      `${file} must resolve Vision readers through strict policy context`);
+  }
 });
 
 test("substituteImages replaces an image part with the engine's caption", async () => {

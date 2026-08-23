@@ -41,11 +41,15 @@ export function catalogModelsAt(catalogPath) {
 // have no gate at all.
 export function nativeVisionEngines({ models, hidden, authorized } = {}) {
   if (authorized !== true) return [];
+  const captured = (Array.isArray(models) ? models : []).map((model) => ({
+    ...model,
+    __nativeProvenance: "codex-native-catalog",
+  }));
   return allowedVisionReaders({
     strict: true,
     callerSession: { usable: true },
     nativeReaders: nativeVisionCandidates(
-      models,
+      captured,
       hidden instanceof Set ? hidden : new Set(hidden || []),
     ),
   });

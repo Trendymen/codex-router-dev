@@ -703,23 +703,18 @@ test("overlapping turns share a read only when they ask the same thing", async (
 });
 
 // A pin is a picker entry the operator chose. When it stops resolving -- the
-// provider was disabled, the model left the registry -- the bridge is still on,
-// but the only thing the turn can say is the message written for "off".
-test("a pinned engine that no longer resolves is reported as the bridge being off", async () => {
+// provider was disabled, the model left the registry -- the request is a
+// client-visible policy error rather than a misleading bridge-off transcript.
+test("a pinned engine that no longer resolves returns vision_engine_not_supported", async () => {
   const upstreams = await bridgeUpstreams({ visionDelayMs: 0 });
   const router = await startBridgedRouter(upstreams, { engine: "no-such-provider/no-such-model" });
 
   try {
     const result = await turn(router.port, imageTurn({ question: "What is this?" }));
-    assert.equal(result.status, 200);
+    assert.equal(result.status, 400);
     assert.equal(upstreams.state.visionRequests.length, 0);
-    const stated = textParts(upstreams.state.gatewayRequests.at(-1).input).find((text) =>
-      text.includes("could not be read"),
-    );
-    report(`unresolvable pin: ${stated}`);
-    // Measured, not endorsed: the operator pinned an engine and switched
-    // nothing off, yet the turn tells the model the bridge is off.
-    assert.match(stated, /vision bridge is off or has no enabled vision model/);
+    assert.equal(result.payload.error.code, "vision_engine_not_supported");
+    assert.equal(upstreams.state.gatewayRequests.length, 0);
   } finally {
     await router.stop();
     await closeServer(upstreams.server);

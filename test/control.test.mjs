@@ -876,3 +876,25 @@ test("the tray usage advertises rebuild alongside the supervised actions", () =>
     rmSync(stateDir, { recursive: true, force: true });
   }
 });
+
+test("control, setup, doctor, and published clients use live strict Vision policy", () => {
+  for (const file of [
+    "src/control.mjs",
+    "src/setup.mjs",
+    "src/doctor.mjs",
+    "src/routed-client-models.mjs",
+  ]) {
+    const source = readFileSync(path.join(root, file), "utf8");
+    assert.match(source, /resolveVisionEngine\([\s\S]{0,1400}strict:\s*true/,
+      `${file} must pass strict Vision policy facts`);
+  }
+  const control = readFileSync(path.join(root, "src/control.mjs"), "utf8");
+  assert.match(control, /nativeSessionStatus\(\)/, "UI candidate/setter must use current usable session state");
+  assert.match(control, /resolveVisionReader\(slug,/, "Vision setter must use the central reader policy");
+});
+
+test("control probe publishes only the live-session-filtered native Vision list", () => {
+  const source = readFileSync(path.join(root, "src/control.mjs"), "utf8");
+  assert.match(source, /const visibleNatives = nativeUsable \? natives : \[\]/);
+  assert.match(source, /nativeEngines: rankVisionEngines\(visibleNatives\)/);
+});

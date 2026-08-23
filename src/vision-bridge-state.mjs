@@ -6,6 +6,7 @@ import path from "node:path";
 
 import { writePrivateJson } from "./file-security.mjs";
 import { STATE_DIR } from "./paths.mjs";
+import { isLoopbackBaseUrl, visionEngineNotSupportedError } from "./vision-reader-policy.mjs";
 
 export const VISION_BRIDGE_STATE_PATH =
   process.env.MODEL_ROUTER_VISION_BRIDGE_STATE ||
@@ -81,6 +82,9 @@ function normalizeLocal(value) {
   const model = typeof value.model === "string" ? value.model.trim() : "";
   const baseUrl = typeof value.baseUrl === "string" ? value.baseUrl.trim() : "";
   if (!model && !baseUrl) return null;
+  if (baseUrl && !isLoopbackBaseUrl(baseUrl)) {
+    return { ...(model ? { model } : {}), invalidBaseUrl: true };
+  }
   const local = {};
   if (model) local.model = model;
   if (baseUrl) local.baseUrl = baseUrl;
@@ -117,6 +121,7 @@ export function readVisionBridgeSettings() {
         engine: typeof parsed.engine === "string" && parsed.engine ? parsed.engine : null,
         effort: normalizeEffort(parsed.effort),
         local: normalizeLocal(parsed.local),
+        ...(parsed.defaulted === true ? { defaulted: true } : {}),
       };
     }
   } catch {
@@ -132,7 +137,9 @@ function writeSettings(settings) {
 
 export function setVisionBridgeEnabled(enabled) {
   const current = readVisionBridgeSettings();
-  return writeSettings({ ...current, version: 1, enabled: enabled === true });
+  const next = { ...current, version: 1, enabled: enabled === true };
+  if (enabled !== true) delete next.defaulted;
+  return writeSettings(next);
 }
 
 // A tiny local vision model (Ollama, LM Studio, llama.cpp) is the free, private,
@@ -142,7 +149,10 @@ export function setVisionBridgeEnabled(enabled) {
 export function setVisionBridgeLocal({ model, baseUrl } = {}) {
   const current = readVisionBridgeSettings();
   const local = normalizeLocal({ model, baseUrl });
-  return writeSettings({ ...current, version: 1, engine: "local", local });
+  if (local?.invalidBaseUrl) throw visionEngineNotSupportedError("local");
+  const next = { ...current, version: 1, engine: "local", local };
+  delete next.defaulted;
+  return writeSettings(next);
 }
 
 // A pinned engine survives catalog rebuilds, so an operator who chose a cheap
@@ -151,7 +161,12 @@ export function setVisionBridgeLocal({ model, baseUrl } = {}) {
 export function setVisionBridgeEngine(slug) {
   const value = slug === null || slug === undefined ? null : String(slug).trim();
   const current = readVisionBridgeSettings();
-  return writeSettings({ ...current, version: 1, engine: value || null });
+  if (value === "local" && current.local?.invalidBaseUrl) {
+    throw visionEngineNotSupportedError("local");
+  }
+  const next = { ...current, version: 1, engine: value || null };
+  delete next.defaulted;
+  return writeSettings(next);
 }
 
 // Only the native and gateway paths carry this. A local engine speaks chat

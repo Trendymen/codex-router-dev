@@ -36,7 +36,11 @@ import {
   NATIVE_CONTEXT_VARIANT_SLUGS,
   withNativeContextVariants,
 } from "./native-context-variants.mjs";
-import { selectedConfiguredListedModels, configuredProviderIds } from "./provider-selection.mjs";
+import {
+  configuredProviderIds,
+  readProviderSelection,
+  selectedConfiguredListedModels,
+} from "./provider-selection.mjs";
 import { assertStateOwnership } from "./state-owner.mjs";
 import { scanTomlDocument, tomlStringValue } from "./toml-structure.mjs";
 import { applyVisionBridge, resolveVisionEngine } from "./vision-bridge.mjs";
@@ -904,13 +908,14 @@ function main() {
     hidden: hiddenModels,
     authorized: openaiAuthenticated && !loginFree,
   });
+  const enabledProviders = new Set(readProviderSelection());
   const configuredProviders = new Set(configuredProviderIds());
   // Vision readers come from the same verified Node route set as dispatch.
   // Legacy registry models may still exist in an operator's old user-models
   // file, but they are not an Appendix-H reader merely because they declare
   // image input.
   const selectedVisionModels = nodeRoutableModels({
-    enabledProviders: configuredProviders,
+    enabledProviders,
     hiddenModels: hiddenModels,
   });
   const visionEngine = resolveVisionEngine(
@@ -919,7 +924,7 @@ function main() {
     {
       strict: true,
       callerSession: { usable: openaiAuthenticated && !loginFree },
-      enabledProviders: configuredProviders,
+      enabledProviders,
       credentialedProviders: configuredProviders,
     },
   );
