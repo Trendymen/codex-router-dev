@@ -223,11 +223,11 @@ test("the tool-result-aging switch follows the snapshot when it is present", () 
 test("a read-only surface refuses only what it did not advertise", () => {
   const capabilities = {
     readOnly: true,
-    allowedCommands: ["control_snapshot"],
+    allowedCommands: ["lifecycle.status"],
     localCommands: ["hide_panel"],
   };
-  assert.equal(commandRefused(capabilities, "set_tool_result_aging"), true);
-  assert.equal(commandRefused(capabilities, "control_snapshot"), false);
+  assert.equal(commandRefused(capabilities, "tool-result-aging.on"), true);
+  assert.equal(commandRefused(capabilities, "lifecycle.status"), false);
   assert.equal(commandRefused(capabilities, "hide_panel"), false);
   // A shell that advertises no limit carries the full table and refuses
   // nothing, which is how the tray and the Electron window stay unaffected.
@@ -291,19 +291,21 @@ test("every mutating control in the desktop UI names the command it drives", () 
     readFileSync(path.join(root, "apps", "desktop", "ui", "app.js"), "utf8"),
   ].join("\n");
   for (const command of [
-    "set_tool_result_aging",
-    "set_login_free",
-    "set_signed_routing",
-    "set_presence_mode",
-    "set_vision_bridge",
-    "set_subagent_mode",
-    "set_subagent_model",
-    "set_picker_model",
-    "set_provider_enabled",
-    "save_api_key",
-    "remove_api_key",
-    "install_local_model",
-    "set_local_model_enabled",
+    "tool-result-aging.on",
+    "presence.mode",
+    "vision.on",
+    "vision.engine",
+    "vision.effort",
+    "subagents.mode",
+    "subagents.model",
+    "subagents.selection",
+    "picker.set",
+    "picker.show-all",
+    "provider.enable",
+    "credential.set",
+    "credential.remove",
+    "maintenance.update",
+    "doctor.fix",
   ]) {
     assert.ok(
       markup.includes(`data-command="${command}"`),

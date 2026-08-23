@@ -11,6 +11,30 @@ const SAFE_FIELDS = new Set([
 const SAFE_HEADER = /^(?:x-)?request-id$|^(?:x-)?rate-limit(?:-|_).*|^ratelimit(?:-|_).*|^retry-after$/i;
 const SAFE_CODE = /^[a-z0-9_.-]{1,128}$/i;
 const SAFE_REQUEST_ID = /^[a-z0-9_.:-]{1,256}$/i;
+const LOG_MAX_MESSAGE = 16 * 1024;
+const LOG_LEVEL = /^(?:trace|debug|info|warn|error|fatal)$/i;
+const LOG_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/;
+const LOG_SECRET_VALUE = /\b(caller[_-]?key|api[_-]?key|access[_-]?token|refresh[_-]?token|password|secret|authorization|prompt|input|content|reasoning|tool[_-]?(?:args|arguments)|provider[_-]?(?:response|body)|response[_-]?body|body|cause)\s*[:=]\s*(?:"[^"]*"|'[^']*'|\S+)/gi;
+const LOG_AUTHORIZATION = /\bAuthorization\s*:\s*(?:Basic|Bearer)\s+[^\s,;]+/gi;
+const LOG_CAPABILITY_URL = /https?:\/\/(?:127\.0\.0\.1|localhost|\[::1\]):\d+\/_codex-router\/[^/\s]+(?:\/v1)?/gi;
+
+function sanitizeLogMessage(value) {
+  if (typeof value !== "string" || value.length > LOG_MAX_MESSAGE) return REDACTED;
+  return value
+    .replace(LOG_AUTHORIZATION, "Authorization: [REDACTED]")
+    .replace(LOG_CAPABILITY_URL, "http://127.0.0.1:[PORT]/_codex-router/[REDACTED]/v1")
+    .replace(LOG_SECRET_VALUE, (_match, key) => `${key}=[REDACTED]`);
+}
+
+function redactLog(value) {
+  if (typeof value === "string") return sanitizeLogMessage(value);
+  if (!value || typeof value !== "object" || Array.isArray(value)) return { message: REDACTED };
+  const safe = {};
+  if (typeof value.timestamp === "string" && LOG_TIMESTAMP.test(value.timestamp)) safe.timestamp = value.timestamp;
+  if (typeof value.level === "string" && LOG_LEVEL.test(value.level)) safe.level = value.level.toLowerCase();
+  safe.message = sanitizeLogMessage(value.message);
+  return safe;
+}
 
 function safeStatus(value) {
   return Number.isInteger(value) && value >= 100 && value <= 599 ? value : undefined;
@@ -115,6 +139,7 @@ function redactSupportBundle(value, seen) {
 // a closed protocol allowlist; support bundles use their separately closed
 // structural profile before serialization.
 export function redactSensitive(value, context = {}) {
+  if (context.profile === "log") return redactLog(value);
   const seen = new WeakSet();
   return context.profile === "support-bundle"
     ? redactSupportBundle(value, seen)

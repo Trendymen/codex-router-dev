@@ -23,6 +23,11 @@ const DECOYS = {
   snapshot: "task1-snapshot-decoy-2a694cf1",
   temporary: "task1-temp-decoy-fb57466d",
   support: "task1-support-decoy-7222383a",
+  authorization: "task1-authorization-decoy-5224125e",
+  input: "task1-input-decoy-cb620c8f",
+  content: "task1-content-decoy-f6ab3610",
+  body: "task1-body-decoy-b846809b",
+  capability: "task1-capability-decoy-9c081779",
 };
 
 const SERIALIZED_DECOYS = Object.values(DECOYS);
@@ -187,6 +192,34 @@ test("redactor removes decoys from diagnostic output, snapshots, temp files, and
   };
   const redacted = redactSensitive(channels);
   assert.deepEqual(redacted, {});
+  assertNoDecoys(redacted);
+});
+
+test("shared log redaction preserves bounded safe fields while sanitizing every Appendix I value", () => {
+  const line = {
+    timestamp: "2026-08-23T12:34:56.000Z",
+    level: "error",
+    message: [
+      "request failed",
+      `caller_key=${DECOYS.apiKey}`,
+      `Authorization: Basic ${DECOYS.authorization}`,
+      `prompt=${DECOYS.prompt}`,
+      `input=${DECOYS.input}`,
+      `content=${DECOYS.content}`,
+      `reasoning=${DECOYS.reasoning}`,
+      `tool_args=${DECOYS.arguments}`,
+      `provider_response=${DECOYS.providerBody}`,
+      `body=${DECOYS.body}`,
+      `cause=${DECOYS.cause}`,
+      `http://127.0.0.1:4202/_codex-router/${DECOYS.capability}/v1`,
+    ].join(" "),
+    prompt: DECOYS.prompt,
+    body: DECOYS.body,
+  };
+  const redacted = redactSensitive(line, { profile: "log" });
+  assert.equal(redacted.timestamp, line.timestamp);
+  assert.equal(redacted.level, "error");
+  assert.match(redacted.message, /^request failed/);
   assertNoDecoys(redacted);
 });
 

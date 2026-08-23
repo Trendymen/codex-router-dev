@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { COMMANDS, desktopCommandDefinitions } from "../src/desktop-commands.mjs";
+import * as desktopCommands from "../src/desktop-commands.mjs";
 
 test("canonical desktop definitions are read-only and credential scoped", () => {
-  const definitions = desktopCommandDefinitions();
+  const definitions = desktopCommands.desktopCommandDefinitions();
   assert.ok(definitions.has("credential.set"));
   assert.equal(definitions.get("credential.set").protectedInput, true);
   assert.throws(() => definitions.set("unexpected", {}), /read-only/);
@@ -12,91 +12,23 @@ test("canonical desktop definitions are read-only and credential scoped", () => 
   assert.equal(definitions.has("local-chat.enable"), false);
 });
 
-test("desktop local-model commands use the shared model argument", () => {
-  assert.deepEqual(COMMANDS.install_local_model({ model: "gemma4:12b" }), {
-    args: ["local-models", "install", "gemma4:12b", "--yes"],
-  });
-  assert.deepEqual(COMMANDS.install_local_model({ model: "gemma4:12b", force: true }), {
-    args: ["local-models", "install", "gemma4:12b", "--yes", "--force"],
-  });
-  assert.deepEqual(COMMANDS.uninstall_local_model({ model: "gemma4:12b" }), {
-    args: ["local-models", "uninstall", "gemma4:12b", "--yes", "--async"],
-  });
-  assert.deepEqual(COMMANDS.cancel_local_model({ model: "gemma4:12b" }), {
-    args: ["local-models", "cancel", "gemma4:12b"],
-  });
-  assert.deepEqual(COMMANDS.set_local_model_enabled({ model: "gemma4:12b", enabled: true }), {
-    args: ["local-models", "set", "gemma4:12b", "on"],
-  });
-  // LM Studio ids carry slashes ("qwen/qwen3-4b"), which requireTag permits.
-  assert.deepEqual(
-    COMMANDS.set_lmstudio_model_enabled({ model: "qwen/qwen3-4b", enabled: true }),
-    { args: ["local-models", "lmstudio-set", "qwen/qwen3-4b", "on"] },
-  );
-  assert.deepEqual(
-    COMMANDS.set_lmstudio_model_enabled({ id: "qwen/qwen3-4b", enabled: false }),
-    { args: ["local-models", "lmstudio-set", "qwen/qwen3-4b", "off"] },
-  );
-  assert.deepEqual(COMMANDS.local_model_speed({ model: "gemma4:12b" }), {
-    args: ["local-models", "benchmark", "gemma4:12b"],
-  });
-  assert.deepEqual(COMMANDS.benchmark_vision_model({ model: "qwen2.5vl:3b" }), {
-    args: ["vision-bridge", "benchmark", "qwen2.5vl:3b"],
-  });
-  assert.deepEqual(COMMANDS.use_local_vision_model({ model: "qwen2.5vl:3b" }), {
-    args: ["vision-bridge", "local", "qwen2.5vl:3b"],
-  });
+test("the retired legacy command table is absent instead of offering setup and local chat aliases", () => {
+  assert.equal(Object.hasOwn(desktopCommands, "COMMANDS"), false);
+  for (const name of ["provider_setup", "local_models", "set_signed_routing", "set_login_free"]) {
+    assert.equal(desktopCommands.desktopCommandDefinitions().has(name), false, name);
+  }
 });
 
-test("desktop settings commands preserve the Windows and macOS tray contract", () => {
-  assert.deepEqual(COMMANDS.set_provider_enabled({ provider: "deepseek", enabled: true }), {
-    args: ["set-apply", "deepseek", "on", "--targets", "codex", "--activate"],
-    timeoutMs: 330_000,
-    then: ["--json"],
-  });
-  assert.deepEqual(COMMANDS.set_signed_routing({ enabled: true }), {
-    args: ["signed-routing", "on"],
-    then: ["--json"],
-  });
-  assert.deepEqual(COMMANDS.set_presence_mode({ mode: "follow-codex" }), {
-    args: ["presence", "set", "follow-codex"],
-  });
-  assert.deepEqual(COMMANDS.service_start(), { args: ["service", "start"] });
-  assert.deepEqual(COMMANDS.service_stop(), { args: ["service", "stop"] });
-  assert.deepEqual(COMMANDS.set_tool_result_aging({ enabled: true }), {
-    args: ["tool-result-aging", "on"],
-  });
-  assert.deepEqual(COMMANDS.set_vision_engine({ engine: "gpt-5.6-luna", effort: "low" }), {
-    args: ["vision-bridge", "engine", "gpt-5.6-luna", "low"],
-  });
-  assert.deepEqual(COMMANDS.doctor_fix(), {
-    args: ["doctor", "--fix", "--json"],
-  });
-});
-
-test("desktop credential commands rely on the control plane's atomic publication", () => {
-  assert.deepEqual(COMMANDS.save_api_key({ provider: "deepseek", apiKey: "test-key" }), {
-    args: ["credential", "deepseek"],
-    stdin: "test-key",
-    timeoutMs: 330_000,
-    then: ["providers", "--json"],
-  });
-  assert.deepEqual(COMMANDS.remove_api_key({ provider: "deepseek" }), {
-    args: ["credential", "deepseek", "--remove"],
-    timeoutMs: 330_000,
-    then: ["providers", "--json"],
-  });
-});
-
-test("desktop local-model commands retain the legacy tag argument and validation", () => {
-  assert.deepEqual(COMMANDS.install_local_model({ tag: "gemma4:12b" }), {
-    args: ["local-models", "install", "gemma4:12b", "--yes"],
-  });
-  assert.deepEqual(COMMANDS.cancel_local_model({ tag: "gemma4:12b" }), {
-    args: ["local-models", "cancel", "gemma4:12b"],
-  });
-  assert.throws(
-    () => COMMANDS.install_local_model({ model: "not a model" }),
-    /Unknown model tag: not a model/,
-  );
+test("canonical mappings preserve the control CLI contract", () => {
+  const definitions = desktopCommands.desktopCommandDefinitions();
+  assert.deepEqual(definitions.get("provider.enable").execute({ provider: "deepseek", enabled: true }), [
+    "set-apply", "deepseek", "on", "--targets", "codex", "--activate",
+  ]);
+  assert.deepEqual(definitions.get("presence.mode").execute({ mode: "follow-codex" }), [
+    "presence", "set", "follow-codex",
+  ]);
+  assert.deepEqual(definitions.get("vision.engine").execute({ engine: "gpt-5.6-luna", effort: "low" }), [
+    "vision-bridge", "engine", "gpt-5.6-luna", "low",
+  ]);
+  assert.deepEqual(definitions.get("doctor.fix").execute({}), ["doctor", "--fix", "--json"]);
 });

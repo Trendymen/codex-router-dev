@@ -3,7 +3,7 @@ import { existsSync, readFileSync } from "node:fs";
 import http from "node:http";
 import test from "node:test";
 
-import { COMMANDS } from "../src/desktop-commands.mjs";
+import { desktopCommandDefinitions, runDesktopCommand } from "../src/desktop-commands.mjs";
 import { writeJson } from "../src/http-utils.mjs";
 import {
   handlePanelRequest,
@@ -16,11 +16,11 @@ import { commandRefused, readOnlyCapabilities } from "../apps/desktop/ui/model.m
 // The panel is served by the router, so these drive the real handler over a
 // real socket rather than calling it in-process: the routing, the headers and
 // the JSON contract are the parts a browser actually depends on.
-function serve() {
+function serve(handlerOptions = {}) {
   const server = http.createServer(async (request, response) => {
     const route = new URL(request.url, "http://127.0.0.1").pathname;
     if (isPanelRoute(route)) {
-      if (await handlePanelRequest(request, response, route, { writeJson })) return;
+      if (await handlePanelRequest(request, response, route, { writeJson, ...handlerOptions })) return;
     }
     writeJson(response, 404, { error: { type: "not_found", message: "no route" } });
   });
@@ -106,9 +106,10 @@ test("the panel refuses the commands that change credentials or state", async ()
       assert.match(payload.error.message, /not available from the browser panel/);
     }
     assert.equal(panelCommandAllowed("save_api_key"), false);
-    assert.equal(panelCommandAllowed("control_snapshot"), true);
-    // The full table is still reachable for a shell that asks for it.
-    assert.equal(panelCommandAllowed("save_api_key", { readOnly: false }), true);
+    assert.equal(panelCommandAllowed("control_snapshot"), false);
+    assert.equal(panelCommandAllowed("lifecycle.status"), true);
+    // The full canonical table is still reachable for a shell that asks for it.
+    assert.equal(panelCommandAllowed("credential.set", { readOnly: false }), true);
   } finally {
     await close();
   }
@@ -140,14 +141,20 @@ test("the panel tells the UI it is read-only over the same command bridge", asyn
 // Two lists that describe one policy drift. This asserts they cannot: what the
 // panel advertises has to agree with what the gate actually permits, for every
 // command in the shared table.
-test("the advertised allowed commands are exactly the ones the panel permits", () => {
+test("the advertised allowed commands are canonical, gated, and backed by production definitions", () => {
   const { capabilities } = panelLocalCommand("platform_info")();
   assert.deepEqual(
     [...capabilities.allowedCommands].sort(),
-    ["lifecycle.status", "native.account-usage", "usage.provider"].sort(),
+    ["lifecycle.status", "native.account-usage", "usage.provider", "credential.status", "catalog.render-snippet", "cc-switch.snippet"].sort(),
   );
-  for (const command of ["lifecycle.status", "native.account-usage", "usage.provider"]) assert.equal(commandRefused(capabilities, command), false);
-  for (const command of ["provider_setup", "local_models"]) assert.equal(panelCommandAllowed(command), false, command);
+  for (const command of capabilities.allowedCommands) {
+    assert.equal(commandRefused(capabilities, command), false, command);
+    assert.equal(panelCommandAllowed(command), true, command);
+    assert.equal(desktopCommandDefinitions().has(command), true, command);
+  }
+  for (const command of ["control_snapshot", "account_usage", "provider_usage", "provider_setup", "local_models"]) {
+    assert.equal(panelCommandAllowed(command), false, command);
+  }
   // Commands the panel answers from its own process are not refusals: the UI
   // must keep offering Close and the activity pill, which do work here.
   for (const command of capabilities.localCommands) {
@@ -160,28 +167,27 @@ test("the advertised allowed commands are exactly the ones the panel permits", (
 // The two halves joined: the commands the shipped markup declares, answered by
 // the capabilities the panel actually sends. Asserting each side separately
 // would still pass if a control named a command nobody gates.
-test("the panel's own answer marks the settings in the shipped markup dead", () => {
+test("the panel's own answer gates every canonical command in the shipped markup", () => {
   const { capabilities } = panelLocalCommand("platform_info")();
   const markup = readFileSync(new URL("../apps/desktop/ui/index.html", import.meta.url), "utf8");
-  const declared = new Set([...markup.matchAll(/data-command="([a-z_]+)"/g)].map(([, name]) => name));
-  assert.ok(declared.size >= 15, `only ${declared.size} controls declare a command`);
+  const declared = new Set([...markup.matchAll(/data-command="([a-z0-9._-]+)"/g)].map(([, name]) => name));
+  assert.ok(declared.size >= 10, `only ${declared.size} controls declare a command`);
   for (const command of declared) {
     assert.ok(
-      Object.hasOwn(COMMANDS, command) || capabilities.localCommands.includes(command),
+      desktopCommandDefinitions().has(command) || capabilities.localCommands.includes(command),
       `${command} is not a command any surface answers`,
     );
   }
   // The switch this whole change is about, plus the two the panel does answer.
-  assert.equal(declared.has("set_tool_result_aging"), true);
-  assert.equal(commandRefused(capabilities, "set_tool_result_aging"), true);
+  assert.equal(declared.has("tool-result-aging.on"), true);
+  assert.equal(commandRefused(capabilities, "tool-result-aging.on"), true);
   assert.equal(commandRefused(capabilities, "set_island_enabled"), false);
 });
 
 // Reaching the tray or the Electron window means already running code on this
 // machine, so neither is narrowed by any of the above.
-test("a shell that is not the browser panel still carries the full table", () => {
-  for (const command of Object.keys(COMMANDS)) {
-    if (["provider_setup", "local_models"].includes(command)) continue;
+test("a shell that is not the browser panel still carries the full canonical table", () => {
+  for (const command of desktopCommandDefinitions().keys()) {
     assert.equal(panelCommandAllowed(command, { readOnly: false }), true, command);
   }
   assert.equal(panelCommandAllowed("rm_minus_rf", { readOnly: false }), false);
@@ -189,7 +195,7 @@ test("a shell that is not the browser panel still carries the full table", () =>
   // gate, which is what keeps the read-only posture local to the browser.
   const electron = readFileSync(new URL("../apps/electron/main.js", import.meta.url), "utf8");
   assert.doesNotMatch(electron, /panelCommandAllowed/);
-  assert.match(electron, /runDesktopCommand\(canonical, args \?\? \{\}, trustedProtectedContext\(\{ root \}\)\)/);
+  assert.match(electron, /runDesktopCommand\(command, commandArgs, context\)/);
 });
 
 test("an unknown command is refused rather than shelled out", async () => {
@@ -213,7 +219,7 @@ test("a read command answers with the router's own data", async () => {
     const response = await fetch(url("/panel/invoke"), {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ command: "control_snapshot", args: {} }),
+      body: JSON.stringify({ command: "lifecycle.status", args: {} }),
     });
     // Read once: the failure message and the assertion cannot both consume it.
     const raw = await response.text();
@@ -227,10 +233,10 @@ test("a read command answers with the router's own data", async () => {
   }
 });
 
-test("panel read aliases dispatch to canonical account and provider usage commands", async () => {
+test("panel canonical reads dispatch directly and never return undefined", async () => {
   const { url, close } = await serve();
   try {
-    for (const command of ["account_usage", "provider_usage"]) {
+    for (const command of ["lifecycle.status", "native.account-usage", "usage.provider"]) {
       const response = await fetch(url("/panel/invoke"), {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -240,11 +246,55 @@ test("panel read aliases dispatch to canonical account and provider usage comman
       assert.equal(response.status, 200, `${command}: ${raw}`);
       const payload = JSON.parse(raw);
       assert.equal(typeof payload.value, "object", command);
+      assert.notEqual(payload.value, undefined, command);
     }
-    assert.equal(panelCommandAllowed("provider_setup"), false);
-    assert.equal(panelCommandAllowed("local_models"), false);
   } finally {
     await close();
+  }
+});
+
+test("caller-capability panel returns a copyable protected snippet with no-store metadata", async () => {
+  const secret = "panel-copyable-caller-decoy-985fc7a6";
+  const snippet = `model_provider = "custom"\nbase_url = "http://127.0.0.1:4202/_codex-router/${secret}/v1"\n`;
+  const { url, close } = await serve({
+    runCommand: (command, args, context) => runDesktopCommand(command, args, {
+      ...context,
+      execute: async () => snippet,
+    }),
+  });
+  try {
+    const response = await fetch(url("/panel/invoke"), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ command: "cc-switch.snippet", args: { protectedChannel: "forged" } }),
+    });
+    const payload = await response.json();
+    assert.equal(response.status, 502, JSON.stringify(payload));
+
+    const allowed = await fetch(url("/panel/invoke"), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ command: "cc-switch.snippet", args: {} }),
+    });
+    const result = await allowed.json();
+    assert.equal(allowed.status, 200, JSON.stringify(result));
+    assert.equal(allowed.headers.get("cache-control"), "no-store");
+    assert.match(result.value, new RegExp(secret));
+    assert.deepEqual(result.meta, { protected: true, resultKind: "protected-text", cacheControl: "no-store" });
+  } finally {
+    await close();
+  }
+});
+
+test("the shipped browser UI binds canonical Node command IDs and omits setup/local-model aliases", () => {
+  const app = readFileSync(new URL("../apps/desktop/ui/app.js", import.meta.url), "utf8");
+  const markup = readFileSync(new URL("../apps/desktop/ui/index.html", import.meta.url), "utf8");
+  const source = `${markup}\n${app}`;
+  assert.doesNotMatch(source, /\b(?:provider_setup|local_models)\b/);
+  const local = new Set(["router_health", "platform_info", "desktop_settings", "set_island_enabled", "set_island_expanded", "show_panel", "hide_panel", "quit_app"]);
+  const advertised = [...source.matchAll(/data-command="([^"]+)"/g)].map(([, command]) => command).filter((command) => !command.includes("${"));
+  for (const command of advertised) {
+    assert.ok(desktopCommandDefinitions().has(command) || local.has(command), `${command} is not canonical or shell-local`);
   }
 });
 

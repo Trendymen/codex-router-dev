@@ -1,13 +1,26 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
-import test from "node:test";
+import test, { after } from "node:test";
 import { fileURLToPath } from "node:url";
 
-import {
+const liveStateDir =
+  process.env.MODEL_ROUTER_STATE_DIR ||
+  process.env.CODEX_ROUTER_STATE_DIR ||
+  process.env.KIMI_CODEX_STATE_DIR ||
+  path.join(process.env.CODEX_HOME || path.join(os.homedir(), ".codex"), "codex-router");
+const livePurgePath = process.env.MODEL_ROUTER_VISION_CACHE_PURGE || path.join(liveStateDir, "vision-cache-purge.json");
+const livePurgeBefore = existsSync(livePurgePath)
+  ? { exists: true, content: readFileSync(livePurgePath), mtimeNs: statSync(livePurgePath, { bigint: true }).mtimeNs }
+  : { exists: false };
+const isolatedStateDir = mkdtempSync(path.join(os.tmpdir(), "vision-bridge-test-"));
+process.env.MODEL_ROUTER_STATE_DIR = isolatedStateDir;
+process.env.MODEL_ROUTER_VISION_CACHE_PURGE = path.join(isolatedStateDir, "vision-cache-purge.json");
+
+const {
   applyVisionBridge,
   createEvidenceCache,
   requestVisionCachePurge,
@@ -38,10 +51,49 @@ import {
   VISION_EVIDENCE_MAX_CHARS,
   VISION_QUESTION_MAX_CHARS,
   VISION_RECORD_MAX_CHARS,
-} from "../src/vision-bridge.mjs";
-import { nativeVisionEngines } from "../src/vision-engines.mjs";
+} = await import("../src/vision-bridge.mjs");
+const { nativeVisionEngines } = await import("../src/vision-engines.mjs");
+
+after(() => {
+  if (livePurgeBefore.exists) {
+    assert.equal(existsSync(livePurgePath), true, "the user's live purge marker was deleted");
+    assert.deepEqual(readFileSync(livePurgePath), livePurgeBefore.content, "the user's live purge marker content changed");
+    assert.equal(
+      statSync(livePurgePath, { bigint: true }).mtimeNs,
+      livePurgeBefore.mtimeNs,
+      "the user's live purge marker mtime changed",
+    );
+  } else {
+    assert.equal(existsSync(livePurgePath), false, "the test created a purge marker in the user's live state");
+  }
+  rmSync(isolatedStateDir, { recursive: true, force: true });
+});
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const purgeChild = path.join(repoRoot, "test", "fixtures", "vision-purge-child.mjs");
+
+function requestPurgeFromChild(purgePath, now) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [purgeChild, purgePath, String(now)], {
+      cwd: repoRoot,
+      env: {
+        ...process.env,
+        MODEL_ROUTER_STATE_DIR: path.dirname(purgePath),
+        MODEL_ROUTER_VISION_CACHE_PURGE: purgePath,
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8").on("data", (chunk) => { stdout += chunk; });
+    child.stderr.setEncoding("utf8").on("data", (chunk) => { stderr += chunk; });
+    child.once("error", reject);
+    child.once("exit", (code) => {
+      if (code !== 0) reject(new Error(stderr || `vision purge child exited ${code}`));
+      else resolve(JSON.parse(stdout));
+    });
+  });
+}
 
 const TEXT_ONLY = {
   slug: "deepseek/deepseek-v4-pro",
@@ -102,7 +154,13 @@ test("vision cache purge uses the evidence owner and leaves an active download u
     const result = spawnSync(process.execPath, ["src/control.mjs", "vision-purge-cache"], {
       cwd: repoRoot,
       encoding: "utf8",
-      env: { ...process.env, MODEL_ROUTER_VISION_DOWNLOAD_STATE: download, MODEL_ROUTER_VISION_DOWNLOAD_CLAIM: claim },
+      env: {
+        ...process.env,
+        MODEL_ROUTER_STATE_DIR: state,
+        MODEL_ROUTER_VISION_CACHE_PURGE: path.join(state, "vision-cache-purge.json"),
+        MODEL_ROUTER_VISION_DOWNLOAD_STATE: download,
+        MODEL_ROUTER_VISION_DOWNLOAD_CLAIM: claim,
+      },
     });
     assert.equal(result.status, 0, result.stderr);
     assert.equal(existsSync(download), true);
@@ -117,6 +175,36 @@ test("vision cache purge uses the evidence owner and leaves an active download u
     assert.equal(logs.status, 0, logs.stderr);
     assert.match(logs.stdout, /healthy router started/);
     assert.doesNotMatch(logs.stdout, /log-secret/);
+  } finally {
+    rmSync(state, { recursive: true, force: true });
+  }
+});
+
+test("purge generations stay atomic and monotonic across same-ms concurrent children and clock rollback", async () => {
+  const state = mkdtempSync(path.join(os.tmpdir(), "vision-purge-atomic-"));
+  const purgePath = path.join(state, "vision-cache-purge.json");
+  try {
+    writeFileSync(purgePath, `${JSON.stringify({ version: 1, generation: 9000 })}\n`);
+    const rolledBack = await requestPurgeFromChild(purgePath, 1000);
+    assert.equal(rolledBack.generation, 9001);
+
+    const sameMillisecond = await Promise.all(
+      Array.from({ length: 8 }, () => requestPurgeFromChild(purgePath, 1000)),
+    );
+    const generations = sameMillisecond.map(({ generation }) => generation).sort((a, b) => a - b);
+    assert.deepEqual(generations, [9002, 9003, 9004, 9005, 9006, 9007, 9008, 9009]);
+    assert.deepEqual(JSON.parse(readFileSync(purgePath, "utf8")), { version: 1, generation: 9009 });
+
+    const owner = createEvidenceCache({ purgePath });
+    owner.set("data:image/png;base64,atomic-owner", "question", "answer");
+    assert.equal(owner.size, 1);
+    await requestPurgeFromChild(purgePath, 1000);
+    assert.equal(owner.size, 0, "the owner did not consume the child generation");
+    assert.equal(
+      process._getActiveHandles().filter((handle) => handle?.constructor?.name === "FSWatcher").length,
+      0,
+      "purge ownership leaked an fs watcher",
+    );
   } finally {
     rmSync(state, { recursive: true, force: true });
   }

@@ -129,10 +129,21 @@ async function handleInvoke(command, args) {
     return null;
   }
 
-  // The shared runner, so the shell adds a window and an IPC hop and nothing
-  // else. Behaviour lives in src/desktop-commands.mjs for every surface.
-  const canonical = { service_start: "lifecycle.start", service_stop: "lifecycle.stop", presence_status: "presence.status" }[command] || command;
-  const result = await runDesktopCommand(canonical, args ?? {}, trustedProtectedContext({ root }));
+  // The shipped UI speaks canonical IDs. Credential bytes are peeled off at
+  // this trusted IPC boundary and supplied through the ephemeral protected
+  // callback; caller data can never select the protected output Symbol.
+  let commandArgs = args ?? {};
+  let protectedInput;
+  if (command === "credential.set") {
+    const descriptor = commandArgs && typeof commandArgs === "object"
+      ? Object.getOwnPropertyDescriptor(commandArgs, "apiKey")
+      : undefined;
+    const secret = descriptor && Object.hasOwn(descriptor, "value") ? descriptor.value : undefined;
+    commandArgs = { provider: commandArgs?.provider };
+    protectedInput = typeof secret === "string" ? async () => secret : undefined;
+  }
+  const context = trustedProtectedContext({ root, ...(protectedInput ? { protectedInput } : {}) });
+  const result = await runDesktopCommand(command, commandArgs, context);
   if (result?.ok === false) throw new Error(result.error?.message || "The router command failed.");
   return result?.ok === true ? result.value : result;
 }

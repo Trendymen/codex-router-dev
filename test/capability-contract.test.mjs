@@ -1,5 +1,9 @@
 import assert from "node:assert/strict";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 import fixture from "./fixtures/required-capabilities.json" with { type: "json" };
 import {
@@ -9,9 +13,12 @@ import {
 } from "../src/capability-manifest.mjs";
 import {
   desktopCommandDefinitions,
+  runControl,
   runDesktopCommand,
   trustedProtectedContext,
 } from "../src/desktop-commands.mjs";
+
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 test("Node command table exactly covers the independent oracle", () => {
   const commands = desktopCommandDefinitions();
@@ -239,6 +246,69 @@ test("every canonical command has a real control-bridge invocation and result ki
   assert.equal(invoked.length, fixture.nodeCommands.length);
 });
 
+test("every canonical mapping spawns the actual control child in an isolated state and returns a bounded result", async () => {
+  const state = mkdtempSync(path.join(os.tmpdir(), "canonical-control-bridge-"));
+  const codexHome = path.join(state, "codex-home");
+  mkdirSync(codexHome, { recursive: true });
+  writeFileSync(path.join(state, "caller-secret"), `${"c".repeat(48)}\n`);
+  writeFileSync(path.join(state, "routed-models.json"), `${JSON.stringify({ models: [] })}\n`);
+  writeFileSync(path.join(state, "enabled-providers.json"), "[]\n");
+  writeFileSync(path.join(codexHome, "config.toml"), "");
+  const preload = path.join(repoRoot, "test", "fixtures", "control-safe-stubs.cjs");
+  const environment = {
+    ...process.env,
+    CODEX_HOME: codexHome,
+    CODEX_ROUTER_STATE_DIR: state,
+    MODEL_ROUTER_STATE_DIR: state,
+    MODEL_ROUTER_SOURCE_ROOT: repoRoot,
+    MODEL_ROUTER_TARGET: "codex",
+    MODEL_ROUTER_VISION_CACHE_PURGE: path.join(state, "vision-cache-purge.json"),
+    MODEL_ROUTER_VISION_DOWNLOAD_STATE: path.join(state, "vision-download.json"),
+    MODEL_ROUTER_VISION_DOWNLOAD_CLAIM: path.join(state, "vision-download.claim"),
+    NODE_OPTIONS: `${process.env.NODE_OPTIONS || ""} --require=${preload}`.trim(),
+  };
+  const argsByCommand = Object.fromEntries(fixture.nodeCommands.map((name) => [name, {}]));
+  Object.assign(argsByCommand, {
+    "credential.status": { provider: "deepseek" }, "credential.set": { provider: "deepseek" }, "credential.remove": { provider: "deepseek" },
+    "provider.enable": { provider: "deepseek", enabled: true }, "model.visibility": { slug: "deepseek/deepseek-v4-pro", visible: true }, "model.canary": { slug: "qwen-plan/qwen3.7-max", enabled: false },
+    "protocol-proof.status": { slug: "deepseek/deepseek-v4-pro" }, "protocol-proof.verify": { slug: "deepseek/deepseek-v4-pro" }, "protocol-proof.revoke": { slug: "deepseek/deepseek-v4-pro" },
+    "picker.set": { slug: "deepseek/deepseek-v4-pro", visible: true }, "picker.show-all": { visible: true },
+    "subagents.mode": { mode: "proven" }, "subagents.model": { slug: "deepseek/deepseek-v4-pro", enabled: true }, "subagents.selection": { selection: "select-all" }, "subagents.verify": { slug: "deepseek/deepseek-v4-pro" },
+    "tool-result-aging.ttl": { days: 7 }, "tool-result-aging.purge": { expiredOnly: true }, "usage.provider": { provider: "deepseek" }, "usage.model": { slug: "deepseek/deepseek-v4-pro" },
+    "vision.engine": { engine: "auto" }, "vision.effort": { effort: "default" }, "vision.pull": { tag: "qwen2.5vl:3b" }, "presence.mode": { mode: "always" },
+  });
+  try {
+    for (const name of fixture.nodeCommands) {
+      const definition = desktopCommandDefinitions().get(name);
+      const context = {
+        root: repoRoot,
+        protectedInput: name === "credential.set" ? "isolated-provider-secret" : undefined,
+        runControl: (root, argv, options) => runControl(root, argv, {
+          ...options,
+          runtime: { command: process.execPath, env: environment },
+          timeoutMs: 20_000,
+        }),
+      };
+      const trusted = definition.resultKind === "protected-text" ? trustedProtectedContext(context) : context;
+      const result = await runDesktopCommand(name, argsByCommand[name], trusted);
+      assert.equal(typeof result?.ok, "boolean", `${name}: missing envelope`);
+      if (result.ok) {
+        assert.notEqual(result.value, undefined, `${name}: undefined production value`);
+        if (definition.resultKind === "text" || definition.resultKind === "protected-text") {
+          assert.equal(typeof result.value, "string", `${name}: wrong text shape`);
+        } else {
+          assert.equal(typeof result.value, "object", `${name}: wrong JSON shape`);
+        }
+      } else {
+        assert.equal(typeof result.error?.code, "string", `${name}: missing safe error code`);
+        assert.equal(typeof result.error?.message, "string", `${name}: missing safe error message`);
+      }
+    }
+  } finally {
+    rmSync(state, { recursive: true, force: true });
+  }
+});
+
 test("hostile executor errors use own-data extraction and never trigger getters", async () => {
   const hostile = Object.create(null);
   Object.defineProperty(hostile, "code", { get() { throw new Error("error-secret"); }, enumerable: true });
@@ -267,13 +337,22 @@ test("result sanitizer protects bearer/caller values in arrays and neutralizes p
   assert.equal(Object.getPrototypeOf(result.value), null);
 });
 
-test("snippet output requires an authorized channel and preserves deterministic redacted URL shape", async () => {
+test("snippet output requires an authorized channel and preserves the usable caller capability only there", async () => {
   const execute = async () => "base_url = \"http://127.0.0.1:4200/_codex-router/caller-secret/v1\"\n";
   const refused = await runDesktopCommand("cc-switch.snippet", {}, { execute });
   assert.equal(refused.ok, false);
   assert.equal(refused.error.code, "protected_output_required");
+  const forged = await runDesktopCommand("cc-switch.snippet", {}, { execute, protectedChannel: Symbol("forged") });
+  assert.equal(forged.ok, false);
+  assert.equal(forged.error.code, "protected_output_required");
   const allowed = await runDesktopCommand("cc-switch.snippet", {}, trustedProtectedContext({ execute }));
   assert.equal(allowed.ok, true);
-  assert.match(allowed.value, /_codex-router\/\[REDACTED\]\/v1/);
-  assert.doesNotMatch(allowed.value, /caller-secret/);
+  assert.match(allowed.value, /_codex-router\/caller-secret\/v1/);
+  assert.deepEqual(allowed.meta, { protected: true, resultKind: "protected-text", cacheControl: "no-store" });
+
+  const oversized = await runDesktopCommand("cc-switch.snippet", {}, trustedProtectedContext({
+    execute: async () => "x".repeat(64 * 1024 + 1),
+  }));
+  assert.equal(oversized.ok, false);
+  assert.equal(oversized.error.code, "invalid_command_arguments");
 });

@@ -274,18 +274,19 @@ function startPanel() {
   async function refreshPanel({ quiet = false } = {}) {
     elements.refresh.disabled = true;
     const requests = [
-      ["snapshot", "control_snapshot"],
-      ["account", "account_usage"],
-      ["providerUsage", "provider_usage"],
-      ["providerSetup", "provider_setup"],
-      ["health", "router_health"],
-      ["platform", "platform_info"],
-      ["settings", "desktop_settings"],
+      ["snapshot", "lifecycle.status", {}],
+      ["account", "native.account-usage", {}],
+      ["providerUsage", "usage.provider", {}],
+      ["credential:deepseek", "credential.status", { provider: "deepseek" }],
+      ["credential:qwen-plan", "credential.status", { provider: "qwen-plan" }],
+      ["health", "router_health", {}],
+      ["platform", "platform_info", {}],
+      ["settings", "desktop_settings", {}],
     ];
     const results = await Promise.all(
-      requests.map(async ([key, command]) => {
+      requests.map(async ([key, command, args]) => {
         try {
-          return { key, value: await call(command) };
+          return { key, value: await call(command, args) };
         } catch (error) {
           return { key, error };
         }
@@ -293,9 +294,17 @@ function startPanel() {
     );
     const errors = [];
     for (const result of results) {
-      if ("value" in result) state[result.key] = result.value;
+      if ("value" in result) {
+        if (result.key.startsWith("credential:")) continue;
+        state[result.key] = result.value;
+      }
       else errors.push(result.error);
     }
+    state.providerSetup = {
+      providers: results
+        .filter((result) => result.key.startsWith("credential:") && result.value?.status)
+        .map((result) => result.value.status),
+    };
     // The control snapshot already contains the local-model, vision-bridge,
     // and presence views. Reusing them avoids starting separate Node processes
     // for the same Ollama inventory and keeps all three sections consistent.
@@ -322,7 +331,7 @@ function startPanel() {
     }
     const nextActivityState = state.health?.activity?.state || "offline";
     if (state.lastActivityState === "generating" && nextActivityState !== "generating") {
-      call("provider_usage")
+      call("usage.provider")
         .then((usage) => {
           state.providerUsage = usage;
           renderStatus();
@@ -608,8 +617,8 @@ function startPanel() {
       ? `<div class="local-section-label"><span>Local image readers</span><small>${models.length} available</small></div>${models.map((model) => {
           const installed = model.installed === true;
           const active = operation?.tag === model.tag && operation?.status === "downloading";
-          const action = active ? `<button class="mini-button" type="button" disabled>${Number(operation.percent || 0)}%</button>` : installed ? `<button class="mini-button" type="button" data-command="use_local_vision_model" data-vision-action="use" data-model="${escapeHtml(model.tag)}">${vision.engine === "local" && vision.local?.model === model.tag ? "Using" : "Use"}</button>` : `<button class="mini-button" type="button" data-command="pull_vision_model" data-vision-action="download" data-model="${escapeHtml(model.tag)}"${state.visionBusy ? " disabled" : ""}>Download</button>`;
-          const tests = installed ? `<button class="text-button" type="button" data-command="benchmark_vision_model" data-vision-action="benchmark" data-model="${escapeHtml(model.tag)}"${state.localBenchmarkBusy ? " disabled" : ""}>Test</button>` : "";
+          const action = active ? `<button class="mini-button" type="button" disabled>${Number(operation.percent || 0)}%</button>` : installed ? `<button class="mini-button" type="button" disabled>${vision.engine === "local" && vision.local?.model === model.tag ? "Using" : "Installed"}</button>` : `<button class="mini-button" type="button" data-command="vision.pull" data-vision-action="download" data-model="${escapeHtml(model.tag)}"${state.visionBusy ? " disabled" : ""}>Download</button>`;
+          const tests = "";
           return `<div class="vision-model-row"><span><strong>${escapeHtml(model.label || model.tag)}</strong><small>${escapeHtml(model.tag)} · ${escapeHtml(model.accuracy || "unmeasured")}</small></span><span>${tests}${action}</span></div>`;
         }).join("")}`
       : "";
@@ -650,19 +659,19 @@ function startPanel() {
     const canRemove = provider.kind === "api" && provider.configured;
     const actionButton = isAnonymous
       ? `<button class="mini-button" type="button" disabled title="${escapeHtml(provider.anonymousNote || t("connections.noApiKey"))}">${escapeHtml(actionLabel)}</button>`
-      : `<button class="mini-button" type="button" data-command="${action === "connect" ? "connect_oauth" : "save_api_key"}" data-action="${action}" data-provider="${escapeHtml(provider.id)}"${isBusy ? " disabled" : ""}>${escapeHtml(actionLabel)}</button>`;
+      : `<button class="mini-button" type="button" data-command="credential.set" data-action="key" data-provider="${escapeHtml(provider.id)}"${isBusy ? " disabled" : ""}>${escapeHtml(actionLabel)}</button>`;
     return `<article class="provider-row">
       <div><strong>${escapeHtml(provider.displayName)}</strong><small>${escapeHtml(detail)}</small>${provider.planNote ? `<small>${escapeHtml(localizeProviderPlan(provider.planNote))}</small>` : ""}${provider.anonymousNote ? `<small>${escapeHtml(provider.anonymousNote)}</small>` : ""}</div>
       <div class="provider-actions">
         ${actionButton}
         ${
           canRemove
-            ? `<button class="mini-button danger" type="button" data-command="remove_api_key" data-action="remove-key" data-provider="${escapeHtml(provider.id)}" aria-label="${escapeHtml(t("connections.removeCredentialAria", { provider: provider.displayName }))}"${isBusy ? " disabled" : ""}>${escapeHtml(t("actions.remove"))}</button>`
+            ? `<button class="mini-button danger" type="button" data-command="credential.remove" data-action="remove-key" data-provider="${escapeHtml(provider.id)}" aria-label="${escapeHtml(t("connections.removeCredentialAria", { provider: provider.displayName }))}"${isBusy ? " disabled" : ""}>${escapeHtml(t("actions.remove"))}</button>`
             : ""
         }
         ${
           provider.configured
-            ? `<label class="provider-check"><input type="checkbox" data-command="set_provider_enabled" data-provider="${escapeHtml(provider.id)}" aria-label="${escapeHtml(t("connections.enableProviderAria", { provider: provider.displayName }))}"${enabled ? " checked" : ""}${isBusy ? " disabled" : ""}></label>`
+            ? `<label class="provider-check"><input type="checkbox" data-command="provider.enable" data-provider="${escapeHtml(provider.id)}" aria-label="${escapeHtml(t("connections.enableProviderAria", { provider: provider.displayName }))}"${enabled ? " checked" : ""}${isBusy ? " disabled" : ""}></label>`
             : ""
         }
       </div>
@@ -734,15 +743,11 @@ function startPanel() {
         setting === "picker"
           ? [t("actions.showAll"), t("actions.hideAll")]
           : [t("actions.subagentsOn"), t("actions.subagentsOff")];
-      const groupCommand = setting === "picker" ? "set_picker_provider" : "set_subagent_provider";
       return groups
         .map(
           (group) => `<details class="model-provider-group" open>
             <summary><span>${escapeHtml(providerLabel(group.provider))}</span><span class="model-provider-count">${escapeHtml(groupSummary(group))}</span></summary>
-            <div class="model-provider-toolbar">
-              <button class="text-button" type="button" data-command="${groupCommand}" data-provider-setting="${setting}" data-provider="${escapeHtml(group.provider)}" data-enabled="true">${onLabel}</button>
-              <button class="text-button" type="button" data-command="${groupCommand}" data-provider-setting="${setting}" data-provider="${escapeHtml(group.provider)}" data-enabled="false">${offLabel}</button>
-            </div>
+            <div class="model-provider-toolbar"><small>${escapeHtml(onLabel)} / ${escapeHtml(offLabel)}</small></div>
             <div class="model-settings-list">${group.items.map(rowMarkup).join("")}</div>
           </details>`,
         )
@@ -779,7 +784,7 @@ function startPanel() {
                 : t("models.untested");
         return `<label class="model-setting-row">
           <span><strong>${escapeHtml(model.displayName)}</strong><small>${escapeHtml(badge)}</small></span>
-          <span class="provider-check"><input type="checkbox" data-command="set_subagent_model" data-subagent="${escapeHtml(model.slug)}" aria-label="${escapeHtml(t("models.useModelAria", { model: model.displayName }))}"${checked ? " checked" : ""}${state.modelSettingsBusy || model.visible === false ? " disabled" : ""}></span>
+          <span class="provider-check"><input type="checkbox" data-command="subagents.model" data-subagent="${escapeHtml(model.slug)}" aria-label="${escapeHtml(t("models.useModelAria", { model: model.displayName }))}"${checked ? " checked" : ""}${state.modelSettingsBusy || model.visible === false ? " disabled" : ""}></span>
         </label>`;
       };
 
@@ -806,7 +811,7 @@ function startPanel() {
         const visible = !hiddenModels.has(model.slug);
         return `<label class="model-setting-row">
           <span><strong>${escapeHtml(model.displayName)}</strong><small>${escapeHtml(model.slug)}</small></span>
-          <span class="provider-check"><input type="checkbox" data-command="set_picker_model" data-picker="${escapeHtml(model.slug)}" aria-label="${escapeHtml(t("models.showModelAria", { model: model.displayName }))}"${visible ? " checked" : ""}${state.modelSettingsBusy ? " disabled" : ""}></span>
+          <span class="provider-check"><input type="checkbox" data-command="picker.set" data-picker="${escapeHtml(model.slug)}" aria-label="${escapeHtml(t("models.showModelAria", { model: model.displayName }))}"${visible ? " checked" : ""}${state.modelSettingsBusy ? " disabled" : ""}></span>
         </label>`;
       };
 
@@ -907,14 +912,14 @@ function startPanel() {
               ? " is-running"
               : " is-ready";
       const cancelButton = running && download.tag
-        ? `<button class="mini-button danger" type="button" data-command="cancel_local_model" data-local-action="cancel-operation" data-model="${escapeHtml(download.tag)}"${state.localCancelBusy ? " disabled" : ""}>Cancel</button>`
+        ? `<button class="mini-button danger" type="button" data-legacy-command="cancel_local_model" data-local-action="cancel-operation" data-model="${escapeHtml(download.tag)}"${state.localCancelBusy ? " disabled" : ""}>Cancel</button>`
         : "";
       // A terminal download failure/cancellation must be recoverable from the
       // status card itself.  The install form is still available, but a
       // one-click retry makes an interrupted pull obvious and avoids making
       // the operator retype a long Ollama tag or URL.
       const retryButton = !running && !removal && (failed || cancelled) && download.tag
-        ? `<button class="mini-button" type="button" data-command="install_local_model" data-local-action="retry-operation" data-model="${escapeHtml(download.tag)}"${state.localModelBusy || state.localCancelBusy ? " disabled" : ""}>Retry</button>`
+        ? `<button class="mini-button" type="button" data-legacy-command="install_local_model" data-local-action="retry-operation" data-model="${escapeHtml(download.tag)}"${state.localModelBusy || state.localCancelBusy ? " disabled" : ""}>Retry</button>`
         : "";
       elements.localDownloadStatus.innerHTML = `<div class="download-status${statusClass}">
         <div class="download-status-head"><span class="operation-pulse" aria-hidden="true"></span><strong>${title}</strong><span>${failed || cancelled || removal ? "" : `${percent}%`}</span>${cancelButton}${retryButton}</div>
@@ -941,7 +946,7 @@ function startPanel() {
     elements.localQuickPicks.innerHTML = picks.length
       ? `<div class="local-section-label"><span>${escapeHtml(t("models.quickPicks"))}</span><small>${escapeHtml(t("models.recommendedForMachine"))}</small></div>${picks
           .map(
-            (model) => `<button type="button" class="quick-pick" data-command="install_local_model" data-local-action="install" data-model="${escapeHtml(model.tag)}"${installBusy ? " disabled" : ""}>
+            (model) => `<button type="button" class="quick-pick" data-legacy-command="install_local_model" data-local-action="install" data-model="${escapeHtml(model.tag)}"${installBusy ? " disabled" : ""}>
               <span><strong>${escapeHtml(model.tag)}</strong><small>${escapeHtml(model.codex === "verified" ? t("models.verifiedInCodex") : model.fit || t("models.untested"))}</small></span>
               <span>${Number(model.sizeGb || 0).toFixed(1)} GB</span>
             </button>`,
@@ -953,8 +958,14 @@ function startPanel() {
     const runtime = local.runtime || {};
     const machine = local.machine ? `<small class="muted-line">${escapeHtml(local.machine)}</small>` : "";
     elements.localRuntimeActions.innerHTML = runtime.installed
-      ? `<div><small>Ollama ${escapeHtml(runtime.version || "installed")} · headless server ${runtime.running ? "running" : "not started"}</small>${runtime.modelsPath ? `<small class="muted-line">Models: ${escapeHtml(runtime.modelsPath)}</small>` : ""}${machine}</div><button class="text-button" type="button" data-command="update_local_ollama" data-local-runtime-action="update"${state.maintenanceBusy || state.localModelBusy ? " disabled" : ""}>Update Ollama</button>`
+      ? `<div><small>Ollama ${escapeHtml(runtime.version || "installed")} · headless server ${runtime.running ? "running" : "not started"}</small>${runtime.modelsPath ? `<small class="muted-line">Models: ${escapeHtml(runtime.modelsPath)}</small>` : ""}${machine}</div><button class="text-button" type="button" data-legacy-command="update_local_ollama" data-local-runtime-action="update"${state.maintenanceBusy || state.localModelBusy ? " disabled" : ""}>Update Ollama</button>`
       : `<small>Ollama is not installed. Installing a model can set it up with explicit consent.</small>`;
+  }
+
+  async function refreshLocalModelsSnapshot() {
+    const snapshot = await call("lifecycle.status");
+    state.snapshot = snapshot;
+    return snapshot?.targets?.codex?.modelSettings?.localModels || state.localModels || {};
   }
 
   // LM Studio owns loading and unloading its models, so this section is a
@@ -988,7 +999,7 @@ function startPanel() {
           ? model.enabled ? "In the picker" : "Served · unchecked"
           : "Checked but not currently served";
         return `<article class="local-model-row${isBusy ? " is-busy" : ""}">
-          <label class="provider-check"><input type="checkbox" data-command="set_lmstudio_model_enabled" data-lmstudio-toggle="${escapeHtml(model.id)}" aria-label="Offer ${escapeHtml(model.id)} in the model picker"${model.enabled ? " checked" : ""}${rowBusy ? " disabled" : ""}></label>
+          <label class="provider-check"><input type="checkbox" data-legacy-command="set_lmstudio_model_enabled" data-lmstudio-toggle="${escapeHtml(model.id)}" aria-label="Offer ${escapeHtml(model.id)} in the model picker"${model.enabled ? " checked" : ""}${rowBusy ? " disabled" : ""}></label>
           <div><strong>${escapeHtml(model.id)}</strong><small>${escapeHtml(detail)}</small></div>
         </article>`;
       })
@@ -1128,7 +1139,7 @@ function startPanel() {
     } else if (installed.has(tag)) {
       action = '<span class="local-catalog-installed">Installed</span>';
     } else {
-      action = `<button class="mini-button${tooLarge ? " danger" : ""}" type="button" data-command="install_local_model" data-local-action="install" data-model="${escapeHtml(tag)}"${installBusy ? " disabled" : ""}>${tooLarge ? "Anyway" : "Download"}</button>`;
+      action = `<button class="mini-button${tooLarge ? " danger" : ""}" type="button" data-legacy-command="install_local_model" data-local-action="install" data-model="${escapeHtml(tag)}"${installBusy ? " disabled" : ""}>${tooLarge ? "Anyway" : "Download"}</button>`;
     }
     return `<article class="local-catalog-row${tooLarge ? " is-too-large" : ""}">
       <div class="local-catalog-copy"><strong>${escapeHtml(title)}</strong><small>${escapeHtml(tag)}${escapeHtml(capabilities)}</small></div>
@@ -1169,15 +1180,15 @@ function startPanel() {
       model.agent === "agent" ? t("models.worksInCodex") : model.tools ? t("models.chatUntested") : t("models.noToolCalling"),
       Number.isFinite(speed) ? `${speed.toFixed(1)} tok/s` : t("models.speedUnmeasured"),
     ].join(" · ");
-    const speedAction = `<button class="text-button" type="button" data-command="local_model_speed" data-local-action="measure-speed" data-model="${escapeHtml(model.tag)}"${state.localBenchmarkBusy ? " disabled" : ""}>Speed</button>`;
+    const speedAction = `<button class="text-button" type="button" data-legacy-command="local_model_speed" data-local-action="measure-speed" data-model="${escapeHtml(model.tag)}"${state.localBenchmarkBusy ? " disabled" : ""}>Speed</button>`;
     const visionActions = model.vision
-      ? `<button class="text-button" type="button" data-command="benchmark_vision_model" data-local-action="test-image" data-model="${escapeHtml(model.tag)}"${state.localBenchmarkBusy ? " disabled" : ""}>Test image</button><button class="text-button" type="button" data-command="use_local_vision_model" data-local-action="use-image" data-model="${escapeHtml(model.tag)}"${state.visionBusy ? " disabled" : ""}>${state.visionBridge?.engine === "local" && state.visionBridge?.local?.model === model.tag ? "Using image" : "Use image"}</button>`
+      ? `<button class="text-button" type="button" data-legacy-command="benchmark_vision_model" data-local-action="test-image" data-model="${escapeHtml(model.tag)}"${state.localBenchmarkBusy ? " disabled" : ""}>Test image</button><button class="text-button" type="button" data-legacy-command="use_local_vision_model" data-local-action="use-image" data-model="${escapeHtml(model.tag)}"${state.visionBusy ? " disabled" : ""}>${state.visionBridge?.engine === "local" && state.visionBridge?.local?.model === model.tag ? "Using image" : "Use image"}</button>`
       : "";
     return `<article class="local-model-row${isBusy ? " is-busy" : ""}">
-      <label class="provider-check"><input type="checkbox" data-command="set_local_model_enabled" data-local-toggle="${escapeHtml(model.tag)}" aria-label="${escapeHtml(t("models.enableLocalAria", { model: model.tag }))}"${model.enabled ? " checked" : ""}${busy || model.tools !== true ? " disabled" : ""}></label>
+      <label class="provider-check"><input type="checkbox" data-legacy-command="set_local_model_enabled" data-local-toggle="${escapeHtml(model.tag)}" aria-label="${escapeHtml(t("models.enableLocalAria", { model: model.tag }))}"${model.enabled ? " checked" : ""}${busy || model.tools !== true ? " disabled" : ""}></label>
       <div><strong>${escapeHtml(model.tag)}</strong><small>${escapeHtml(detail)}</small></div>
       <span class="local-size">${Number(model.sizeGb || 0).toFixed(1)} GB</span>
-      <div class="local-model-actions">${speedAction}${visionActions}<button class="mini-button danger" type="button" data-command="uninstall_local_model" data-local-action="${armed ? "confirm-remove" : "remove"}" data-model="${escapeHtml(model.tag)}"${busy ? " disabled" : ""}>${armed ? escapeHtml(t("actions.confirm")) : escapeHtml(t("actions.remove"))}</button></div>
+      <div class="local-model-actions">${speedAction}${visionActions}<button class="mini-button danger" type="button" data-legacy-command="uninstall_local_model" data-local-action="${armed ? "confirm-remove" : "remove"}" data-model="${escapeHtml(model.tag)}"${busy ? " disabled" : ""}>${armed ? escapeHtml(t("actions.confirm")) : escapeHtml(t("actions.remove"))}</button></div>
     </article>`;
   }
 
@@ -1259,7 +1270,7 @@ function startPanel() {
       await pollLocalOperation(model, "uninstall");
     } catch (error) {
       try {
-        state.localModels = await call("local_models");
+        state.localModels = await refreshLocalModelsSnapshot();
       } catch {
         state.localModels = {
           ...(state.localModels || {}),
@@ -1336,7 +1347,7 @@ function startPanel() {
     } catch (error) {
       const detail = errorMessage(error);
       try {
-        state.localModels = await call("local_models");
+        state.localModels = await refreshLocalModelsSnapshot();
       } catch {}
       state.localModelBusy = null;
       renderLocalModels();
@@ -1359,7 +1370,7 @@ function startPanel() {
   async function pollLocalOperation(model, kind) {
     window.clearTimeout(state.localPollTimer);
     try {
-      state.localModels = await call("local_models");
+      state.localModels = await refreshLocalModelsSnapshot();
       renderLocalModels();
       const download = state.localModels?.download;
       if (download?.tag === model && ["downloading", "uninstalling"].includes(download.status)) {
@@ -1389,7 +1400,7 @@ function startPanel() {
     renderLocalModels();
     try {
       const result = await call("cancel_local_model", { model });
-      state.localModels = await call("local_models");
+      state.localModels = await refreshLocalModelsSnapshot();
       showToast(result?.cancelled ? `${model} operation cancelled.` : "No local model operation is running.");
     } catch (error) {
       showToast(errorMessage(error), true);
@@ -1491,7 +1502,7 @@ function startPanel() {
     state.visionDownload = { tag: model, status: "downloading", percent: 0, detail: "starting" };
     renderVisionBridge();
     try {
-      await call("pull_vision_model", { model });
+      await call("vision.pull", { tag: model });
       pollVisionDownload(model);
     } catch (error) {
       state.visionBusy = false;
@@ -1504,7 +1515,9 @@ function startPanel() {
   async function pollVisionDownload(model) {
     window.clearTimeout(state.visionPollTimer);
     try {
-      const status = await call("vision_pull_status");
+      const snapshot = await call("lifecycle.status");
+      state.snapshot = snapshot;
+      const status = snapshot?.targets?.codex?.modelSettings?.visionBridge?.download || { status: "idle" };
       state.visionDownload = status;
       renderVisionBridge();
       if (status?.tag === model && status.status === "downloading") {
@@ -1533,7 +1546,7 @@ function startPanel() {
     state.modelSettingsBusy = true;
     renderModelSettings();
     try {
-      state.snapshot = await call("set_subagent_mode", { mode });
+      state.snapshot = await call("subagents.mode", { mode });
       showToast(enabled ? t("models.allSubagentsEnabled") : t("models.subagentModeUpdated"));
       await refreshPanel({ quiet: true });
     } catch (error) {
@@ -1582,11 +1595,11 @@ function startPanel() {
     try {
       if (group === "subagents") {
         const selectAll = action === "select-all";
-        state.snapshot = await call("set_subagent_selection", { selectAll });
+        state.snapshot = await call("subagents.selection", { selection: selectAll ? "select-all" : "unselect-all" });
         showToast(t(selectAll ? "models.everyPickerModelSubagent" : "models.subagentSelectionCleared"));
       } else {
         const showAll = action === "show-all";
-        state.snapshot = await call("set_picker_models", { showAll });
+        state.snapshot = await call("picker.show-all", { visible: showAll });
         showToast(t(showAll ? "models.everyModelVisible" : "models.allModelsHidden"));
       }
       await refreshPanel({ quiet: true });
@@ -1606,13 +1619,13 @@ function startPanel() {
     renderModelSettings();
     try {
       if (subagent) {
-        state.snapshot = await call("set_subagent_model", {
+        state.snapshot = await call("subagents.model", {
           slug: subagent.dataset.subagent,
           enabled: subagent.checked,
         });
         showToast(t("models.subagentSelectionUpdated"));
       } else {
-        state.snapshot = await call("set_picker_model", {
+        state.snapshot = await call("picker.set", {
           slug: picker.dataset.picker,
           visible: picker.checked,
         });
@@ -1697,7 +1710,7 @@ function startPanel() {
     checkbox.disabled = true;
     state.busyProvider = provider;
     try {
-      state.snapshot = await call("set_provider_enabled", { provider, enabled });
+      state.snapshot = await call("provider.enable", { provider, enabled });
       showToast(enabled ? t("connections.providerEnabled") : t("connections.providerHidden"));
       await refreshPanel({ quiet: true });
     } catch (error) {
@@ -1770,7 +1783,7 @@ function startPanel() {
     state.presenceBusy = true;
     renderPresence();
     try {
-      state.presence = await call("set_presence_mode", { mode });
+      state.presence = await call("presence.mode", { mode });
       showToast(mode === "follow-codex" ? "Tray will follow Codex presence." : "Tray will stay visible.");
     } catch (error) {
       elements.presenceMode.value = previous;
@@ -1786,7 +1799,7 @@ function startPanel() {
     state.visionBusy = true;
     renderVisionBridge();
     try {
-      state.visionBridge = await call("set_vision_bridge", { enabled });
+      state.visionBridge = await call(enabled ? "vision.on" : "vision.off", {});
       showToast(enabled ? "Vision bridge enabled for pasted images." : "Vision bridge disabled.");
       await refreshPanel({ quiet: true });
     } catch (error) {
@@ -1804,7 +1817,7 @@ function startPanel() {
     state.visionBusy = true;
     renderVisionBridge();
     try {
-      state.visionBridge = await call("set_vision_engine", { engine, effort });
+      state.visionBridge = await call("vision.engine", { engine, effort });
       showToast(engine === "local" ? "Local vision model selected." : "Vision engine selected.");
       await refreshPanel({ quiet: true });
     } catch (error) {
@@ -1820,7 +1833,7 @@ function startPanel() {
     state.visionBusy = true;
     renderVisionBridge();
     try {
-      state.visionBridge = await call("set_vision_effort", { effort });
+      state.visionBridge = await call("vision.effort", { effort });
       showToast(effort === "default" ? "Vision effort reset to model default." : `Vision effort set to ${effort}.`);
       await refreshPanel({ quiet: true });
     } catch (error) {
@@ -1837,7 +1850,7 @@ function startPanel() {
     state.maintenanceResult = null;
     renderMaintenance();
     try {
-      const result = await call(kind === "fix" ? "doctor_fix" : "maintenance");
+      const result = await call(kind === "fix" ? "doctor.fix" : "maintenance.update");
       state.maintenanceResult = {
         ok: result?.ok !== false,
         message: kind === "fix"
@@ -1862,7 +1875,7 @@ function startPanel() {
     state.toolResultAgingBusy = true;
     renderToolResultAgingSetting();
     try {
-      await call("set_tool_result_aging", { enabled });
+      await call(enabled ? "tool-result-aging.on" : "tool-result-aging.off", {});
       await refreshPanel({ quiet: true });
       showToast(
         enabled
@@ -1888,7 +1901,7 @@ function startPanel() {
     state.busyProvider = provider;
     renderProviders();
     try {
-      await call("save_api_key", { provider, apiKey });
+      await call("credential.set", { provider, apiKey });
       showToast(t("connections.credentialSaved"));
       await refreshPanel({ quiet: true });
     } catch (error) {
@@ -1907,7 +1920,7 @@ function startPanel() {
     state.busyProvider = provider;
     renderProviders();
     try {
-      const result = await call("remove_api_key", { provider });
+      const result = await call("credential.remove", { provider });
       showToast(removalMessage(result?.removal));
       await refreshPanel({ quiet: true });
     } catch (error) {
@@ -1995,9 +2008,8 @@ function startIsland() {
     if (state.usagePending) return;
     state.usagePending = true;
     const requests = [
-      ["account", "account_usage"],
-      ["providerUsage", "provider_usage"],
-      ["providerSetup", "provider_setup"],
+      ["account", "native.account-usage"],
+      ["providerUsage", "usage.provider"],
     ];
     const results = await Promise.all(
       requests.map(async ([key, command]) => {

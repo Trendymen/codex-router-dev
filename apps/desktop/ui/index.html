@@ -118,24 +118,24 @@
           <h2 data-i18n="connections.title">Connections</h2>
           <p data-i18n="connections.onlyConnected">Only connected providers appear in Usage.</p>
         </div>
-        <div class="mode-setting">
+        <div class="mode-setting" hidden>
           <div>
             <strong data-i18n="connections.useWithoutOpenAILogin">Use without OpenAI login</strong>
             <small id="login-free-note" data-i18n="connections.useConnectedModels">Use connected external models in new Codex sessions</small>
           </div>
           <label class="switch" id="login-free-switch-label">
-            <input id="login-free-switch" type="checkbox" data-command="set_login_free" />
+            <input id="login-free-switch" type="checkbox" />
             <span aria-hidden="true"></span>
             <span class="sr-only" data-i18n="connections.useWithoutOpenAILoginAria">Use Codex without OpenAI login</span>
           </label>
         </div>
-        <div class="mode-setting">
+        <div class="mode-setting" hidden>
           <div>
             <strong>Use Router with ChatGPT</strong>
             <small id="signed-routing-note">Keep native ChatGPT transport and task history</small>
           </div>
           <label class="switch" id="signed-routing-switch-label">
-            <input id="signed-routing-switch" type="checkbox" data-command="set_signed_routing" />
+            <input id="signed-routing-switch" type="checkbox" />
             <span aria-hidden="true"></span>
             <span class="sr-only">Use Router with ChatGPT</span>
           </label>
@@ -145,7 +145,7 @@
             <strong>Show tray</strong>
             <small id="presence-note">Keep the Windows tray visible</small>
           </div>
-          <select id="presence-mode" aria-label="Show tray mode" data-command="set_presence_mode">
+          <select id="presence-mode" aria-label="Show tray mode" data-command="presence.mode">
             <option value="always">Always</option>
             <option value="follow-codex">With Codex</option>
           </select>
@@ -157,8 +157,8 @@
             <small id="maintenance-note">Update the checkout and verify its installation.</small>
           </div>
           <div class="maintenance-actions">
-            <button id="maintenance-update" class="text-button" type="button" data-command="maintenance">Update</button>
-            <button id="maintenance-fix" class="text-button" type="button" data-command="doctor_fix">Fix</button>
+            <button id="maintenance-update" class="text-button" type="button" data-command="maintenance.update">Update</button>
+            <button id="maintenance-fix" class="text-button" type="button" data-command="doctor.fix">Fix</button>
           </div>
         </div>
       </section>
@@ -170,7 +170,7 @@
             <small id="tool-result-aging-note" data-i18n="models.reduceRepeatedContext">Reduce repeated context on external models</small>
           </div>
           <label class="switch" id="tool-result-aging-switch-label">
-            <input id="tool-result-aging-switch" type="checkbox" data-command="set_tool_result_aging" />
+            <input id="tool-result-aging-switch" type="checkbox" data-command="tool-result-aging.on" />
             <span aria-hidden="true"></span>
             <span class="sr-only" data-i18n="models.compactOldToolResultsAria">Compact old tool results for external models</span>
           </label>
@@ -190,14 +190,14 @@
                 <small id="vision-note">A vision engine reads pasted images and returns quoted text.</small>
               </div>
               <label class="switch" id="vision-switch-label">
-                <input id="vision-switch" type="checkbox" data-command="set_vision_bridge" />
+                <input id="vision-switch" type="checkbox" data-command="vision.on" />
                 <span aria-hidden="true"></span>
                 <span class="sr-only">Read images for text-only models</span>
               </label>
             </div>
             <div class="vision-controls">
-              <label>Engine<select id="vision-engine" aria-label="Vision engine" data-command="set_vision_engine"></select></label>
-              <label>Effort<select id="vision-effort" aria-label="Vision effort" data-command="set_vision_effort"></select></label>
+              <label>Engine<select id="vision-engine" aria-label="Vision engine" data-command="vision.engine"></select></label>
+              <label>Effort<select id="vision-effort" aria-label="Vision effort" data-command="vision.effort"></select></label>
             </div>
             <div id="vision-local-models" class="vision-local-models"></div>
           </div>
@@ -217,15 +217,15 @@
                 <small data-i18n="models.exposeVerifiedModels">Expose every verified v2 model as a Codex subagent</small>
               </div>
               <label class="switch" id="subagent-all-switch-label">
-                <input id="subagent-all-switch" type="checkbox" data-command="set_subagent_mode" />
+                <input id="subagent-all-switch" type="checkbox" data-command="subagents.mode" />
                 <span aria-hidden="true"></span>
                 <span class="sr-only" data-i18n="models.useAllProvenModelsAria">Use all proven v2 models as subagents</span>
               </label>
             </div>
             <p class="accordion-note" data-i18n="models.subagentExplanation">Choices here decide what Codex can spawn as a subagent. They do not hide anything from Codex's model picker — use Model picker below for that.</p>
             <div class="accordion-toolbar">
-              <button class="text-button" type="button" data-model-action="subagents" data-action="select-all" data-command="set_subagent_selection" data-i18n="actions.subagentsOn">Subagents on</button>
-              <button class="text-button" type="button" data-model-action="subagents" data-action="unselect-all" data-command="set_subagent_selection" data-i18n="actions.subagentsOff">Subagents off</button>
+              <button class="text-button" type="button" data-model-action="subagents" data-action="select-all" data-command="subagents.selection" data-i18n="actions.subagentsOn">Subagents on</button>
+              <button class="text-button" type="button" data-model-action="subagents" data-action="unselect-all" data-command="subagents.selection" data-i18n="actions.subagentsOff">Subagents off</button>
             </div>
             <div id="subagent-model-list" class="model-settings-list"></div>
           </div>
@@ -242,14 +242,14 @@
           <div class="accordion-body is-open" data-accordion-body="picker">
             <p class="accordion-note" data-i18n="models.pickerHiddenExplanation">Models hidden here stay connected but are not offered by Codex.</p>
             <div class="accordion-toolbar">
-              <button class="text-button" type="button" data-model-action="picker" data-action="show-all" data-command="set_picker_models" data-i18n="actions.showAll">Show all</button>
-              <button class="text-button" type="button" data-model-action="picker" data-action="hide-all" data-command="set_picker_models" data-i18n="actions.hideAll">Hide all</button>
+              <button class="text-button" type="button" data-model-action="picker" data-action="show-all" data-command="picker.show-all" data-i18n="actions.showAll">Show all</button>
+              <button class="text-button" type="button" data-model-action="picker" data-action="hide-all" data-command="picker.show-all" data-i18n="actions.hideAll">Hide all</button>
             </div>
             <div id="picker-model-list" class="model-settings-list"></div>
           </div>
         </div>
 
-        <div class="accordion">
+        <div class="accordion" hidden>
           <button class="accordion-header" type="button" data-accordion="local" aria-expanded="true">
             <span>
               <strong data-i18n="models.localLlms">Local LLMs</strong>
@@ -265,8 +265,8 @@
             <form id="local-model-form" class="local-install-form">
               <label for="local-model-input" data-i18n="models.installModel">Install a model</label>
               <div>
-                <input id="local-model-input" type="text" data-command="install_local_model" autocomplete="off" spellcheck="false" data-i18n-placeholder="models.ollamaPlaceholder" placeholder="gemma4:12b or ollama.com/library/gemma4:12b" />
-                <button class="mini-button" type="submit" data-command="install_local_model" data-i18n="actions.install">Install</button>
+                <input id="local-model-input" type="text" autocomplete="off" spellcheck="false" data-i18n-placeholder="models.ollamaPlaceholder" placeholder="gemma4:12b or ollama.com/library/gemma4:12b" />
+                <button class="mini-button" type="submit" data-i18n="actions.install">Install</button>
               </div>
               <small data-i18n="models.ollamaTagOrUrl">Enter an Ollama tag or model-page URL.</small>
             </form>
@@ -311,7 +311,7 @@
           <input id="api-key" type="password" autocomplete="off" spellcheck="false" data-i18n-placeholder="connections.pasteCredential" placeholder="Paste credential" required />
           <div class="dialog-actions">
             <button id="cancel-key" class="button secondary" type="button" data-i18n="actions.cancel">Cancel</button>
-            <button class="button primary" type="submit" data-command="save_api_key" data-i18n="actions.saveCredential">Save credential</button>
+            <button class="button primary" type="submit" data-command="credential.set" data-i18n="actions.saveCredential">Save credential</button>
           </div>
         </form>
       </dialog>
@@ -331,7 +331,7 @@
           </p>
           <div class="dialog-actions">
             <button id="cancel-remove" class="button secondary" type="button" data-i18n="actions.cancel">Cancel</button>
-            <button class="button danger" type="submit" data-command="remove_api_key" data-i18n="actions.removeKey">Remove key</button>
+            <button class="button danger" type="submit" data-command="credential.remove" data-i18n="actions.removeKey">Remove key</button>
           </div>
         </form>
       </dialog>

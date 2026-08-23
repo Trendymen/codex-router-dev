@@ -10,7 +10,7 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { COMMANDS, desktopCommandDefinitions, runDesktopCommand, sourceRoot } from "./desktop-commands.mjs";
+import { desktopCommandDefinitions, runDesktopCommand, sourceRoot, trustedProtectedContext } from "./desktop-commands.mjs";
 
 const UI_DIR = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -71,17 +71,18 @@ export function isPanelRoute(route) {
 // and "save this API key" is not something to expose on that assumption. The
 // tray and the Electron shell keep the full table because reaching them means
 // already running code on the machine.
-const PANEL_COMMANDS = Object.freeze({
-  control_snapshot: "lifecycle.status",
-  account_usage: "native.account-usage",
-  provider_usage: "usage.provider",
-});
-const CANONICAL_PANEL_COMMANDS = new Set(Object.values(PANEL_COMMANDS));
+const CANONICAL_PANEL_COMMANDS = new Set([
+  "lifecycle.status",
+  "native.account-usage",
+  "usage.provider",
+  "credential.status",
+  "catalog.render-snippet",
+  "cc-switch.snippet",
+]);
 
 export function panelCommandAllowed(command, { readOnly = true } = {}) {
-  if (command === "provider_setup" || command === "local_models") return false;
-  if (readOnly) return Object.hasOwn(PANEL_COMMANDS, command);
-  return Object.hasOwn(COMMANDS, command) || CANONICAL_PANEL_COMMANDS.has(command);
+  if (readOnly) return CANONICAL_PANEL_COMMANDS.has(command);
+  return desktopCommandDefinitions().has(command);
 }
 
 // Commands the shells answer from their own process rather than the CLI. A
@@ -132,7 +133,11 @@ async function readBody(request, limit = 64 * 1024) {
   return Buffer.concat(chunks).toString("utf8");
 }
 
-export async function handlePanelRequest(request, response, route, { writeJson }) {
+export async function handlePanelRequest(request, response, route, {
+  writeJson,
+  runCommand = runDesktopCommand,
+  root = sourceRoot(),
+}) {
   // index.html loads styles.css and app.js relatively. Served at "/panel" the
   // browser resolves those one level too high and the page renders empty, so
   // the directory form is the canonical one and the bare name redirects to it.
@@ -216,20 +221,28 @@ export async function handlePanelRequest(request, response, route, { writeJson }
   }
 
   try {
-    // The panel keeps its historical wire id for the current UI, but the
-    // dispatcher receives only the Phase3 canonical command table.
-    const canonicalCommand = PANEL_COMMANDS[command] || command;
-    const canonicalArgs = canonicalCommand === "usage.provider" && !args?.provider ? {} : args ?? {};
-    if (!desktopCommandDefinitions().has(canonicalCommand)) {
+    const canonicalArgs = command === "usage.provider" && !args?.provider ? {} : args ?? {};
+    const definition = desktopCommandDefinitions().get(command);
+    if (!definition) {
       writeJson(response, 403, { error: { type: "invalid_request", message: `${command} is not available from the browser panel.` } });
       return true;
     }
-    const result = await runDesktopCommand(canonicalCommand, canonicalArgs, { root: sourceRoot() });
+    // This handler is reached only after router.mjs has stripped and verified
+    // the caller-capability path.  The trusted Symbol is constructed here;
+    // `args` can never select or forge the protected channel.
+    const context = definition.resultKind === "protected-text"
+      ? trustedProtectedContext({ root })
+      : { root };
+    const result = await runCommand(command, canonicalArgs, context);
     if (result?.ok === false) {
       writeJson(response, 502, { error: result.error });
       return true;
     }
-    writeJson(response, 200, { value: result?.ok === true ? result.value : result });
+    if (result?.meta?.protected) response.setHeader("cache-control", "no-store");
+    writeJson(response, 200, {
+      value: result?.ok === true ? result.value : result,
+      ...(result?.meta?.protected ? { meta: result.meta } : {}),
+    });
   } catch (error) {
     writeJson(response, 502, {
       error: { type: "upstream_error", message: error?.message || "The router command failed." },

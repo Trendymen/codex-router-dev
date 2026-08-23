@@ -599,15 +599,19 @@ async function printModelUsage(slug) {
 
 async function printRouterLogs() {
   const { LOG_PATH } = await import("./paths.mjs");
+  const { redactSensitive } = await import("./sensitive-redactor.mjs");
   if (!existsSync(LOG_PATH)) {
     process.stdout.write(JSON.stringify({ path: LOG_PATH, lines: [] }) + "\n");
     return;
   }
   const lines = readFileSync(LOG_PATH, "utf8").split(/\r?\n/).filter(Boolean).slice(-200);
-  const redactLogLine = (line) => String(line)
-    .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+/gi, "Bearer [REDACTED]")
-    .replace(/https?:\/\/(?:127\.0\.0\.1|localhost|\[::1\]):\d+\/_codex-router\/[^/\s]+(?:\/v1)?/gi, "http://127.0.0.1:[PORT]/_codex-router/[REDACTED]/v1")
-    .replace(/((?:api[_-]?key|access[_-]?token|refresh[_-]?token|password|secret)\s*[=:]\s*)[^\s,;]+/gi, "$1[REDACTED]");
+  const redactLogLine = (line) => {
+    try {
+      return JSON.stringify(redactSensitive(JSON.parse(line), { profile: "log" }));
+    } catch {
+      return redactSensitive(String(line), { profile: "log" });
+    }
+  };
   process.stdout.write(`${lines.map(redactLogLine).join("\n")}\n`);
 }
 

@@ -1,12 +1,18 @@
 import { createHash } from "node:crypto";
+import path from "node:path";
+import { performance } from "node:perf_hooks";
 
 import { PROVIDERS } from "./model-registry.mjs";
-import { readFileSync, existsSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmdirSync, statSync } from "node:fs";
 import { writePrivateJson } from "./file-security.mjs";
 import { STATE_DIR } from "./paths.mjs";
 
 export const VISION_CACHE_PURGE_PATH = process.env.MODEL_ROUTER_VISION_CACHE_PURGE || `${STATE_DIR}/vision-cache-purge.json`;
 let purgeGeneration = 0;
+const PURGE_LOCK_STALE_MS = 30_000;
+const PURGE_LOCK_WAIT_MS = 10_000;
+const PURGE_LOCK_POLL_MS = 10;
+const purgeLockWaiter = new Int32Array(new SharedArrayBuffer(4));
 
 function purgeRequestGeneration(purgePath = VISION_CACHE_PURGE_PATH) {
   if (!existsSync(purgePath)) return 0;
@@ -21,10 +27,47 @@ function purgeRequestGeneration(purgePath = VISION_CACHE_PURGE_PATH) {
 }
 
 export function requestVisionCachePurge(purgePath = VISION_CACHE_PURGE_PATH) {
-  const generation = Math.max(Date.now(), purgeGeneration + 1);
-  purgeGeneration = generation;
-  writePrivateJson(purgePath, { version: 1, generation }, { space: 0, directoryMode: 0o700 });
-  return { requested: true, generation };
+  const lockPath = `${purgePath}.lock`;
+  mkdirSync(path.dirname(purgePath), { recursive: true, mode: 0o700 });
+  const startedAt = performance.now();
+  for (;;) {
+    try {
+      mkdirSync(lockPath);
+      break;
+    } catch (error) {
+      if (error?.code !== "EEXIST") throw error;
+      try {
+        if (new Date().getTime() - statSync(lockPath).mtimeMs > PURGE_LOCK_STALE_MS) {
+          rmdirSync(lockPath);
+          continue;
+        }
+      } catch (lockError) {
+        if (!["ENOENT", "ENOTEMPTY"].includes(lockError?.code)) throw lockError;
+      }
+      if (performance.now() - startedAt >= PURGE_LOCK_WAIT_MS) {
+        const timeout = new Error("Timed out waiting to request a vision cache purge.");
+        timeout.code = "vision_cache_purge_locked";
+        throw timeout;
+      }
+      Atomics.wait(purgeLockWaiter, 0, 0, PURGE_LOCK_POLL_MS);
+    }
+  }
+
+  try {
+    const diskGeneration = purgeRequestGeneration(purgePath);
+    if (diskGeneration >= Number.MAX_SAFE_INTEGER || purgeGeneration >= Number.MAX_SAFE_INTEGER) {
+      throw new Error("Vision cache purge generation exhausted the safe integer range.");
+    }
+    const generation = Math.max(Date.now(), diskGeneration + 1, purgeGeneration + 1);
+    if (!Number.isSafeInteger(generation) || generation <= 0) {
+      throw new Error("Could not allocate a safe vision cache purge generation.");
+    }
+    purgeGeneration = generation;
+    writePrivateJson(purgePath, { version: 1, generation }, { space: 0, directoryMode: 0o700 });
+    return { requested: true, generation };
+  } finally {
+    rmdirSync(lockPath);
+  }
 }
 
 // A text-only model cannot read a pasted screenshot, so the router reads it on
