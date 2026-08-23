@@ -48,6 +48,8 @@ export interface LocalModel {
   sizeGb?: number;
   enabled?: boolean;
   installed?: boolean;
+  vision?: boolean;
+  running?: boolean;
   inputModalities?: string[];
   accuracy?: string;
   fits?: boolean;
