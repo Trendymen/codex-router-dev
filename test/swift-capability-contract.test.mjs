@@ -92,6 +92,28 @@ test("unknown and invalid capability majors retain only a minimal health/version
   assert.match(swiftSource, /capabilitySnapshot = CapabilitySnapshotV1\(\n\s+capabilitySchemaVersion: reported/);
 });
 
+test("CapabilitySnapshotV1 declares the complete keyed decoding contract", () => {
+  const start = swiftSource.indexOf("struct CapabilitySnapshotV1");
+  const end = swiftSource.indexOf("// This envelope intentionally", start);
+  assert.ok(start >= 0 && end > start, "CapabilitySnapshotV1 source is present");
+  const source = swiftSource.slice(start, end);
+  const codingKeys = source.match(/private enum CodingKeys: String, CodingKey \{([\s\S]*?)\n  \}/)?.[1] ?? "";
+  assert.deepEqual(
+    [...codingKeys.matchAll(/\bcase\s+([A-Za-z_]\w*)/g)].map(([, key]) => key),
+    ["capabilitySchemaVersion", "compatibility", "mutationsEnabled", "commands", "capabilities"],
+  );
+});
+
+test("the Swift command bridge zeroizes initialized input bytes before releasing them", () => {
+  const start = swiftSource.indexOf("private static func zeroize");
+  const end = swiftSource.indexOf("private static func isEnvelope", start);
+  assert.ok(start >= 0 && end > start, "zeroize helper is present");
+  const source = swiftSource.slice(start, end);
+  assert.match(source, /guard let baseAddress = buffer\.baseAddress else \{ return \}/);
+  assert.match(source, /Darwin\.memset\(baseAddress, 0, buffer\.count\)/);
+  assert.doesNotMatch(source, /buffer\.initialize\(/);
+});
+
 test("all Router mutations use the canonical Node bridge and observed schema version", () => {
   assert.match(swiftSource, /DesktopCommandBridge/);
   assert.match(swiftSource, /capabilitySchemaVersion: capabilitySnapshot\.capabilitySchemaVersion/);
@@ -126,7 +148,8 @@ test("Node process I/O drains both streams, bounds output, times out, and preser
   assert.match(swiftSource, /completion\.isCompleted/);
   assert.match(swiftSource, /completion\.fail\(\.cancelled\)/);
   assert.match(swiftSource, /case BridgeFailure\.cancelled = error/);
-  assert.match(swiftSource, /Thread\.sleep\(forTimeInterval: Self\.terminationGraceSeconds\)/);
+  assert.match(swiftSource, /try\? await Task\.sleep\(for: \.seconds\(Self\.terminationGraceSeconds\)\)/);
+  assert.doesNotMatch(swiftSource, /Thread\.sleep\(/);
   assert.doesNotMatch(swiftSource, /withThrowingTaskGroup/);
   assert.doesNotMatch(swiftSource, /statusTask/);
   assert.match(swiftSource, /process\.processIdentifier/);

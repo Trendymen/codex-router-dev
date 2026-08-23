@@ -295,6 +295,14 @@ struct CapabilitySnapshotV1: Decodable {
     capabilities = try values.decodeIfPresent([CapabilityDescription].self, forKey: .capabilities) ?? []
   }
 
+  private enum CodingKeys: String, CodingKey {
+    case capabilitySchemaVersion
+    case compatibility
+    case mutationsEnabled
+    case commands
+    case capabilities
+  }
+
   var isCompatible: Bool {
     capabilitySchemaVersion == 1 && !compatibility.readOnly && mutationsEnabled
   }
@@ -592,7 +600,8 @@ private struct DesktopCommandBridge {
 
   private static func zeroize(_ data: inout Data) {
     data.withUnsafeMutableBytes { buffer in
-      buffer.initialize(repeating: 0)
+      guard let baseAddress = buffer.baseAddress else { return }
+      _ = Darwin.memset(baseAddress, 0, buffer.count)
     }
     data.removeAll(keepingCapacity: false)
   }
@@ -608,7 +617,7 @@ private struct DesktopCommandBridge {
   private static func terminateProcess(_ process: Process) async {
     let worker = Task.detached(priority: .userInitiated) { [process] in
       if process.isRunning { process.terminate() }
-      Thread.sleep(forTimeInterval: Self.terminationGraceSeconds)
+      try? await Task.sleep(for: .seconds(Self.terminationGraceSeconds))
       if process.isRunning { Darwin.kill(process.processIdentifier, SIGKILL) }
     }
     await worker.value
