@@ -8,6 +8,85 @@ import util from "node:util";
 
 export const CAPABILITY_SCHEMA_VERSION = 1;
 
+function deepFreeze(value, seen = new WeakSet()) {
+  if (!value || typeof value !== "object" || seen.has(value)) return value;
+  seen.add(value);
+  for (const child of Object.values(value)) deepFreeze(child, seen);
+  return Object.freeze(value);
+}
+
+const objectSchema = (properties = {}, required = []) => deepFreeze({
+  type: "object",
+  additionalProperties: false,
+  properties,
+  required,
+});
+const string = (pattern = undefined) => deepFreeze({ type: "string", ...(pattern ? { pattern } : {}) });
+const boolean = deepFreeze({ type: "boolean" });
+const slug = string("^[A-Za-z0-9][A-Za-z0-9._/-]{0,255}$");
+const provider = string("^[a-z0-9][a-z0-9-]{0,63}$");
+const credentialProvider = deepFreeze({ ...provider, enum: ["deepseek", "qwen-plan"] });
+const noArgs = objectSchema();
+
+// This is the one immutable schema source consumed by both the desktop
+// dispatcher and the browser manifest. Keeping it here avoids a circular
+// import while ensuring the UI cannot publish an empty `{ type: object }`
+// placeholder where the dispatcher has a stricter contract.
+export const CAPABILITY_ARGUMENTS = deepFreeze({
+  "lifecycle.status": noArgs, "lifecycle.start": noArgs, "lifecycle.stop": noArgs, "lifecycle.restart": noArgs, "lifecycle.logs": noArgs,
+  "doctor.status": noArgs, "doctor.fix": noArgs, "maintenance.update": noArgs, "maintenance.rollback": noArgs,
+  "native.status": noArgs, "native.account-usage": noArgs,
+  "credential.status": objectSchema({ provider: credentialProvider }, ["provider"]),
+  "credential.set": objectSchema({ provider: credentialProvider }, ["provider"]),
+  "credential.remove": objectSchema({ provider: credentialProvider }, ["provider"]),
+  "provider.enable": objectSchema({ provider, enabled: boolean }, ["provider", "enabled"]),
+  "model.visibility": objectSchema({ slug, visible: boolean }, ["slug", "visible"]),
+  "model.canary": objectSchema({ slug, enabled: boolean }, ["slug", "enabled"]),
+  "protocol-proof.status": objectSchema({ slug }, ["slug"]),
+  "protocol-proof.verify": objectSchema({ slug }, ["slug"]),
+  "protocol-proof.revoke": objectSchema({ slug }, ["slug"]),
+  "picker.status": noArgs, "picker.set": objectSchema({ slug, visible: boolean }, ["slug", "visible"]), "picker.show-all": objectSchema({ visible: boolean }, ["visible"]),
+  "catalog.status": noArgs, "catalog.render-snippet": noArgs,
+  "subagents.status": noArgs, "subagents.mode": objectSchema({ mode: string("^(all|selected|proven)$") }, ["mode"]),
+  "subagents.model": objectSchema({ slug, enabled: boolean }, ["slug", "enabled"]),
+  "subagents.selection": objectSchema({ selection: string("^(select-all|unselect-all)$") }, ["selection"]),
+  "subagents.verify": objectSchema({ slug }, ["slug"]),
+  "failover.status": noArgs, "failover.reset": noArgs,
+  "tool-result-aging.status": noArgs, "tool-result-aging.on": noArgs, "tool-result-aging.off": noArgs,
+  "tool-result-aging.ttl": objectSchema({ days: { type: ["integer", "null"] } }, ["days"]),
+  "tool-result-aging.purge": objectSchema({ expiredOnly: boolean }, ["expiredOnly"]),
+  "usage.router": noArgs, "usage.provider": objectSchema({ provider }), "usage.model": objectSchema({ slug }, ["slug"]),
+  "vision.status": noArgs, "vision.on": noArgs, "vision.off": noArgs,
+  "vision.engine": objectSchema({ engine: string(), effort: string() }, ["engine"]),
+  "vision.effort": objectSchema({ effort: string() }, ["effort"]), "vision.probe": noArgs,
+  "vision.pull": objectSchema({ tag: string("^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$") }, ["tag"]),
+  "vision.purge-cache": noArgs,
+  "presence.status": noArgs, "presence.mode": objectSchema({ mode: string("^(always|follow-codex|follow-clients)$") }, ["mode"]),
+  "cc-switch.status": noArgs, "cc-switch.snippet": noArgs,
+});
+
+function uiMetadata(name, args, {
+  mutating = false,
+  confirmation = false,
+  quotaWarning = false,
+  protectedInput = false,
+  resultKind = "json",
+} = {}) {
+  const properties = args.properties || {};
+  return deepFreeze({
+    control: resultKind === "protected-text" ? "protected-output" : protectedInput ? "protected-input" : mutating ? "mutation" : "read",
+    confirmation: confirmation ? "server" : "none",
+    quotaWarning: quotaWarning ? "cost-warning" : "none",
+    resultKind,
+    protectedField: protectedInput ? "apiKey" : null,
+    fields: Object.fromEntries(Object.entries(properties).map(([key, schema]) => [key, {
+      type: schema.type,
+      required: (args.required || []).includes(key),
+      enum: schema.enum || null,
+    }])),
+  });
+}
+
 const command = (name, {
   mutating = false,
   confirmation = false,
@@ -16,12 +95,13 @@ const command = (name, {
   resultKind = "json",
 } = {}) => Object.freeze({
   name,
-  arguments: Object.freeze({ type: "object" }),
+  arguments: CAPABILITY_ARGUMENTS[name] || noArgs,
   mutating,
   confirmation,
   quotaWarning,
   protectedInput,
   resultKind,
+  ui: uiMetadata(name, CAPABILITY_ARGUMENTS[name] || noArgs, { mutating, confirmation, quotaWarning, protectedInput, resultKind }),
   // A command result may be returned to a UI, but credential input is never
   // retained in a capability snapshot.
   retainsInput: false,
@@ -77,13 +157,6 @@ const capabilities = [
   });
 });
 
-function deepFreeze(value, seen = new WeakSet()) {
-  if (!value || typeof value !== "object" || seen.has(value)) return value;
-  seen.add(value);
-  for (const child of Object.values(value)) deepFreeze(child, seen);
-  return Object.freeze(value);
-}
-
 export const CAPABILITY_COMMANDS = deepFreeze(commandRows);
 export const CAPABILITY_CAPABILITIES = deepFreeze(capabilities);
 
@@ -105,6 +178,12 @@ const SNAPSHOT_MAX_STRING = 64 * 1024;
 function redactString(value) {
   if (value.length > SNAPSHOT_MAX_STRING) return undefined;
   return value.replace(CAPABILITY_URL, "[REDACTED]").replace(BEARER, "Bearer [REDACTED]");
+}
+
+function cloneJson(value) {
+  if (Array.isArray(value)) return value.map(cloneJson);
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(Object.entries(value).map(([key, child]) => [key, cloneJson(child)]));
 }
 
 function safeSnapshot(value, state = { seen: new WeakSet(), work: SNAPSHOT_MAX_WORK, keys: 0 }, depth = 0) {
@@ -166,7 +245,7 @@ export function buildCapabilityManifest(snapshot = {}) {
     capabilitySchemaVersion: CAPABILITY_SCHEMA_VERSION,
     compatibility: Object.freeze({ readOnly: false, reason: null }),
     mutationsEnabled: true,
-    commands: commandRows.map((entry) => ({ ...entry, arguments: { ...entry.arguments } })),
+    commands: commandRows.map((entry) => ({ ...entry, arguments: cloneJson(entry.arguments), ui: cloneJson(entry.ui) })),
     capabilities: capabilities.map((entry) => ({ ...entry, nodeCommands: [...entry.nodeCommands] })),
     snapshot: clean,
   });

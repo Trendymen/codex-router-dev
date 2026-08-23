@@ -42,6 +42,7 @@ const ASSETS = new Map([
   ["/panel/styles.css", { file: "styles.css", type: "text/css; charset=utf-8" }],
   ["/panel/app.js", { file: "app.js", type: "text/javascript; charset=utf-8" }],
   ["/panel/model.mjs", { file: "model.mjs", type: "text/javascript; charset=utf-8" }],
+  ["/panel/i18n.mjs", { file: "i18n.mjs", type: "text/javascript; charset=utf-8" }],
   [
     "/panel/thinking-orb.mjs",
     { file: "thinking-orb.mjs", type: "text/javascript; charset=utf-8" },
@@ -82,27 +83,37 @@ async function __panelJson(path, { requestId, confirmationToken, body } = {}) {
     "x-request-id": requestId,
   };
   if (confirmationToken) headers["x-confirmation-token"] = confirmationToken;
-  const response = await fetch(path, {
-    method: "POST",
-    credentials: "same-origin",
-    headers,
-    body: JSON.stringify(body || {}),
-  });
-  const payload = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(payload?.error?.message || "The router command failed.");
-  return payload;
+  let attempt = 0;
+  while (true) {
+    try {
+      const response = await fetch(path, {
+        method: "POST",
+        credentials: "same-origin",
+        headers,
+        body: JSON.stringify(body || {}),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(payload?.error?.message || "The router command failed.");
+      return payload;
+    } catch (error) {
+      if (attempt++ >= 1) throw error;
+      // A transport/timeout retry keeps the same request UUID, so the server
+      // either completes once or returns its bounded replay result.
+    }
+  }
 }
-async function __panelInvoke(command, args) {
-  const requestId = __panelRequestId();
-  if (__panelResults.has(requestId)) return __panelResults.get(requestId);
-  if (__panelInFlight.has(requestId)) return __panelInFlight.get(requestId);
+async function __panelInvoke(command, args, operation = {}) {
+  const operationId = operation.operationId || __panelRequestId();
+  const requestId = operation.requestId || operationId;
+  if (__panelResults.has(operationId)) return __panelResults.get(operationId);
+  if (__panelInFlight.has(operationId)) return __panelInFlight.get(operationId);
   const promise = (async () => {
     const metadata = __panelCommandMetadata.get(command);
     let confirmationToken;
     if (metadata?.confirmation) {
       const confirmation = await __panelJson("./confirmations", {
-        requestId: __panelRequestId(),
-        body: { command, args: args || {} },
+        requestId: operation.confirmationRequestId || __panelRequestId(),
+        body: { command, args: args || {}, argumentsHash: operation.argumentsHash },
       });
       confirmationToken = confirmation.token;
     }
@@ -113,14 +124,14 @@ async function __panelInvoke(command, args) {
     });
     return payload.value;
   })();
-  __panelInFlight.set(requestId, promise);
+  __panelInFlight.set(operationId, promise);
   try {
     const result = await promise;
-    __panelResults.set(requestId, result);
+    __panelResults.set(operationId, result);
     while (__panelResults.size > 64) __panelResults.delete(__panelResults.keys().next().value);
     return result;
   } finally {
-    __panelInFlight.delete(requestId);
+    __panelInFlight.delete(operationId);
   }
 }
 window.__TAURI__ = {
@@ -327,9 +338,11 @@ export async function handlePanelRequest(request, response, route, {
         throw Object.assign(new Error("The panel request was not valid JSON."), { code: "invalid_command_arguments" });
       }
       const operationCommand = body?.command;
-      const operationArgsHash = route === "/panel/confirmations"
-        ? (typeof body.argumentsHash === "string" ? body.argumentsHash : canonicalArgumentsHash(body.args ?? {}))
-        : canonicalArgumentsHash(body?.args ?? {});
+      const computedArgumentsHash = canonicalArgumentsHash(body?.args ?? {});
+      if (route === "/panel/confirmations" && body.argumentsHash !== undefined && body.argumentsHash !== computedArgumentsHash) {
+        throw Object.assign(new Error("The confirmation argument hash does not match the supplied arguments."), { code: "panel_confirmation_invalid" });
+      }
+      const operationArgsHash = computedArgumentsHash;
       const fingerprint = operationFingerprint({
         sessionId: context.sessionId,
         requestId: context.requestId,
@@ -353,7 +366,7 @@ export async function handlePanelRequest(request, response, route, {
         const command = body?.command;
         const definition = desktopCommandDefinitions().get(command);
         if (!definition?.confirmation) throw Object.assign(new Error("confirmation required"), { code: "panel_confirmation_invalid" });
-        const hash = typeof body.argumentsHash === "string" ? body.argumentsHash : canonicalArgumentsHash(body.args ?? {});
+        const hash = computedArgumentsHash;
         if (!/^[A-Za-z0-9_-]{43}$/.test(hash)) throw Object.assign(new Error("invalid argument hash"), { code: "invalid_command_arguments" });
         const confirmation = sessionStore.mintConfirmation(context.sessionId, command, hash);
         const result = { status: 200, payload: confirmation };

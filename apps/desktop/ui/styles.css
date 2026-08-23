@@ -2334,6 +2334,16 @@ h2 {
   transform: translateY(-1px);
 }
 
+.browser-panel :focus-visible {
+  outline: 2px solid #9cc2ff;
+  outline-offset: 3px;
+}
+
+.capability-action .copy-result {
+  min-width: 68px;
+  color: #cfe0ff;
+}
+
 .capability-action > button:disabled {
   cursor: wait;
   opacity: 0.52;
@@ -2377,6 +2387,7 @@ h2 {
   color: var(--muted-strong);
   font: 10px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace;
   white-space: pre-wrap;
+  user-select: text;
 }
 
 .capability-incompatible {

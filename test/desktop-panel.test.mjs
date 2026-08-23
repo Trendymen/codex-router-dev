@@ -77,6 +77,7 @@ test("the panel serves each asset the UI loads", async () => {
       ["/panel/styles.css", /text\/css/],
       ["/panel/app.js", /javascript/],
       ["/panel/model.mjs", /javascript/],
+      ["/panel/i18n.mjs", /javascript/],
       ["/panel/thinking-orb.mjs", /javascript/],
     ]) {
       const response = await fetch(url(asset));
@@ -152,11 +153,21 @@ test("destructive browser actions obtain an operation-bound server confirmation"
   try {
     const missing = await fetch(served.url("/panel/invoke"), { method: "POST", headers: mutationHeaders(served), body: JSON.stringify({ command: "lifecycle.stop", args: {} }) });
     assert.equal(missing.status, 409);
-    const confirmation = await fetch(served.url("/panel/confirmations"), { method: "POST", headers: mutationHeaders(served), body: JSON.stringify({ command: "lifecycle.stop", args: {} }) });
+    const mismatchedHash = await fetch(served.url("/panel/confirmations"), { method: "POST", headers: mutationHeaders(served), body: JSON.stringify({ command: "lifecycle.stop", args: {}, argumentsHash: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" }) });
+    assert.equal(mismatchedHash.status, 409);
+    const confirmation = await fetch(served.url("/panel/confirmations"), { method: "POST", headers: mutationHeaders(served), body: JSON.stringify({ command: "lifecycle.stop", args: {}, argumentsHash: undefined }) });
     assert.equal(confirmation.status, 200);
     const token = (await confirmation.json()).token;
-    const run = await fetch(served.url("/panel/invoke"), { method: "POST", headers: mutationHeaders(served, crypto.randomUUID(), { "x-confirmation-token": token }), body: JSON.stringify({ command: "lifecycle.stop", args: {} }) });
+    const changed = await fetch(served.url("/panel/invoke"), { method: "POST", headers: mutationHeaders(served, crypto.randomUUID(), { "x-confirmation-token": token }), body: JSON.stringify({ command: "lifecycle.stop", args: { changed: true } }) });
+    assert.equal(changed.status, 409);
+    const secondConfirmation = await fetch(served.url("/panel/confirmations"), { method: "POST", headers: mutationHeaders(served), body: JSON.stringify({ command: "lifecycle.stop", args: {} }) });
+    const secondToken = (await secondConfirmation.json()).token;
+    const requestId = crypto.randomUUID();
+    const run = await fetch(served.url("/panel/invoke"), { method: "POST", headers: mutationHeaders(served, requestId, { "x-confirmation-token": secondToken }), body: JSON.stringify({ command: "lifecycle.stop", args: {} }) });
     assert.equal(run.status, 200);
+    assert.equal(executions, 1);
+    const replay = await fetch(served.url("/panel/invoke"), { method: "POST", headers: mutationHeaders(served, requestId, { "x-confirmation-token": secondToken }), body: JSON.stringify({ command: "lifecycle.stop", args: {} }) });
+    assert.equal(replay.status, 200);
     assert.equal(executions, 1);
   } finally {
     await served.close();

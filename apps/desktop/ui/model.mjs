@@ -284,6 +284,8 @@ function normalizedCommand(manifest, name) {
   const source = commandMetadata(manifest).get(name) || {};
   return {
     name,
+    arguments: source.arguments || { type: "object", additionalProperties: false, properties: {}, required: [] },
+    ui: source.ui || {},
     mutating: source.mutating === true,
     confirmation: source.confirmation === true,
     quotaWarning: source.quotaWarning === true,
@@ -330,25 +332,61 @@ function commandLabel(name) {
     .join(" · ");
 }
 
+function sampleString(schema, key) {
+  if (Array.isArray(schema.enum) && schema.enum.length) return schema.enum[0];
+  if (key === "provider") return "deepseek";
+  if (key === "slug") return "model/test";
+  if (key === "tag") return "test-model";
+  if (key === "engine") return "auto";
+  if (key === "effort") return "default";
+  if (schema.pattern?.includes("follow")) return "always";
+  const enumLike = schema.pattern?.match(/^\^\(([^|)]+)/);
+  if (enumLike) return enumLike[1];
+  return "value";
+}
+
+function schemaTypes(schema) {
+  return Array.isArray(schema?.type) ? schema.type : [schema?.type];
+}
+
+/** Generate a deterministic valid argument object from a command schema. */
+export function browserArgumentsForCommand(definition) {
+  const schema = definition?.arguments || { type: "object", properties: {}, required: [] };
+  const result = {};
+  for (const key of schema.required || []) {
+    const property = schema.properties?.[key] || {};
+    const types = schemaTypes(property);
+    if (types.includes("boolean")) result[key] = false;
+    else if (types.includes("integer")) result[key] = 0;
+    else if (types.includes("string")) result[key] = sampleString(property, key);
+    else if (types.includes("null")) result[key] = null;
+    else result[key] = null;
+  }
+  return result;
+}
+
 function argumentMarkup(command) {
   const fields = [];
-  const name = command.name;
-  const credentialProvider = name === "credential.status" || name === "credential.set" || name === "credential.remove";
-  const hasProvider = credentialProvider || name === "provider.enable" || name === "usage.provider";
-  const hasSlug = /^(model\.visibility|model\.canary|picker\.set|subagents\.model|subagents\.verify|protocol-proof\.(?:status|verify|revoke)|usage\.model)$/.test(name);
-  if (credentialProvider) fields.push('<select data-argument="provider" aria-label="Provider"><option value="deepseek">DeepSeek</option><option value="qwen-plan">Qwen Plan</option></select>');
-  else if (hasProvider) fields.push('<input data-argument="provider" type="text" autocomplete="off" spellcheck="false" placeholder="Provider" aria-label="Provider" />');
-  if (hasSlug) fields.push('<input data-argument="slug" type="text" autocomplete="off" spellcheck="false" placeholder="Model slug" aria-label="Model slug" />');
-  if (name === "vision.pull") fields.push('<input data-argument="tag" type="text" autocomplete="off" spellcheck="false" placeholder="Model tag" aria-label="Model tag" />');
-  if (name === "vision.engine") fields.push('<input data-argument="engine" type="text" autocomplete="off" spellcheck="false" placeholder="auto" aria-label="Vision engine" value="auto" />');
-  if (name === "vision.effort") fields.push('<input data-argument="effort" type="text" autocomplete="off" spellcheck="false" placeholder="default" aria-label="Vision effort" value="default" />');
-  if (name === "presence.mode") fields.push('<select data-argument="mode" aria-label="Presence mode"><option value="always">always</option><option value="follow-codex">follow-codex</option><option value="follow-clients">follow-clients</option></select>');
-  if (name === "subagents.mode") fields.push('<select data-argument="mode" aria-label="Subagent mode"><option value="proven">proven</option><option value="selected">selected</option><option value="all">all</option></select>');
-  if (name === "subagents.selection") fields.push('<select data-argument="selection" aria-label="Subagent selection"><option value="select-all">select-all</option><option value="unselect-all">unselect-all</option></select>');
-  if (name === "tool-result-aging.ttl") fields.push('<input data-argument="days" type="number" min="0" step="1" placeholder="days" aria-label="Age days" />');
-  if (name === "tool-result-aging.purge") fields.push('<label><input data-argument="expiredOnly" type="checkbox" /> Expired only</label>');
-  if (["provider.enable", "model.canary", "subagents.model"].includes(name)) fields.push('<label><input data-argument="enabled" type="checkbox" checked /> Enabled</label>');
-  if (name === "model.visibility" || name === "picker.set") fields.push('<label><input data-argument="visible" type="checkbox" checked /> Visible</label>');
+  const schema = command.arguments || { properties: {}, required: [] };
+  const required = new Set(schema.required || []);
+  for (const [key, property] of Object.entries(schema.properties || {})) {
+    const types = schemaTypes(property);
+    const label = html(key.replaceAll("_", " "));
+    const typeAttribute = html(types.join("|"));
+    const metadata = `data-argument="${html(key)}" data-argument-type="${typeAttribute}" data-argument-required="${required.has(key)}" aria-label="${label}"`;
+    if (Array.isArray(property.enum)) {
+      fields.push(`<select ${metadata}>${property.enum.map((value) => `<option value="${html(value)}">${html(value)}</option>`).join("")}</select>`);
+    } else if (types.includes("boolean")) {
+      fields.push(`<label><input ${metadata} type="checkbox"${required.has(key) ? " checked" : ""} /> ${label}</label>`);
+    } else if (types.includes("integer") && types.includes("null")) {
+      fields.push(`<select ${metadata}><option value="0">0</option><option value="null">null</option></select>`);
+    } else if (types.includes("integer")) {
+      fields.push(`<input ${metadata} type="number" min="0" step="1" value="0" />`);
+    } else {
+      const value = sampleString(property, key);
+      fields.push(`<input ${metadata} type="text" autocomplete="off" spellcheck="false" value="${html(value)}" />`);
+    }
+  }
   if (command.protectedInput) {
     // This is the only browser field that may carry a credential. It never
     // becomes part of serialized panel state; the bridge peels it off at the
@@ -371,7 +409,8 @@ function actionMarkup(command) {
     command.quotaWarning ? "May consume provider quota" : "",
     command.protectedInput ? "Protected input" : "",
   ].filter(Boolean).join(" · ");
-  return `<div class="capability-action" data-capability-action="true"><button type="button" ${attributes}>${html(commandLabel(command.name))}</button>${argumentMarkup(command)}${detail ? `<small class="capability-detail">${html(detail)}</small>` : ""}${command.resultKind === "protected-text" ? '<pre class="capability-result" data-protected-output="true" data-result-kind="protected-text" hidden></pre>' : '<output class="capability-result" data-result-kind="json" hidden></output>'}</div>`;
+  const protectedResult = command.resultKind === "protected-text";
+  return `<div class="capability-action" data-capability-action="true"><button type="button" ${attributes}>${html(commandLabel(command.name))}</button>${argumentMarkup(command)}${detail ? `<small class="capability-detail">${html(detail)}</small>` : ""}${protectedResult ? '<pre class="capability-result" data-protected-output="true" data-result-kind="protected-text" hidden></pre><button class="copy-result" type="button" data-copy-result="protected" aria-label="Copy protected result" disabled>Copy</button>' : '<output class="capability-result" data-result-kind="json" hidden></output>'}</div>`;
 }
 
 /**
@@ -405,6 +444,73 @@ export function serializeBrowserState(value, state = { seen: new WeakSet(), dept
     if (item !== undefined) output[key] = item;
   }
   return output;
+}
+
+// RFC 8785-compatible JSON serialization for the plain argument values the
+// browser command schemas admit. Object keys are sorted recursively and no
+// secret-bearing protected field is included by the caller before hashing.
+export function canonicalJson(value) {
+  if (value === null || typeof value === "boolean" || typeof value === "string") return JSON.stringify(value);
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) throw new TypeError("canonical JSON does not accept non-finite numbers");
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) return `[${value.map((item) => canonicalJson(item)).join(",")}]`;
+  if (!value || typeof value !== "object") throw new TypeError("canonical JSON accepts only JSON values");
+  return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(",")}}`;
+}
+
+export async function canonicalArgumentsHash(value, cryptoImpl = globalThis.crypto) {
+  if (!cryptoImpl?.subtle?.digest) throw new Error("The browser crypto digest API is unavailable.");
+  const digest = new Uint8Array(await cryptoImpl.subtle.digest("SHA-256", new TextEncoder().encode(canonicalJson(value))));
+  let binary = "";
+  for (const byte of digest) binary += String.fromCharCode(byte);
+  const encoded = typeof btoa === "function" ? btoa(binary) : Buffer.from(digest).toString("base64");
+  return encoded.replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/u, "");
+}
+
+export function createBrowserOperationState({ uuid = () => globalThis.crypto?.randomUUID?.(), maxRecords = 64 } = {}) {
+  const records = new Map();
+  function begin(command, args) {
+    const requestId = uuid?.();
+    if (typeof requestId !== "string") throw new Error("A UUID source is required for browser operations.");
+    const operation = { operationId: requestId, requestId, command, args: serializeBrowserState(args), status: "in-flight", attempts: 0, applied: false, result: undefined };
+    records.set(operation.operationId, operation);
+    while (records.size > maxRecords) records.delete(records.keys().next().value);
+    return operation;
+  }
+  function get(operationId) { return records.get(operationId); }
+  function retry(operationId) {
+    const operation = records.get(operationId);
+    if (!operation) return undefined;
+    operation.attempts += 1;
+    return operation;
+  }
+  function apply(operationId, result, effect) {
+    const operation = records.get(operationId);
+    if (!operation || operation.applied) return false;
+    operation.applied = true;
+    operation.status = "completed";
+    operation.result = result;
+    effect?.(result);
+    return true;
+  }
+  function fail(operationId, result, effect) {
+    const operation = records.get(operationId);
+    if (!operation || operation.applied) return false;
+    operation.applied = true;
+    operation.status = "failed";
+    operation.result = result;
+    effect?.(result);
+    return true;
+  }
+  function timeout(operationId) {
+    const operation = records.get(operationId);
+    if (!operation || operation.applied) return false;
+    operation.status = "timed-out";
+    return true;
+  }
+  return Object.freeze({ begin, get, retry, apply, fail, timeout });
 }
 
 function smoothPath(points) {

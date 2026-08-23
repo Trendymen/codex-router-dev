@@ -13,6 +13,8 @@ import {
   todayTokens,
   toolResultAgingChecked,
   renderCapabilitySurface,
+  canonicalArgumentsHash,
+  createBrowserOperationState,
   serializeBrowserState,
   visibleSections,
 } from "./model.mjs";
@@ -54,6 +56,7 @@ function startBrowserPanel() {
     manifest: window.__CODEX_ROUTER_MANIFEST__ || null,
     snapshot: null,
     busy: new Set(),
+    operations: createBrowserOperationState(),
     feedback: "Session ready. Actions use the router's canonical command contract.",
     error: false,
   };
@@ -94,10 +97,10 @@ function startBrowserPanel() {
 
   function applyBrowserActionState() {
     for (const button of workspace.querySelectorAll("button[data-command]")) {
-      button.disabled = state.busy.has(button.dataset.command);
+      button.disabled = button.dataset.operationId ? state.busy.has(button.dataset.operationId) : false;
       const action = button.closest(".capability-action");
       const output = action?.querySelector(".capability-result");
-      if (output && state.busy.has(button.dataset.command)) output.hidden = false;
+      if (output && button.dataset.operationId && state.busy.has(button.dataset.operationId)) output.hidden = false;
     }
   }
 
@@ -109,12 +112,14 @@ function startBrowserPanel() {
 
   async function runBrowserCommand(button) {
     const command = button.dataset.command;
-    if (!command || state.busy.has(command)) return;
+    if (!command || button.dataset.operationId && state.busy.has(button.dataset.operationId)) return;
     if (button.dataset.confirmation === "server" && !window.confirm("此操作需要服务器确认，是否继续？")) return;
     const action = button.closest(".capability-action");
     const output = action?.querySelector(".capability-result");
     const args = collectBrowserArguments(action, command);
-    state.busy.add(command);
+    const operation = state.operations.begin(command, args);
+    button.dataset.operationId = operation.operationId;
+    state.busy.add(operation.operationId);
     state.error = false;
     state.feedback = `${command} is being verified by the router…`;
     if (output) {
@@ -123,19 +128,29 @@ function startBrowserPanel() {
     }
     renderFeedbackOnly();
     try {
-      const value = await invoke(command, args);
-      state.feedback = `${command} completed. Repeated responses reuse the same result slot.`;
-      if (output) output.textContent = resultText(value);
+      const hashArgs = { ...args };
+      delete hashArgs.apiKey;
+      const argumentsHash = await canonicalArgumentsHash(hashArgs);
+      const value = await invoke(command, args, { operationId: operation.operationId, requestId: operation.requestId, argumentsHash });
+      state.operations.apply(operation.operationId, value, (result) => {
+        state.feedback = `${command} completed. Replayed responses reuse the same result slot.`;
+        if (output) output.textContent = resultText(result);
+        const copy = action?.querySelector("button[data-copy-result=protected]");
+        if (copy && output?.textContent) copy.disabled = false;
+      });
       if (command === "lifecycle.status" && value?.capabilities) {
         state.manifest = value.capabilities;
         render();
       }
     } catch (error) {
-      state.error = true;
-      state.feedback = errorMessage(error);
-      if (output) output.textContent = state.feedback;
+      state.operations.fail(operation.operationId, { error: errorMessage(error) }, (result) => {
+        state.error = true;
+        state.feedback = result.error;
+        if (output) output.textContent = result.error;
+      });
     } finally {
-      state.busy.delete(command);
+      state.busy.delete(operation.operationId);
+      button.dataset.operationId = "";
       applyBrowserActionState();
       renderFeedbackOnly();
     }
@@ -151,6 +166,11 @@ function startBrowserPanel() {
     const refresh = event.target.closest("[data-browser-action=refresh]");
     if (refresh) {
       refreshBrowserStatus();
+      return;
+    }
+    const copy = event.target.closest("button[data-copy-result=protected]");
+    if (copy) {
+      copyProtectedResult(copy);
       return;
     }
     const button = event.target.closest("button[data-command]");
@@ -176,6 +196,30 @@ function startBrowserPanel() {
       renderFeedbackOnly();
     }
   }
+
+  async function copyProtectedResult(button) {
+    const output = button.closest(".capability-action")?.querySelector("[data-protected-output=\"true\"]");
+    if (!output || output.hidden || !output.textContent) return;
+    let copied = false;
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(output.textContent);
+        copied = true;
+      }
+    } catch { /* fallback below */ }
+    if (!copied) {
+      const selection = window.getSelection();
+      const range = document.createRange();
+      range.selectNodeContents(output);
+      selection?.removeAllRanges();
+      selection?.addRange(range);
+      try { copied = document.execCommand?.("copy") === true; } catch { copied = false; }
+      selection?.removeAllRanges();
+    }
+    state.feedback = copied ? "Protected result copied." : "Copy is unavailable in this session.";
+    state.error = !copied;
+    renderFeedbackOnly();
+  }
 }
 
 function collectBrowserArguments(action, command) {
@@ -183,7 +227,10 @@ function collectBrowserArguments(action, command) {
   for (const field of action?.querySelectorAll("[data-argument]") || []) {
     const key = field.dataset.argument;
     if (!key) continue;
+    const types = String(field.dataset.argumentType || "string").split("|");
     if (field.type === "checkbox") args[key] = field.checked;
+    else if (field.value === "null" && types.includes("null")) args[key] = null;
+    else if (types.includes("integer")) args[key] = Number(field.value);
     else if (field.value !== "") args[key] = field.value;
   }
   const secret = action?.querySelector("[data-protected-field=apiKey]");

@@ -10,6 +10,7 @@ import util from "node:util";
 import { fileURLToPath } from "node:url";
 
 import {
+  CAPABILITY_ARGUMENTS,
   CAPABILITY_COMMANDS,
   CAPABILITY_SCHEMA_VERSION,
   isMutationCommand,
@@ -110,52 +111,6 @@ function deepFreeze(value, seen = new WeakSet()) {
   return Object.freeze(value);
 }
 
-const objectSchema = (properties = {}, required = []) => deepFreeze({
-  type: "object",
-  additionalProperties: false,
-  properties,
-  required,
-});
-const string = (pattern = undefined) => deepFreeze({ type: "string", ...(pattern ? { pattern } : {}) });
-const boolean = deepFreeze({ type: "boolean" });
-const slug = string("^[A-Za-z0-9][A-Za-z0-9._/-]{0,255}$");
-const provider = string("^[a-z0-9][a-z0-9-]{0,63}$");
-const credentialProvider = { ...provider, enum: ["deepseek", "qwen-plan"] };
-const noArgs = objectSchema();
-
-const ARGUMENTS = {
-  "lifecycle.status": noArgs, "lifecycle.start": noArgs, "lifecycle.stop": noArgs, "lifecycle.restart": noArgs, "lifecycle.logs": noArgs,
-  "doctor.status": noArgs, "doctor.fix": noArgs, "maintenance.update": noArgs, "maintenance.rollback": noArgs,
-  "native.status": noArgs, "native.account-usage": noArgs,
-  "credential.status": objectSchema({ provider: credentialProvider }, ["provider"]),
-  "credential.set": objectSchema({ provider: credentialProvider }, ["provider"]),
-  "credential.remove": objectSchema({ provider: credentialProvider }, ["provider"]),
-  "provider.enable": objectSchema({ provider, enabled: boolean }, ["provider", "enabled"]),
-  "model.visibility": objectSchema({ slug, visible: boolean }, ["slug", "visible"]),
-  "model.canary": objectSchema({ slug, enabled: boolean }, ["slug", "enabled"]),
-  "protocol-proof.status": objectSchema({ slug }, ["slug"]),
-  "protocol-proof.verify": objectSchema({ slug }, ["slug"]),
-  "protocol-proof.revoke": objectSchema({ slug }, ["slug"]),
-  "picker.status": noArgs, "picker.set": objectSchema({ slug, visible: boolean }, ["slug", "visible"]), "picker.show-all": objectSchema({ visible: boolean }, ["visible"]),
-  "catalog.status": noArgs, "catalog.render-snippet": noArgs,
-  "subagents.status": noArgs, "subagents.mode": objectSchema({ mode: string("^(all|selected|proven)$") }, ["mode"]),
-  "subagents.model": objectSchema({ slug, enabled: boolean }, ["slug", "enabled"]),
-  "subagents.selection": objectSchema({ selection: string("^(select-all|unselect-all)$") }, ["selection"]),
-  "subagents.verify": objectSchema({ slug }, ["slug"]),
-  "failover.status": noArgs, "failover.reset": noArgs,
-  "tool-result-aging.status": noArgs, "tool-result-aging.on": noArgs, "tool-result-aging.off": noArgs,
-  "tool-result-aging.ttl": objectSchema({ days: { type: ["integer", "null"] } }, ["days"]),
-  "tool-result-aging.purge": objectSchema({ expiredOnly: boolean }, ["expiredOnly"]),
-  "usage.router": noArgs, "usage.provider": objectSchema({ provider }), "usage.model": objectSchema({ slug }, ["slug"]),
-  "vision.status": noArgs, "vision.on": noArgs, "vision.off": noArgs,
-  "vision.engine": objectSchema({ engine: string(), effort: string() }, ["engine"]),
-  "vision.effort": objectSchema({ effort: string() }, ["effort"]), "vision.probe": noArgs,
-  "vision.pull": objectSchema({ tag: string("^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$") }, ["tag"]),
-  "vision.purge-cache": noArgs,
-  "presence.status": noArgs, "presence.mode": objectSchema({ mode: string("^(always|follow-codex|follow-clients)$") }, ["mode"]),
-  "cc-switch.status": noArgs, "cc-switch.snippet": noArgs,
-};
-
 const CONTROL_ARGS = {
   "lifecycle.status": () => ["--json"], "lifecycle.start": () => ["service", "start"], "lifecycle.stop": () => ["service", "stop"], "lifecycle.restart": () => ["service", "restart"], "lifecycle.logs": () => ["logs"],
   "doctor.status": () => ["doctor", "--json"], "doctor.fix": () => ["doctor", "--fix", "--json"], "maintenance.update": () => ["maintenance"], "maintenance.rollback": () => ["rollback"],
@@ -240,7 +195,7 @@ function validate(schema, value, state = { seen: new WeakSet(), work: MAX_ARGUME
 }
 
 const COMMAND_DEFINITIONS_MAP = new Map(CAPABILITY_COMMANDS.map((metadata) => {
-  const args = ARGUMENTS[metadata.name] || noArgs;
+  const args = CAPABILITY_ARGUMENTS[metadata.name] || { type: "object", additionalProperties: false, properties: {}, required: [] };
   return [metadata.name, deepFreeze({
     ...metadata,
     arguments: args,
