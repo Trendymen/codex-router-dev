@@ -17,6 +17,16 @@ const DNS_LABEL = "[A-Za-z](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?";
 const LABEL_PATTERN = new RegExp(`^(?:${DNS_LABEL}\\.)+${DNS_LABEL}$`);
 const MODES = new Set(["production", "acceptance", "test"]);
 const PORT_NAMES = Object.keys(PRODUCTION_PORTS);
+const validatedTargets = new WeakSet();
+const validatedIsolationRoots = new WeakMap();
+
+export function isValidatedServiceTarget(value) {
+  return Boolean(value && typeof value === "object" && validatedTargets.has(value));
+}
+
+export function validatedIsolationRoot(value) {
+  return validatedIsolationRoots.get(value);
+}
 
 function absolute(value, name) {
   if (typeof value !== "string" || !value || !path.isAbsolute(value)) {
@@ -288,5 +298,8 @@ export function resolveServiceTarget(overrides = {}, defaults = PRODUCTION_SERVI
       }
     }
   }
-  return Object.freeze(target);
+  const frozen = Object.freeze(target);
+  validatedTargets.add(frozen);
+  if (root) validatedIsolationRoots.set(frozen, root);
+  return frozen;
 }

@@ -8,44 +8,15 @@ fi
 
 repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$repo_dir"
-# The service, gateway, ports, and credentials are one plane shared by every
-# client integration -- the same reason `bin/disable` stopped tearing it down
-# unconditionally. Uninstalling one client is not a reason to stop the other
-# working, so the service goes only once nothing is pointed at it any more.
-retire_service_if_unused() {
-  remaining=$(node src/target-integration.mjs installed-targets)
-  if [ -z "$remaining" ]; then
-    node src/service.mjs uninstall
-    echo "No client integrations remain, so the background service was removed."
-  else
-    echo "The background service is still running for: $remaining."
-  fi
-}
-
-case "${MODEL_ROUTER_TARGET:-codex}" in
-  codex)
-    node src/config-manager.mjs disable
-    node src/skills-install.mjs uninstall
-    # The shim is a file named `codex` on the user's PATH that execs this
-    # checkout. Leaving it behind after the checkout is gone means every `codex`
-    # they run from then on prints a warning about a router that is not coming
-    # back. Removing an integration has to remove the thing standing in front of
-    # it. Only marker-bearing files are touched, so a real `codex` is never at
-    # risk, and there is nothing to remove on Windows.
-    node src/shim-cli.mjs uninstall >/dev/null 2>&1 || true
-    retire_service_if_unused
-    echo "The Codex integration was removed."
-    ;;
-  dsh)
-    node src/dsh-config-manager.mjs uninstall >/dev/null
-    retire_service_if_unused
-    echo "The DeepSeek Harness integration was removed."
-    ;;
-  gemini)
-    node src/gemini-config-manager.mjs uninstall >/dev/null
-    retire_service_if_unused
-    echo "The Gemini CLI integration was removed."
-    ;;
+target=${MODEL_ROUTER_TARGET:-codex}
+case "$target" in
+  codex|dsh|gemini) ;;
   *) echo "MODEL_ROUTER_TARGET must be codex, dsh, or gemini." >&2; exit 2 ;;
 esac
+# Snapshot happens before the client config, skills, shim, service, or runtime
+# is touched. The Node boundary owns the entire callback and restores the
+# resolver-bound snapshot before restarting the old service on any failure.
+# Its callback runs `src/service.mjs uninstall` before `src/skills-install.mjs uninstall`
+# when this is the last client, preserving the old stop-before-skills ordering.
+node src/local-uninstall.mjs --router-runtime --client-target "$target"
 echo "The repository, cached native catalog, logs, and provider credentials were retained."

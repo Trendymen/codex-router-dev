@@ -2329,7 +2329,7 @@ if (args.includes("--probe")) {
   await printRouterLogs();
 } else if (args[0] === "rollback") {
   const { rollbackCheckout } = await import("./update.mjs");
-  process.stdout.write(`${JSON.stringify(rollbackCheckout({ force: args.includes("--force") }))}\n`);
+  process.stdout.write(`${JSON.stringify(await rollbackCheckout({ force: args.includes("--force") }))}\n`);
 } else if (args[0] === "model-canary") {
   if (!args[1] || !["on", "off"].includes(args[2])) throw new Error("Usage: control model-canary <model-slug> <on|off>");
   await setCanary(args[1], args[2] === "on");

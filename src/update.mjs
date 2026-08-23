@@ -5,7 +5,31 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { refuseUnsupportedPlatform } from "./platform-gate.mjs";
-import { currentServiceTarget, INSTALL_MANIFEST_PATH, SOURCE_ROOT, TARGET } from "./paths.mjs";
+import { CALLER_SECRET_PATH, currentServiceTarget, INSTALL_MANIFEST_PATH, SOURCE_ROOT, TARGET } from "./paths.mjs";
+import {
+  ownedRuntimePaths,
+  removeOwnedRuntime,
+  restoreOwnedRuntime,
+  snapshotOwnedRuntime,
+} from "./owned-runtime-paths.mjs";
+import { migrateRuntime } from "./runtime-migration.mjs";
+import { waitForRouterHealth } from "./router-health.mjs";
+import { buildCapabilityManifest } from "./capability-manifest.mjs";
+import { desktopCommandDefinitions } from "./desktop-commands.mjs";
+import { isPanelRoute, panelLocalCommand } from "./desktop-panel.mjs";
+
+const OLD_RUNTIME_ARTIFACTS = Object.freeze([
+  "legacy-router-plist",
+  "legacy-prototype-plist",
+  "legacy-tray-app",
+  "legacy-venv",
+  "legacy-litellm-config",
+  "legacy-gateway-config",
+]);
+
+function errorMessage(error) {
+  return error instanceof Error ? error.message : String(error);
+}
 
 // Keep the CLI gate ahead of the manifest module's provider/skill imports. A
 // non-macOS update must reject before even loading registry-backed state, let
@@ -138,6 +162,166 @@ function installCurrentCheckout() {
   }
 }
 
+export async function verifyBrowserCapabilityContract(target, { fetchImpl = fetch, callerKey: suppliedCallerKey } = {}) {
+  const base = `http://${target.host}:${target.ports.router}`;
+  let callerKey = suppliedCallerKey;
+  if (callerKey === undefined) {
+    try {
+      callerKey = readFileSync(CALLER_SECRET_PATH, "utf8").trim();
+    } catch (error) {
+      throw new Error(`Browser panel contract verification failed: caller key is unavailable (${errorMessage(error)}).`, { cause: error });
+    }
+  }
+  if (!callerKey) throw new Error("Browser panel contract verification failed: caller key is empty.");
+  const mint = await fetchImpl(`${base}/_codex-router/${callerKey}/panel-sessions`, {
+    method: "POST",
+    headers: {
+      host: `${target.host}:${target.ports.router}`,
+      authorization: `Bearer ${callerKey}`,
+      "content-type": "application/json",
+    },
+    body: "{}",
+  });
+  if (!mint.ok) throw new Error(`Browser panel contract verification failed: session bootstrap HTTP ${mint.status}.`);
+  const minted = await mint.json();
+  if (typeof minted?.nonce !== "string" || !minted.nonce) throw new Error("Browser panel contract verification failed: nonce is missing.");
+  const bootstrap = await fetchImpl(`${base}/panel-bootstrap/${minted.nonce}`, {
+    redirect: "manual",
+    headers: { host: `${target.host}:${target.ports.router}` },
+  });
+  const cookie = bootstrap.headers?.get?.("set-cookie")?.split(";", 1)[0];
+  if (bootstrap.status !== 303 || !cookie) throw new Error("Browser panel contract verification failed: bootstrap cookie is missing.");
+  const response = await fetchImpl(`${base}/panel/`, {
+    headers: { host: `${target.host}:${target.ports.router}`, cookie },
+  });
+  if (!response.ok && response.status !== 304) {
+    throw new Error(`Browser panel contract verification failed: HTTP ${response.status}.`);
+  }
+  const body = await response.text();
+  if (!body.includes("__CODEX_ROUTER_MANIFEST__") || !body.includes("__TAURI__")) {
+    throw new Error("Browser panel contract verification failed: capability bridge is missing.");
+  }
+  if (!isPanelRoute("/panel/") || !isPanelRoute("/panel/app.js")) {
+    throw new Error("Browser panel contract verification failed: static asset routes are incomplete.");
+  }
+  const manifest = buildCapabilityManifest();
+  const localManifest = panelLocalCommand("platform_info")()?.capabilityManifest;
+  if (manifest.capabilitySchemaVersion !== localManifest?.capabilitySchemaVersion) {
+    throw new Error("Browser panel contract verification failed: manifest versions disagree.");
+  }
+  for (const command of manifest.commands || []) {
+    if (!desktopCommandDefinitions().has(command.name)) {
+      throw new Error(`Browser panel contract verification failed: ${command.name} is not executable.`);
+    }
+  }
+  return { ok: true, commands: manifest.commands?.length || 0 };
+}
+
+export function verifySwiftCommandContract(target, {
+  exists = existsSync,
+  read = readFileSync,
+  run = spawnSync,
+  expectedManifest = buildCapabilityManifest(),
+} = {}) {
+  if (target.platform !== "darwin") return { ok: true, skipped: true };
+  const source = path.join(target.sourceRoot, "apps", "macos", "ModelRouterTray", "Sources", "ModelRouterTrayApp.swift");
+  const packageManifest = path.join(target.sourceRoot, "apps", "macos", "ModelRouterTray", "Package.swift");
+  const bridge = path.join(target.sourceRoot, "src", "desktop-command-bridge.mjs");
+  if (!exists(target.appBinary) || !exists(source) || !exists(packageManifest) || !exists(bridge)) {
+    throw new Error("Swift command contract verification failed: app, package, or bridge is missing.");
+  }
+  const swift = read(source, "utf8");
+  const bridgeSource = read(bridge, "utf8");
+  for (const pattern of [/capabilitySchemaVersion/, /executeCanonicalCommand\(/, /DesktopCommandBridge/]) {
+    if (!pattern.test(`${swift}\n${bridgeSource}`)) {
+      throw new Error(`Swift command contract verification failed: missing ${pattern}.`);
+    }
+  }
+  const probe = run(target.appBinary, ["--codex-router-capability-probe"], {
+    cwd: target.sourceRoot,
+    encoding: "utf8",
+    timeout: 15_000,
+    stdio: ["ignore", "pipe", "pipe"],
+    windowsHide: true,
+  });
+  if (probe?.error) throw probe.error;
+  if (probe?.status !== 0) throw new Error(`Swift command contract probe exited with ${probe?.status ?? "unknown"}.`);
+  let envelope;
+  try {
+    envelope = JSON.parse(String(probe?.stdout || ""));
+  } catch (error) {
+    throw new Error("Swift command contract probe returned invalid JSON.", { cause: error });
+  }
+  const reported = envelope?.value?.capabilityManifest;
+  if (envelope?.ok !== true || !reported || reported.capabilitySchemaVersion !== expectedManifest.capabilitySchemaVersion) {
+    throw new Error("Swift command contract probe returned an incompatible capability manifest.");
+  }
+  const expectedCommands = (expectedManifest.commands || []).map(({ name }) => name).sort();
+  const reportedCommands = (reported.commands || []).map(({ name }) => name).sort();
+  if (JSON.stringify(reportedCommands) !== JSON.stringify(expectedCommands)) {
+    throw new Error("Swift command contract probe returned a different command set.");
+  }
+  return { ok: true };
+}
+
+async function verifyInstalledRuntime(target) {
+  const health = await waitForRouterHealth({
+    target: TARGET,
+    url: `http://${target.host}:${target.ports.router}/health`,
+  });
+  if (!health.ok) throw new Error(`Router health verification failed: ${health.error}`);
+
+  const callerPath = path.join(target.stateRoot, "caller-secret");
+  const callerKey = existsSync(callerPath) ? readFileSync(callerPath, "utf8").trim() : undefined;
+  await verifyBrowserCapabilityContract(target, { callerKey });
+  verifySwiftCommandContract(target);
+  return true;
+}
+
+function restartOldRuntime(target) {
+  if (target.platform !== "darwin") return true;
+  const result = spawnSync(
+    process.execPath,
+    [path.join(SOURCE_ROOT, "src", "service.mjs"), "restart"],
+    { cwd: SOURCE_ROOT, env: process.env, stdio: "inherit" },
+  );
+  if (result.error) throw result.error;
+  if (result.status !== 0) throw new Error(`Old Router service restart exited with ${result.status}.`);
+  return true;
+}
+
+/**
+ * Public update/rollback boundary. The runtime snapshot is captured before
+ * the replacement installer runs, and cleanup is reachable only after the
+ * Router, browser, and Swift contracts have all passed.
+ */
+export async function runRuntimeMigration({
+  target = currentServiceTarget(),
+  runtimeRoots,
+  snapshot,
+  installReplacement = installCurrentCheckout,
+  verifyReplacement = () => verifyInstalledRuntime(target),
+  publishReplacement = rebuildNodeSnapshotsAfterUpdate,
+  cleanupOld,
+  restoreSnapshot = (value) => restoreOwnedRuntime(value),
+  restartOldService = () => restartOldRuntime(target),
+} = {}) {
+  const paths = ownedRuntimePaths(target, runtimeRoots || snapshot?.options || {});
+  const runtimeSnapshot = snapshot || snapshotOwnedRuntime(paths);
+  if (snapshot && (snapshot.target !== target || JSON.stringify(snapshot.options) !== JSON.stringify(paths.options))) {
+    throw new Error("Runtime migration snapshot is bound to a different ServiceTarget or runtime roots.");
+  }
+  return migrateRuntime({
+    snapshot: runtimeSnapshot,
+    installReplacement,
+    verifyReplacement,
+    publishReplacement,
+    cleanupOld: cleanupOld || ((runtimeSnapshot) => removeOwnedRuntime(paths, { ids: OLD_RUNTIME_ARTIFACTS, snapshot: runtimeSnapshot })),
+    restoreSnapshot,
+    restartOldService,
+  });
+}
+
 function registeredTrayBundlePath(label) {
   const resolvedLabel = label || currentServiceTarget().trayLabel;
   try {
@@ -239,14 +423,13 @@ export function rebuildNodeSnapshotsAfterUpdate({ run = spawnSync } = {}) {
   return true;
 }
 
-export function updateCheckout({ force = false } = {}) {
+export async function updateCheckout({ force = false, runtime = {} } = {}) {
   const status = checkForUpdate();
   if (!status.updateAvailable) {
     if (!installationNeedsRefresh(readInstallManifestSnapshot(), status.current)) {
       return { ...status, updated: false, reinstalled: false };
     }
-    installCurrentCheckout();
-    rebuildNodeSnapshotsAfterUpdate();
+    await runRuntimeMigration({ ...runtime, installReplacement: runtime.installReplacement || installCurrentCheckout });
     refreshTrayCompanion();
     return { ...status, updated: false, reinstalled: true };
   }
@@ -261,28 +444,19 @@ export function updateCheckout({ force = false } = {}) {
   }
   git(["update-ref", "refs/codex-router/rollback", status.current]);
   git(["merge", "--ff-only", status.available], { inherit: true });
-  try {
-    installCurrentCheckout();
-    rebuildNodeSnapshotsAfterUpdate();
-    refreshTrayCompanion();
-  } catch (error) {
-    try {
+  await runRuntimeMigration({
+    ...runtime,
+    installReplacement: runtime.installReplacement || installCurrentCheckout,
+    restoreSnapshot: runtime.restoreSnapshot || (async (runtimeSnapshot) => {
+      restoreOwnedRuntime(runtimeSnapshot);
       restoreRevision(status.current);
-    } catch (restoreError) {
-      throw new AggregateError(
-        [error, restoreError],
-        `Update failed and automatic rollback also failed. The previous commit is ${status.current}.`,
-      );
-    }
-    throw new Error(
-      `Update failed; Codex Router was restored to ${status.current.slice(0, 12)}.`,
-      { cause: error },
-    );
-  }
+    }),
+  });
+  refreshTrayCompanion();
   return { ...status, updated: true, reinstalled: true };
 }
 
-export function rollbackCheckout({ force = false } = {}) {
+export async function rollbackCheckout({ force = false, runtime = {} } = {}) {
   requireManagedCheckout();
   // A rollback checks out a different revision, so it overwrites tracked edits
   // exactly the way an update does.
@@ -299,18 +473,21 @@ export function rollbackCheckout({ force = false } = {}) {
   }
   if (target === current) throw new Error("The rollback revision is already installed.");
   git(["update-ref", "refs/codex-router/rollback", current]);
-  try {
+  // A bare checkout without an install manifest is not a managed runtime
+  // installation yet (for example, a deterministic control-child fixture),
+  // so preserve the old checkout-only rollback path. Real managed installs
+  // and injected acceptance transactions always take the snapshot gate.
+  if (Object.keys(runtime).length || existsSync(INSTALL_MANIFEST_PATH)) {
+    await runRuntimeMigration({
+      ...runtime,
+      installReplacement: runtime.installReplacement || (() => restoreRevision(target)),
+      restoreSnapshot: runtime.restoreSnapshot || (async (runtimeSnapshot) => {
+        restoreOwnedRuntime(runtimeSnapshot);
+        restoreRevision(current);
+      }),
+    });
+  } else {
     restoreRevision(target);
-  } catch (error) {
-    try {
-      restoreRevision(current);
-    } catch (restoreError) {
-      throw new AggregateError(
-        [error, restoreError],
-        `Rollback failed and the current revision could not be restored (${current}).`,
-      );
-    }
-    throw error;
   }
   return { rolledBack: true, from: current, to: target };
 }
@@ -341,7 +518,7 @@ async function main() {
     console.error("Usage: update.mjs check|update|rollback [--force]");
     process.exit(2);
   }
-  process.stdout.write(`${JSON.stringify(command({ force }), null, 2)}\n`);
+  process.stdout.write(`${JSON.stringify(await command({ force }), null, 2)}\n`);
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

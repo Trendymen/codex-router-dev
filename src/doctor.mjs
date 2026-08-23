@@ -84,6 +84,8 @@ import {
 } from "./tool-result-retention.mjs";
 import { retentionTtlMs } from "./tool-result-aging-state.mjs";
 import { refuseUnsupportedPlatform } from "./platform-gate.mjs";
+import { runRuntimeMigration } from "./update.mjs";
+import { currentServiceTarget } from "./paths.mjs";
 
 if (process.argv.includes("--fix") && refuseUnsupportedPlatform("doctor:fix")) process.exit(2);
 
@@ -185,7 +187,14 @@ function childJson(script, args = []) {
   );
 }
 
-function repair() {
+export async function repairRuntimeTransaction(steps = {}) {
+  return runRuntimeMigration({
+    ...steps,
+    target: steps.target || currentServiceTarget(),
+  });
+}
+
+async function repair() {
   requireMacOSRepair();
   const ownership = stateOwnershipStatus();
   if (
@@ -237,37 +246,41 @@ function repair() {
       `A known older router (${legacy.installations.map((item) => item.id).join(", ")}) was found. Re-run with --fix --migrate-known to snapshot and migrate it.`,
     );
   }
-  if (legacy.installations.length) {
-    childJson("legacy-migration.mjs", ["apply", "--yes"]);
-  }
   const repairStdio = jsonOutput ? ["inherit", "ignore", "inherit"] : "inherit";
   // Checkout repair rebuilds dependencies unconditionally: the fingerprints
   // an ordinary install trusts cannot see a corrupted node_modules or virtual
   // environment. Homebrew has already validated its package-owned tree above,
   // so its repair only regenerates configuration and services.
   const posixArguments = homebrewManaged ? [] : ["--force-deps"];
-  const result = process.platform === "win32"
-    ? spawnSync(
-        "powershell.exe",
-        [
-          "-NoLogo",
-          "-NoProfile",
-          "-ExecutionPolicy",
-          "Bypass",
-          "-File",
-          path.join(SOURCE_ROOT, "install.ps1"),
-          "-CheckoutInstall",
-          "-ForceDeps",
-        ],
-        { cwd: SOURCE_ROOT, env: process.env, stdio: repairStdio },
-      )
-    : spawnSync(path.join(SOURCE_ROOT, "bin", "install"), posixArguments, {
-        cwd: SOURCE_ROOT,
-        env: process.env,
-        stdio: repairStdio,
-      });
-  if (result.error) throw result.error;
-  if (result.status !== 0) throw new Error(`Repair installer exited with ${result.status}.`);
+  await repairRuntimeTransaction({
+    installReplacement: async () => {
+      if (legacy.installations.length) {
+        childJson("legacy-migration.mjs", ["apply", "--yes"]);
+      }
+      const result = process.platform === "win32"
+        ? spawnSync(
+            "powershell.exe",
+            [
+              "-NoLogo",
+              "-NoProfile",
+              "-ExecutionPolicy",
+              "Bypass",
+              "-File",
+              path.join(SOURCE_ROOT, "install.ps1"),
+              "-CheckoutInstall",
+              "-ForceDeps",
+            ],
+            { cwd: SOURCE_ROOT, env: process.env, stdio: repairStdio },
+          )
+        : spawnSync(path.join(SOURCE_ROOT, "bin", "install"), posixArguments, {
+            cwd: SOURCE_ROOT,
+            env: process.env,
+            stdio: repairStdio,
+          });
+      if (result.error) throw result.error;
+      if (result.status !== 0) throw new Error(`Repair installer exited with ${result.status}.`);
+    },
+  });
 }
 
 if (process.argv.includes("--help")) {
@@ -282,7 +295,7 @@ Known older routers are migrated only with the explicit --migrate-known flag.
 
 if (process.argv.includes("--fix")) {
   try {
-    repair();
+    await repair();
     if (!jsonOutput) process.stdout.write("Repair completed; verifying the result.\n\n");
   } catch (error) {
     console.error(`codex-router repair: ${error instanceof Error ? error.message : String(error)}`);

@@ -2417,6 +2417,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
   private var terminationRestoreTask: Task<Void, Never>?
 
   func applicationDidFinishLaunching(_ notification: Notification) {
+    if CommandLine.arguments.contains("--codex-router-capability-probe") {
+      Task { @MainActor in
+        do {
+          let result = try await DesktopCommandBridge().execute(
+            "platform_info",
+            arguments: [:],
+            protectedInput: nil,
+            capabilitySchemaVersion: 1
+          )
+          FileHandle.standardOutput.write(result)
+          FileHandle.standardOutput.write(Data("\n".utf8))
+          exit(0)
+        } catch {
+          FileHandle.standardError.write(Data("capability probe failed\n".utf8))
+          exit(1)
+        }
+      }
+      return
+    }
     NSApp.setActivationPolicy(.accessory)
     islandController = IslandWindowController(store: store)
     desktopPanelController = DesktopPanelWindowController(store: store)

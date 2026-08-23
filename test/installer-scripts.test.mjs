@@ -121,6 +121,15 @@ test("install.sh is valid POSIX shell", { skip: !POSIX_SHELL_AVAILABLE }, () => 
   assert.equal(result.status, 0, result.stderr);
 });
 
+test("uninstall snapshots the complete client transaction before any client mutation", () => {
+  const source = readScript("bin", "uninstall");
+  const transaction = source.indexOf("local-uninstall.mjs --router-runtime");
+  assert.notEqual(transaction, -1, "uninstall must enter the runtime transaction");
+  assert.equal(source.includes("config-manager.mjs disable"), false, "client mutation must run inside the Node transaction");
+  assert.doesNotMatch(source, /^\s*node .*skills-install\.mjs uninstall/m, "skills mutation must run inside the Node transaction");
+  assert.match(source, /--client-target/);
+});
+
 test("Homebrew setup never reconciles package-manager-owned dependencies", () => {
   const installer = readScript("bin", "install");
   const policy = installer.slice(
