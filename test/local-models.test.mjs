@@ -115,6 +115,11 @@ test("Control Center LocalModel mirrors the Vision snapshot without legacy chat 
     "researchStatus",
     "researchCapabilities",
     "researchNote",
+    "capabilities",
+    "tokensPerSecond",
+    "speedStatus",
+    "agent",
+    "agentCapable",
   ];
   for (const field of legacyFields) {
     assert.doesNotMatch(localModel, new RegExp(`\\b${field}\\??\\s*:`), `${field} must stay out of LocalModel`);
@@ -124,7 +129,9 @@ test("Control Center LocalModel mirrors the Vision snapshot without legacy chat 
     inventory: parseOllamaList("NAME  ID  SIZE  MODIFIED\nqwen2.5vl:3b  aaa  3.2 GB  now\n"),
     running: ["qwen2.5vl:3b"],
     selection: { version: 1, enabled: [] },
+    benchmarks: { "qwen2.5vl:3b": { tier: "accurate", tokensPerSecond: 42 } },
     capabilities: { "qwen2.5vl:3b": ["completion", "vision"] },
+    agentChecks: { "qwen2.5vl:3b": { verdict: "verified", agentCapable: true } },
     runtime: { installed: true, running: true },
   });
   const model = snapshot.models.find((entry) => entry.tag === "qwen2.5vl:3b");
