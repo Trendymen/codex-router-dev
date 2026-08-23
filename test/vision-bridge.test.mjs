@@ -387,6 +387,73 @@ test("an abandoned stale owner is recovered before acquiring the purge lock", ()
   }
 });
 
+test("stale recovery never removes a replacement owner observed after liveness", () => {
+  const state = mkdtempSync(path.join(os.tmpdir(), "vision-purge-owner-replacement-"));
+  const purgePath = path.join(state, "vision-cache-purge.json");
+  const lockPath = `${purgePath}.lock`;
+  const ownerPath = path.join(lockPath, "owner.json");
+  const replacementToken = "replacement-owner-token";
+  const replacementPath = ownerPath;
+  const waitError = new Error("replacement owner is still in its critical section");
+  let replaced = false;
+  try {
+    mkdirSync(lockPath);
+    writeFileSync(ownerPath, `${JSON.stringify({ pid: 999_999, token: "stale-owner-token" })}\n`);
+    const staleAt = new Date(Date.now() - 60_000);
+    utimesSync(lockPath, staleAt, staleAt);
+    assert.throws(
+      () => requestVisionCachePurge(purgePath, {
+        staleMs: 1,
+        wait() {
+          throw waitError;
+        },
+        fs: {
+          readFile(target, encoding) {
+            const content = readFileSync(target, encoding);
+            if (target === ownerPath && !replaced) {
+              replaced = true;
+              writeFileSync(
+                replacementPath,
+                `${JSON.stringify({ pid: process.pid, processIdentity: "replacement-start", token: replacementToken })}\n`,
+              );
+            }
+            return content;
+          },
+        },
+      }),
+      (error) => error === waitError,
+    );
+    assert.equal(replaced, true, "the test did not replace the owner after its liveness read");
+    assert.equal(existsSync(replacementPath), true, "stale recovery removed the replacement owner");
+    assert.equal(JSON.parse(readFileSync(replacementPath, "utf8")).token, replacementToken);
+  } finally {
+    rmSync(state, { recursive: true, force: true });
+  }
+});
+
+test("stale recovery rejects a reused PID with a different process start identity", () => {
+  const state = mkdtempSync(path.join(os.tmpdir(), "vision-purge-pid-reuse-"));
+  const purgePath = path.join(state, "vision-cache-purge.json");
+  const lockPath = `${purgePath}.lock`;
+  try {
+    mkdirSync(lockPath);
+    writeFileSync(
+      path.join(lockPath, "owner.json"),
+      `${JSON.stringify({ pid: process.pid, processIdentity: "old-start|node", token: "old-owner-token" })}\n`,
+    );
+    const staleAt = new Date(Date.now() - 60_000);
+    utimesSync(lockPath, staleAt, staleAt);
+    const result = requestVisionCachePurge(purgePath, {
+      staleMs: 1,
+      processIdentity: () => "new-start|node",
+    });
+    assert.equal(result.requested, true);
+    assert.equal(existsSync(lockPath), false);
+  } finally {
+    rmSync(state, { recursive: true, force: true });
+  }
+});
+
 test("a cheap vision tier outranks a higher-priority flagship", () => {
   const ranked = rankVisionEngines([TEXT_ONLY, FLAGSHIP_VISION, FLASH_VISION]);
   assert.deepEqual(
