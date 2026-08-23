@@ -5,6 +5,7 @@ import test from "node:test";
 
 import { desktopCommandDefinitions, runDesktopCommand } from "../src/desktop-commands.mjs";
 import { writeJson } from "../src/http-utils.mjs";
+import { createPanelSessionStore } from "../src/panel-sessions.mjs";
 import {
   handlePanelRequest,
   isPanelRoute,
@@ -437,5 +438,65 @@ test("the bare panel path redirects to the directory form", async () => {
     assert.equal(response.headers.get("location"), "./panel/");
   } finally {
     await close();
+  }
+});
+
+test("secured panel bootstrap, CSRF and request replay are enforced before command execution", async () => {
+  const store = createPanelSessionStore({ randomBytes: (size) => Buffer.alloc(size, 0x55) });
+  const minted = store.mintNonce();
+  let calls = 0;
+  const server = http.createServer(async (request, response) => {
+    const route = new URL(request.url, "http://127.0.0.1").pathname;
+    if (isPanelRoute(route)) {
+      await handlePanelRequest(request, response, route, {
+        writeJson,
+        policy: { port: server.address()?.port },
+        sessionStore: store,
+        runCommand: async () => {
+          calls += 1;
+          return { ok: true, value: { calls } };
+        },
+      });
+      return;
+    }
+    writeJson(response, 404, { error: { type: "not_found" } });
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = server.address().port;
+  const base = `http://127.0.0.1:${port}`;
+  try {
+    const bootstrap = await fetch(`${base}/panel-bootstrap/${minted.nonce}`, { redirect: "manual" });
+    assert.equal(bootstrap.status, 303);
+    assert.equal(bootstrap.headers.get("location"), "/panel/");
+    const cookie = bootstrap.headers.get("set-cookie").split(";", 1)[0];
+    assert.match(bootstrap.headers.get("set-cookie"), /HttpOnly; SameSite=Strict; Path=\/panel$/);
+
+    const session = await fetch(`${base}/panel/session`, { headers: { cookie } });
+    assert.equal(session.status, 200);
+    const { csrfToken } = await session.json();
+    const headers = {
+      cookie,
+      origin: base,
+      "content-type": "application/json",
+      "x-csrf-token": csrfToken,
+      "x-request-id": "11111111-1111-4111-8111-111111111111",
+    };
+    const first = await fetch(`${base}/panel/invoke`, { method: "POST", headers, body: JSON.stringify({ command: "presence.mode", args: { mode: "always" } }) });
+    assert.equal(first.status, 200, await first.text());
+    const second = await fetch(`${base}/panel/invoke`, { method: "POST", headers, body: JSON.stringify({ command: "presence.mode", args: { mode: "never" } }) });
+    assert.equal(second.status, 200);
+    assert.equal((await second.json()).value.calls, 1);
+    assert.equal(calls, 1);
+
+    const badOrigin = await fetch(`${base}/panel/invoke`, { method: "POST", headers: { ...headers, origin: "http://localhost:" + port }, body: "{}" });
+    assert.equal(badOrigin.status, 403);
+    const badHost = await new Promise((resolve, reject) => {
+      const req = http.request({ hostname: "127.0.0.1", port, path: "/panel/", headers: { host: `localhost:${port}` } }, resolve);
+      req.on("error", reject);
+      req.end();
+    });
+    assert.equal(badHost.statusCode, 421);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
   }
 });

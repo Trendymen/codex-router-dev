@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import http from "node:http";
 import { createHash, randomUUID } from "node:crypto";
 import {
@@ -17,6 +17,7 @@ import {
   secretEqual,
 } from "./caller-auth.mjs";
 import { handlePanelRequest, isPanelRoute } from "./desktop-panel.mjs";
+import { createPanelSessionStore, panelSecurityHeaders, validatePanelRequest } from "./panel-sessions.mjs";
 import { handleGeminiRequest, isGeminiRoute } from "./gemini-surface.mjs";
 import {
   applyKeepAliveTimeouts,
@@ -175,6 +176,7 @@ const CATALOG_PATH =
 const INTERNAL_KEY =
   process.env.CODEX_ROUTER_INTERNAL_KEY || process.env.KIMI_INTERNAL_KEY;
 const CALLER_KEY = process.env.CODEX_ROUTER_CALLER_KEY;
+const PANEL_SESSIONS = createPanelSessionStore();
 const QUIET =
   process.env.CODEX_ROUTER_QUIET === "1" || process.env.KIMI_PROXY_QUIET === "1";
 // Kill switch for the zero-prompt-token substitution (#95). It is on because a
@@ -2300,6 +2302,20 @@ function writeIdleNoProviderError(response) {
   });
 }
 
+const NODE_ROUTE_REQUIRED_FIELDS = Object.freeze([
+  "slug", "provider", "upstreamModel", "effectiveTransport", "toolDialect",
+  "requestProfile", "reasoningDisplayMode", "declaredFinalReasoningShape",
+  "effectiveFinalReasoningShape", "rolloutState", "purpose",
+]);
+function validNodeRouteSnapshot(document, route, slug) {
+  if (!document || typeof document !== "object" || Array.isArray(document) || document.version !== 1 || !Array.isArray(document.routes)) return false;
+  if (!route || typeof route !== "object" || Array.isArray(route)) return false;
+  if (!NODE_ROUTE_REQUIRED_FIELDS.every((field) => Object.hasOwn(route, field) && typeof route[field] === "string" && route[field].length > 0)) return false;
+  if (!["routable", "listed", "visible"].every((field) => Object.hasOwn(route, field) && typeof route[field] === "boolean")) return false;
+  if (route.slug !== slug || route.routable !== true || route.listed !== true || route.visible !== true) return false;
+  return true;
+}
+
 function readResolvedNodeRoute(slug) {
   if (!slug) return undefined;
   try {
@@ -2307,13 +2323,24 @@ function readResolvedNodeRoute(slug) {
     const route = Array.isArray(document?.routes)
       ? document.routes.find((entry) => entry?.slug === slug)
       : undefined;
-    if (!route) return undefined;
-    // node-routes.json is emitted only from resolveNodeModel(). Presence in
-    // this protected snapshot is therefore the runtime routability proof;
-    // retain the full registry descriptor for endpoint/capability fields.
-    return { ...MODEL_BY_SLUG.get(slug), ...route, routable: true, listed: true, visible: true };
+    if (!validNodeRouteSnapshot(document, route, slug)) return undefined;
+    const registered = MODEL_BY_SLUG.get(slug);
+    if (!registered) return undefined;
+    // The raw protected entry is the authorization proof. Registry metadata is
+    // merged only after the entry has proved its own version, shape, binding,
+    // and visible/listed/routable facts; never fill those facts from a stale
+    // registry row and never force a false snapshot value to true.
+    return { ...registered, ...route };
   } catch {
     return undefined;
+  }
+}
+
+function nodeRouteSnapshotPresent() {
+  try {
+    return existsSync(NODE_ROUTES_PATH);
+  } catch {
+    return false;
   }
 }
 
@@ -2695,7 +2722,7 @@ async function handleResponses(request, response, requestUrl) {
       return;
     }
 
-    if (route && !resolvedNodeRoute && process.env.CODEX_ROUTER_DIRECT_DISPATCH !== "0") {
+    if (route && !resolvedNodeRoute && (process.env.CODEX_ROUTER_DIRECT_DISPATCH !== "0" || nodeRouteSnapshotPresent())) {
       const safe = routerError("provider_not_available_in_node_build");
       writeJson(response, safe.status, safe.body);
       recordUsageEvent({
@@ -3584,9 +3611,46 @@ async function handleRequest(request, response) {
   }
   requestUrl.pathname = route;
 
+  if (request.method === "POST" && (route === "/panel-sessions" || route === "/panel-sessions/revoke")) {
+    try {
+      validatePanelRequest(request, { port: LISTEN_PORT, method: "POST", json: true, requireRequestId: false });
+      const authorization = request.headers.authorization;
+      const presented = typeof authorization === "string" && /^Bearer\s+(.+)$/i.exec(authorization)?.[1];
+      if (!secretEqual(presented || "", CALLER_KEY || "")) {
+        for (const [name, value] of Object.entries(panelSecurityHeaders())) response.setHeader(name, value);
+        writeJson(response, 401, { error: { type: "authentication_error", message: "The caller capability is invalid." } });
+        return;
+      }
+      if (route === "/panel-sessions/revoke") {
+        PANEL_SESSIONS.revokeAll();
+        for (const [name, value] of Object.entries(panelSecurityHeaders())) response.setHeader(name, value);
+        response.writeHead(204);
+        response.end();
+        return;
+      }
+      const bootstrapBody = await readRequestBody(request);
+      if (bootstrapBody.length > 0) {
+        const parsed = JSON.parse(bootstrapBody.toString("utf8"));
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw Object.assign(new Error("invalid panel bootstrap body"), { code: "panel_invalid_request" });
+      }
+      const result = PANEL_SESSIONS.mintNonce();
+      for (const [name, value] of Object.entries(panelSecurityHeaders())) response.setHeader(name, value);
+      writeJson(response, 200, result);
+    } catch (error) {
+      const status = error?.status || (error?.code === "panel_host_invalid" ? 421 : error?.code === "panel_peer_invalid" ? 403 : error?.code === "panel_method_invalid" ? 405 : error?.code === "panel_content_type_invalid" ? 415 : 400);
+      for (const [name, value] of Object.entries(panelSecurityHeaders())) response.setHeader(name, value);
+      writeJson(response, status, { error: { type: "router_error", code: error?.code || "panel_invalid_request", message: "The panel bootstrap request is invalid.", param: null } });
+    }
+    return;
+  }
+
   // Behind the caller capability, like every other local endpoint: the panel
   // reads the same data the tray does, so it is gated the same way.
-  if (isPanelRoute(route) && (await handlePanelRequest(request, response, route, { writeJson }))) {
+  if (isPanelRoute(route) && (await handlePanelRequest(request, response, route, {
+    writeJson,
+    policy: { port: LISTEN_PORT },
+    sessionStore: PANEL_SESSIONS,
+  }))) {
     return;
   }
 

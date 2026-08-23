@@ -754,6 +754,24 @@ test("experimental authorization is proof-gated before the direct-dispatch trans
       expectedStatus: 404,
     });
     await exercise({
+      name: "malformed slug-only route is not authorization",
+      legacyKillSwitch: true,
+      nodeRoutes: [{ slug: canary.slug }],
+      expectedStatus: 404,
+    });
+    await exercise({
+      name: "wrong-type route authorization facts are rejected",
+      legacyKillSwitch: true,
+      nodeRoutes: [{ ...resolved, visible: "true" }],
+      expectedStatus: 404,
+    });
+    await exercise({
+      name: "stale hidden route authorization facts are rejected",
+      legacyKillSwitch: true,
+      nodeRoutes: [{ ...resolved, visible: false }],
+      expectedStatus: 404,
+    });
+    await exercise({
       name: "kill switch with stale route and mismatched proof",
       legacyKillSwitch: true,
       nodeRoutes: [resolved],

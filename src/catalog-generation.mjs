@@ -101,7 +101,9 @@ const ROUTE_SNAPSHOT_SCHEMA = Object.freeze({
         properties: {
           slug: { type: "string" }, provider: { type: "string" }, upstreamModel: { type: "string" },
           effectiveTransport: { type: "string" }, toolDialect: { type: "string" }, requestProfile: { type: "string" },
-          reasoningDisplayMode: { type: "string" }, effectiveFinalReasoningShape: { type: "string" }, purpose: { type: "string" },
+          declaredFinalReasoningShape: { type: "string" }, reasoningDisplayMode: { type: "string" }, effectiveFinalReasoningShape: { type: "string" },
+          rolloutState: { type: "string" }, purpose: { type: "string" },
+          routable: { type: "boolean" }, listed: { type: "boolean" }, visible: { type: "boolean" },
         },
       },
     },

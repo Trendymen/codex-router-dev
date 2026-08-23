@@ -71,9 +71,14 @@ function route(model) {
     effectiveTransport: model.effectiveTransport,
     toolDialect: model.toolDialect,
     requestProfile: model.requestProfile,
+    ...(model.declaredFinalReasoningShape === undefined ? {} : { declaredFinalReasoningShape: model.declaredFinalReasoningShape }),
     reasoningDisplayMode: model.reasoningDisplayMode,
     effectiveFinalReasoningShape: model.effectiveFinalReasoningShape,
+    ...(model.rolloutState === undefined ? {} : { rolloutState: model.rolloutState }),
     purpose: model.purpose,
+    ...(model.routable === undefined ? {} : { routable: model.routable }),
+    ...(model.listed === undefined ? {} : { listed: model.listed }),
+    ...(model.visible === undefined ? {} : { visible: model.visible }),
   };
 }
 

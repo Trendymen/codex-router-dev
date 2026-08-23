@@ -947,7 +947,10 @@ function main() {
       slug: model.slug, provider: model.provider, upstreamModel: model.upstreamModel,
       effectiveTransport: model.effectiveTransport, toolDialect: model.toolDialect,
       requestProfile: model.requestProfile, reasoningDisplayMode: model.reasoningDisplayMode,
-      effectiveFinalReasoningShape: model.effectiveFinalReasoningShape, purpose: model.purpose,
+      declaredFinalReasoningShape: model.declaredFinalReasoningShape,
+      effectiveFinalReasoningShape: model.effectiveFinalReasoningShape,
+      rolloutState: model.rolloutState, purpose: model.purpose,
+      routable: model.routable, listed: model.listed, visible: model.visible,
     })) };
     const visibleMerged = {
       models: merged.map((model) => ({
