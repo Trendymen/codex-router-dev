@@ -12,6 +12,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { desktopCommandDefinitions, runDesktopCommand, sourceRoot, trustedProtectedContext } from "./desktop-commands.mjs";
+import { buildCapabilityManifest } from "./capability-manifest.mjs";
 import {
   canonicalArgumentsHash,
   createPanelSessionStore,
@@ -51,30 +52,80 @@ const ASSETS = new Map([
 // else, so presenting that one function is the whole port. Injected rather
 // than shipped as a file in apps/desktop/ui, because that directory belongs to
 // the shells that load it from disk.
+const PANEL_MANIFEST = buildCapabilityManifest();
+const PANEL_MANIFEST_JSON = JSON.stringify(PANEL_MANIFEST).replaceAll("<", "\\u003c");
 const BRIDGE = `<script>
+window.__CODEX_ROUTER_PANEL__ = true;
+window.__CODEX_ROUTER_MANIFEST__ = ${PANEL_MANIFEST_JSON};
 let __panelCsrf;
+const __panelResults = new Map();
+const __panelInFlight = new Map();
+const __panelCommandMetadata = new Map((window.__CODEX_ROUTER_MANIFEST__.commands || []).map((item) => [item.name, item]));
 async function __panelCsrfToken() {
   if (!__panelCsrf) __panelCsrf = fetch("./session", { credentials: "same-origin" }).then(async (response) => {
     const payload = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(payload?.error?.message || "The panel session is unavailable.");
+    if (typeof payload.csrfToken !== "string") throw new Error("The panel session is unavailable.");
     return payload.csrfToken;
   });
   return __panelCsrf;
 }
+function __panelRequestId() {
+  if (!globalThis.crypto?.randomUUID) throw new Error("The browser does not provide request UUIDs.");
+  return globalThis.crypto.randomUUID();
+}
+async function __panelJson(path, { requestId, confirmationToken, body } = {}) {
+  const csrfToken = await __panelCsrfToken();
+  const headers = {
+    "content-type": "application/json",
+    "x-csrf-token": csrfToken,
+    "x-request-id": requestId,
+  };
+  if (confirmationToken) headers["x-confirmation-token"] = confirmationToken;
+  const response = await fetch(path, {
+    method: "POST",
+    credentials: "same-origin",
+    headers,
+    body: JSON.stringify(body || {}),
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(payload?.error?.message || "The router command failed.");
+  return payload;
+}
+async function __panelInvoke(command, args) {
+  const requestId = __panelRequestId();
+  if (__panelResults.has(requestId)) return __panelResults.get(requestId);
+  if (__panelInFlight.has(requestId)) return __panelInFlight.get(requestId);
+  const promise = (async () => {
+    const metadata = __panelCommandMetadata.get(command);
+    let confirmationToken;
+    if (metadata?.confirmation) {
+      const confirmation = await __panelJson("./confirmations", {
+        requestId: __panelRequestId(),
+        body: { command, args: args || {} },
+      });
+      confirmationToken = confirmation.token;
+    }
+    const payload = await __panelJson("./invoke", {
+      requestId,
+      confirmationToken,
+      body: { command, args: args || {} },
+    });
+    return payload.value;
+  })();
+  __panelInFlight.set(requestId, promise);
+  try {
+    const result = await promise;
+    __panelResults.set(requestId, result);
+    while (__panelResults.size > 64) __panelResults.delete(__panelResults.keys().next().value);
+    return result;
+  } finally {
+    __panelInFlight.delete(requestId);
+  }
+}
 window.__TAURI__ = {
   core: {
-    invoke: async (command, args) => {
-      const csrfToken = await __panelCsrfToken();
-      const response = await fetch("./invoke", {
-        method: "POST",
-        credentials: "same-origin",
-        headers: { "content-type": "application/json", "x-csrf-token": csrfToken, "x-request-id": crypto.randomUUID() },
-        body: JSON.stringify({ command, args: args || {} }),
-      });
-      const payload = await response.json().catch(() => ({}));
-      if (!response.ok) throw new Error(payload?.error?.message || "The router command failed.");
-      return payload.value;
-    },
+    invoke: __panelInvoke,
   },
 };
 </script>
@@ -94,24 +145,6 @@ export function isPanelRoute(route) {
   );
 }
 
-// Read commands remain available to the legacy direct handler used by the
-// embedded shell tests. A browser request routed through the session gate uses
-// the full canonical table only after cookie, CSRF, replay, and confirmation
-// validation have completed.
-const CANONICAL_PANEL_COMMANDS = new Set([
-  "lifecycle.status",
-  "native.account-usage",
-  "usage.provider",
-  "credential.status",
-  "catalog.render-snippet",
-  "cc-switch.snippet",
-]);
-
-export function panelCommandAllowed(command, { readOnly = true } = {}) {
-  if (readOnly) return CANONICAL_PANEL_COMMANDS.has(command);
-  return desktopCommandDefinitions().has(command);
-}
-
 // Commands the shells answer from their own process rather than the CLI. A
 // browser tab has no window to show, hide or quit and cannot float an overlay
 // above other applications, so those resolve to the honest answer instead of
@@ -122,18 +155,9 @@ const LOCAL = {
     platform: process.platform,
     island: false,
     shell: "web",
-    // What this surface will and will not run, said out loud. The UI could
-    // infer it from `shell`, but then two places would encode the same policy
-    // and only one of them is the gate. Both lists are the real ones -- a
-    // command in neither is precisely what /panel/invoke answers 403 for -- so
-    // a control the UI leaves live cannot disagree with what the panel permits.
-    // The tray and the Electron shell advertise nothing here and keep the full
-    // table, which is why this field is additive rather than a mode switch.
-    capabilities: {
-      readOnly: true,
-      allowedCommands: [...CANONICAL_PANEL_COMMANDS],
-      localCommands: Object.keys(LOCAL),
-    },
+    // The browser renders only this manifest. It never infers support from the
+    // host name or keeps an allowlist of its own.
+    capabilityManifest: PANEL_MANIFEST,
   }),
   desktop_settings: () => ({ islandEnabled: false, islandExpanded: false }),
   // The router is answering this request, so it is by definition reachable.
@@ -188,7 +212,11 @@ function sendStoredResult(response, writeJson, result, { logout = false } = {}) 
 }
 
 function commandResult(result) {
-  if (result?.ok !== false) return { status: 200, payload: { value: result?.ok === true ? result.value : result } };
+  if (result?.ok !== false) {
+    const payload = { value: result?.ok === true ? result.value : result };
+    if (result?.meta?.protected === true) payload.meta = result.meta;
+    return { status: 200, payload };
+  }
   const code = result?.error?.code;
   const safe = Object.hasOwn(ERROR_DEFINITIONS, code) ? routerError(code) : routerError("invalid_command_arguments");
   return { status: safe.status, payload: safe.body };
@@ -418,72 +446,7 @@ export async function handlePanelRequest(request, response, route, {
     return true;
   }
 
-  if (route !== "/panel/invoke") return false;
-  if (request.method !== "POST") {
-    applyHeaders(response);
-    writeJson(response, 405, { error: { type: "invalid_request", message: "Use POST." } });
-    return true;
-  }
-
-  let command;
-  let args;
-  try {
-    ({ command, args } = JSON.parse(await readBody(request)) || {});
-  } catch {
-    applyHeaders(response);
-    writeJson(response, 400, {
-      error: { type: "invalid_request", message: "The panel request was not valid JSON." },
-    });
-    return true;
-  }
-
-  const local = panelLocalCommand(command);
-  if (local) {
-    writeJson(response, 200, { value: local() });
-    return true;
-  }
-
-  if (!panelCommandAllowed(command)) {
-    applyHeaders(response);
-    writeJson(response, 403, {
-      error: {
-        type: "invalid_request",
-        message: `${command} is not available from the browser panel.`,
-      },
-    });
-    return true;
-  }
-
-  try {
-    const canonicalArgs = command === "usage.provider" && !args?.provider ? {} : args ?? {};
-    const definition = desktopCommandDefinitions().get(command);
-    if (!definition) {
-      applyHeaders(response);
-      writeJson(response, 403, { error: { type: "invalid_request", message: `${command} is not available from the browser panel.` } });
-      return true;
-    }
-    // This handler is reached only after router.mjs has stripped and verified
-    // the caller-capability path.  The trusted Symbol is constructed here;
-    // `args` can never select or forge the protected channel.
-    const context = definition.resultKind === "protected-text"
-      ? trustedProtectedContext({ root })
-      : { root };
-    const result = await runCommand(command, canonicalArgs, context);
-    if (result?.ok === false) {
-      applyHeaders(response);
-      writeJson(response, 502, { error: result.error });
-      return true;
-    }
-    applyHeaders(response);
-    writeJson(response, 200, {
-      value: result?.ok === true ? result.value : result,
-      ...(result?.meta?.protected ? { meta: result.meta } : {}),
-    });
-  } catch (error) {
-    applyHeaders(response);
-    writeJson(response, 502, {
-      error: { type: "upstream_error", message: error?.message || "The router command failed." },
-    });
-  }
-  return true;
+  // A panel invocation without a write-session policy is a configuration bug,
+  // not a legacy compatibility path. The router always supplies `policy`.
+  return false;
 }

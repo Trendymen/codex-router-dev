@@ -246,6 +246,167 @@ export function toolResultAgingChecked(aging) {
   return aging?.enabled === true;
 }
 
+// The browser is deliberately a manifest consumer.  It must not grow a
+// second command list in markup or event handlers: the Node snapshot is the
+// only authority for which sections and actions exist on this surface.
+const BROWSER_SCHEMA_VERSION = 1;
+const COMMAND_ID = /^[a-z0-9][a-z0-9._-]*$/;
+const SECRET_FIELD = /(?:api.?key|caller.?key|access.?token|authorization|csrf|password|secret|bearer|credential|cookie|session.?id|confirmation|bootstrap|nonce|token)/i;
+
+function browserManifestSupported(manifest) {
+  return Boolean(manifest && typeof manifest === "object" && manifest.capabilitySchemaVersion === BROWSER_SCHEMA_VERSION);
+}
+
+export function readOnlyIncompatibility(manifest) {
+  const reported = Number.isSafeInteger(manifest?.capabilitySchemaVersion)
+    ? manifest.capabilitySchemaVersion
+    : "unknown";
+  return {
+    id: "capability-compatibility",
+    title: "Read-only compatibility",
+    description: `Capability schema ${reported} is not supported for browser mutations.`,
+    readOnly: true,
+    browser: true,
+    nodeCommands: [],
+    commands: [],
+  };
+}
+
+function commandMetadata(manifest) {
+  const result = new Map();
+  for (const item of Array.isArray(manifest?.commands) ? manifest.commands : []) {
+    if (item && typeof item.name === "string" && COMMAND_ID.test(item.name)) result.set(item.name, item);
+  }
+  return result;
+}
+
+function normalizedCommand(manifest, name) {
+  const source = commandMetadata(manifest).get(name) || {};
+  return {
+    name,
+    mutating: source.mutating === true,
+    confirmation: source.confirmation === true,
+    quotaWarning: source.quotaWarning === true,
+    protectedInput: source.protectedInput === true,
+    resultKind: source.resultKind || "json",
+  };
+}
+
+/**
+ * Return the browser-visible capability sections from a versioned snapshot.
+ * Unknown major versions intentionally collapse to one read-only message.
+ */
+export function visibleSections(manifest) {
+  if (!browserManifestSupported(manifest)) return [readOnlyIncompatibility(manifest)];
+  return (Array.isArray(manifest.capabilities) ? manifest.capabilities : [])
+    .filter((item) => item && item.browser)
+    .map((item) => ({
+      ...item,
+      readOnly: false,
+      commands: (Array.isArray(item.nodeCommands) ? item.nodeCommands : [])
+        .filter((name) => typeof name === "string" && COMMAND_ID.test(name))
+        .map((name) => normalizedCommand(manifest, name)),
+    }));
+}
+
+/** Return canonical command IDs advertised by all browser-visible sections. */
+export function browserCommandIds(manifest) {
+  return [...new Set(visibleSections(manifest).flatMap((section) => section.commands.map(({ name }) => name)))];
+}
+
+function html(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+}
+
+function commandLabel(name) {
+  return name
+    .split(".")
+    .map((part) => part.replaceAll("-", " "))
+    .join(" · ");
+}
+
+function argumentMarkup(command) {
+  const fields = [];
+  const name = command.name;
+  const credentialProvider = name === "credential.status" || name === "credential.set" || name === "credential.remove";
+  const hasProvider = credentialProvider || name === "provider.enable" || name === "usage.provider";
+  const hasSlug = /^(model\.visibility|model\.canary|picker\.set|subagents\.model|subagents\.verify|protocol-proof\.(?:status|verify|revoke)|usage\.model)$/.test(name);
+  if (credentialProvider) fields.push('<select data-argument="provider" aria-label="Provider"><option value="deepseek">DeepSeek</option><option value="qwen-plan">Qwen Plan</option></select>');
+  else if (hasProvider) fields.push('<input data-argument="provider" type="text" autocomplete="off" spellcheck="false" placeholder="Provider" aria-label="Provider" />');
+  if (hasSlug) fields.push('<input data-argument="slug" type="text" autocomplete="off" spellcheck="false" placeholder="Model slug" aria-label="Model slug" />');
+  if (name === "vision.pull") fields.push('<input data-argument="tag" type="text" autocomplete="off" spellcheck="false" placeholder="Model tag" aria-label="Model tag" />');
+  if (name === "vision.engine") fields.push('<input data-argument="engine" type="text" autocomplete="off" spellcheck="false" placeholder="auto" aria-label="Vision engine" value="auto" />');
+  if (name === "vision.effort") fields.push('<input data-argument="effort" type="text" autocomplete="off" spellcheck="false" placeholder="default" aria-label="Vision effort" value="default" />');
+  if (name === "presence.mode") fields.push('<select data-argument="mode" aria-label="Presence mode"><option value="always">always</option><option value="follow-codex">follow-codex</option><option value="follow-clients">follow-clients</option></select>');
+  if (name === "subagents.mode") fields.push('<select data-argument="mode" aria-label="Subagent mode"><option value="proven">proven</option><option value="selected">selected</option><option value="all">all</option></select>');
+  if (name === "subagents.selection") fields.push('<select data-argument="selection" aria-label="Subagent selection"><option value="select-all">select-all</option><option value="unselect-all">unselect-all</option></select>');
+  if (name === "tool-result-aging.ttl") fields.push('<input data-argument="days" type="number" min="0" step="1" placeholder="days" aria-label="Age days" />');
+  if (name === "tool-result-aging.purge") fields.push('<label><input data-argument="expiredOnly" type="checkbox" /> Expired only</label>');
+  if (["provider.enable", "model.canary", "subagents.model"].includes(name)) fields.push('<label><input data-argument="enabled" type="checkbox" checked /> Enabled</label>');
+  if (name === "model.visibility" || name === "picker.set") fields.push('<label><input data-argument="visible" type="checkbox" checked /> Visible</label>');
+  if (command.protectedInput) {
+    // This is the only browser field that may carry a credential. It never
+    // becomes part of serialized panel state; the bridge peels it off at the
+    // trusted boundary and the action handler clears it after submit.
+    fields.push('<input class="capability-secret" type="password" autocomplete="off" spellcheck="false" data-protected-field="apiKey" aria-label="Credential" />');
+  }
+  return fields.join("");
+}
+
+function actionMarkup(command) {
+  const attributes = [
+    `data-command="${html(command.name)}"`,
+    `data-confirmation="${command.confirmation ? "server" : "none"}"`,
+    `data-quota-warning="${command.quotaWarning ? "true" : "false"}"`,
+    `data-protected-input="${command.protectedInput ? "true" : "false"}"`,
+    `data-result-kind="${html(command.resultKind)}"`,
+  ].join(" ");
+  const detail = [
+    command.confirmation ? "Server confirmation required" : "",
+    command.quotaWarning ? "May consume provider quota" : "",
+    command.protectedInput ? "Protected input" : "",
+  ].filter(Boolean).join(" · ");
+  return `<div class="capability-action" data-capability-action="true"><button type="button" ${attributes}>${html(commandLabel(command.name))}</button>${argumentMarkup(command)}${detail ? `<small class="capability-detail">${html(detail)}</small>` : ""}${command.resultKind === "protected-text" ? '<pre class="capability-result" data-protected-output="true" data-result-kind="protected-text" hidden></pre>' : '<output class="capability-result" data-result-kind="json" hidden></output>'}</div>`;
+}
+
+/**
+ * Produce the browser workspace markup from the received manifest. This is
+ * intentionally a pure function so source/unit tests can prove the inverse
+ * capability contract without starting a browser or a router.
+ */
+export function renderCapabilitySurface(manifest) {
+  return visibleSections(manifest).map((section) => {
+    if (section.readOnly) {
+      return `<section class="capability-section capability-incompatible" data-capability-id="${html(section.id)}" data-read-only="true"><h2>${html(section.title)}</h2><p>${html(section.description)}</p></section>`;
+    }
+    const commands = section.commands.map(actionMarkup).join("");
+    return `<section class="capability-section" data-capability-id="${html(section.id)}"><header><p class="eyebrow">Capability</p><h2>${html(section.id)}</h2><p>${html(section.browser === "full" ? "Available on this browser session." : section.browser === "protected" ? "Protected channel actions." : "Write-session actions with server policy.")}</p></header><div class="capability-actions">${commands}</div></section>`;
+  }).join("");
+}
+
+// UI state serialization is used only for in-memory diagnostics and tests. It
+// is intentionally conservative: a secret-looking field is omitted before a
+// caller can hand the result to any future snapshot, log, or history helper.
+export function serializeBrowserState(value, state = { seen: new WeakSet(), depth: 0 }) {
+  if (value === null || typeof value === "boolean" || typeof value === "number") return Number.isFinite(value) ? value : undefined;
+  if (typeof value === "string") return value.length <= 64 * 1024 ? value : undefined;
+  if (!value || typeof value !== "object" || state.seen.has(value) || state.depth > 16) return undefined;
+  state.seen.add(value);
+  if (Array.isArray(value)) return value.map((item) => serializeBrowserState(item, { ...state, depth: state.depth + 1 })).filter((item) => item !== undefined);
+  const output = {};
+  for (const key of Object.keys(value)) {
+    if (SECRET_FIELD.test(key)) continue;
+    const item = serializeBrowserState(value[key], { ...state, depth: state.depth + 1 });
+    if (item !== undefined) output[key] = item;
+  }
+  return output;
+}
+
 function smoothPath(points) {
   if (!points.length) return "";
   if (points.length === 1) return `M ${points[0].x.toFixed(2)} ${points[0].y.toFixed(2)}`;

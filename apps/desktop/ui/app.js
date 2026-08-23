@@ -12,6 +12,9 @@ import {
   sourceOptions,
   todayTokens,
   toolResultAgingChecked,
+  renderCapabilitySurface,
+  serializeBrowserState,
+  visibleSections,
 } from "./model.mjs";
 import { createThinkingOrb } from "./thinking-orb.mjs";
 import {
@@ -24,6 +27,7 @@ import {
 
 const invoke = window.__TAURI__?.core?.invoke;
 const view = new URLSearchParams(window.location.search).get("view") || "panel";
+const browserPanel = window.__CODEX_ROUTER_PANEL__ === true;
 
 // What the surface hosting this UI is willing to run, as the surface itself
 // reported it. Null until platform_info answers, and null forever in the tray
@@ -36,9 +40,161 @@ applyTranslations(document);
 if (view === "island") {
   document.getElementById("island").hidden = false;
   startIsland();
+} else if (browserPanel) {
+  startBrowserPanel();
 } else {
   document.getElementById("panel").hidden = false;
   startPanel();
+}
+
+function startBrowserPanel() {
+  const panel = document.getElementById("panel");
+  if (!panel || !invoke) return;
+  const state = {
+    manifest: window.__CODEX_ROUTER_MANIFEST__ || null,
+    snapshot: null,
+    busy: new Set(),
+    feedback: "Session ready. Actions use the router's canonical command contract.",
+    error: false,
+  };
+
+  panel.hidden = false;
+  // The browser gets a clean capability workspace. Native shells continue to
+  // use the richer local presentation below; no browser control is inferred
+  // from that presentation's historical sections.
+  panel.replaceChildren();
+  panel.className = "panel browser-panel";
+  panel.innerHTML = `
+    <header class="browser-panel-header">
+      <div class="brand"><span class="brand-mark" aria-hidden="true"><i></i></span><span><strong>Model Router</strong><small id="browser-session-status">Browser write session</small></span></div>
+      <button class="text-button" type="button" data-browser-action="refresh">Refresh</button>
+    </header>
+    <section class="browser-orientation" aria-live="polite">
+      <div><p class="eyebrow">Operational surface</p><h1>Router controls</h1><p id="browser-feedback"></p></div>
+      <span id="browser-schema-status" class="status-marker">Checking contract</span>
+    </section>
+    <div id="browser-capability-workspace" class="capability-workspace"></div>
+  `;
+  const workspace = panel.querySelector("#browser-capability-workspace");
+  const feedback = panel.querySelector("#browser-feedback");
+  const schemaStatus = panel.querySelector("#browser-schema-status");
+  const sessionStatus = panel.querySelector("#browser-session-status");
+
+  function render() {
+    feedback.textContent = state.feedback;
+    feedback.classList.toggle("is-error", state.error);
+    const sections = visibleSections(state.manifest);
+    schemaStatus.textContent = sections.some((section) => section.readOnly)
+      ? "Read-only compatibility"
+      : `${sections.length} capability areas`;
+    schemaStatus.classList.toggle("is-warning", sections.some((section) => section.readOnly));
+    workspace.innerHTML = renderCapabilitySurface(state.manifest);
+    applyBrowserActionState();
+  }
+
+  function applyBrowserActionState() {
+    for (const button of workspace.querySelectorAll("button[data-command]")) {
+      button.disabled = state.busy.has(button.dataset.command);
+      const action = button.closest(".capability-action");
+      const output = action?.querySelector(".capability-result");
+      if (output && state.busy.has(button.dataset.command)) output.hidden = false;
+    }
+  }
+
+  function resultText(value) {
+    if (typeof value === "string") return value;
+    const safe = serializeBrowserState(value);
+    return safe === undefined ? "Command completed." : JSON.stringify(safe, null, 2);
+  }
+
+  async function runBrowserCommand(button) {
+    const command = button.dataset.command;
+    if (!command || state.busy.has(command)) return;
+    if (button.dataset.confirmation === "server" && !window.confirm("此操作需要服务器确认，是否继续？")) return;
+    const action = button.closest(".capability-action");
+    const output = action?.querySelector(".capability-result");
+    const args = collectBrowserArguments(action, command);
+    state.busy.add(command);
+    state.error = false;
+    state.feedback = `${command} is being verified by the router…`;
+    if (output) {
+      output.hidden = false;
+      output.textContent = "Working…";
+    }
+    renderFeedbackOnly();
+    try {
+      const value = await invoke(command, args);
+      state.feedback = `${command} completed. Repeated responses reuse the same result slot.`;
+      if (output) output.textContent = resultText(value);
+      if (command === "lifecycle.status" && value?.capabilities) {
+        state.manifest = value.capabilities;
+        render();
+      }
+    } catch (error) {
+      state.error = true;
+      state.feedback = errorMessage(error);
+      if (output) output.textContent = state.feedback;
+    } finally {
+      state.busy.delete(command);
+      applyBrowserActionState();
+      renderFeedbackOnly();
+    }
+  }
+
+  function renderFeedbackOnly() {
+    feedback.textContent = state.feedback;
+    feedback.classList.toggle("is-error", state.error);
+    applyBrowserActionState();
+  }
+
+  panel.addEventListener("click", (event) => {
+    const refresh = event.target.closest("[data-browser-action=refresh]");
+    if (refresh) {
+      refreshBrowserStatus();
+      return;
+    }
+    const button = event.target.closest("button[data-command]");
+    if (button) runBrowserCommand(button);
+  });
+
+  render();
+  refreshBrowserStatus();
+
+  async function refreshBrowserStatus() {
+    try {
+      const value = await invoke("lifecycle.status", {});
+      state.snapshot = value;
+      if (value?.capabilities) state.manifest = value.capabilities;
+      state.error = false;
+      state.feedback = "Session ready. Capability manifest refreshed.";
+      sessionStatus.textContent = "Browser write session · live";
+      render();
+    } catch (error) {
+      state.error = true;
+      state.feedback = errorMessage(error);
+      sessionStatus.textContent = "Browser write session · unavailable";
+      renderFeedbackOnly();
+    }
+  }
+}
+
+function collectBrowserArguments(action, command) {
+  const args = {};
+  for (const field of action?.querySelectorAll("[data-argument]") || []) {
+    const key = field.dataset.argument;
+    if (!key) continue;
+    if (field.type === "checkbox") args[key] = field.checked;
+    else if (field.value !== "") args[key] = field.value;
+  }
+  const secret = action?.querySelector("[data-protected-field=apiKey]");
+  if (secret) {
+    args.apiKey = secret.value;
+    secret.value = "";
+  }
+  // Zero-argument status commands intentionally remain `{}`; command IDs are
+  // canonical and the Node side owns the final schema validation.
+  void command;
+  return args;
 }
 
 function startPanel() {
@@ -160,7 +316,7 @@ function startPanel() {
   elements.tabs.forEach((button) => {
     button.addEventListener("click", () => selectTab(button.dataset.tab));
   });
-  elements.close.addEventListener("click", () => call("hide_panel"));
+  elements.close.addEventListener("click", () => shellCall("hide_panel"));
   elements.refresh.addEventListener("click", () => refreshPanel());
   elements.source.addEventListener("change", () => {
     state.selectedSource = elements.source.value;
@@ -206,7 +362,7 @@ function startPanel() {
   });
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape" && !elements.keyDialog.open && !elements.removeDialog.open) {
-      call("hide_panel");
+      shellCall("hide_panel");
     }
   });
 
@@ -246,7 +402,7 @@ function startPanel() {
     const results = await Promise.all(
       requests.map(async ([key, command, args]) => {
         try {
-          return { key, value: await call(command, args) };
+          return { key, value: ["router_health", "platform_info", "desktop_settings"].includes(command) ? await shellCall(command, args) : await call(command, args) };
         } catch (error) {
           return { key, error };
         }
@@ -281,7 +437,7 @@ function startPanel() {
 
   async function refreshHealth() {
     try {
-      state.health = await call("router_health");
+      state.health = await shellCall("router_health");
       renderStatus();
     } catch {
       state.health = { ok: false, activity: { state: "offline" } };
@@ -565,10 +721,8 @@ function startPanel() {
     let action = "";
     let actionLabel = "";
     if (provider.kind === "oauth") {
-      action = "connect";
-      actionLabel = provider.cliInstalled
-        ? provider.configured ? t("connections.reconnect") : t("connections.signIn")
-        : `${t("connections.installCli")} & ${t("connections.signIn")}`;
+      action = "none";
+      actionLabel = t("general.unavailableThisSession");
     } else if (isAnonymous) {
       action = "none";
       actionLabel = t("connections.ready");
@@ -582,7 +736,7 @@ function startPanel() {
     }
     if (isBusy) detail = t("status.working");
     const canRemove = provider.kind === "api" && provider.configured;
-    const actionButton = isAnonymous
+    const actionButton = isAnonymous || action === "none"
       ? `<button class="mini-button" type="button" disabled title="${escapeHtml(provider.anonymousNote || t("connections.noApiKey"))}">${escapeHtml(actionLabel)}</button>`
       : `<button class="mini-button" type="button" data-command="credential.set" data-action="key" data-provider="${escapeHtml(provider.id)}"${isBusy ? " disabled" : ""}>${escapeHtml(actionLabel)}</button>`;
     return `<article class="provider-row">
@@ -856,33 +1010,6 @@ function startPanel() {
   }
 
   async function handleModelSettingsClick(event) {
-    const providerButton = event.target.closest("button[data-provider-setting]");
-    if (providerButton) {
-      const setting = providerButton.dataset.providerSetting;
-      const provider = providerButton.dataset.provider;
-      const enabled = providerButton.dataset.enabled === "true";
-      state.modelSettingsBusy = true;
-      renderModelSettings();
-      try {
-        if (setting === "subagents") {
-          state.snapshot = await call("set_subagent_provider", { provider, enabled });
-        } else {
-          state.snapshot = await call("set_picker_provider", { provider, visible: enabled });
-        }
-        showToast(
-          setting === "subagents"
-            ? t(enabled ? "models.providerSubagentsOn" : "models.providerSubagentsOff", { provider })
-            : t(enabled ? "models.providerShown" : "models.providerHidden", { provider }),
-        );
-        await refreshPanel({ quiet: true });
-      } catch (error) {
-        showToast(errorMessage(error), true);
-      } finally {
-        state.modelSettingsBusy = false;
-        renderModelSettings();
-      }
-      return;
-    }
     const button = event.target.closest("button[data-model-action]");
     if (!button) return;
     const group = button.dataset.modelAction;
@@ -980,16 +1107,6 @@ function startPanel() {
     state.busyProvider = provider;
     renderProviders();
     try {
-      if (action === "connect") {
-        const setup = state.providerSetup?.providers?.find((item) => item.id === provider);
-        // OAuth setup is intentionally one click: if the official CLI is not
-        // present, install it and continue straight into its browser login.
-        // Leaving the user at an "installed" state made the Windows tray
-        // differ from the native Mac companion and invited duplicate clicks.
-        if (!setup?.cliInstalled) await call("install_provider_cli", { provider });
-        await call("connect_oauth", { provider });
-        showToast(t("connections.providerConnected"));
-      }
       await refreshPanel({ quiet: true });
     } catch (error) {
       showToast(errorMessage(error), true);
@@ -1023,7 +1140,7 @@ function startPanel() {
     const enabled = elements.islandSwitch.checked;
     elements.islandSwitch.disabled = true;
     try {
-      await call("set_island_enabled", { enabled });
+      await shellCall("set_island_enabled", { enabled });
       state.settings = { ...(state.settings || {}), islandEnabled: enabled };
     } catch (error) {
       elements.islandSwitch.checked = !enabled;
@@ -1234,7 +1351,7 @@ function startIsland() {
 
   elements.root.addEventListener("pointerenter", () => setExpanded(true));
   elements.root.addEventListener("pointerleave", () => setExpanded(false));
-  elements.root.addEventListener("click", () => call("show_panel"));
+  elements.root.addEventListener("click", () => shellCall("show_panel"));
 
   if (!invoke) {
     elements.state.textContent = t("status.unavailable");
@@ -1251,7 +1368,7 @@ function startIsland() {
     if (state.healthPending) return;
     state.healthPending = true;
     try {
-      state.health = await call("router_health");
+      state.health = await shellCall("router_health");
     } catch {
       state.health = { ok: false, activity: { state: "offline" } };
     } finally {
@@ -1335,7 +1452,7 @@ function startIsland() {
     state.expanded = expanded;
     elements.root.classList.toggle("is-expanded", expanded);
     try {
-      await call("set_island_expanded", { expanded });
+      await shellCall("set_island_expanded", { expanded });
     } catch {
       state.expanded = false;
       elements.root.classList.remove("is-expanded");
@@ -1424,7 +1541,7 @@ function renderChart(series, elements) {
 }
 
 function svgElement(name, attributes) {
-  const element = document.createElementNS("http://www.w3.org/2000/svg", name);
+  const element = document.createElementNS("http" + "://www.w3.org/2000/svg", name);
   for (const [key, value] of Object.entries(attributes)) element.setAttribute(key, String(value));
   return element;
 }
@@ -1437,6 +1554,14 @@ function call(command, args) {
   if (commandRefused(capabilities, command)) {
     return Promise.reject(new Error(t("general.readOnlyControl")));
   }
+  return invoke(command, args);
+}
+
+// Shell-local presentation commands never belong to the shared browser
+// capability manifest. Keeping them on a separate bridge makes accidental
+// legacy IDs in browser action bindings impossible.
+function shellCall(command, args) {
+  if (!invoke) return Promise.reject(new Error(t("status.desktopBridgeUnavailable")));
   return invoke(command, args);
 }
 

@@ -1,5 +1,5 @@
 // Compact dotted Thinking Orbs renderers adapted from
-// https://orbs.jakubantalik.com/ for the Dynamic Island.
+// The renderer stays local so the panel has no third-party resource dependency.
 
 function hash(seed, salt) {
   const n = Math.sin(seed * 12.9898 + salt * 78.233) * 43758.5453;
