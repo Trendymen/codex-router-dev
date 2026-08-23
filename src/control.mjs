@@ -24,6 +24,7 @@ import {
 import { presenceSnapshot } from "./presence-state.mjs";
 import { harnessSnapshotWithWeb } from "./dsh-install.mjs";
 import { USER_MODELS_PATH } from "./user-models.mjs";
+import { buildCapabilityManifest } from "./capability-manifest.mjs";
 
 // Cross-target control plane for a tray/UI (e.g. the planned pane fork). It
 // reads which registry models are enabled per target and toggles them. Toggling
@@ -395,7 +396,12 @@ async function printOverview(asJson) {
     // harness as stopped and offers to start one that is already up.
     process.stdout.write(
       `${JSON.stringify(
-        { targets, presence: presenceSnapshot(), harness: await harnessSnapshotWithWeb() },
+        {
+          targets,
+          presence: presenceSnapshot(),
+          harness: await harnessSnapshotWithWeb(),
+          capabilities: buildCapabilityManifest({ targets, presence: presenceSnapshot() }),
+        },
         null,
         2,
       )}\n`,

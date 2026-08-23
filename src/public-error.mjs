@@ -26,6 +26,10 @@ const definitions = [
   ["panel_csrf_invalid", 403, "Invalid panel mutation proof."],
   ["panel_confirmation_required", 409, "An operation-bound confirmation is required."],
   ["vision_engine_not_supported", 400, "The selected vision engine is not supported."],
+  ["command_not_supported", 404, "This desktop command is not supported."],
+  ["invalid_command_arguments", 400, "The desktop command arguments are invalid."],
+  ["protected_input_required", 400, "This credential operation requires protected input."],
+  ["capability_schema_unsupported", 409, "This capability schema is not supported for mutations."],
 ];
 
 export const ERROR_DEFINITIONS = Object.freeze(

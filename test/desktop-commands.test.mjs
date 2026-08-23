@@ -1,7 +1,16 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { COMMANDS } from "../src/desktop-commands.mjs";
+import { COMMANDS, desktopCommandDefinitions } from "../src/desktop-commands.mjs";
+
+test("canonical desktop definitions are read-only and credential scoped", () => {
+  const definitions = desktopCommandDefinitions();
+  assert.ok(definitions.has("credential.set"));
+  assert.equal(definitions.get("credential.set").protectedInput, true);
+  assert.throws(() => definitions.set("unexpected", {}), /read-only/);
+  assert.equal(definitions.has("signed-routing.enable"), false);
+  assert.equal(definitions.has("local-chat.enable"), false);
+});
 
 test("desktop local-model commands use the shared model argument", () => {
   assert.deepEqual(COMMANDS.install_local_model({ model: "gemma4:12b" }), {

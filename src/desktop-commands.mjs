@@ -8,6 +8,13 @@ import { existsSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import {
+  CAPABILITY_COMMANDS,
+  CAPABILITY_SCHEMA_VERSION,
+  isMutationCommand,
+} from "./capability-manifest.mjs";
+import { ERROR_DEFINITIONS } from "./public-error.mjs";
+
 const CONTROL_TIMEOUT_MS = 120_000;
 const CATALOG_MUTATION_TIMEOUT_MS = 330_000;
 
@@ -226,7 +233,7 @@ export function parseJson(output) {
 // Runs a command from the table end to end. Every surface calls this rather
 // than sequencing runControl itself, so "mutate, then re-read so the caller
 // paints fresh state" cannot be implemented three slightly different ways.
-export async function runDesktopCommand(command, args = {}, { root = sourceRoot() } = {}) {
+async function runLegacyDesktopCommand(command, args = {}, { root = sourceRoot() } = {}) {
   const build = COMMANDS[command];
   if (!build) throw new Error(`Unknown command: ${command}`);
   const plan = build(args ?? {});
@@ -236,4 +243,181 @@ export async function runDesktopCommand(command, args = {}, { root = sourceRoot(
   });
   if (plan.then) return parseJson(await runControl(root, plan.then));
   return output.trim() ? parseJson(output) : null;
+}
+
+const objectSchema = (properties = {}, required = []) => ({
+  type: "object",
+  additionalProperties: false,
+  properties,
+  required,
+});
+const string = (pattern = undefined) => ({ type: "string", ...(pattern ? { pattern } : {}) });
+const boolean = { type: "boolean" };
+const slug = string("^[A-Za-z0-9][A-Za-z0-9._/-]{0,255}$");
+const provider = string("^[a-z0-9][a-z0-9-]{0,63}$");
+const credentialProvider = { ...provider, enum: ["deepseek", "qwen-plan"] };
+const noArgs = objectSchema();
+
+const ARGUMENTS = {
+  "lifecycle.status": noArgs, "lifecycle.start": noArgs, "lifecycle.stop": noArgs, "lifecycle.restart": noArgs, "lifecycle.logs": noArgs,
+  "doctor.status": noArgs, "doctor.fix": noArgs, "maintenance.update": noArgs, "maintenance.rollback": noArgs,
+  "native.status": noArgs, "native.account-usage": noArgs,
+  "credential.status": objectSchema({ provider: credentialProvider }, ["provider"]),
+  "credential.set": objectSchema({ provider: credentialProvider }, ["provider"]),
+  "credential.remove": objectSchema({ provider: credentialProvider }, ["provider"]),
+  "provider.enable": objectSchema({ provider, enabled: boolean }, ["provider", "enabled"]),
+  "model.visibility": objectSchema({ slug, visible: boolean }, ["slug", "visible"]),
+  "model.canary": objectSchema({ slug, enabled: boolean }, ["slug", "enabled"]),
+  "protocol-proof.status": objectSchema({ slug }, ["slug"]),
+  "protocol-proof.verify": objectSchema({ slug }, ["slug"]),
+  "protocol-proof.revoke": objectSchema({ slug }, ["slug"]),
+  "picker.status": noArgs, "picker.set": objectSchema({ slug, visible: boolean }, ["slug", "visible"]), "picker.show-all": objectSchema({ visible: boolean }, ["visible"]),
+  "catalog.status": noArgs, "catalog.render-snippet": noArgs,
+  "subagents.status": noArgs, "subagents.mode": objectSchema({ mode: string("^(all|selected|proven)$") }, ["mode"]),
+  "subagents.model": objectSchema({ slug, enabled: boolean }, ["slug", "enabled"]),
+  "subagents.selection": objectSchema({ selection: string("^(select-all|unselect-all)$") }, ["selection"]),
+  "subagents.verify": objectSchema({ slug }, ["slug"]),
+  "failover.status": noArgs, "failover.reset": noArgs,
+  "tool-result-aging.status": noArgs, "tool-result-aging.on": noArgs, "tool-result-aging.off": noArgs,
+  "tool-result-aging.ttl": objectSchema({ days: { type: ["integer", "null"] } }, ["days"]),
+  "tool-result-aging.purge": objectSchema({ expiredOnly: boolean }, ["expiredOnly"]),
+  "usage.router": noArgs, "usage.provider": objectSchema({ provider }, ["provider"]), "usage.model": objectSchema({ slug }, ["slug"]),
+  "vision.status": noArgs, "vision.on": noArgs, "vision.off": noArgs,
+  "vision.engine": objectSchema({ engine: string(), effort: string() }, ["engine"]),
+  "vision.effort": objectSchema({ effort: string() }, ["effort"]), "vision.probe": noArgs,
+  "vision.pull": objectSchema({ tag: string("^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$") }, ["tag"]),
+  "vision.purge-cache": noArgs,
+  "presence.status": noArgs, "presence.mode": objectSchema({ mode: string("^(always|follow-codex|follow-clients)$") }, ["mode"]),
+  "cc-switch.status": noArgs, "cc-switch.snippet": noArgs,
+};
+
+const CONTROL_ARGS = {
+  "lifecycle.status": () => ["service", "status"], "lifecycle.start": () => ["service", "start"], "lifecycle.stop": () => ["service", "stop"], "lifecycle.restart": () => ["service", "restart"], "lifecycle.logs": () => ["logs"],
+  "doctor.status": () => ["doctor", "--json"], "doctor.fix": () => ["doctor", "--fix", "--json"], "maintenance.update": () => ["maintenance"], "maintenance.rollback": () => ["rollback"],
+  "native.status": () => ["native-status", "--json"], "native.account-usage": () => ["account", "--json"],
+  "credential.status": ({ provider: id }) => ["providers", "--json", id], "credential.set": ({ provider: id }) => ["credential", id], "credential.remove": ({ provider: id }) => ["credential", id, "--remove"],
+  "provider.enable": ({ provider: id, enabled }) => ["set-apply", id, enabled ? "on" : "off", "--targets", "codex", "--activate"],
+  "model.visibility": ({ slug: id, visible }) => ["picker", "set", id, visible ? "show" : "hide"], "model.canary": ({ slug: id, enabled }) => ["model-canary", id, enabled ? "on" : "off"],
+  "protocol-proof.status": ({ slug: id }) => ["protocol-proof", "status", id], "protocol-proof.verify": ({ slug: id }) => ["protocol-proof", "verify", id, "--yes"], "protocol-proof.revoke": ({ slug: id }) => ["protocol-proof", "revoke", id],
+  "picker.status": () => ["picker", "status"], "picker.set": ({ slug: id, visible }) => ["picker", "set", id, visible ? "show" : "hide"], "picker.show-all": ({ visible }) => ["picker", "all", visible ? "show" : "hide"],
+  "catalog.status": () => ["catalog", "status"], "catalog.render-snippet": () => ["catalog", "render-snippet"],
+  "subagents.status": () => ["subagents", "status"], "subagents.mode": ({ mode }) => ["subagents", "mode", mode], "subagents.model": ({ slug: id, enabled }) => ["subagents", "set", id, enabled ? "on" : "off"], "subagents.selection": ({ selection }) => ["subagents", selection], "subagents.verify": ({ slug: id }) => ["subagents", "verify", id, "--yes"],
+  "failover.status": () => ["failover", "status"], "failover.reset": () => ["failover", "reset", "--yes"],
+  "tool-result-aging.status": () => ["tool-result-aging", "status"], "tool-result-aging.on": () => ["tool-result-aging", "on"], "tool-result-aging.off": () => ["tool-result-aging", "off"], "tool-result-aging.ttl": ({ days }) => ["tool-result-aging", "ttl", days == null ? "off" : String(days)], "tool-result-aging.purge": ({ expiredOnly }) => ["tool-result-aging", "purge", ...(expiredOnly ? ["--expired"] : []), "--yes"],
+  "usage.router": () => ["usage", "router"], "usage.provider": ({ provider: id }) => ["provider-usage", "--json", id], "usage.model": ({ slug: id }) => ["usage", "model", id],
+  "vision.status": () => ["vision-bridge", "status"], "vision.on": () => ["vision-bridge", "on"], "vision.off": () => ["vision-bridge", "off"], "vision.engine": ({ engine, effort }) => ["vision-bridge", "engine", engine, ...(effort ? [effort] : [])], "vision.effort": ({ effort }) => ["vision-bridge", "effort", effort], "vision.probe": () => ["vision-bridge", "probe"], "vision.pull": ({ tag }) => ["vision-bridge", "pull", tag], "vision.purge-cache": () => ["vision-bridge", "purge-cache", "--yes"],
+  "presence.status": () => ["presence", "status"], "presence.mode": ({ mode }) => ["presence", "set", mode], "cc-switch.status": () => ["cc-switch", "status"], "cc-switch.snippet": () => ["catalog", "render-snippet"],
+};
+
+const secretKey = /^(?:credential|apiKey|api_key|token|secret|password|authorization)$/i;
+function errorEnvelope(code) {
+  const messages = {
+    command_not_supported: "This desktop command is not supported.",
+    invalid_command_arguments: "The desktop command arguments are invalid.",
+    protected_input_required: "This credential operation requires protected input.",
+    capability_schema_unsupported: "This capability schema is not supported for mutations.",
+  };
+  const safeCode = messages[code] || ERROR_DEFINITIONS[code] ? code : "invalid_command_arguments";
+  return {
+    ok: false,
+    error: {
+      type: "router_error",
+      code: safeCode,
+      message: messages[safeCode] || ERROR_DEFINITIONS[safeCode]?.message,
+      param: null,
+    },
+  };
+}
+
+function validate(schema, value) {
+  if (!value || typeof value !== "object" || Array.isArray(value) || schema.type !== "object") return false;
+  const keys = Object.keys(value);
+  if (schema.additionalProperties === false && keys.some((key) => !Object.hasOwn(schema.properties, key))) return false;
+  if ((schema.required || []).some((key) => !Object.hasOwn(value, key))) return false;
+  for (const [key, rule] of Object.entries(schema.properties || {})) {
+    if (!Object.hasOwn(value, key)) continue;
+    const item = value[key];
+    const types = Array.isArray(rule.type) ? rule.type : [rule.type];
+    const validType = types.some((type) => type === "null" ? item === null : type === "integer" ? Number.isSafeInteger(item) : typeof item === type);
+    if (!validType || rule.pattern && (typeof item !== "string" || !new RegExp(rule.pattern).test(item)) || rule.enum && !rule.enum.includes(item)) return false;
+  }
+  return true;
+}
+
+const COMMAND_DEFINITIONS_MAP = new Map(CAPABILITY_COMMANDS.map((metadata) => {
+  const args = ARGUMENTS[metadata.name] || noArgs;
+  return [metadata.name, Object.freeze({
+    ...metadata,
+    arguments: Object.freeze(args),
+    execute: CONTROL_ARGS[metadata.name],
+  })];
+}));
+
+const COMMAND_DEFINITIONS = new Proxy(COMMAND_DEFINITIONS_MAP, {
+  get(target, property) {
+    if (property === "set" || property === "delete" || property === "clear") {
+      return () => { throw new TypeError("desktop command definitions are read-only"); };
+    }
+    const value = Reflect.get(target, property);
+    return typeof value === "function" ? value.bind(target) : value;
+  },
+});
+
+export function desktopCommandDefinitions() {
+  return COMMAND_DEFINITIONS;
+}
+
+function majorVersion(manifest) {
+  return Number.isSafeInteger(manifest?.capabilitySchemaVersion) ? manifest.capabilitySchemaVersion : CAPABILITY_SCHEMA_VERSION;
+}
+
+function scrubResult(value) {
+  if (Array.isArray(value)) return value.map(scrubResult);
+  if (!value || typeof value !== "object") return value;
+  const output = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (secretKey.test(key)) continue;
+    output[key] = scrubResult(item);
+  }
+  return output;
+}
+
+/** Run one canonical Node command. The protected input callback is ephemeral. */
+export async function runDesktopCommand(command, args = {}, context = {}) {
+  if (!COMMAND_DEFINITIONS.has(command)) {
+    if (Object.hasOwn(COMMANDS, command)) return runLegacyDesktopCommand(command, args, context);
+    return errorEnvelope("command_not_supported");
+  }
+  const definition = COMMAND_DEFINITIONS.get(command);
+  if (majorVersion(context.manifest) > CAPABILITY_SCHEMA_VERSION && isMutationCommand(command)) return errorEnvelope("capability_schema_unsupported");
+  if (definition.protectedInput && Object.keys(args || {}).some((key) => secretKey.test(key))) return errorEnvelope("protected_input_required");
+  if (!validate(definition.arguments, args)) return errorEnvelope("invalid_command_arguments");
+  let protectedValue;
+  if (definition.protectedInput) {
+    if (typeof context.protectedInput === "function") protectedValue = await context.protectedInput();
+    else protectedValue = context.protectedInput;
+    if (typeof protectedValue !== "string" || !protectedValue) return errorEnvelope("protected_input_required");
+  }
+  try {
+    let value;
+    if (typeof context.execute === "function") value = await context.execute(command, { ...args }, protectedValue);
+    else {
+      const plan = definition.execute?.(args);
+      if (!plan) return errorEnvelope("command_not_supported");
+      value = await runControl(context.root || sourceRoot(), plan, {
+        stdin: protectedValue,
+        timeoutMs: definition.protectedInput ? CATALOG_MUTATION_TIMEOUT_MS : CONTROL_TIMEOUT_MS,
+      });
+      value = value.trim() ? parseJson(value) : null;
+    }
+    return { ok: true, value: scrubResult(value) };
+  } catch (error) {
+    const code = typeof error?.code === "string" ? error.code : error?.body?.error?.code;
+    if (code && code !== "invalid_command_arguments" && code !== "command_not_supported") {
+      return errorEnvelope(code);
+    }
+    return errorEnvelope("invalid_command_arguments");
+  } finally {
+    protectedValue = undefined;
+  }
 }

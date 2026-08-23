@@ -824,6 +824,23 @@ test("aggregate overview covers every target", () => {
   }
 });
 
+test("aggregate overview publishes the versioned capability manifest", () => {
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), "control-capabilities-"));
+  try {
+    const output = execFileSync(process.execPath, [path.join(root, "src", "control.mjs"), "--json"], {
+      cwd: root,
+      encoding: "utf8",
+      env: { ...process.env, CODEX_HOME: stateDir, MODEL_ROUTER_STATE_DIR: stateDir },
+    });
+    const snapshot = JSON.parse(output);
+    assert.equal(snapshot.capabilities.capabilitySchemaVersion, 1);
+    assert.equal(snapshot.capabilities.compatibility.readOnly, false);
+    assert.ok(snapshot.capabilities.commands.some(({ name }) => name === "vision.pull"));
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
 test("the harness target appears only once its route has been published", () => {
   const stateDir = mkdtempSync(path.join(os.tmpdir(), "control-targets-dsh-"));
   try {
