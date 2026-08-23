@@ -719,8 +719,23 @@ test("experimental authorization is proof-gated before the direct-dispatch trans
     verifiedAt: "2026-08-23T00:00:00.000Z",
   };
   const mismatchedProof = { ...validProof, transport: "anthropic-messages" };
+  const alias = MODEL_BY_SLUG.get("qwen-plan-responses/glm-5.2");
+  const aliasRoute = { ...alias, effectiveFinalReasoningShape: "hybrid-summary", routable: true, listed: false, visible: false };
+  const aliasProof = {
+    slug: alias.slug,
+    provider: alias.provider,
+    upstreamModel: alias.upstreamModel,
+    transport: alias.effectiveTransport,
+    toolDialect: alias.toolDialect,
+    requestProfile: alias.requestProfile,
+    verdict: "passing",
+    verifierVersion: PROTOCOL_PROOF_VERIFIER_VERSION,
+    fingerprint: registryFingerprint(alias, PROTOCOL_PROOF_VERIFIER_VERSION),
+    measuredFinalReasoningShape: "hybrid-summary",
+    verifiedAt: "2026-08-23T00:00:00.000Z",
+  };
 
-  const exercise = async ({ name, legacyKillSwitch, nodeRoutes, protocolProofs, expectedStatus, expectedPath }) => {
+  const exercise = async ({ name, legacyKillSwitch, model = canary, nodeRoutes, protocolProofs, expectedStatus, expectedPath }) => {
     const before = seen.length;
     const routerPort = await openPort();
     const child = run({
@@ -734,7 +749,7 @@ test("experimental authorization is proof-gated before the direct-dispatch trans
         ["/responses", "authorization ordinary"],
         ["/responses/compact", [{ type: "message", role: "user", content: [{ type: "input_text", text: "authorization compact" }] }]],
       ]) {
-        const result = await readRouted(routerPort, { model: canary.slug, stream: false, input }, suffix);
+        const result = await readRouted(routerPort, { model: model.slug, stream: false, input }, suffix);
         assert.equal(result.status, expectedStatus, `${name} ${suffix}: ${result.body}`);
         if (expectedStatus === 404) assert.equal(JSON.parse(result.body).error.code, "model_not_enabled", `${name} ${suffix}`);
       }
@@ -801,6 +816,75 @@ test("experimental authorization is proof-gated before the direct-dispatch trans
       expectedStatus: 200,
       expectedPath: "/qwen/responses",
     });
+    await exercise({
+      name: "unlisted hidden compatibility alias remains direct-call authorized with exact proof",
+      legacyKillSwitch: false,
+      model: alias,
+      nodeRoutes: [aliasRoute],
+      protocolProofs: { [alias.slug]: aliasProof },
+      expectedStatus: 200,
+      expectedPath: "/qwen/responses",
+    });
+    await exercise({
+      name: "unlisted hidden compatibility alias remains legal through the legacy kill-switch path",
+      legacyKillSwitch: true,
+      model: alias,
+      nodeRoutes: [aliasRoute],
+      protocolProofs: { [alias.slug]: aliasProof },
+      expectedStatus: 200,
+      expectedPath: "/v1/responses",
+    });
+    for (const legacyKillSwitch of [false, true]) {
+      await exercise({
+        name: `unlisted compatibility alias cannot forge visible under ${legacyKillSwitch ? "kill-switch" : "default"} dispatch`,
+        legacyKillSwitch,
+        model: alias,
+        nodeRoutes: [{ ...aliasRoute, visible: true }],
+        protocolProofs: { [alias.slug]: aliasProof },
+        expectedStatus: 404,
+      });
+    }
+    const maliciousBindings = [
+      ["reasoningDisplayMode", "raw-preserve"],
+      ["gatewayModel", "attacker-model"],
+      ["baseUrl", "http://127.0.0.1:9/attacker"],
+      ["effectiveTransport", "anthropic-messages"],
+      ["requestProfile", "attacker-profile"],
+      ["behavior", { attacker: true }],
+      ["endpoint", "/attacker"],
+      ["credential", "attacker-secret-owner"],
+      ["behaviorTemplate", "attacker-template"],
+      ["instructionOverlay", "attacker-instructions"],
+    ];
+    for (const legacyKillSwitch of [false, true]) {
+      for (const field of ["routable", "listed", "visible"]) {
+        const missingFact = { ...resolved };
+        delete missingFact[field];
+        await exercise({
+          name: `raw route requires own ${field} under ${legacyKillSwitch ? "kill-switch" : "default"} dispatch`,
+          legacyKillSwitch,
+          nodeRoutes: [missingFact],
+          protocolProofs: { [canary.slug]: validProof },
+          expectedStatus: 404,
+        });
+      }
+      await exercise({
+        name: `experimental effective shape must match its proof under ${legacyKillSwitch ? "kill-switch" : "default"} dispatch`,
+        legacyKillSwitch,
+        nodeRoutes: [{ ...resolved, effectiveFinalReasoningShape: "raw-content" }],
+        protocolProofs: { [canary.slug]: validProof },
+        expectedStatus: 404,
+      });
+      for (const [field, value] of maliciousBindings) {
+        await exercise({
+          name: `raw ${field} cannot override registry under ${legacyKillSwitch ? "kill-switch" : "default"} dispatch`,
+          legacyKillSwitch,
+          nodeRoutes: [{ ...resolved, [field]: value }],
+          protocolProofs: { [canary.slug]: validProof },
+          expectedStatus: 404,
+        });
+      }
+    }
     await exercise({
       name: "kill switch with an authorized route",
       legacyKillSwitch: true,

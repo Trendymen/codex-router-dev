@@ -73,7 +73,7 @@ export function createPanelSessionStore({
   const now = monotonicClock(clock);
   const nonces = new Map();
   const sessions = new Map();
-  const tombstones = new Map();
+  const logoutTombstones = new Map();
 
   function uniqueToken(collection) {
     for (let attempt = 0; attempt < 16; attempt += 1) {
@@ -90,8 +90,10 @@ export function createPanelSessionStore({
         sessions.delete(id);
       }
     }
-    for (const [id, tombstone] of tombstones) if (tombstone.expiresAt <= at) tombstones.delete(id);
-    while (tombstones.size > 64) tombstones.delete(tombstones.keys().next().value);
+    for (const [fingerprint, tombstone] of logoutTombstones) {
+      if (tombstone.expiresAt <= at) logoutTombstones.delete(fingerprint);
+    }
+    while (logoutTombstones.size > 64) logoutTombstones.delete(logoutTombstones.keys().next().value);
   }
 
   function mintNonce() {
@@ -146,26 +148,47 @@ export function createPanelSessionStore({
     return result.session;
   }
 
-  function logout(sessionId, requestId, { tombstone = true } = {}) {
+  function logout(sessionId) {
     const session = sessions.get(sessionId);
     if (!session) return;
     session.revoked = true;
-    const replay = new Map();
-    if (requestId && session.replay.has(requestId)) replay.set(requestId, session.replay.get(requestId));
-    session.replay = replay;
-    if (tombstone) tombstones.set(sessionId, { csrfToken: session.csrfToken, replay, expiresAt: now() + TOMBSTONE_TTL_MS });
     sessions.delete(sessionId);
+  }
+
+  function revokeForLogout(sessionId, csrfToken, requestId, fingerprint) {
+    const at = now();
+    purgeExpired(at);
+    const active = sessions.get(sessionId);
+    if (active) {
+      if (!sameSecret(active.csrfToken, csrfToken)) return { status: "invalid" };
+      active.revoked = true;
+      sessions.delete(sessionId);
+      const result = { status: 204, payload: {} };
+      logoutTombstones.set(fingerprint, {
+        sessionId,
+        csrfToken: active.csrfToken,
+        requestId,
+        result,
+        expiresAt: at + TOMBSTONE_TTL_MS,
+      });
+      while (logoutTombstones.size > 64) logoutTombstones.delete(logoutTombstones.keys().next().value);
+      return { status: "completed", result };
+    }
+    const tombstone = logoutTombstones.get(fingerprint);
+    return tombstone && tombstone.sessionId === sessionId && tombstone.requestId === requestId && sameSecret(tombstone.csrfToken, csrfToken)
+      ? { status: "completed", result: tombstone.result }
+      : { status: "invalid" };
   }
 
   function revokeAll() {
     sessions.clear();
     nonces.clear();
-    tombstones.clear();
+    logoutTombstones.clear();
   }
 
   function replay(sessionId, requestId) {
     const session = getSession(sessionId).session;
-    const entry = session ? session.replay.get(requestId) : tombstones.get(sessionId)?.replay.get(requestId);
+    const entry = session?.replay.get(requestId);
     return entry?.result ?? entry;
   }
 
@@ -177,11 +200,7 @@ export function createPanelSessionStore({
 
   function reserve(sessionId, requestId, fingerprint) {
     const active = getSession(sessionId, { touch: true }).session;
-    if (!active) {
-      const entry = tombstones.get(sessionId)?.replay.get(requestId);
-      if (!entry) return { status: "invalid" };
-      return entry.fingerprint === fingerprint ? { status: "completed", result: entry.result } : { status: "mismatch" };
-    }
+    if (!active) return { status: "invalid" };
     const completed = active.replay.get(requestId);
     if (completed) return completed.fingerprint === fingerprint ? { status: "completed", result: completed.result } : { status: "mismatch" };
     const running = active.inFlight.get(requestId);
@@ -208,10 +227,7 @@ export function createPanelSessionStore({
   function mutationSession(sessionId, csrfToken, requestId) {
     const active = getSession(sessionId, { touch: true }).session;
     if (active) return sameSecret(active.csrfToken, csrfToken) ? { valid: true, session: active } : { valid: false };
-    const tombstone = tombstones.get(sessionId);
-    return tombstone && tombstone.replay.has(requestId) && sameSecret(tombstone.csrfToken, csrfToken)
-      ? { valid: true, tombstone }
-      : { valid: false };
+    return { valid: false };
   }
 
   function mintConfirmation(sessionId, command, argumentsHash) {
@@ -241,6 +257,7 @@ export function createPanelSessionStore({
     getSession,
     touchSession,
     logout,
+    revokeForLogout,
     revokeAll,
     replay,
     remember,

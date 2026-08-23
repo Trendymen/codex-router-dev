@@ -6,6 +6,7 @@ import { jcsBytes } from "../src/jcs.mjs";
 import {
   createPanelSessionStore,
   canonicalArgumentsHash,
+  operationFingerprint,
   validatePanelRequest,
 } from "../src/panel-sessions.mjs";
 
@@ -136,16 +137,38 @@ test("confirmation hashing uses shared JCS and rejects hostile values", () => {
   assert.throws(() => canonicalArgumentsHash("\ud800"), /JCS|surrogate/i);
 });
 
-test("logout keeps an idempotent tombstone for the completed request", () => {
+test("logout revocation ignores old replay identity and keeps only the exact logout retry", () => {
   const store = createPanelSessionStore({ randomBytes: sequenceRandomBytes() });
   const session = store.consumeNonce(store.mintNonce().nonce);
   const requestId = "11111111-1111-4111-8111-111111111111";
-  const result = { status: 204, payload: {} };
-  store.remember(session.sessionId, requestId, result);
-  store.logout(session.sessionId, requestId);
-  const replay = store.reserve(session.sessionId, requestId);
-  assert.equal(replay.status, "completed");
-  assert.deepEqual(replay.result, result);
+  const invokeFingerprint = operationFingerprint({
+    sessionId: session.sessionId,
+    requestId,
+    method: "POST",
+    route: "/panel/invoke",
+    command: "presence.mode",
+    argsHash: canonicalArgumentsHash({ mode: "always" }),
+  });
+  const invoke = store.reserve(session.sessionId, requestId, invokeFingerprint);
+  invoke.complete({ status: 200, payload: { value: "old mutation" } });
+
+  const logoutFingerprint = operationFingerprint({
+    sessionId: session.sessionId,
+    requestId,
+    method: "POST",
+    route: "/panel/logout",
+    command: "panel.logout",
+    argsHash: canonicalArgumentsHash({}),
+  });
+  const revoked = store.revokeForLogout(session.sessionId, session.csrfToken, requestId, logoutFingerprint);
+  assert.equal(revoked.status, "completed");
+  assert.deepEqual(revoked.result, { status: 204, payload: {} });
+  assert.equal(store.getSession(session.sessionId).valid, false);
+
+  const retry = store.revokeForLogout(session.sessionId, session.csrfToken, requestId, logoutFingerprint);
+  assert.equal(retry.status, "completed");
+  assert.deepEqual(retry.result, { status: 204, payload: {} });
+  assert.equal(store.reserve(session.sessionId, requestId, invokeFingerprint).status, "invalid");
 });
 
 test("random token collisions resample and fail closed without deterministic derivation", () => {
@@ -160,8 +183,15 @@ test("logout tombstones expire and never replay after a long clock jump", () => 
   const store = createPanelSessionStore({ clock: () => now, randomBytes: sequenceRandomBytes() });
   const session = store.consumeNonce(store.mintNonce().nonce);
   const requestId = "55555555-5555-4555-8555-555555555555";
-  store.remember(session.sessionId, requestId, { status: 204, payload: {} });
-  store.logout(session.sessionId);
-  now += 2 * 60 * 60_000;
-  assert.equal(store.reserve(session.sessionId, requestId).status, "invalid");
+  const fingerprint = operationFingerprint({
+    sessionId: session.sessionId,
+    requestId,
+    method: "POST",
+    route: "/panel/logout",
+    command: "panel.logout",
+    argsHash: canonicalArgumentsHash({}),
+  });
+  assert.equal(store.revokeForLogout(session.sessionId, session.csrfToken, requestId, fingerprint).status, "completed");
+  now += 30_001;
+  assert.equal(store.revokeForLogout(session.sessionId, session.csrfToken, requestId, fingerprint).status, "invalid");
 });

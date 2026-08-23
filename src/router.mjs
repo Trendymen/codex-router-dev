@@ -2328,6 +2328,7 @@ function validNodeRouteSnapshot(document, route, slug, registered) {
   if (route.slug !== slug || route.routable !== true || !registered) return false;
   const expectedListed = registered.listed === true;
   if (route.listed !== expectedListed) return false;
+  if (route.visible && !route.listed) return false;
   if (!NODE_ROUTE_FINAL_SHAPES.has(route.effectiveFinalReasoningShape)) return false;
   if (registered.rolloutState !== "experimental" && route.effectiveFinalReasoningShape !== registered.declaredFinalReasoningShape) return false;
   for (const field of NODE_ROUTE_REQUIRED_FIELDS) {

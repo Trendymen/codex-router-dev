@@ -530,10 +530,27 @@ test("secured panel bootstrap, CSRF and request replay are enforced before comma
     const shared = { cookie: secondCookie, origin: base, "content-type": "application/json", "x-csrf-token": secondCsrf, "x-request-id": "88888888-8888-4888-8888-888888888888" };
     const firstSecond = await fetch(`${base}/panel/invoke`, { method: "POST", headers: shared, body: JSON.stringify({ command: "presence.mode", args: { mode: "always" } }) });
     assert.equal(firstSecond.status, 200);
-    const conflictingLogout = await fetch(`${base}/panel/logout`, { method: "POST", headers: shared, body: "{}" });
-    assert.equal(conflictingLogout.status, 409);
+    const conflictingLogout = await fetch(`${base}/panel/logout`, {
+      method: "POST",
+      headers: shared,
+      body: JSON.stringify({ command: "presence.mode", args: { mode: "never" } }),
+    });
+    assert.equal(conflictingLogout.status, 204);
     assert.match(conflictingLogout.headers.get("set-cookie"), /Max-Age=0/);
     assert.equal((await fetch(`${base}/panel/session`, { headers: { cookie: secondCookie } })).status, 401);
+    const conflictingLogoutRetry = await fetch(`${base}/panel/logout`, {
+      method: "POST",
+      headers: shared,
+      body: JSON.stringify({ args: { changed: true } }),
+    });
+    assert.equal(conflictingLogoutRetry.status, 204);
+    assert.match(conflictingLogoutRetry.headers.get("set-cookie"), /Max-Age=0/);
+    const crossRouteReplay = await fetch(`${base}/panel/invoke`, {
+      method: "POST",
+      headers: shared,
+      body: JSON.stringify({ command: "presence.mode", args: { mode: "always" } }),
+    });
+    assert.equal(crossRouteReplay.status, 401);
   } finally {
     await new Promise((resolve) => server.close(resolve));
   }
