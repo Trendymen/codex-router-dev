@@ -114,6 +114,7 @@ struct CapabilityArgumentSchema: Decodable {
 
 struct CapabilityFieldPresentation: Decodable {
   let label: String
+  let localizationKey: String
   let type: String
   let required: Bool
   let enumValues: [String]
@@ -121,6 +122,7 @@ struct CapabilityFieldPresentation: Decodable {
   init(from decoder: Decoder) throws {
     let values = try decoder.container(keyedBy: CodingKeys.self)
     label = try values.decodeIfPresent(String.self, forKey: .label) ?? "Field"
+    localizationKey = try values.decodeIfPresent(String.self, forKey: .localizationKey) ?? "field.value"
     if let single = try? values.decode(String.self, forKey: .type) {
       type = single
     } else {
@@ -130,11 +132,12 @@ struct CapabilityFieldPresentation: Decodable {
     enumValues = try values.decodeIfPresent([String].self, forKey: .enumValues) ?? []
   }
 
-  private enum CodingKeys: String, CodingKey { case label, type, required, enumValues = "enum" }
+  private enum CodingKeys: String, CodingKey { case label, localizationKey, type, required, enumValues = "enum" }
 }
 
 struct CapabilityUI: Decodable {
   let title: String
+  let localizationKey: String
   let control: String
   let confirmation: String
   let quotaWarning: String
@@ -145,6 +148,7 @@ struct CapabilityUI: Decodable {
   init(from decoder: Decoder) throws {
     let values = try decoder.container(keyedBy: CodingKeys.self)
     title = try values.decodeIfPresent(String.self, forKey: .title) ?? "Router command"
+    localizationKey = try values.decodeIfPresent(String.self, forKey: .localizationKey) ?? "capability.router"
     control = try values.decodeIfPresent(String.self, forKey: .control) ?? "read"
     confirmation = try values.decodeIfPresent(String.self, forKey: .confirmation) ?? "none"
     quotaWarning = try values.decodeIfPresent(String.self, forKey: .quotaWarning) ?? "none"
@@ -154,7 +158,7 @@ struct CapabilityUI: Decodable {
   }
 
   private enum CodingKeys: String, CodingKey {
-    case title, control, confirmation, quotaWarning, resultKind, protectedField, fields
+    case title, localizationKey, control, confirmation, quotaWarning, resultKind, protectedField, fields
   }
 }
 
@@ -182,7 +186,7 @@ struct CapabilityCommand: Decodable, Identifiable {
     protectedInput = try values.decodeIfPresent(Bool.self, forKey: .protectedInput) ?? false
     resultKind = try values.decodeIfPresent(String.self, forKey: .resultKind) ?? "json"
     ui = try values.decodeIfPresent(CapabilityUI.self, forKey: .ui)
-      ?? CapabilityUI(title: "Router command", control: "read", confirmation: "none", quotaWarning: "none", resultKind: "json", protectedField: nil, fields: [:])
+      ?? CapabilityUI(title: "Router command", localizationKey: "capability.router", control: "read", confirmation: "none", quotaWarning: "none", resultKind: "json", protectedField: nil, fields: [:])
   }
 
   private enum CodingKeys: String, CodingKey {
@@ -191,8 +195,9 @@ struct CapabilityCommand: Decodable, Identifiable {
 }
 
 extension CapabilityUI {
-  init(title: String, control: String, confirmation: String, quotaWarning: String, resultKind: String, protectedField: String?, fields: [String: CapabilityFieldPresentation]) {
+  init(title: String, localizationKey: String, control: String, confirmation: String, quotaWarning: String, resultKind: String, protectedField: String?, fields: [String: CapabilityFieldPresentation]) {
     self.title = title
+    self.localizationKey = localizationKey
     self.control = control
     self.confirmation = confirmation
     self.quotaWarning = quotaWarning
@@ -204,6 +209,7 @@ extension CapabilityUI {
 
 struct CapabilityDescription: Decodable, Identifiable {
   let id: String
+  let localizationKey: String
   let schemaVersion: Int
   let nodeCommands: [String]
   let swift: String
@@ -216,6 +222,7 @@ struct CapabilityDescription: Decodable, Identifiable {
   init(from decoder: Decoder) throws {
     let values = try decoder.container(keyedBy: CodingKeys.self)
     id = try values.decode(String.self, forKey: .id)
+    localizationKey = try values.decodeIfPresent(String.self, forKey: .localizationKey) ?? "capability.\(id)"
     schemaVersion = try values.decodeIfPresent(Int.self, forKey: .schemaVersion) ?? 1
     nodeCommands = try values.decodeIfPresent([String].self, forKey: .nodeCommands) ?? []
     swift = try values.decodeIfPresent(String.self, forKey: .swift) ?? "read-only"
@@ -227,7 +234,7 @@ struct CapabilityDescription: Decodable, Identifiable {
   }
 
   private enum CodingKeys: String, CodingKey {
-    case id, schemaVersion, nodeCommands, swift, browser, confirmation, quotaWarning, protectedInput, resultKind
+    case id, localizationKey, schemaVersion, nodeCommands, swift, browser, confirmation, quotaWarning, protectedInput, resultKind
   }
 }
 
@@ -432,6 +439,7 @@ private struct RouterError: LocalizedError {
 private struct DesktopCommandBridge {
   private static let outputLimit = 256 * 1024
   private static let commandTimeout = Duration.seconds(120)
+  private static let terminationGrace = Duration.seconds(2)
   private let root: URL?
 
   private enum BridgeFailure: LocalizedError {
@@ -539,10 +547,18 @@ private struct DesktopCommandBridge {
   }
 
   private static func waitForProcess(_ process: Process) async -> Int32 {
-    await Task.detached(priority: .userInitiated) {
-      process.waitUntilExit()
-      return process.terminationStatus
-    }.value
+    await withTaskCancellationHandler {
+      await withCheckedContinuation { continuation in
+        process.terminationHandler = { child in
+          continuation.resume(returning: child.terminationStatus)
+        }
+        if !process.isRunning {
+          continuation.resume(returning: process.terminationStatus)
+        }
+      }
+    } onCancel: {
+      if process.isRunning { process.terminate() }
+    }
   }
 
   func execute(
@@ -596,7 +612,7 @@ private struct DesktopCommandBridge {
     stdin.fileHandleForWriting.closeFile()
     Self.zeroize(&input)
 
-    let statusTask = Task.detached(priority: .userInitiated) { await Self.waitForProcess(process) }
+    let statusTask = Task { await Self.waitForProcess(process) }
     let status: Int32
     do {
       status = try await withThrowingTaskGroup(of: Int32.self) { group in
@@ -610,6 +626,19 @@ private struct DesktopCommandBridge {
       }
     } catch {
       stopProcess()
+      let terminated = await withTaskGroup(of: Bool.self) { group in
+        group.addTask { _ = await statusTask.value; return true }
+        group.addTask {
+          try? await Task.sleep(for: Self.terminationGrace)
+          return false
+        }
+        let first = await group.next() ?? false
+        group.cancelAll()
+        return first
+      }
+      if !terminated, process.isRunning {
+        Darwin.kill(process.processIdentifier, SIGKILL)
+      }
       _ = await statusTask.value
       _ = await stdoutReader.value
       _ = await stderrReader.value
@@ -914,18 +943,41 @@ struct RouterPresence: Decodable {
   private enum CodingKeys: String, CodingKey { case mode, effectiveMode, harnessPublished, terminalCodex }
 }
 
+struct RouterActivitySnapshot: Decodable {
+  let state: RouterActivityState
+  let provider: String?
+  let model: String?
+  let sessionName: String?
+  let activeCount: Int
+  let active: [RouterActiveRequest]
+
+  init(from decoder: Decoder) throws {
+    let values = try decoder.container(keyedBy: CodingKeys.self)
+    state = try values.decodeIfPresent(RouterActivityState.self, forKey: .state) ?? .idle
+    provider = try values.decodeIfPresent(String.self, forKey: .provider)
+    model = try values.decodeIfPresent(String.self, forKey: .model)
+    sessionName = try values.decodeIfPresent(String.self, forKey: .sessionName)
+    active = try values.decodeIfPresent([RouterActiveRequest].self, forKey: .active) ?? []
+    activeCount = try values.decodeIfPresent(Int.self, forKey: .activeCount) ?? active.count
+  }
+
+  private enum CodingKeys: String, CodingKey { case state, provider, model, sessionName, activeCount, active }
+}
+
 struct RouterSnapshot: Decodable {
   let targets: [String: RouterTarget]
   let presence: RouterPresence?
+  let activity: RouterActivitySnapshot?
   let capabilities: CapabilitySnapshotV1?
   let accountUsage: CodexAccountUsage?
   let providerUsage: ProviderUsageSnapshot?
 
-  static let empty = RouterSnapshot(targets: [:], presence: nil, capabilities: nil, accountUsage: nil, providerUsage: nil)
+  static let empty = RouterSnapshot(targets: [:], presence: nil, activity: nil, capabilities: nil, accountUsage: nil, providerUsage: nil)
 
-  init(targets: [String: RouterTarget], presence: RouterPresence?, capabilities: CapabilitySnapshotV1?, accountUsage: CodexAccountUsage?, providerUsage: ProviderUsageSnapshot?) {
+  init(targets: [String: RouterTarget], presence: RouterPresence?, activity: RouterActivitySnapshot?, capabilities: CapabilitySnapshotV1?, accountUsage: CodexAccountUsage?, providerUsage: ProviderUsageSnapshot?) {
     self.targets = targets
     self.presence = presence
+    self.activity = activity
     self.capabilities = capabilities
     self.accountUsage = accountUsage
     self.providerUsage = providerUsage
@@ -935,12 +987,13 @@ struct RouterSnapshot: Decodable {
     let values = try decoder.container(keyedBy: CodingKeys.self)
     targets = (try? values.decode([String: RouterTarget].self, forKey: .targets)) ?? [:]
     presence = try? values.decode(RouterPresence.self, forKey: .presence)
+    activity = try? values.decode(RouterActivitySnapshot.self, forKey: .activity)
     capabilities = try? values.decode(CapabilitySnapshotV1.self, forKey: .capabilities)
     accountUsage = try? values.decode(CodexAccountUsage.self, forKey: .accountUsage)
     providerUsage = try? values.decode(ProviderUsageSnapshot.self, forKey: .providerUsage)
   }
 
-  private enum CodingKeys: String, CodingKey { case targets, presence, capabilities, accountUsage, providerUsage }
+  private enum CodingKeys: String, CodingKey { case targets, presence, activity, capabilities, accountUsage, providerUsage }
 }
 
 struct DailyUsagePoint: Identifiable, Equatable {
@@ -1067,6 +1120,14 @@ enum TrayPresenceMode: String, CaseIterable, Identifiable {
   var id: String { rawValue }
   var label: String { self == .always ? routerLocalized("Always") : routerLocalized("With Codex") }
   var controlValue: String { self == .always ? "always" : "follow-codex" }
+
+  static func fromNode(_ value: String?) -> TrayPresenceMode? {
+    switch value {
+    case "always": return .always
+    case "follow-codex", "follow-clients": return .followCodex
+    default: return nil
+    }
+  }
 }
 
 enum MenuBarCustomIconError: Error, Equatable { case tooLarge }
@@ -1095,6 +1156,8 @@ enum MenuBarLayoutMetrics {
 @MainActor
 final class RouterStore: ObservableObject {
   static let shared = RouterStore()
+
+  private enum ServiceIntent { case unknown, running, stopped }
 
   @Published private(set) var snapshot = RouterSnapshot.empty
   @Published private(set) var capabilitySnapshot = CapabilitySnapshotV1.empty
@@ -1133,7 +1196,6 @@ final class RouterStore: ObservableObject {
   private let menuBarIconStyleKey = "ModelRouterTray.menuBarIconStyle"
   private let menuBarPresetIconKey = "ModelRouterTray.menuBarPresetIcon"
   private let menuBarCustomIconPathKey = "ModelRouterTray.menuBarCustomIconPath"
-  private let presenceModeKey = "ModelRouterTray.presenceMode"
   private let hostAppAbsenceGrace = Duration.seconds(30)
   private let hostAppRecheckInterval = Duration.seconds(5)
   private var pendingServiceStop: Task<Void, Never>?
@@ -1146,6 +1208,7 @@ final class RouterStore: ObservableObject {
   private var hostObservationTask: Task<Void, Never>?
   private var surfaceVisibilityTask: Task<Void, Never>?
   private var workspaceObservers: [NSObjectProtocol] = []
+  private var serviceIntent: ServiceIntent = .unknown
   private let hostAppBundleIDs = ["com.openai.codex", "com.openai.chat"]
   nonisolated static let hostProcessNames = ["codex"]
 
@@ -1244,11 +1307,9 @@ final class RouterStore: ObservableObject {
     menuBarCustomIconPath = menu.customIconPath
     menuBarCustomIconImage = Self.loadCustomMenuBarIcon(path: menu.customIconPath).image
     menuBarCustomIconMissing = Self.loadCustomMenuBarIcon(path: menu.customIconPath).missing
-    if let raw = defaults.string(forKey: presenceModeKey), let mode = TrayPresenceMode(rawValue: raw) {
-      presenceMode = mode
-    } else {
-      presenceMode = .always
-    }
+    // Presence is owned by Node and filled by the first lifecycle.status
+    // refresh; a new launch must not resurrect a stale local preference.
+    presenceMode = .always
   }
 
   // NSWorkspace sees bundled desktop clients, while a terminal Codex process
@@ -1468,12 +1529,19 @@ final class RouterStore: ObservableObject {
 
   private func refreshHostAppRunning() async {
     let processRunning = hostAppRunningNow()
-    var routerPresence = false
     if let value = try? await executeCanonicalCommand("presence.status"), case .object(let object) = value {
-      if case let .some(.bool(published)) = object["harnessPublished"], published { routerPresence = true }
-      if case let .some(.bool(terminal)) = object["terminalCodex"], terminal { routerPresence = true }
+      let published = object["harnessPublished"].flatMap { value -> Bool? in if case .bool(let flag) = value { return flag }; return nil } ?? false
+      let terminal = object["terminalCodex"].flatMap { value -> Bool? in if case .bool(let flag) = value { return flag }; return nil } ?? false
+      routerPinsServiceOn = published || terminal
+      if case let .some(.string(effective)) = object["effectiveMode"] {
+        presenceMode = TrayPresenceMode.fromNode(effective) ?? presenceMode
+      }
     }
-    hostAppRunning = processRunning || routerPresence
+    hostAppRunning = processRunning
+    if effectivePresenceMode == .followCodex, processRunning, serviceIntent == .stopped {
+      serviceIntent = .unknown
+      Task { @MainActor [weak self] in await self?.runServiceCommand("start") }
+    }
     refreshSurfacesVisible()
     if effectivePresenceMode == .followCodex, !hostAppRunning { schedulePresenceStop() }
   }
@@ -1504,15 +1572,27 @@ final class RouterStore: ObservableObject {
 
   private func runServiceCommand(_ action: String) async {
     let command = action == "stop" ? "lifecycle.stop" : "lifecycle.start"
-    _ = try? await executeCanonicalCommand(command)
+    do {
+      _ = try await executeCanonicalCommand(command)
+      serviceIntent = action == "stop" ? .stopped : .running
+    } catch {
+      serviceIntent = .unknown
+      message = error.localizedDescription
+    }
   }
 
   func setPresenceMode(_ mode: TrayPresenceMode) {
-    presenceMode = mode
-    defaults.set(mode.rawValue, forKey: presenceModeKey)
-    Task { _ = try? await executeCanonicalCommand("presence.mode", arguments: ["mode": mode.controlValue]) }
-    if mode != .always { schedulePresenceStop() }
-    refreshSurfacesVisible()
+    Task { @MainActor [weak self] in
+      guard let self else { return }
+      do {
+        _ = try await executeCanonicalCommand("presence.mode", arguments: ["mode": mode.controlValue])
+        _ = await refresh()
+      } catch {
+        message = error.localizedDescription
+        // The Node snapshot remains authoritative when the mutation fails.
+      }
+      refreshSurfacesVisible()
+    }
   }
 
   func startPolling() async {
@@ -1614,6 +1694,17 @@ final class RouterStore: ObservableObject {
       }
       let decoded = try JSONDecoder().decode(RouterSnapshot.self, from: data)
       snapshot = decoded
+      if let activity = decoded.activity {
+        activityState = activity.state
+        activeRequests = activity.active
+        activeRequestCount = activity.activeCount
+        activeModel = activity.model
+        activitySessionName = activity.sessionName
+      }
+      if let presence = decoded.presence {
+        presenceMode = TrayPresenceMode.fromNode(presence.effectiveMode) ?? TrayPresenceMode.fromNode(presence.mode) ?? .always
+        routerPinsServiceOn = presence.harnessPublished || presence.terminalCodex
+      }
       if let capabilities = decoded.capabilities {
         capabilitySnapshot = capabilities
         healthVersion = HealthVersionEnvelope(
@@ -1639,6 +1730,14 @@ final class RouterStore: ObservableObject {
     capabilitySnapshot = .empty
     healthVersion = .empty
     commandResult = nil
+    presenceMode = .always
+    routerPinsServiceOn = false
+    activeRequests = []
+    activeRequestCount = 0
+    activeModel = nil
+    activitySessionName = nil
+    activityState = .idle
+    serviceIntent = .unknown
   }
 
   func clearCommandResult() { commandResult = nil }
@@ -1857,7 +1956,7 @@ private struct CapabilitySectionView: View {
   var body: some View {
     VStack(alignment: .leading, spacing: 7) {
       HStack {
-        Text(capability.id.replacingOccurrences(of: "-", with: " ").capitalized).font(.subheadline.weight(.semibold))
+        Text(routerLocalized(capability.localizationKey)).font(.subheadline.weight(.semibold))
         Spacer()
         Text("\(capability.nodeCommands.count)").font(.caption.monospaced()).foregroundStyle(routerMuted)
       }
@@ -1888,7 +1987,7 @@ private struct CapabilityCommandRow: View {
       HStack(spacing: 7) {
         Image(systemName: command.isMutating ? "slider.horizontal.3" : "waveform.path.ecg")
           .foregroundStyle(command.isMutating ? routerAccent : routerMuted)
-        Text(command.ui.title).font(.caption.weight(.medium))
+        Text(routerLocalized(command.ui.localizationKey)).font(.caption.weight(.medium))
         Spacer()
         if command.hasQuotaWarning { Text(routerLocalized("Quota warning")).font(.caption2).foregroundStyle(routerYellow) }
       }
@@ -1932,7 +2031,7 @@ private struct CapabilityCommandRow: View {
   private func argumentField(_ name: String) -> some View {
     let presentation = command.ui.fields[name]
     if let presentation, !presentation.enumValues.isEmpty {
-      Picker(presentation.label, selection: Binding(
+      Picker(routerLocalized(presentation.localizationKey), selection: Binding(
         get: { fields[name, default: ""] },
         set: { fields[name] = $0 }
       )) {
@@ -1942,12 +2041,12 @@ private struct CapabilityCommandRow: View {
       }
       .pickerStyle(.menu)
     } else if presentation?.type.contains("boolean") == true {
-      Toggle(presentation?.label ?? name, isOn: Binding(
+      Toggle(routerLocalized(presentation?.localizationKey ?? "field.value"), isOn: Binding(
         get: { fields[name, default: "true"] == "true" },
         set: { fields[name] = $0 ? "true" : "false" }
       ))
     } else {
-      TextField(presentation?.label ?? name, text: Binding(
+      TextField(routerLocalized(presentation?.localizationKey ?? "field.value"), text: Binding(
         get: { fields[name, default: ""] },
         set: { fields[name] = $0 }
       ))

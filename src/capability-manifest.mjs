@@ -77,8 +77,10 @@ function uiMetadata(name, args, {
     .split(".")
     .map((part) => part.replaceAll("-", " ").replace(/\b\w/g, (letter) => letter.toUpperCase()))
     .join(" · ");
+  const namespace = name.split(".", 1)[0];
   return deepFreeze({
     title,
+    localizationKey: `capability.${namespace}`,
     control: resultKind === "protected-text" ? "protected-output" : protectedInput ? "protected-input" : mutating ? "mutation" : "read",
     confirmation: confirmation ? "server" : "none",
     quotaWarning: quotaWarning ? "cost-warning" : "none",
@@ -86,6 +88,7 @@ function uiMetadata(name, args, {
     protectedField: protectedInput ? "apiKey" : null,
     fields: Object.fromEntries(Object.entries(properties).map(([key, schema]) => [key, {
       label: key.replaceAll("-", " ").replace(/\b\w/g, (letter) => letter.toUpperCase()),
+      localizationKey: `field.${key}`,
       type: schema.type,
       required: (args.required || []).includes(key),
       enum: schema.enum || null,
@@ -152,6 +155,7 @@ const capabilities = [
   const rows = nodeCommands.map((name) => commandRows.find((entry) => entry.name === name));
   return Object.freeze({
     id,
+    localizationKey: `capability.${id}`,
     schemaVersion: CAPABILITY_SCHEMA_VERSION,
     nodeCommands: Object.freeze(nodeCommands),
     swift: "full",

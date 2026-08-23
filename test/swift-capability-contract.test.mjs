@@ -42,8 +42,9 @@ test("Swift renders the real swift capability set through manifest expressions",
   assert.match(swiftSource, /ForEach\(capability\.nodeCommands\.compactMap\(store\.capabilitySnapshot\.command\)/);
   assert.match(swiftSource, /CapabilityCommandRow\(store: store, command: command\)/);
   assert.match(swiftSource, /executeCanonicalCommand\(command\.name/);
-  assert.match(swiftSource, /command\.ui\.title/);
+  assert.match(swiftSource, /routerLocalized\(command\.ui\.localizationKey\)/);
   assert.match(swiftSource, /command\.ui\.fields/);
+  assert.match(swiftSource, /routerLocalized\(presentation\.localizationKey\)/);
   for (const forbidden of fixture.forbiddenCommands) {
     assert.doesNotMatch(swiftSource, new RegExp(forbidden.replaceAll(".", "\\.")), forbidden);
   }
@@ -54,12 +55,17 @@ test("the real Node manifest encodes Swift-decodable boolean metadata", () => {
   const manifest = JSON.parse(encoded);
   assert.equal(manifest.capabilitySchemaVersion, 1);
   assert.ok(manifest.commands.length > 0);
+  for (const capability of manifest.capabilities) assert.match(capability.localizationKey, /^capability\.[a-z0-9-]+$/);
   for (const command of manifest.commands) {
     assert.equal(typeof command.confirmation, "boolean", command.name);
     assert.equal(typeof command.quotaWarning, "boolean", command.name);
     assert.equal(typeof command.protectedInput, "boolean", command.name);
     assert.equal(typeof command.ui.title, "string", command.name);
-    for (const field of Object.values(command.ui.fields)) assert.equal(typeof field.label, "string", command.name);
+    assert.match(command.ui.localizationKey, /^capability\.[a-z0-9-]+$/, command.name);
+    for (const field of Object.values(command.ui.fields)) {
+      assert.equal(typeof field.label, "string", command.name);
+      assert.match(field.localizationKey, /^field\.[A-Za-z0-9-]+$/, command.name);
+    }
   }
   assert.match(swiftSource, /decodeIfPresent\(Bool\.self, forKey: \.confirmation\)/);
   assert.match(swiftSource, /decodeIfPresent\(Bool\.self, forKey: \.quotaWarning\)/);
@@ -77,6 +83,8 @@ test("unknown and invalid capability majors retain only a minimal health/version
   const unknown = buildCapabilityManifest({ capabilitySchemaVersion: 99 });
   assert.equal(unknown.mutationsEnabled, false);
   assert.deepEqual(unknown.commands, []);
+  assert.match(swiftSource, /commandResult = nil/);
+  assert.match(swiftSource, /capabilitySnapshot = CapabilitySnapshotV1\(\n\s+capabilitySchemaVersion: reported/);
 });
 
 test("all Router mutations use the canonical Node bridge and observed schema version", () => {
@@ -105,6 +113,12 @@ test("Node process I/O drains both streams, bounds output, times out, and preser
   assert.match(swiftSource, /standardError = stderr/);
   assert.match(swiftSource, /outputLimit/);
   assert.match(swiftSource, /commandTimeout/);
+  assert.match(swiftSource, /terminationHandler/);
+  assert.match(swiftSource, /terminationGrace/);
+  assert.match(swiftSource, /SIGKILL/);
+  assert.match(swiftSource, /withTaskCancellationHandler/);
+  assert.match(swiftSource, /process\.processIdentifier/);
+  assert.doesNotMatch(swiftSource, /waitUntilExit\(\)/);
   assert.match(swiftSource, /process\.terminate\(\)/);
   assert.match(swiftSource, /stdoutReader/);
   assert.match(swiftSource, /stderrReader/);
@@ -140,6 +154,23 @@ test("bridge passes schema versions, ignores hostile environment redirects, and 
   assert.equal(oversized.envelope?.error?.code, "invalid_command_arguments");
 });
 
+test("real lifecycle.status keeps bounded targets, presence, health/version, and the complete capability manifest", () => {
+  const status = runBridge("lifecycle.status", { args: {}, capabilitySchemaVersion: 1 });
+  assert.equal(status.envelope?.ok, true, status.stderr);
+  const value = status.envelope.value;
+  assert.ok(value && typeof value === "object");
+  assert.ok(value.targets && typeof value.targets === "object");
+  assert.ok(value.presence && typeof value.presence === "object");
+  assert.ok(value.capabilities && typeof value.capabilities === "object");
+  assert.equal(value.capabilities.capabilitySchemaVersion, 1);
+  assert.equal(value.capabilities.commands.length, fixture.nodeCommands.length);
+  assert.deepEqual(value.capabilities.commands.map(({ name }) => name).sort(), [...fixture.nodeCommands].sort());
+  assert.ok(value.capabilities.commands.every(({ confirmation, quotaWarning, ui }) => typeof confirmation === "boolean" && typeof quotaWarning === "boolean" && typeof ui?.title === "string"));
+  assert.equal(typeof value.health, "string");
+  assert.equal(typeof value.version, "string");
+  assert.doesNotMatch(JSON.stringify(value), /(?:DIRECT_SECRET|test-(?:internal|router)-|Bearer\s+[A-Za-z0-9._~+/=-]+)/i);
+});
+
 test("result kind/status/error and ephemeral protected output are rendered accessibly", () => {
   assert.match(swiftSource, /@Published private\(set\) var commandResult/);
   assert.match(swiftSource, /result\.resultKind/);
@@ -163,6 +194,13 @@ test("status/activity/usage polling is cancellable and host observation rechecks
   assert.match(swiftSource, /hostAppRecheckInterval = Duration\.seconds\(5\)/);
   assert.match(swiftSource, /activeRequestCount == 0 && activityState == \.idle/);
   assert.match(swiftSource, /runServiceCommand\("stop"\)/);
+  assert.match(swiftSource, /presenceMode = TrayPresenceMode\.fromNode/);
+  assert.match(swiftSource, /routerPinsServiceOn = presence\.harnessPublished/);
+  assert.match(swiftSource, /activeRequests = activity\.active/);
+  assert.match(swiftSource, /activeRequestCount = activity\.activeCount/);
+  assert.doesNotMatch(swiftSource, /presenceModeKey/);
+  assert.match(swiftSource, /serviceIntent == \.stopped/);
+  assert.match(swiftSource, /runServiceCommand\("start"\)/);
 });
 
 test("all localized capability literals keep exact key parity across language tables", () => {
@@ -170,6 +208,10 @@ test("all localized capability literals keep exact key parity across language ta
   const reference = keySet(localizationSources[0]);
   for (const [index, source] of localizationSources.slice(1).entries()) {
     assert.deepEqual(keySet(source), reference, `language table ${index + 1} drifted`);
+    const values = new Map([...source.matchAll(/^\s*"((?:[^"\\]|\\.)*)":\s*"((?:[^"\\]|\\.)*)"/gm)].map(([, key, value]) => [key, value]));
+    for (const key of [...reference].filter((value) => value.startsWith("capability.") || value.startsWith("field."))) {
+      assert.notEqual(values.get(key), key, `language table ${index + 1} left ${key} untranslated`);
+    }
   }
 });
 

@@ -190,7 +190,7 @@ test("every schema version except exactly one is read-only for mutations", async
     manifest: { capabilitySchemaVersion: 99 },
     execute: async () => ({ state: "running" }),
   });
-  assert.deepEqual({ ...read.value }, { state: "running" });
+  assert.deepEqual({ ...read.value }, { state: "running", health: "available", version: "unknown" });
 });
 
 test("command definitions and schemas are deeply immutable", () => {

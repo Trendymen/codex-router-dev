@@ -141,6 +141,25 @@ const MAX_RESULT_KEYS = 256;
 const MAX_RESULT_ARRAY = 1024;
 const MAX_RESULT_NODES = 4096;
 const MAX_RESULT_STRING = 64 * 1024;
+const DEFAULT_RESULT_LIMITS = Object.freeze({
+  maxDepth: MAX_RESULT_DEPTH,
+  maxKeys: MAX_RESULT_KEYS,
+  maxArray: MAX_RESULT_ARRAY,
+  maxNodes: MAX_RESULT_NODES,
+  maxString: MAX_RESULT_STRING,
+});
+// lifecycle.status is the one UI result that intentionally carries several
+// bounded documents at once. Each document gets its own larger budget so a
+// verbose target probe cannot consume the keys needed for presence and the
+// complete capability manifest. The projection remains closed and every
+// scalar/object still passes through the same secret scrubber.
+const LIFECYCLE_RESULT_LIMITS = Object.freeze({
+  maxDepth: 32,
+  maxKeys: 32 * 1024,
+  maxArray: 4096,
+  maxNodes: 128 * 1024,
+  maxString: 128 * 1024,
+});
 const COMMAND_ERROR_CODES = Object.freeze({
   command_not_supported: true,
   invalid_command_arguments: true,
@@ -233,10 +252,10 @@ function majorVersion(manifest, supplied = false) {
   return descriptor && Object.hasOwn(descriptor, "value") ? descriptor.value : undefined;
 }
 
-function scrubResult(value, sensitiveValues = [], state = { seen: new WeakSet(), nodes: 0, keys: 0 }, depth = 0) {
-  if (depth > MAX_RESULT_DEPTH || state.nodes++ >= MAX_RESULT_NODES) return undefined;
+function scrubResult(value, sensitiveValues = [], state = { seen: new WeakSet(), nodes: 0, keys: 0 }, depth = 0, limits = DEFAULT_RESULT_LIMITS) {
+  if (depth > limits.maxDepth || state.nodes++ >= limits.maxNodes) return undefined;
   if (typeof value === "string") {
-    if (value.length > MAX_RESULT_STRING) return undefined;
+    if (value.length > limits.maxString) return undefined;
     let clean = value.replace(CAPABILITY_URL, "[REDACTED]").replace(BEARER, "Bearer [REDACTED]");
     for (const sensitive of sensitiveValues) if (sensitive) clean = clean.split(sensitive).join("[REDACTED]");
     return clean;
@@ -247,19 +266,42 @@ function scrubResult(value, sensitiveValues = [], state = { seen: new WeakSet(),
   state.seen.add(value);
   if (Array.isArray(value)) {
     const length = Object.getOwnPropertyDescriptor(value, "length")?.value;
-    if (!Number.isSafeInteger(length) || length > MAX_RESULT_ARRAY) return undefined;
-    return Array.from({ length }, (_, index) => scrubResult(Object.getOwnPropertyDescriptor(value, String(index))?.value, sensitiveValues, state, depth + 1));
+    if (!Number.isSafeInteger(length) || length > limits.maxArray) return undefined;
+    return Array.from({ length }, (_, index) => scrubResult(Object.getOwnPropertyDescriptor(value, String(index))?.value, sensitiveValues, state, depth + 1, limits));
   }
   const output = Object.create(null);
   const keys = Object.getOwnPropertyNames(value);
-  if (keys.length > MAX_RESULT_KEYS || state.keys + keys.length > MAX_RESULT_KEYS) return undefined;
+  if (keys.length > limits.maxKeys || state.keys + keys.length > limits.maxKeys) return undefined;
   state.keys += keys.length;
   for (const key of keys) {
     if (secretKey.test(key) || DANGEROUS_KEY.test(key)) continue;
     const descriptor = Object.getOwnPropertyDescriptor(value, key);
     if (!descriptor || !Object.hasOwn(descriptor, "value")) continue;
-    const item = scrubResult(descriptor.value, sensitiveValues, state, depth + 1);
+    const item = scrubResult(descriptor.value, sensitiveValues, state, depth + 1, limits);
     if (item !== undefined) Object.defineProperty(output, key, { value: item, enumerable: true, writable: false, configurable: false });
+  }
+  return deepFreeze(output);
+}
+
+function scrubLifecycleStatus(value, sensitiveValues = []) {
+  if (!value || typeof value !== "object" || Array.isArray(value) || util.types.isProxy(value)) return scrubResult(value, sensitiveValues);
+  const output = Object.create(null);
+  for (const key of ["targets", "presence", "harness", "capabilities", "health", "version", "state", "activity"]) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (!descriptor || !Object.hasOwn(descriptor, "value")) continue;
+    const item = scrubResult(descriptor.value, sensitiveValues, undefined, 0, LIFECYCLE_RESULT_LIMITS);
+    if (item !== undefined) Object.defineProperty(output, key, { value: item, enumerable: true, writable: false, configurable: false });
+  }
+  if (!Object.hasOwn(output, "health")) {
+    Object.defineProperty(output, "health", { value: "available", enumerable: true, writable: false, configurable: false });
+  }
+  if (!Object.hasOwn(output, "version")) {
+    const capabilities = Object.getOwnPropertyDescriptor(value, "capabilities")?.value;
+    const schema = capabilities && typeof capabilities === "object"
+      ? Object.getOwnPropertyDescriptor(capabilities, "capabilitySchemaVersion")?.value
+      : undefined;
+    const version = Number.isSafeInteger(schema) ? `capability-schema-${schema}` : "unknown";
+    Object.defineProperty(output, "version", { value: version, enumerable: true, writable: false, configurable: false });
   }
   return deepFreeze(output);
 }
@@ -341,7 +383,11 @@ export async function runDesktopCommand(command, args = {}, context = {}) {
         meta: { protected: true, resultKind: "protected-text", cacheControl: "no-store" },
       };
     }
-    return { ok: true, value: scrubResult(value, protectedValue ? [protectedValue] : []) };
+    const sensitiveValues = protectedValue ? [protectedValue] : [];
+    const sanitized = definition.name === "lifecycle.status"
+      ? scrubLifecycleStatus(value, sensitiveValues)
+      : scrubResult(value, sensitiveValues);
+    return { ok: true, value: sanitized };
   } catch (error) {
     const code = safeErrorCode(error);
     if (definition.protectedInput && protectedValue === undefined) return errorEnvelope("protected_input_required");
