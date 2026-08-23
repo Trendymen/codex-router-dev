@@ -77,7 +77,13 @@ export function runControl(
       },
       (error, stdout, stderr) => {
         if (error) {
-          reject(new Error(String(stderr || error.message).trim() || "The router command failed."));
+          const message = String(stderr || error.message).trim() || "The router command failed.";
+          const failure = new Error(message);
+          const code = Object.keys(ERROR_DEFINITIONS).find((candidate) =>
+            new RegExp(`(?:^|[^A-Za-z0-9_.-])${candidate.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?:$|[^A-Za-z0-9_.-])`).test(message)
+          );
+          if (code) failure.code = code;
+          reject(failure);
           return;
         }
         resolve(stdout);

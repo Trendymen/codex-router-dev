@@ -223,6 +223,27 @@ test("shared log redaction preserves bounded safe fields while sanitizing every 
   assertNoDecoys(redacted);
 });
 
+test("unstructured log fields redact multi-word, JSON, and multiline values without hiding safe prose", () => {
+  const cases = [
+    `request failed prompt=${DECOYS.prompt} leaked suffix ${DECOYS.content}`,
+    `request failed input='${DECOYS.input} leaked suffix ${DECOYS.reasoning}' status=failed`,
+    `request failed \"content\":\"${DECOYS.content} leaked suffix ${DECOYS.body}\"`,
+    `request failed tool_arguments={\"value\":\"${DECOYS.arguments} leaked suffix ${DECOYS.cause}\"}`,
+    `request failed body=${DECOYS.body}\nsecond line ${DECOYS.support}`,
+    `request failed Authorization: Bearer ${DECOYS.authorization} trailing ${DECOYS.temporary}`,
+    `request failed Basic ${DECOYS.authorization} trailing ${DECOYS.snapshot}`,
+    `request failed at http://127.0.0.1:4202/_codex-router/${DECOYS.capability}/v1`,
+  ];
+  for (const line of cases) {
+    const redacted = redactSensitive(line, { profile: "log" });
+    assert.match(redacted, /^request failed/);
+    assertNoDecoys(redacted);
+  }
+
+  const safe = "request input validation completed; response status is healthy";
+  assert.equal(redactSensitive(safe, { profile: "log" }), safe);
+});
+
 test("post-relay failures use one safe terminal frame followed by one done frame", () => {
   const event = failedResponseEvent(
     {

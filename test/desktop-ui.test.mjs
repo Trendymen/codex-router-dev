@@ -15,7 +15,6 @@ import {
   quotaWindow,
   readOnlyCapabilities,
   toolResultAgingChecked,
-  visibleLocalDownload,
 } from "../apps/desktop/ui/model.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -147,35 +146,6 @@ test("token counts remain compact without hiding small values", () => {
   assert.equal(compactTokens(1_250), "1.3k");
   assert.equal(compactTokens(28_800), "29k");
   assert.equal(compactTokens(2_500_000), "2.5m");
-});
-
-test("completed local downloads disappear when the model is no longer installed", () => {
-  const done = { tag: "gemma4:12b", status: "done", percent: 100 };
-  assert.equal(visibleLocalDownload({ models: [], download: done }), null);
-  assert.deepEqual(
-    visibleLocalDownload({ models: [{ tag: "gemma4:12b" }], download: done }),
-    done,
-  );
-  const removedWithWarning = {
-    tag: "gemma4:12b",
-    kind: "uninstall",
-    status: "done",
-    detail: "Model removed · catalog refresh needed",
-    catalogError: "The Codex catalog could not be refreshed.",
-  };
-  assert.deepEqual(
-    visibleLocalDownload({ models: [], download: removedWithWarning }),
-    removedWithWarning,
-  );
-  const active = { tag: "gemma4:12b", status: "downloading", percent: 42 };
-  assert.deepEqual(visibleLocalDownload({ models: [], download: active }), active);
-  assert.equal(
-    visibleLocalDownload({
-      models: [],
-      download: { tag: "gemma4:12b", status: "cancelled", detail: "Download cancelled" },
-    }),
-    null,
-  );
 });
 
 test("active model speed prefers its provider and matches qualified slugs", () => {

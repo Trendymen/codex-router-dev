@@ -118,28 +118,6 @@
           <h2 data-i18n="connections.title">Connections</h2>
           <p data-i18n="connections.onlyConnected">Only connected providers appear in Usage.</p>
         </div>
-        <div class="mode-setting" hidden>
-          <div>
-            <strong data-i18n="connections.useWithoutOpenAILogin">Use without OpenAI login</strong>
-            <small id="login-free-note" data-i18n="connections.useConnectedModels">Use connected external models in new Codex sessions</small>
-          </div>
-          <label class="switch" id="login-free-switch-label">
-            <input id="login-free-switch" type="checkbox" />
-            <span aria-hidden="true"></span>
-            <span class="sr-only" data-i18n="connections.useWithoutOpenAILoginAria">Use Codex without OpenAI login</span>
-          </label>
-        </div>
-        <div class="mode-setting" hidden>
-          <div>
-            <strong>Use Router with ChatGPT</strong>
-            <small id="signed-routing-note">Keep native ChatGPT transport and task history</small>
-          </div>
-          <label class="switch" id="signed-routing-switch-label">
-            <input id="signed-routing-switch" type="checkbox" />
-            <span aria-hidden="true"></span>
-            <span class="sr-only">Use Router with ChatGPT</span>
-          </label>
-        </div>
         <div class="mode-setting mode-setting-select">
           <div>
             <strong>Show tray</strong>
@@ -249,33 +227,6 @@
           </div>
         </div>
 
-        <div class="accordion" hidden>
-          <button class="accordion-header" type="button" data-accordion="local" aria-expanded="true">
-            <span>
-              <strong data-i18n="models.localLlms">Local LLMs</strong>
-              <small id="local-model-summary" data-i18n="models.localLoading">Loading…</small>
-            </span>
-            <span class="accordion-chevron" aria-hidden="true"></span>
-          </button>
-          <div class="accordion-body is-open" data-accordion-body="local">
-            <p class="accordion-note" data-i18n="models.runThroughOllama">Run models locally through Ollama. Installed models remain on this machine.</p>
-            <div id="local-model-operation" class="operation-banner" role="status" hidden></div>
-            <div id="local-download-status" aria-live="polite"></div>
-            <div id="local-model-list" class="local-model-list"></div>
-            <form id="local-model-form" class="local-install-form">
-              <label for="local-model-input" data-i18n="models.installModel">Install a model</label>
-              <div>
-                <input id="local-model-input" type="text" autocomplete="off" spellcheck="false" data-i18n-placeholder="models.ollamaPlaceholder" placeholder="gemma4:12b or ollama.com/library/gemma4:12b" />
-                <button class="mini-button" type="submit" data-i18n="actions.install">Install</button>
-              </div>
-              <small data-i18n="models.ollamaTagOrUrl">Enter an Ollama tag or model-page URL.</small>
-            </form>
-            <div id="local-quick-picks" class="local-quick-picks"></div>
-            <div id="local-catalog" class="local-catalog"></div>
-            <div id="local-runtime-actions" class="local-runtime-actions"></div>
-            <div id="lmstudio-section" class="lmstudio-section"></div>
-          </div>
-        </div>
       </section>
 
       <footer class="panel-footer">

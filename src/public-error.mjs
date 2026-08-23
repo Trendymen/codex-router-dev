@@ -31,6 +31,8 @@ const definitions = [
   ["protected_input_required", 400, "This credential operation requires protected input."],
   ["capability_schema_unsupported", 409, "This capability schema is not supported for mutations."],
   ["protected_output_required", 403, "This command requires an authorized protected output channel."],
+  ["protocol_probe_not_implemented", 501, "Protocol verification requires an injected or explicitly enabled live probe."],
+  ["local_probe_disabled", 501, "Local runtime probing is disabled for this process."],
 ];
 
 export const ERROR_DEFINITIONS = Object.freeze(

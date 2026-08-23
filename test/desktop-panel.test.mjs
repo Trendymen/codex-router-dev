@@ -290,11 +290,67 @@ test("the shipped browser UI binds canonical Node command IDs and omits setup/lo
   const app = readFileSync(new URL("../apps/desktop/ui/app.js", import.meta.url), "utf8");
   const markup = readFileSync(new URL("../apps/desktop/ui/index.html", import.meta.url), "utf8");
   const source = `${markup}\n${app}`;
-  assert.doesNotMatch(source, /\b(?:provider_setup|local_models)\b/);
+  const forbiddenSource = [
+    "login-free-switch",
+    "signed-routing-switch",
+    "local-model-summary",
+    "local-model-operation",
+    "local-download-status",
+    "local-model-list",
+    "local-model-form",
+    "local-model-input",
+    "local-quick-picks",
+    "local-catalog",
+    "local-runtime-actions",
+    "lmstudio-section",
+    "renderLoginFreeSetting",
+    "renderSignedRouting",
+    "renderLocalModels",
+    "handleLoginFreeToggle",
+    "handleSignedRoutingToggle",
+    "handleLocalModelInstall",
+    "handleLocalModelClick",
+    "set_login_free",
+    "set_signed_routing",
+    "install_local_model",
+    "set_local_model_enabled",
+    "uninstall_local_model",
+    "cancel_local_model",
+    "update_local_ollama",
+    "local_model_speed",
+    "benchmark_vision_model",
+    "use_local_vision_model",
+    "set_lmstudio_model_enabled",
+    "provider_setup",
+    "local_models",
+  ];
+  for (const forbidden of forbiddenSource) {
+    assert.equal(source.includes(forbidden), false, `forbidden shared UI source survived: ${forbidden}`);
+  }
+  assert.doesNotMatch(markup, /data-accordion="local"|Local LLMs|Use without OpenAI login|Use Router with ChatGPT/i);
+  assert.match(markup, /id="vision-local-models"/);
+  assert.match(app, /data-command="vision\.pull"/);
+
   const local = new Set(["router_health", "platform_info", "desktop_settings", "set_island_enabled", "set_island_expanded", "show_panel", "hide_panel", "quit_app"]);
   const advertised = [...source.matchAll(/data-command="([^"]+)"/g)].map(([, command]) => command).filter((command) => !command.includes("${"));
   for (const command of advertised) {
     assert.ok(desktopCommandDefinitions().has(command) || local.has(command), `${command} is not canonical or shell-local`);
+  }
+  const invoked = [...app.matchAll(/\bcall\("([^"]+)"/g)].map(([, command]) => command);
+  for (const command of [
+    "set_login_free",
+    "set_signed_routing",
+    "install_local_model",
+    "set_local_model_enabled",
+    "uninstall_local_model",
+    "cancel_local_model",
+    "update_local_ollama",
+    "local_model_speed",
+    "benchmark_vision_model",
+    "use_local_vision_model",
+    "set_lmstudio_model_enabled",
+  ]) {
+    assert.equal(invoked.includes(command), false, `${command} is a surviving forbidden call edge`);
   }
 });
 

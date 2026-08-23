@@ -534,7 +534,7 @@ async function runSetApply(provider, desired) {
   const activate = args.includes("--activate");
   let publication;
   const { transactNodeMutationAndRefreshTargets } = await import("./node-snapshot-triggers.mjs");
-  await transactNodeMutationAndRefreshTargets({
+  const transaction = await transactNodeMutationAndRefreshTargets({
     files: [PROVIDER_SELECTION_PATH],
     reason: `provider-selection:${provider}:${desired}`,
     mutate: () => setProviderSelectionForTargets(provider, desired, selected),
@@ -545,6 +545,11 @@ async function runSetApply(provider, desired) {
       return publication;
     },
   });
+  publication ??= {
+    applied: [],
+    skipped: [...TARGETS],
+    deferred: transaction?.deferred === true,
+  };
   process.stderr.write(
     `Set ${provider} ${desired} for: ${selected.join(", ")}. ` +
       `Applied: ${publication.applied.join(", ") || "none"}. ` +
@@ -1409,6 +1414,9 @@ async function handleVisionBridge(action, value, extra) {
   if (action === "probe") {
     // Read-only: reports what the machine can run and what the local server
     // already has, without pulling, pinning, or spending anything.
+    if (process.env.CODEX_ROUTER_ALLOW_LOCAL_PROBE === "0") {
+      throw Object.assign(new Error("local_probe_disabled"), { code: "local_probe_disabled" });
+    }
     const { suggestLocalVisionSetup } = await import("./vision-host.mjs");
     const suggestion = await suggestLocalVisionSetup(readVisionBridgeSettings());
     process.stdout.write(`${JSON.stringify(suggestion)}\n`);

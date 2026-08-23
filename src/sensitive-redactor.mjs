@@ -14,16 +14,19 @@ const SAFE_REQUEST_ID = /^[a-z0-9_.:-]{1,256}$/i;
 const LOG_MAX_MESSAGE = 16 * 1024;
 const LOG_LEVEL = /^(?:trace|debug|info|warn|error|fatal)$/i;
 const LOG_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/;
-const LOG_SECRET_VALUE = /\b(caller[_-]?key|api[_-]?key|access[_-]?token|refresh[_-]?token|password|secret|authorization|prompt|input|content|reasoning|tool[_-]?(?:args|arguments)|provider[_-]?(?:response|body)|response[_-]?body|body|cause)\s*[:=]\s*(?:"[^"]*"|'[^']*'|\S+)/gi;
-const LOG_AUTHORIZATION = /\bAuthorization\s*:\s*(?:Basic|Bearer)\s+[^\s,;]+/gi;
+const LOG_UNSAFE_FIELD = /(?:^|[\s,{])(?:"|')?(caller[_-]?key|api[_-]?key|access[_-]?token|refresh[_-]?token|password|secret|authorization|prompt|input|content|reasoning|tool[_-]?(?:args|arguments)|provider[_-]?(?:response|body)|response[_-]?body|body|cause)(?:"|')?\s*[:=]/i;
+const LOG_AUTHORIZATION = /\b(?:Authorization\s*:\s*)?(?:Basic|Bearer)\s+[^\s,;]+/gi;
 const LOG_CAPABILITY_URL = /https?:\/\/(?:127\.0\.0\.1|localhost|\[::1\]):\d+\/_codex-router\/[^/\s]+(?:\/v1)?/gi;
 
 function sanitizeLogMessage(value) {
   if (typeof value !== "string" || value.length > LOG_MAX_MESSAGE) return REDACTED;
-  return value
+  const cleaned = value
     .replace(LOG_AUTHORIZATION, "Authorization: [REDACTED]")
-    .replace(LOG_CAPABILITY_URL, "http://127.0.0.1:[PORT]/_codex-router/[REDACTED]/v1")
-    .replace(LOG_SECRET_VALUE, (_match, key) => `${key}=[REDACTED]`);
+    .replace(LOG_CAPABILITY_URL, "http://127.0.0.1:[PORT]/_codex-router/[REDACTED]/v1");
+  const unsafe = LOG_UNSAFE_FIELD.exec(cleaned);
+  if (!unsafe) return cleaned;
+  const fieldStart = unsafe.index + unsafe[0].indexOf(unsafe[1]);
+  return `${cleaned.slice(0, fieldStart)}${unsafe[1]}=[REDACTED]`;
 }
 
 function redactLog(value) {

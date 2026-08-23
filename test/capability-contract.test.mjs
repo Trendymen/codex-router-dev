@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -17,8 +18,48 @@ import {
   runDesktopCommand,
   trustedProtectedContext,
 } from "../src/desktop-commands.mjs";
+import { PROVIDERS } from "../src/model-registry.mjs";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+
+const REAL_CHILD_EXPECTATIONS = Object.freeze({
+  "lifecycle.status": "json", "lifecycle.start": "json", "lifecycle.stop": "json", "lifecycle.restart": "json", "lifecycle.logs": "text",
+  "doctor.status": "json", "doctor.fix": "json", "maintenance.update": "json", "maintenance.rollback": "json",
+  "native.status": "json", "native.account-usage": "json",
+  "credential.status": "json", "credential.set": "json", "credential.remove": "json",
+  "provider.enable": "json", "model.visibility": "json", "model.canary": "json",
+  "protocol-proof.status": "json", "protocol-proof.verify": "error:protocol_probe_not_implemented", "protocol-proof.revoke": "json",
+  "picker.status": "json", "picker.set": "json", "picker.show-all": "json",
+  "catalog.status": "json", "catalog.render-snippet": "protected-text",
+  "subagents.status": "json", "subagents.mode": "json", "subagents.model": "json", "subagents.selection": "json", "subagents.verify": "json",
+  "failover.status": "json", "failover.reset": "json",
+  "tool-result-aging.status": "json", "tool-result-aging.on": "json", "tool-result-aging.off": "json", "tool-result-aging.ttl": "json", "tool-result-aging.purge": "json",
+  "usage.router": "json", "usage.provider": "json", "usage.model": "json",
+  "vision.status": "json", "vision.on": "json", "vision.off": "json", "vision.engine": "json", "vision.effort": "json", "vision.probe": "error:local_probe_disabled", "vision.pull": "json", "vision.purge-cache": "json",
+  "presence.status": "json", "presence.mode": "json",
+  "cc-switch.status": "json", "cc-switch.snippet": "protected-text",
+});
+
+const PROVIDER_CREDENTIAL_ENV = Object.freeze([...new Set([
+  ...[...PROVIDERS.values()].flatMap((provider) => provider.credential?.environment || []),
+  "OPENAI_API_KEY",
+  "AZURE_OPENAI_API_KEY",
+  "ANTHROPIC_AUTH_TOKEN",
+  "CLAUDE_CODE_OAUTH_TOKEN",
+  "AWS_ACCESS_KEY_ID",
+  "AWS_SECRET_ACCESS_KEY",
+  "AWS_SESSION_TOKEN",
+  "GOOGLE_APPLICATION_CREDENTIALS",
+])].sort());
+
+function repositorySnapshot() {
+  const git = (...args) => execFileSync("git", args, { cwd: repoRoot, encoding: "utf8", windowsHide: true });
+  return {
+    head: git("rev-parse", "HEAD"),
+    status: git("status", "--porcelain=v1", "--untracked-files=all"),
+    tree: git("diff", "--binary", "--no-ext-diff", "HEAD", "--", "."),
+  };
+}
 
 test("Node command table exactly covers the independent oracle", () => {
   const commands = desktopCommandDefinitions();
@@ -246,66 +287,161 @@ test("every canonical command has a real control-bridge invocation and result ki
   assert.equal(invoked.length, fixture.nodeCommands.length);
 });
 
-test("every canonical mapping spawns the actual control child in an isolated state and returns a bounded result", async () => {
+test("every canonical mapping spawns the actual control child inside a fail-closed oracle", async () => {
+  assert.deepEqual(Object.keys(REAL_CHILD_EXPECTATIONS).sort(), [...fixture.nodeCommands].sort());
+  const beforeRepository = repositorySnapshot();
   const state = mkdtempSync(path.join(os.tmpdir(), "canonical-control-bridge-"));
   const codexHome = path.join(state, "codex-home");
+  const userHome = path.join(state, "user-home");
+  const tracePath = path.join(state, "safe-child-trace.jsonl");
+  const purgePath = path.join(state, "vision-cache-purge.json");
+  const callerSecret = "c".repeat(48);
+  const protectedSecret = "isolated-provider-secret-41ef2ab7";
   mkdirSync(codexHome, { recursive: true });
-  writeFileSync(path.join(state, "caller-secret"), `${"c".repeat(48)}\n`);
+  mkdirSync(userHome, { recursive: true });
+  mkdirSync(path.join(state, "appdata"), { recursive: true });
+  mkdirSync(path.join(state, "localappdata"), { recursive: true });
+  mkdirSync(path.join(state, "launch-agents"), { recursive: true });
+  writeFileSync(path.join(state, "caller-secret"), `${callerSecret}\n`);
+  writeFileSync(path.join(state, "internal-secret"), `${"i".repeat(48)}\n`);
   writeFileSync(path.join(state, "routed-models.json"), `${JSON.stringify({ models: [] })}\n`);
   writeFileSync(path.join(state, "enabled-providers.json"), "[]\n");
   writeFileSync(path.join(codexHome, "config.toml"), "");
+  writeFileSync(purgePath, `${JSON.stringify({ version: 1, generation: 1 })}\n`);
+  writeFileSync(tracePath, "");
   const preload = path.join(repoRoot, "test", "fixtures", "control-safe-stubs.cjs");
   const environment = {
-    ...process.env,
+    PATH: process.env.PATH || process.env.Path || "",
+    PATHEXT: process.env.PATHEXT || "",
+    SystemRoot: process.env.SystemRoot || process.env.SYSTEMROOT || "",
+    WINDIR: process.env.WINDIR || process.env.SystemRoot || process.env.SYSTEMROOT || "",
+    ComSpec: process.env.ComSpec || process.env.COMSPEC || "",
+    TEMP: state,
+    TMP: state,
+    HOME: userHome,
+    USERPROFILE: userHome,
+    APPDATA: path.join(state, "appdata"),
+    LOCALAPPDATA: path.join(state, "localappdata"),
     CODEX_HOME: codexHome,
+    CODEX_BINARY: path.join(state, "fake-codex.exe"),
+    DSH_HOME: path.join(state, "dsh-home"),
+    GEMINI_CLI_HOME: path.join(state, "gemini-home"),
     CODEX_ROUTER_STATE_DIR: state,
     MODEL_ROUTER_STATE_DIR: state,
     MODEL_ROUTER_SOURCE_ROOT: repoRoot,
+    CODEX_ROUTER_SOURCE_ROOT: repoRoot,
     MODEL_ROUTER_TARGET: "codex",
-    MODEL_ROUTER_VISION_CACHE_PURGE: path.join(state, "vision-cache-purge.json"),
+    MODEL_ROUTER_LAUNCH_AGENTS_DIR: path.join(state, "launch-agents"),
+    MODEL_ROUTER_DSH_SETTINGS: path.join(state, "dsh-home", "settings.yaml"),
+    MODEL_ROUTER_DSH_CREDENTIALS: path.join(state, "dsh-home", ".credentials.yaml"),
+    MODEL_ROUTER_GEMINI_ENV: path.join(state, "gemini-home", ".gemini", ".env"),
+    MODEL_ROUTER_VISION_CACHE_PURGE: purgePath,
     MODEL_ROUTER_VISION_DOWNLOAD_STATE: path.join(state, "vision-download.json"),
     MODEL_ROUTER_VISION_DOWNLOAD_CLAIM: path.join(state, "vision-download.claim"),
-    NODE_OPTIONS: `${process.env.NODE_OPTIONS || ""} --require=${preload}`.trim(),
+    CODEX_ROUTER_ALLOW_LIVE_PROTOCOL_PROBE: "0",
+    CODEX_ROUTER_ALLOW_LOCAL_PROBE: "0",
+    CONTROL_SAFE_TRACE: tracePath,
+    NODE_TEST_CONTEXT: "child-v8",
+    NODE_OPTIONS: `--require=${preload}`,
   };
+  for (const name of PROVIDER_CREDENTIAL_ENV) environment[name] = "";
+  for (const name of PROVIDER_CREDENTIAL_ENV) {
+    assert.equal(environment[name], "", `provider credential environment was not blanked: ${name}`);
+  }
+
   const argsByCommand = Object.fromEntries(fixture.nodeCommands.map((name) => [name, {}]));
   Object.assign(argsByCommand, {
     "credential.status": { provider: "deepseek" }, "credential.set": { provider: "deepseek" }, "credential.remove": { provider: "deepseek" },
     "provider.enable": { provider: "deepseek", enabled: true }, "model.visibility": { slug: "deepseek/deepseek-v4-pro", visible: true }, "model.canary": { slug: "qwen-plan/qwen3.7-max", enabled: false },
-    "protocol-proof.status": { slug: "deepseek/deepseek-v4-pro" }, "protocol-proof.verify": { slug: "deepseek/deepseek-v4-pro" }, "protocol-proof.revoke": { slug: "deepseek/deepseek-v4-pro" },
+    "protocol-proof.status": { slug: "qwen-plan/qwen3.7-max" }, "protocol-proof.verify": { slug: "qwen-plan/qwen3.7-max" }, "protocol-proof.revoke": { slug: "qwen-plan/qwen3.7-max" },
     "picker.set": { slug: "deepseek/deepseek-v4-pro", visible: true }, "picker.show-all": { visible: true },
-    "subagents.mode": { mode: "proven" }, "subagents.model": { slug: "deepseek/deepseek-v4-pro", enabled: true }, "subagents.selection": { selection: "select-all" }, "subagents.verify": { slug: "deepseek/deepseek-v4-pro" },
+    "subagents.mode": { mode: "proven" }, "subagents.model": { slug: "deepseek/deepseek-v4-pro", enabled: true }, "subagents.selection": { selection: "select-all" }, "subagents.verify": { slug: "grok-api/grok-4.5" },
     "tool-result-aging.ttl": { days: 7 }, "tool-result-aging.purge": { expiredOnly: true }, "usage.provider": { provider: "deepseek" }, "usage.model": { slug: "deepseek/deepseek-v4-pro" },
     "vision.engine": { engine: "auto" }, "vision.effort": { effort: "default" }, "vision.pull": { tag: "qwen2.5vl:3b" }, "presence.mode": { mode: "always" },
   });
+
   try {
     for (const name of fixture.nodeCommands) {
+      if (name === "picker.show-all") {
+        const nativeCatalog = { models: [{
+          slug: "gpt-fixture-native",
+          base_instructions: "fixture native instructions",
+          model_messages: { instructions_template: "fixture native instructions" },
+          supports_parallel_tool_calls: false,
+        }] };
+        const emptyModels = { version: 1, models: [] };
+        for (const [file, contents] of Object.entries({
+          "merged-models.json": nativeCatalog,
+          "routed-models.json": nativeCatalog,
+          "node-routes.json": { version: 1, routes: [] },
+          "control-models.json": emptyModels,
+          "swift-models.json": emptyModels,
+          "browser-models.json": emptyModels,
+        })) {
+          writeFileSync(path.join(state, file), `${JSON.stringify(contents)}\n`);
+        }
+      }
       const definition = desktopCommandDefinitions().get(name);
+      let childFailure;
       const context = {
         root: repoRoot,
-        protectedInput: name === "credential.set" ? "isolated-provider-secret" : undefined,
+        protectedInput: name === "credential.set" ? protectedSecret : undefined,
         runControl: (root, argv, options) => runControl(root, argv, {
           ...options,
-          runtime: { command: process.execPath, env: environment },
+          runtime: {
+            command: process.execPath,
+            env: { ...environment, CONTROL_SAFE_CANONICAL_COMMAND: name },
+          },
           timeoutMs: 20_000,
+        }).catch((error) => {
+          childFailure = String(error?.message || error)
+            .split(protectedSecret).join("[REDACTED]")
+            .split(callerSecret).join("[REDACTED]");
+          throw error;
         }),
       };
       const trusted = definition.resultKind === "protected-text" ? trustedProtectedContext(context) : context;
       const result = await runDesktopCommand(name, argsByCommand[name], trusted);
-      assert.equal(typeof result?.ok, "boolean", `${name}: missing envelope`);
-      if (result.ok) {
-        assert.notEqual(result.value, undefined, `${name}: undefined production value`);
-        if (definition.resultKind === "text" || definition.resultKind === "protected-text") {
-          assert.equal(typeof result.value, "string", `${name}: wrong text shape`);
-        } else {
-          assert.equal(typeof result.value, "object", `${name}: wrong JSON shape`);
-        }
+      const expected = REAL_CHILD_EXPECTATIONS[name];
+      if (expected.startsWith("error:")) {
+        assert.equal(result?.ok, false, `${name}: expected ${expected}, got ${JSON.stringify(result)}`);
+        assert.equal(result.error?.code, expected.slice("error:".length), `${name}: received an undeclared error code; child=${childFailure || "none"}`);
+        continue;
+      }
+      assert.equal(result?.ok, true, `${name}: expected ${expected} success, got ${JSON.stringify(result)}; child=${childFailure || "none"}`);
+      if (expected === "json") {
+        assert.ok(result.value && typeof result.value === "object" && !Array.isArray(result.value), `${name}: expected a JSON object`);
       } else {
-        assert.equal(typeof result.error?.code, "string", `${name}: missing safe error code`);
-        assert.equal(typeof result.error?.message, "string", `${name}: missing safe error message`);
+        assert.equal(typeof result.value, "string", `${name}: expected text`);
+        assert.ok(result.value.length > 0, `${name}: expected non-empty text`);
+      }
+      if (expected === "protected-text") {
+        assert.match(result.value, new RegExp(callerSecret), `${name}: protected snippet lost its caller capability`);
+        assert.deepEqual(result.meta, { protected: true, resultKind: "protected-text", cacheControl: "no-store" });
       }
     }
+
+    const traceRaw = readFileSync(tracePath, "utf8");
+    const trace = traceRaw.split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line));
+    assert.ok(trace.some((event) => event.type === "preload"), "real control children did not load the safety preload");
+    assert.equal(trace.filter((event) => event.type === "network").length, 0, traceRaw);
+    assert.ok(trace.filter((event) => event.type === "child").every((event) => event.stubbed === true), "an inner child was not stubbed");
+    assert.ok(
+      trace.some((event) => event.owner === "maintenance.rollback" && event.category === "git" && event.stubbed === true),
+      "rollback did not reach the deterministic git stub",
+    );
+    assert.doesNotMatch(traceRaw, new RegExp(protectedSecret));
+    assert.doesNotMatch(traceRaw, new RegExp(callerSecret));
+    const routerLog = path.join(state, "router.log");
+    if (existsSync(routerLog)) {
+      const log = readFileSync(routerLog, "utf8");
+      assert.doesNotMatch(log, new RegExp(protectedSecret));
+      assert.doesNotMatch(log, new RegExp(callerSecret));
+    }
   } finally {
+    const afterRepository = repositorySnapshot();
     rmSync(state, { recursive: true, force: true });
+    assert.deepEqual(afterRepository, beforeRepository, "the real repository changed while the child oracle ran");
   }
 });
 
