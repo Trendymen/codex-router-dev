@@ -7,6 +7,16 @@ import Testing
 // Parallel cases would clobber each other's language mid-assertion.
 @Suite("Tray language", .serialized)
 struct LocalizationTests {
+  @Test("capability safety labels are translated")
+  func capabilityLabelsTranslate() {
+    let original = RouterLanguage.selection
+    defer { RouterLanguage.setSelection(original) }
+    RouterLanguage.setSelection(.chinese)
+    #expect(routerLocalized("Quota warning") == "配额警告")
+    #expect(routerLocalized("Confirm and run") == "确认并运行")
+    #expect(routerLocalized("Only health and version information is available for this Router capability version.") == "此路由能力版本仅提供健康状态和版本信息。")
+  }
+
   @Test("an explicit choice overrides the system language in both directions")
   func explicitChoiceWins() {
     let original = RouterLanguage.selection

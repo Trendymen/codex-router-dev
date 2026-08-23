@@ -5,6 +5,14 @@ import Testing
 
 @Suite("Menu bar settings", .serialized)
 struct MenuBarSettingsTests {
+  @Test("the native tray keeps one auditable canonical command catalog")
+  func canonicalCommandCatalogIsComplete() {
+    #expect(CapabilityCommandCatalog.canonicalCommandIDs.count == 52)
+    #expect(Set(CapabilityCommandCatalog.canonicalCommandIDs).count == 52)
+    #expect(CapabilityCommandCatalog.canonicalCommandSet.contains("credential.set"))
+    #expect(CapabilityCommandCatalog.canonicalCommandSet.contains("vision.purge-cache"))
+  }
+
   @Test("a missing key keeps the shipped activity-dot look")
   func missingKeysKeepShippedLook() {
     let settings = RouterStore.resolveMenuBarSettings(
