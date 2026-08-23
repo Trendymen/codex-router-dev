@@ -74,6 +74,7 @@ import { venvRuntimeProblem } from "./venv-runtime.mjs";
 import {
   dependencyRepairHint,
   isHomebrewManaged,
+  requireMacOSRepair,
 } from "./dependency-repair.mjs";
 import {
   describeRetentionAge,
@@ -82,6 +83,9 @@ import {
   retainedToolResultsUsage,
 } from "./tool-result-retention.mjs";
 import { retentionTtlMs } from "./tool-result-aging-state.mjs";
+import { refuseUnsupportedPlatform } from "./platform-gate.mjs";
+
+if (process.argv.includes("--fix") && refuseUnsupportedPlatform("doctor:fix")) process.exit(2);
 
 const checks = [];
 const add = (status, name, detail, fix) => checks.push({ status, name, detail, fix });
@@ -182,6 +186,7 @@ function childJson(script, args = []) {
 }
 
 function repair() {
+  requireMacOSRepair();
   const ownership = stateOwnershipStatus();
   if (
     ownership.foreign &&

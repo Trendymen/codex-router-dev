@@ -360,7 +360,7 @@ test("protocol-proof verify warns without --yes and makes no proof request", () 
   }
 });
 
-test("model-router restricts protocol-proof to codex and Phase 1 --yes fails closed", () => {
+test("model-router restricts protocol-proof to codex and Phase 1 --yes fails closed", { skip: process.platform !== "darwin" }, () => {
   const stateDir = mkdtempSync(path.join(os.tmpdir(), "control-protocol-proof-cli-"));
   const env = {
     ...process.env,
@@ -554,7 +554,7 @@ test("set-apply mutates shared selection and skips an inactive Codex target with
   }
 });
 
-test("apply samples an active target once and never falls through to its installer", () => {
+test("apply samples an active target once and never falls through to its installer", { skip: process.platform !== "darwin" }, () => {
   const fixtureRoot = mkdtempSync(path.join(os.tmpdir(), "control-active-snapshot-"));
   const stateDir = path.join(fixtureRoot, "state");
   const binDir = path.join(fixtureRoot, "bin");

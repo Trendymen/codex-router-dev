@@ -137,13 +137,14 @@ test("Homebrew setup never reconciles package-manager-owned dependencies", () =>
   );
 });
 
-test("Homebrew force-deps fails early with the package-manager repair command", { skip: !POSIX_SHELL_AVAILABLE }, () => {
+test("non-macOS force-deps refuses before package-manager repair", { skip: !POSIX_SHELL_AVAILABLE }, () => {
   const result = spawnSync("sh", [path.join(root, "bin", "install"), "--force-deps"], {
     encoding: "utf8",
     env: { ...process.env, CODEX_ROUTER_PACKAGE_MANAGER: "homebrew" },
   });
   assert.equal(result.status, 2);
-  assert.match(result.stderr, /brew reinstall codex-router/);
+  assert.match(result.stderr, /unsupported_platform/);
+  assert.doesNotMatch(result.stderr, /brew reinstall codex-router/);
   assert.doesNotMatch(result.stdout, /npm ci|LiteLLM|service|catalog/i);
 });
 

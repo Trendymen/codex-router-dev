@@ -1,5 +1,7 @@
 #!/bin/sh
 set -eu
 
+sh "$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/platform-gate"
+
 repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 exec node "$repo_dir/src/compatibility-test.mjs" "$@"

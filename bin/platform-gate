@@ -1,10 +1,9 @@
 #!/bin/sh
 set -eu
 
+# Never resolve uname through PATH: a caller-controlled PATH must not be able
+# to impersonate Darwin before a mutating public wrapper starts.
 if [ "$(/usr/bin/uname -s 2>/dev/null || printf unknown)" != "Darwin" ]; then
   printf 'codex-router: unsupported_platform\n' >&2
   exit 2
 fi
-
-repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-exec node "$repo_dir/src/control.mjs" "$@"

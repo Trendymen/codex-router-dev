@@ -1,6 +1,8 @@
 #!/bin/sh
 set -eu
 
+sh "$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/platform-gate"
+
 repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 # The smoke test spends provider quota against the shared router plane, so it
 # proves the same routes whichever client asked for it.

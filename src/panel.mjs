@@ -12,7 +12,8 @@ import { execFile } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 
 import { assertCallerSecret, panelBootstrapUrl, panelSessionUrl, redactCallerUrl } from "./caller-auth.mjs";
-import { CALLER_SECRET_PATH, PORTS } from "./paths.mjs";
+import { refuseUnsupportedPlatform } from "./platform-gate.mjs";
+import { CALLER_SECRET_PATH, currentServiceTarget } from "./paths.mjs";
 
 const args = process.argv.slice(2);
 const printOnly = args.includes("--print");
@@ -32,6 +33,9 @@ Opens the Model Router companion in your default browser.
   process.exit(0);
 }
 
+if (refuseUnsupportedPlatform("panel")) process.exit(2);
+const serviceTarget = currentServiceTarget();
+
 // The same failure the router itself reports, pointed at the same repair, so a
 // missing key reads identically wherever someone meets it first.
 function callerSecret() {
@@ -49,7 +53,7 @@ function callerSecret() {
 // without putting the secret on a command line.
 async function routerIsRunning() {
   try {
-    const response = await fetch(`http://127.0.0.1:${PORTS.router}/health`, {
+    const response = await fetch(`http://127.0.0.1:${serviceTarget.ports.router}/health`, {
       signal: AbortSignal.timeout(2000),
     });
     // A degraded dependency still means the Node router is listening and can
@@ -78,7 +82,7 @@ function openInBrowser(url) {
 }
 
 async function mintPanelBootstrapUrl(secret) {
-  const response = await fetch(panelSessionUrl(PORTS.router, secret), {
+  const response = await fetch(panelSessionUrl(serviceTarget.ports.router, secret), {
     method: "POST",
     headers: { "content-type": "application/json", authorization: `Bearer ${secret}` },
     body: "{}",
@@ -90,7 +94,7 @@ async function mintPanelBootstrapUrl(secret) {
     error.status = response.status;
     throw error;
   }
-  return panelBootstrapUrl(PORTS.router, payload.nonce);
+  return panelBootstrapUrl(serviceTarget.ports.router, payload.nonce);
 }
 
 async function main() {
@@ -98,7 +102,7 @@ async function main() {
 
   if (!(await routerIsRunning())) {
     process.stdout.write(
-      `The router is not answering on port ${PORTS.router}, so the panel would load empty.\n` +
+      `The router is not answering on port ${serviceTarget.ports.router}, so the panel would load empty.\n` +
         "Start it first, then run this again.\n",
     );
     process.exitCode = 1;

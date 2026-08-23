@@ -3,16 +3,17 @@ import { chmodSync, existsSync, mkdirSync, renameSync, unlinkSync, writeFileSync
 import path from "node:path";
 
 import {
-  LAUNCH_AGENTS_DIR,
-  TRAY_APP_BINARY,
-  TRAY_APP_PATH,
-  TRAY_LAUNCH_AGENT_PATH,
-  TRAY_SERVICE_LABEL,
+  currentServiceTarget,
 } from "./paths.mjs";
+import { refuseUnsupportedPlatform } from "./platform-gate.mjs";
 
+const command = process.argv[2] || "status";
+const renderOnly = command === "render";
+if (!renderOnly && refuseUnsupportedPlatform(`tray:${command}`)) process.exit(2);
+const target = currentServiceTarget();
 const launchctl = "/bin/launchctl";
-const domain = `gui/${process.getuid()}`;
-const service = `${domain}/${TRAY_SERVICE_LABEL}`;
+const domain = target.launchDomain;
+const service = target.trayService;
 const retryWait = new Int32Array(new SharedArrayBuffer(4));
 
 function xml(value) {
@@ -38,10 +39,10 @@ function plist() {
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>${xml(TRAY_SERVICE_LABEL)}</string>
+  <string>${xml(target.trayLabel)}</string>
   <key>ProgramArguments</key>
   <array>
-    <string>${xml(TRAY_APP_BINARY)}</string>
+    <string>${xml(target.appBinary)}</string>
     <string>--supervised</string>
   </array>
   <key>RunAtLoad</key>
@@ -91,28 +92,27 @@ function bootout() {
     if (!loaded()) return;
     Atomics.wait(retryWait, 0, 0, 100);
   }
-  throw new Error(`Timed out waiting for ${TRAY_SERVICE_LABEL} to stop.`);
+  throw new Error(`Timed out waiting for ${target.trayLabel} to stop.`);
 }
 
 function writeAgent() {
-  mkdirSync(LAUNCH_AGENTS_DIR, { recursive: true });
-  const temporary = `${TRAY_LAUNCH_AGENT_PATH}.tmp.${process.pid}`;
+  mkdirSync(target.launchAgentsDir, { recursive: true });
+  const temporary = `${target.trayPlistPath}.tmp.${process.pid}`;
   writeFileSync(temporary, plist(), { encoding: "utf8", mode: 0o644 });
   chmodSync(temporary, 0o644);
-  renameSync(temporary, TRAY_LAUNCH_AGENT_PATH);
+  renameSync(temporary, target.trayPlistPath);
 }
 
 function bootstrap() {
   run(["enable", service], { quiet: true });
   try {
-    run(["bootstrap", domain, TRAY_LAUNCH_AGENT_PATH], { quiet: true });
+    run(["bootstrap", domain, target.trayPlistPath], { quiet: true });
   } catch (error) {
     // Already bootstrapped is not a failure; anything else is.
     if (!loaded()) throw error;
   }
 }
 
-const command = process.argv[2] || "status";
 if (!new Set(["install", "uninstall", "start", "stop", "restart", "status", "render"]).has(command)) {
   console.error("Usage: tray-service-macos.mjs install|uninstall|start|stop|restart|status|render");
   process.exit(2);
@@ -122,26 +122,26 @@ if (command === "render") {
   process.stdout.write(plist());
 } else if (command === "status") {
   const description = loaded();
-  const installed = existsSync(TRAY_LAUNCH_AGENT_PATH);
+  const installed = existsSync(target.trayPlistPath);
   process.stdout.write(
     `${JSON.stringify({
       installed,
       loaded: Boolean(description) && installed,
-      appPresent: existsSync(TRAY_APP_BINARY),
+      appPresent: existsSync(target.appBinary),
       state: description ? description.match(/state = ([^\n]+)/)?.[1]?.trim() || "loaded" : "stopped",
-      path: TRAY_LAUNCH_AGENT_PATH,
+      path: target.trayPlistPath,
     })}\n`,
   );
 } else if (command === "install") {
-  if (!existsSync(TRAY_APP_BINARY)) {
+  if (!existsSync(target.appBinary)) {
     throw new Error(
-      `The tray app is not built at ${TRAY_APP_PATH}. Run ./bin/model-router-tray first.`,
+      `The tray app is not built at ${target.appPath}. Run ./bin/model-router-tray first.`,
     );
   }
   bootout();
   writeAgent();
   bootstrap();
-  process.stdout.write(`${JSON.stringify({ installed: true, path: TRAY_LAUNCH_AGENT_PATH })}\n`);
+  process.stdout.write(`${JSON.stringify({ installed: true, path: target.trayPlistPath })}\n`);
 } else if (command === "uninstall") {
   bootout();
   try {
@@ -149,14 +149,14 @@ if (command === "render") {
   } catch {
     // Best effort.
   }
-  if (existsSync(TRAY_LAUNCH_AGENT_PATH)) unlinkSync(TRAY_LAUNCH_AGENT_PATH);
+  if (existsSync(target.trayPlistPath)) unlinkSync(target.trayPlistPath);
   process.stdout.write(`${JSON.stringify({ installed: false })}\n`);
 } else if (command === "stop") {
   bootout();
   process.stdout.write(`${JSON.stringify({ state: "stopped" })}\n`);
 } else if (command === "start") {
-  if (!existsSync(TRAY_LAUNCH_AGENT_PATH)) {
-    throw new Error(`The tray agent is not installed at ${TRAY_LAUNCH_AGENT_PATH}.`);
+  if (!existsSync(target.trayPlistPath)) {
+    throw new Error(`The tray agent is not installed at ${target.trayPlistPath}.`);
   }
   if (!loaded()) bootstrap();
   process.stdout.write(`${JSON.stringify({ state: "running" })}\n`);

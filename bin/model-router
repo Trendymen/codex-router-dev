@@ -1,6 +1,11 @@
 #!/bin/sh
 set -eu
 
+if [ "${1:-}" != "--help" ] && [ "$(/usr/bin/uname -s 2>/dev/null || printf unknown)" != "Darwin" ]; then
+  printf 'codex-router: unsupported_platform\n' >&2
+  exit 2
+fi
+
 repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 
 usage() {

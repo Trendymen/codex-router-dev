@@ -397,7 +397,7 @@ test("production source has no SQLite or CC Switch database adapter", () => {
   assert.deepEqual(offenders, []);
 });
 
-test("aggregate status never leaks a decoy caller capability into a support bundle or log tail", () => {
+test("aggregate status never leaks a decoy caller capability into a support bundle or log tail", { skip: process.platform !== "darwin" }, () => {
   const isolated = mkdtempSync(path.join(os.tmpdir(), "codex-router-support-redaction-"));
   const codexHome = path.join(isolated, "codex");
   const stateDir = path.join(codexHome, "router-state");

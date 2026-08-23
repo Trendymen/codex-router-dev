@@ -29,6 +29,18 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$IsMacOS = $false
+try {
+  $IsMacOS = [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform(
+    [System.Runtime.InteropServices.OSPlatform]::OSX
+  )
+} catch {
+  $IsMacOS = $false
+}
+if (-not $IsMacOS) {
+  [Console]::Error.WriteLine("codex-router: unsupported_platform")
+  exit 2
+}
 $env:MODEL_ROUTER_TARGET = $Target
 # Legacy migration replaces an older router's managed Codex config block, and
 # the native catalog is the ChatGPT-plan model list Codex adopts. Neither has a

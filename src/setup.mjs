@@ -1,13 +1,13 @@
 import { execFileSync, spawnSync } from "node:child_process";
 import { closeSync, openSync, readSync, writeSync } from "node:fs";
-import os from "node:os";
 import path from "node:path";
 
 import { detectLegacyInstallations, applyKnownMigrations, rollbackLatestMigration } from "./legacy-migration.mjs";
 import { grokOAuthStatus } from "./grok-oauth-status.mjs";
 import { PROVIDERS, providerNeedsNoKey } from "./model-registry.mjs";
 import { kimiOAuthStatus } from "./oauth-status.mjs";
-import { SOURCE_ROOT, TARGET } from "./paths.mjs";
+import { currentServiceTarget, SOURCE_ROOT, TARGET } from "./paths.mjs";
+import { refuseUnsupportedPlatform } from "./platform-gate.mjs";
 import { credentialStatus } from "./provider-credentials.mjs";
 import {
   installOauthCli,
@@ -24,7 +24,7 @@ import {
   writeProviderSelection,
 } from "./provider-selection.mjs";
 import { writeDiscoveryMode } from "./discovery-mode.mjs";
-import { trayBundleDir, trayDecision } from "./tray-install.mjs";
+import { trayDecision } from "./tray-install.mjs";
 import { resolveVisionEngine } from "./vision-bridge.mjs";
 import { nodeRoutableModels } from "./model-contract.mjs";
 import { nativeSessionAvailable } from "./codex-native-session.mjs";
@@ -100,6 +100,11 @@ if (!setupArgumentError && TARGET !== "codex" && (migrateKnown || adoptNativeCat
     migrateKnown ? "--migrate-known" : "--adopt-native-catalog"
   } applies only to the Codex target.`;
 }
+
+// Parse-only argument errors and --help remain available everywhere. Once the
+// invocation is structurally valid, refuse before environment markers,
+// credential discovery, provider selection, migration, or installer calls.
+if (!setupArgumentError && !args.includes("--help") && refuseUnsupportedPlatform("setup")) process.exit(2);
 
 function option(name) {
   const index = args.indexOf(name);
@@ -303,6 +308,7 @@ function configureProvider(provider) {
 function installTray() {
   try {
     if (process.platform === "darwin") {
+      const serviceTarget = currentServiceTarget();
       try {
         execFileSync("xcrun", ["--find", "swift"], { stdio: "ignore" });
       } catch {
@@ -311,7 +317,7 @@ function installTray() {
         );
         return;
       }
-      const bundleDir = trayBundleDir("darwin", os.homedir());
+      const bundleDir = serviceTarget.appPath;
       run(path.join(SOURCE_ROOT, "scripts", "build-macos-tray-app.sh"), [bundleDir]);
       run("open", [bundleDir]);
       process.stdout.write(`Menu-bar companion installed at ${bundleDir} and opened.\n`);

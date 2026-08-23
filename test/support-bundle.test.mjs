@@ -98,7 +98,7 @@ model_catalog_json = ${JSON.stringify(path.join(stateDir, "merged-models.json"))
       env: process.env,
       encoding: "utf8",
     });
-    assert.equal(cliFailure.status, 1);
+    assert.equal(cliFailure.status, process.platform === "win32" ? 2 : 1);
     assert.doesNotMatch(`${cliFailure.stdout}\n${cliFailure.stderr}`, new RegExp(childErrorDecoy));
   } finally {
     rmSync(testRoot, { recursive: true, force: true });

@@ -49,7 +49,7 @@ test("a bare invocation updates and an explicit check stays read-only", () => {
   assert.equal(resolveCommand(["nonsense"]), undefined);
 });
 
-test("a Homebrew install sends updates back to Homebrew", () => {
+test("a Homebrew install sends updates back to Homebrew", { skip: process.platform !== "darwin" }, () => {
   const result = spawnSync(
     process.execPath,
     [path.join(repoRoot, "src", "update.mjs"), "check"],

@@ -12,24 +12,20 @@ import path from "node:path";
 
 import {
   CODEX_HOME,
-  LAUNCH_AGENT_PATH,
-  LOG_PATH,
-  PORTS,
   SERVICE_LABEL,
-  SOURCE_ROOT,
-  STATE_DIR,
   TARGET,
+  currentServiceTarget,
 } from "./paths.mjs";
+import { refuseUnsupportedPlatform } from "./platform-gate.mjs";
 import { serviceProxyEnvironment } from "./proxy-environment.mjs";
 
 const command = process.argv[2] || "status";
-const effectivePlatform = process.env.CODEX_ROUTER_SERVICE_PLATFORM || process.platform;
-if (effectivePlatform !== "darwin" && command !== "render") {
-  throw new Error("The launchd service manager runs on macOS only.");
-}
+const renderOnly = command === "render";
+if (!renderOnly && refuseUnsupportedPlatform(`service:${command}`)) process.exit(2);
+const target = currentServiceTarget();
 const userId = typeof process.getuid === "function" ? process.getuid() : 501;
-const domain = `gui/${userId}`;
-const service = `${domain}/${SERVICE_LABEL}`;
+const domain = target.launchDomain || `gui/${userId}`;
+const service = target.routerService || `${domain}/${SERVICE_LABEL}`;
 const launchctl = "/bin/launchctl";
 const launchctlRetryWait = new Int32Array(new SharedArrayBuffer(4));
 const nodeBinary = process.env.CODEX_ROUTER_NODE_BIN || process.execPath;
@@ -50,22 +46,22 @@ function environmentEntries() {
   const values = {
     PATH: process.env.PATH || "/usr/local/bin:/usr/bin:/bin",
     MODEL_ROUTER_TARGET: TARGET,
-    MODEL_ROUTER_STATE_DIR: STATE_DIR,
+    MODEL_ROUTER_STATE_DIR: target.stateRoot,
     MODEL_ROUTER_QUIET: "1",
-    MODEL_ROUTER_OAUTH_PORT: String(PORTS.oauth),
-    MODEL_ROUTER_PORT: String(PORTS.router),
-    MODEL_ROUTER_API_PORT: String(PORTS.api),
+    MODEL_ROUTER_OAUTH_PORT: String(target.ports.oauth),
+    MODEL_ROUTER_PORT: String(target.ports.router),
+    MODEL_ROUTER_API_PORT: String(target.ports.api),
     CODEX_HOME,
-    CODEX_ROUTER_STATE_DIR: STATE_DIR,
-    KIMI_CODEX_STATE_DIR: STATE_DIR,
+    CODEX_ROUTER_STATE_DIR: target.stateRoot,
+    KIMI_CODEX_STATE_DIR: target.stateRoot,
     CODEX_ROUTER_QUIET: "1",
     KIMI_PROXY_QUIET: "1",
-    CODEX_ROUTER_OAUTH_PORT: String(PORTS.oauth),
-    CODEX_ROUTER_PORT: String(PORTS.router),
-    CODEX_ROUTER_API_PORT: String(PORTS.api),
+    CODEX_ROUTER_OAUTH_PORT: String(target.ports.oauth),
+    CODEX_ROUTER_PORT: String(target.ports.router),
+    CODEX_ROUTER_API_PORT: String(target.ports.api),
     ...serviceProxyEnvironment(),
     ...(process.env.CODEX_ROUTER_SOURCE_ROOT
-      ? { CODEX_ROUTER_SOURCE_ROOT: SOURCE_ROOT }
+      ? { CODEX_ROUTER_SOURCE_ROOT: target.sourceRoot }
       : {}),
     ...(process.env.CODEX_ROUTER_NODE_BIN
       ? { CODEX_ROUTER_NODE_BIN: nodeBinary }
@@ -81,20 +77,20 @@ function environmentEntries() {
 }
 
 function plist() {
-  const start = path.join(SOURCE_ROOT, "src", "start.mjs");
+  const start = path.join(target.sourceRoot, "src", "start.mjs");
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>${xml(SERVICE_LABEL)}</string>
+  <string>${xml(target.routerLabel)}</string>
   <key>ProgramArguments</key>
   <array>
     <string>${xml(nodeBinary)}</string>
     <string>${xml(start)}</string>
   </array>
   <key>WorkingDirectory</key>
-  <string>${xml(SOURCE_ROOT)}</string>
+  <string>${xml(target.sourceRoot)}</string>
   <key>EnvironmentVariables</key>
   <dict>
 ${environmentEntries()}
@@ -108,9 +104,9 @@ ${environmentEntries()}
   <key>ThrottleInterval</key>
   <integer>10</integer>
   <key>StandardOutPath</key>
-  <string>${xml(LOG_PATH)}</string>
+  <string>${xml(target.logPath)}</string>
   <key>StandardErrorPath</key>
-  <string>${xml(LOG_PATH)}</string>
+  <string>${xml(target.logPath)}</string>
 </dict>
 </plist>
 `;
@@ -154,24 +150,24 @@ function bootout(targetService = service) {
 }
 
 function writePlist() {
-  mkdirSync(path.dirname(LAUNCH_AGENT_PATH), { recursive: true });
-  mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
-  const temporary = `${LAUNCH_AGENT_PATH}.tmp.${process.pid}`;
+  mkdirSync(path.dirname(target.routerPlistPath), { recursive: true });
+  mkdirSync(target.stateRoot, { recursive: true, mode: 0o700 });
+  const temporary = `${target.routerPlistPath}.tmp.${process.pid}`;
   // Proxy URLs may carry credentials, so the generated plist is private just
   // like the state it launches with.
   writeFileSync(temporary, plist(), { encoding: "utf8", mode: 0o600 });
   chmodSync(temporary, 0o600);
-  renameSync(temporary, LAUNCH_AGENT_PATH);
+  renameSync(temporary, target.routerPlistPath);
 }
 
 function bootstrap() {
-  if (!existsSync(LAUNCH_AGENT_PATH)) {
-    throw new Error(`LaunchAgent is not installed at ${LAUNCH_AGENT_PATH}.`);
+  if (!existsSync(target.routerPlistPath)) {
+    throw new Error(`LaunchAgent is not installed at ${target.routerPlistPath}.`);
   }
   run(["enable", service], { quiet: true });
   for (let attempt = 0; attempt < 20; attempt += 1) {
     try {
-      run(["bootstrap", domain, LAUNCH_AGENT_PATH], { quiet: true });
+      run(["bootstrap", domain, target.routerPlistPath], { quiet: true });
       return;
     } catch (error) {
       const description = loaded();
@@ -191,7 +187,7 @@ if (command === "render") {
   process.stdout.write(plist());
 } else if (command === "status") {
   const description = loaded();
-  const installed = existsSync(LAUNCH_AGENT_PATH);
+  const installed = existsSync(target.routerPlistPath);
   const isLoaded = Boolean(description) && installed;
   const state = isLoaded
     ? description?.match(/state = ([^\n]+)/)?.[1]?.trim() || "loaded"
@@ -211,10 +207,10 @@ if (command === "render") {
   // the log grows exactly as before, just under a different name. Between
   // bootout and bootstrap nothing holds it and the next start creates a fresh
   // file. Failures are ignored -- housekeeping must not block an install.
-  rotateLog(LOG_PATH);
+  rotateLog(target.logPath);
   writePlist();
   bootstrap();
-  process.stdout.write(`${JSON.stringify({ installed: true, path: LAUNCH_AGENT_PATH })}\n`);
+  process.stdout.write(`${JSON.stringify({ installed: true, path: target.routerPlistPath })}\n`);
 } else if (command === "uninstall") {
   bootout();
   try {
@@ -222,7 +218,7 @@ if (command === "render") {
   } catch {
     // Best effort.
   }
-  if (existsSync(LAUNCH_AGENT_PATH)) unlinkSync(LAUNCH_AGENT_PATH);
+  if (existsSync(target.routerPlistPath)) unlinkSync(target.routerPlistPath);
   process.stdout.write(`${JSON.stringify({ installed: false })}\n`);
 } else if (command === "stop") {
   bootout();

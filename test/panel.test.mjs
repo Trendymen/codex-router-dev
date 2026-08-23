@@ -90,14 +90,14 @@ test("both entry points expose the command", () => {
 
 test("browser launcher mints a caller-authenticated nonce and opens only the clean bootstrap URL", () => {
   const source = readFileSync(path.join(root, "src", "panel.mjs"), "utf8");
-  assert.match(source, /panelSessionUrl\(PORTS\.router, secret\)/);
+  assert.match(source, /panelSessionUrl\(serviceTarget\.ports\.router, secret\)/);
   assert.match(source, /authorization: `Bearer \$\{secret\}`/);
-  assert.match(source, /panelBootstrapUrl\(PORTS\.router, payload\.nonce\)/);
+  assert.match(source, /panelBootstrapUrl\(serviceTarget\.ports\.router, payload\.nonce\)/);
   assert.doesNotMatch(source, /openInBrowser\(panelUrl/);
   assert.match(source, /Opened the companion in a clean browser session/);
 });
 
-test("real router and launcher keep the caller key out of clean browser bootstrap", async () => {
+test("real router and launcher keep the caller key out of clean browser bootstrap", { skip: process.platform !== "darwin" }, async () => {
   const state = mkdtempSync(path.join(os.tmpdir(), "panel-round2-router-"));
   const caller = "panel-round2-caller-capability-with-sufficient-length";
   const internal = "panel-round2-internal-key-with-sufficient-length";

@@ -83,15 +83,15 @@ test("rotation runs while the service is stopped, never from inside it", () => {
   assert.doesNotMatch(start, /log-rotation/);
 
   const macos = readFileSync(path.join(root, "src", "service-macos.mjs"), "utf8");
-  assert.match(macos, /rotateLog\(LOG_PATH\)/);
+  assert.match(macos, /rotateLog\(target\.logPath\)/);
   // Ordering is the whole fix: rotating before the old process is gone
   // reintroduces the open-descriptor bug.
   assert.ok(
-    macos.indexOf("bootout();") < macos.indexOf("rotateLog(LOG_PATH)"),
+    macos.indexOf("bootout();") < macos.indexOf("rotateLog(target.logPath)"),
     "macOS must stop the service before rotating",
   );
   assert.ok(
-    macos.indexOf("rotateLog(LOG_PATH)") < macos.indexOf("bootstrap();"),
+    macos.indexOf("rotateLog(target.logPath)") < macos.indexOf("bootstrap();"),
     "macOS must rotate before starting the service again",
   );
 

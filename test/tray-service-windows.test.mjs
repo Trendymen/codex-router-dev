@@ -81,13 +81,11 @@ test("the dispatcher routes Windows to the Task Scheduler manager", () => {
   assert.doesNotMatch(result.stdout, /"supported":false/);
 });
 
-test("a platform with no supervisor says so instead of reporting success", () => {
+test("non-macOS tray mutation refuses with the public platform code", () => {
   const result = trayDispatch("install", "linux");
-  assert.equal(result.status, 0, "an install must not fail over an unsupervised companion");
-  assert.match(result.stdout, /"supported":false/);
-  assert.match(result.stderr, /not supervised on linux/);
-  // `status` is machine-readable and stays quiet.
-  assert.equal(trayDispatch("status", "linux").stderr, "");
+  assert.equal(result.status, 2);
+  assert.match(result.stderr, /unsupported_platform/);
+  assert.equal(trayDispatch("status", "linux").status, 2);
 });
 
 // macOS and Linux each have one command that builds the companion and hands it

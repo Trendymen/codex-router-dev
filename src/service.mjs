@@ -2,12 +2,13 @@ import { spawnSync } from "node:child_process";
 import path from "node:path";
 
 import { SOURCE_ROOT } from "./paths.mjs";
+import { refuseUnsupportedPlatform } from "./platform-gate.mjs";
 import { stopManagedOllama } from "./ollama-runtime.mjs";
 import { waitForRouterHealth } from "./router-health.mjs";
 import { withServiceOperationLock } from "./service-operation-lock.mjs";
 import { environmentProxyOptedIn } from "./proxy-environment.mjs";
 
-const platform = process.env.CODEX_ROUTER_SERVICE_PLATFORM || process.platform;
+const platform = process.platform;
 const script = {
   darwin: "service-macos.mjs",
   linux: "service-linux.mjs",
@@ -19,6 +20,7 @@ if (!script) {
 }
 
 const command = process.argv[2] || "status";
+if (refuseUnsupportedPlatform(`service:${command}`)) process.exit(2);
 const mutatingCommands = new Set(["install", "uninstall", "start", "stop", "restart"]);
 const readinessCommands = new Set(["install", "start", "restart"]);
 const shutdownCommands = new Set(["stop", "uninstall"]);

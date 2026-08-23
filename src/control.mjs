@@ -693,13 +693,14 @@ async function printModelUsage(slug) {
 }
 
 async function printRouterLogs() {
-  const { LOG_PATH } = await import("./paths.mjs");
+  const { currentServiceTarget } = await import("./paths.mjs");
+  const { logPath } = currentServiceTarget();
   const { redactSensitive } = await import("./sensitive-redactor.mjs");
-  if (!existsSync(LOG_PATH)) {
-    process.stdout.write(JSON.stringify({ path: LOG_PATH, lines: [] }) + "\n");
+  if (!existsSync(logPath)) {
+    process.stdout.write(JSON.stringify({ path: logPath, lines: [] }) + "\n");
     return;
   }
-  const lines = readFileSync(LOG_PATH, "utf8").split(/\r?\n/).filter(Boolean).slice(-200);
+  const lines = readFileSync(logPath, "utf8").split(/\r?\n/).filter(Boolean).slice(-200);
   const redactLogLine = (line) => {
     try {
       return JSON.stringify(redactSensitive(JSON.parse(line), { profile: "log" }));

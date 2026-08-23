@@ -59,7 +59,7 @@ test("startup polling uses the backoff rather than a fixed sleep", () => {
   assert.match(probe, /probeDelayMs\(attempt\)/);
   assert.doesNotMatch(probe, /setTimeout\(resolve, 200\)/);
   const start = readFileSync(path.join(root, "src", "start.mjs"), "utf8");
-  assert.match(start, /health-probe\.mjs/);
+  assert.match(start, /startNodeRuntime/);
 });
 
 test("the first probe window is unchanged so early failures surface as fast as ever", () => {

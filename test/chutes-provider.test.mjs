@@ -61,7 +61,7 @@ test("the macOS tray labels Chutes as a metered API route", () => {
   );
 });
 
-test("both installer frontends pass provider selection to setup, which accepts Chutes", () => {
+test("both installer frontends pass provider selection to setup, which accepts Chutes", { skip: process.platform !== "darwin" }, () => {
   const testRoot = mkdtempSync(path.join(os.tmpdir(), "chutes-installer-test-"));
   try {
     const posix = readFileSync(path.join(root, "install.sh"), "utf8");

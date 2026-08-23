@@ -1,3 +1,9 @@
+import { requireMacOS } from "./platform-gate.mjs";
+
+export function requireMacOSRepair(platform = process.platform) {
+  return requireMacOS("dependency-repair", platform);
+}
+
 export function isHomebrewManaged(
   packageManager = process.env.CODEX_ROUTER_PACKAGE_MANAGER,
 ) {

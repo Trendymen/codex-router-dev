@@ -3,6 +3,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { trayBundleDir } from "./tray-install.mjs";
+import { PRODUCTION_SERVICE_TARGET, resolveServiceTarget } from "./service-target.mjs";
 
 const supportedTargets = new Set(["codex", "dsh", "gemini"]);
 
@@ -222,6 +223,67 @@ export const PORTS = {
   grokOauth: port("MODEL_ROUTER_GROK_OAUTH_PORT", DEFAULT_PORTS.grokOauth),
   devinCli: port("MODEL_ROUTER_DEVIN_CLI_PORT", DEFAULT_PORTS.devinCli),
 };
+
+function serviceTargetEnvironmentOverrides() {
+  const mode = process.env.MODEL_ROUTER_SERVICE_MODE || process.env.CODEX_ROUTER_SERVICE_MODE;
+  if (!mode || mode === "production") return mode ? { mode } : {};
+  const values = { mode };
+  const names = [
+    ["isolationRoot", ["MODEL_ROUTER_ISOLATION_ROOT", "CODEX_ROUTER_ISOLATION_ROOT"]],
+    ["launchDomain", ["MODEL_ROUTER_LAUNCH_DOMAIN", "CODEX_ROUTER_LAUNCH_DOMAIN"]],
+    ["routerLabel", ["MODEL_ROUTER_SERVICE_LABEL", "CODEX_ROUTER_SERVICE_LABEL"]],
+    ["trayLabel", ["MODEL_ROUTER_TRAY_SERVICE_LABEL", "CODEX_ROUTER_TRAY_SERVICE_LABEL"]],
+    ["launchAgentsDir", ["MODEL_ROUTER_LAUNCH_AGENTS_DIR", "CODEX_ROUTER_LAUNCH_AGENTS_DIR"]],
+    ["routerPlistPath", ["MODEL_ROUTER_LAUNCH_AGENT_PATH", "CODEX_ROUTER_LAUNCH_AGENT_PATH"]],
+    ["trayPlistPath", ["MODEL_ROUTER_TRAY_LAUNCH_AGENT_PATH", "CODEX_ROUTER_TRAY_LAUNCH_AGENT_PATH"]],
+    ["appPath", ["MODEL_ROUTER_TRAY_APP_PATH", "CODEX_ROUTER_TRAY_APP_PATH"]],
+    ["appBinary", ["MODEL_ROUTER_TRAY_APP_BINARY", "CODEX_ROUTER_TRAY_APP_BINARY"]],
+    ["stateRoot", ["MODEL_ROUTER_STATE_DIR", "CODEX_ROUTER_STATE_DIR"]],
+    ["supportRoot", ["MODEL_ROUTER_SUPPORT_DIR", "CODEX_ROUTER_SUPPORT_DIR"]],
+    ["logPath", ["MODEL_ROUTER_LOG_PATH", "CODEX_ROUTER_LOG_PATH"]],
+  ];
+  for (const [key, candidates] of names) {
+    const name = candidates.find((candidate) => process.env[candidate]);
+    if (name) values[key] = process.env[name];
+  }
+  const launchDomain = process.env.MODEL_ROUTER_LAUNCH_DOMAIN || process.env.CODEX_ROUTER_LAUNCH_DOMAIN;
+  if (launchDomain) values.launchDomain = launchDomain;
+  if (process.env.MODEL_ROUTER_OAUTH_PORT) values.ports = { ...(values.ports || {}), oauth: Number(process.env.MODEL_ROUTER_OAUTH_PORT) };
+  if (process.env.MODEL_ROUTER_PORT) values.ports = { ...(values.ports || {}), router: Number(process.env.MODEL_ROUTER_PORT) };
+  if (process.env.MODEL_ROUTER_API_PORT) values.ports = { ...(values.ports || {}), api: Number(process.env.MODEL_ROUTER_API_PORT) };
+  if (process.env.MODEL_ROUTER_GROK_OAUTH_PORT) values.ports = { ...(values.ports || {}), grokOauth: Number(process.env.MODEL_ROUTER_GROK_OAUTH_PORT) };
+  if (process.env.MODEL_ROUTER_DEVIN_CLI_PORT) values.ports = { ...(values.ports || {}), devinCli: Number(process.env.MODEL_ROUTER_DEVIN_CLI_PORT) };
+  return values;
+}
+
+// Keep this adapter in paths.mjs rather than importing paths from the target
+// validator. The target module is deliberately pure so plist renderers and
+// acceptance harnesses can consume one object without an import cycle.
+export function currentServiceTarget(overrides = {}) {
+  const defaults = {
+    sourceRoot: SOURCE_ROOT,
+    launchDomain: `gui/${typeof process.getuid === "function" ? process.getuid() : 501}`,
+    routerLabel: SERVICE_LABEL,
+    trayLabel: TRAY_SERVICE_LABEL,
+    launchAgentsDir: LAUNCH_AGENTS_DIR,
+    routerPlistPath: LAUNCH_AGENT_PATH,
+    trayPlistPath: TRAY_LAUNCH_AGENT_PATH,
+    appPath: TRAY_APP_PATH,
+    appBinary: TRAY_APP_BINARY,
+    stateRoot: STATE_DIR,
+    supportRoot: SUPPORT_DIR,
+    logPath: LOG_PATH,
+    ports: {
+      oauth: PORTS.oauth,
+      router: PORTS.router,
+      api: PORTS.api,
+      grokOauth: PORTS.grokOauth,
+      devinCli: PORTS.devinCli,
+    },
+    production: PRODUCTION_SERVICE_TARGET,
+  };
+  return resolveServiceTarget({ ...serviceTargetEnvironmentOverrides(), ...overrides }, defaults);
+}
 
 export function loopback(portNumber, suffix = "") {
   return `http://127.0.0.1:${portNumber}${suffix}`;

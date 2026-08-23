@@ -176,7 +176,8 @@ test("one companion location: the Node and shell sides name the same directory",
   // script default, and trayBundleDir -- which is how a machine ends up with a
   // separate tray per checkout and launchd pointing at whichever built last.
   const script = readFileSync(path.join(root, "scripts", "build-macos-tray-app.sh"), "utf8");
-  assert.match(script, /bundle_dir=\$\{1:-"\$HOME\/Applications\/Model Router\.app"\}/);
+  assert.match(script, /currentServiceTarget\(\)\.appPath/);
+  assert.doesNotMatch(script, /\$HOME\/Applications\/Model Router\.app/);
   assert.equal(trayBundleDir("darwin", "/Users/example"), "/Users/example/Applications/Model Router.app");
   assert.doesNotMatch(script, /\$repo_dir\/dist\/Model Router\.app"\}/);
 });
@@ -189,6 +190,7 @@ test("the macOS tray is signed only after its resources are assembled", () => {
   assert.ok(resource >= 0, "the checkout link must be placed in the bundle");
   assert.ok(sign > resource, "signing must happen after the final resource write");
   assert.ok(verify > sign, "the completed signature must be verified");
+  assert.match(script, /tray-bundle\.mjs" set-identifier/);
   assert.doesNotMatch(
     script,
     /cp -R .*ModelRouterTray_ModelRouterTray\.bundle" "\$bundle_dir\/"/,
@@ -211,12 +213,13 @@ test("the macOS tray fingerprint stays outside the signed app bundle", () => {
 test("tray updates stage a signed bundle before stopping and replacing the live app", () => {
   const script = readFileSync(path.join(root, "bin", "model-router-tray"), "utf8");
   const build = script.indexOf('build-macos-tray-app.sh" "$staged_bundle"');
-  const stop = script.indexOf("pgrep -x ModelRouterTray");
+  const stop = script.indexOf('osascript -e "tell application id \\"$tray_label\\" to quit"');
   const replace = script.indexOf('mv "$staged_bundle" "$bundle_dir"');
   assert.match(script, /mktemp -d "\$bundle_parent\/\.model-router-tray\.XXXXXX"/);
   assert.ok(build >= 0, "the replacement must be built in staging");
   assert.ok(stop > build, "the old tray stays alive until staging succeeds");
   assert.ok(replace > stop, "the live bundle is replaced only after its process stops");
+  assert.match(script, /service_mode=/);
 });
 
 test("the macOS tray executes control only from the checkout sealed into Info.plist", () => {

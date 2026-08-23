@@ -7,8 +7,9 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const macOnly = { skip: process.platform !== "darwin" };
 
-test("automatic selection-only setup exposes only configured providers", () => {
+test("automatic selection-only setup exposes only configured providers", macOnly, () => {
   const testRoot = mkdtempSync(path.join(os.tmpdir(), "codex-router-setup-"));
   const codexHome = path.join(testRoot, "codex");
   const stateDir = path.join(testRoot, "state");
@@ -51,7 +52,7 @@ test("automatic selection-only setup exposes only configured providers", () => {
   }
 });
 
-test("--no-provider --no-discovery writes an empty selection and the discovery marker", () => {
+test("--no-provider --no-discovery writes an empty selection and the discovery marker", macOnly, () => {
   const testRoot = mkdtempSync(path.join(os.tmpdir(), "codex-router-setup-idle-"));
   const codexHome = path.join(testRoot, "codex");
   const stateDir = path.join(testRoot, "state");
@@ -90,7 +91,7 @@ test("--no-provider --no-discovery writes an empty selection and the discovery m
   }
 });
 
-test("re-running setup without the idle flags clears the discovery marker", () => {
+test("re-running setup without the idle flags clears the discovery marker", macOnly, () => {
   const testRoot = mkdtempSync(path.join(os.tmpdir(), "codex-router-setup-exit-idle-"));
   const codexHome = path.join(testRoot, "codex");
   const stateDir = path.join(testRoot, "state");
@@ -209,7 +210,7 @@ test("ensure-configured accepts an explicitly empty selection as idle", () => {
   }
 });
 
-test("configured setup mode also excludes anonymous providers by default", () => {
+test("configured setup mode also excludes anonymous providers by default", macOnly, () => {
   const testRoot = mkdtempSync(path.join(os.tmpdir(), "codex-router-setup-configured-"));
   const stateDir = path.join(testRoot, "state");
   mkdirSync(stateDir, { recursive: true, mode: 0o700 });

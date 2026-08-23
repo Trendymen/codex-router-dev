@@ -89,7 +89,7 @@ const deepseekConfigured =
 
 test(
   "a scripted run with an unconfigured provider stays strict but keeps the update",
-  { skip: deepseekConfigured },
+  { skip: process.platform !== "darwin" || deepseekConfigured },
   () => {
     // --selection-only returns before the install block, so this exercises the
     // credential step without touching launchd or the Codex config.

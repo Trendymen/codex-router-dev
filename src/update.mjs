@@ -1,11 +1,25 @@
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { readInstallManifest } from "./install-manifest.mjs";
-import { SOURCE_ROOT, TARGET } from "./paths.mjs";
+import { refuseUnsupportedPlatform } from "./platform-gate.mjs";
+import { currentServiceTarget, INSTALL_MANIFEST_PATH, SOURCE_ROOT, TARGET } from "./paths.mjs";
+
+// Keep the CLI gate ahead of the manifest module's provider/skill imports. A
+// non-macOS update must reject before even loading registry-backed state, let
+// alone fetching or replacing a checkout. The full manifest writer remains in
+// install-manifest.mjs for the install path.
+function readInstallManifestSnapshot() {
+  if (!existsSync(INSTALL_MANIFEST_PATH)) return undefined;
+  try {
+    const parsed = JSON.parse(readFileSync(INSTALL_MANIFEST_PATH, "utf8"));
+    return parsed?.version === 1 ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 function git(args, options = {}) {
   const output = execFileSync("git", ["-C", SOURCE_ROOT, ...args], {
@@ -124,13 +138,14 @@ function installCurrentCheckout() {
   }
 }
 
-function registeredTrayBundlePath() {
+function registeredTrayBundlePath(label) {
+  const resolvedLabel = label || currentServiceTarget().trayLabel;
   try {
     const value = execFileSync(
       "defaults",
       [
         "read",
-        "io.github.codex-router.tray",
+        resolvedLabel,
         "ModelRouterTray.loginItemBundlePath",
       ],
       { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
@@ -146,12 +161,16 @@ export function trayRefreshRequired({
   home = os.homedir(),
   sourceRoot = SOURCE_ROOT,
   registeredPath,
+  target,
 } = {}) {
   if (platform !== "darwin") return false;
-  const registered = registeredPath ?? registeredTrayBundlePath();
+  const resolvedTarget = target || (
+    home === os.homedir() && sourceRoot === SOURCE_ROOT ? currentServiceTarget() : undefined
+  );
+  const registered = registeredPath ?? registeredTrayBundlePath(resolvedTarget?.trayLabel);
   const candidates = [
+    resolvedTarget?.appPath || path.join(home, "Applications", "Model Router.app"),
     path.join(sourceRoot, "dist", "Model Router.app"),
-    path.join(home, "Applications", "Model Router.app"),
   ];
   return (
     candidates.some((candidate) => existsSync(candidate)) ||
@@ -163,8 +182,9 @@ export function trayRefreshRequired({
 // update never leaves a stale companion binary behind. Best-effort: the router
 // update itself succeeded, and a failed tray refresh must not roll it back.
 function refreshTrayCompanion() {
-  if (!trayRefreshRequired()) return;
-  const launcher = path.join(SOURCE_ROOT, "bin", "model-router-tray");
+  const target = currentServiceTarget();
+  if (!trayRefreshRequired({ target })) return;
+  const launcher = path.join(target.sourceRoot, "bin", "model-router-tray");
   const result = spawnSync(launcher, [], { cwd: SOURCE_ROOT, stdio: "inherit" });
   if (result.error) {
     process.stderr.write(`Menu-bar companion refresh did not finish: ${result.error.message}\n`);
@@ -222,7 +242,7 @@ export function rebuildNodeSnapshotsAfterUpdate({ run = spawnSync } = {}) {
 export function updateCheckout({ force = false } = {}) {
   const status = checkForUpdate();
   if (!status.updateAvailable) {
-    if (!installationNeedsRefresh(readInstallManifest(), status.current)) {
+    if (!installationNeedsRefresh(readInstallManifestSnapshot(), status.current)) {
       return { ...status, updated: false, reinstalled: false };
     }
     installCurrentCheckout();
@@ -272,7 +292,7 @@ export function rollbackCheckout({ force = false } = {}) {
   try {
     target = git(["rev-parse", "refs/codex-router/rollback"]);
   } catch {
-    target = readInstallManifest()?.history?.find((entry) => entry.commit)?.commit;
+    target = readInstallManifestSnapshot()?.history?.find((entry) => entry.commit)?.commit;
   }
   if (!target || !revisionExists(target)) {
     throw new Error("No locally cached working revision is available to roll back to.");
@@ -314,7 +334,9 @@ export function parseArguments(args) {
 }
 
 async function main() {
-  const { command, force } = parseArguments(process.argv.slice(2));
+  const args = process.argv.slice(2);
+  const { command, force } = parseArguments(args);
+  if (refuseUnsupportedPlatform(`update:${args[0] || "update"}`)) return;
   if (!command) {
     console.error("Usage: update.mjs check|update|rollback [--force]");
     process.exit(2);

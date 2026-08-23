@@ -185,6 +185,15 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
+# The supported runtime is macOS-only. Keep this refusal after argument
+# parsing so --help remains usable, but before target validation, checkout
+# discovery, Git, mkdir, dependency, credential, or service work.
+platform_name=$(/usr/bin/uname -s 2>/dev/null || printf 'unknown')
+if [ "$platform_name" != "Darwin" ]; then
+  printf 'codex-router: unsupported_platform\n' >&2
+  exit 2
+fi
+
 case "$target" in
   codex|dsh|gemini) ;;
   *) die "--target must be codex, dsh, or gemini" ;;

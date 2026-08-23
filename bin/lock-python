@@ -8,6 +8,8 @@
 # fails the suite while they disagree.
 set -eu
 
+sh "$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/platform-gate"
+
 repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$repo_dir"
 

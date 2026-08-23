@@ -17,14 +17,14 @@ import { readInstallManifest } from "./install-manifest.mjs";
 import { protectPrivateFile } from "./file-security.mjs";
 import { detectLegacyInstallations } from "./legacy-migration.mjs";
 import { PROVIDERS, providerNeedsNoKey } from "./model-registry.mjs";
+import { refuseUnsupportedPlatform } from "./platform-gate.mjs";
 import {
   CALLER_SECRET_PATH,
   CONFIG_PATH,
   INTERNAL_SECRET_PATH,
-  LOG_PATH,
   SOURCE_ROOT,
-  SUPPORT_DIR,
 } from "./paths.mjs";
+import { currentServiceTarget } from "./paths.mjs";
 import {
   credentialPaths,
   credentialStatus,
@@ -77,9 +77,9 @@ function redactLogs(contents) {
   return redactSensitive(contents, { sensitive: true });
 }
 
-function logTail() {
-  if (!existsSync(LOG_PATH)) return null;
-  const lines = readFileSync(LOG_PATH, "utf8").split(/\r?\n/);
+function logTail(logPath) {
+  if (!existsSync(logPath)) return null;
+  const lines = readFileSync(logPath, "utf8").split(/\r?\n/);
   return redactLogs(lines.slice(-200).join("\n"));
 }
 
@@ -123,6 +123,9 @@ function outputOption() {
 }
 
 export function createSupportBundle(options = {}) {
+  const serviceTarget = options.serviceTarget || currentServiceTarget();
+  const supportRoot = options.supportRoot || serviceTarget.supportRoot;
+  const logPath = options.logPath || serviceTarget.logPath;
   let configuredProviderCount = 0;
   for (const provider of PROVIDERS.values()) {
     if (provider.kind !== "openai-compatible") continue;
@@ -158,16 +161,16 @@ export function createSupportBundle(options = {}) {
     installed: Boolean(readInstallManifest()),
     files: {
       configExists: fileMetadata(CONFIG_PATH).exists,
-      logExists: fileMetadata(LOG_PATH).exists,
+      logExists: fileMetadata(logPath).exists,
     },
-    ...(options.includeLogs ? { redactedLogTail: logTail() } : {}),
+    ...(options.includeLogs ? { redactedLogTail: logTail(logPath) } : {}),
   };
 
-  mkdirSync(SUPPORT_DIR, { recursive: true, mode: 0o700 });
-  chmodSync(SUPPORT_DIR, 0o700);
+  mkdirSync(supportRoot, { recursive: true, mode: 0o700 });
+  chmodSync(supportRoot, 0o700);
   const timestamp = new Date().toISOString().replaceAll(":", "-").replaceAll(".", "-");
   const target = path.resolve(
-    options.output || path.join(SUPPORT_DIR, `codex-router-support-${timestamp}.json`),
+    options.output || path.join(supportRoot, `codex-router-support-${timestamp}.json`),
   );
   mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
   const serialized = `${redactBundle(bundle)}\n`;
@@ -181,6 +184,7 @@ export function createSupportBundle(options = {}) {
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   try {
+    if (!process.argv.includes("--help") && refuseUnsupportedPlatform("support-bundle")) process.exit(2);
     const known = new Set(["--help", "--include-logs", "--output"]);
     for (let index = 2; index < process.argv.length; index += 1) {
       const argument = process.argv[index];

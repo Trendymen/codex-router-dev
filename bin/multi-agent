@@ -1,6 +1,8 @@
 #!/bin/sh
 set -eu
 
+sh "$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/platform-gate"
+
 repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$repo_dir"
 # Codex-only on purpose. This toggle drives `multi_agent_version` and the

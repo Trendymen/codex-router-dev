@@ -182,7 +182,7 @@ test("the installer is allowed to take ownership", () => {
   });
 });
 
-test("doctor --fix from a foreign checkout delegates to the recorded owner", () => {
+test("doctor --fix from a foreign checkout delegates to the recorded owner", { skip: process.platform !== "darwin" }, () => {
   const owner = mkdtempSync(path.join(os.tmpdir(), "state-owner-checkout-"));
   const marker = path.join(owner, "delegated-doctor-ran");
   mkdirSync(path.join(owner, "bin"), { recursive: true });

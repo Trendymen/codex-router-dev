@@ -12,7 +12,10 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { refuseUnsupportedPlatform } from "./platform-gate.mjs";
+
 import { trayBundleDir } from "./tray-install.mjs";
+import { currentServiceTarget } from "./paths.mjs";
 
 export const SOURCE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -168,11 +171,11 @@ const TRAY_PLATFORMS = {
         ...sourceFilesIn(path.join(base, "Sources"), [".swift"]),
       ];
     },
-    artifact: (root, home) =>
-      path.join(trayBundleDir("darwin", home), "Contents", "MacOS", "ModelRouterTray"),
+    artifact: (root, home, target) =>
+      target?.appBinary || path.join(trayBundleDir("darwin", home), "Contents", "MacOS", "ModelRouterTray"),
     // The source fingerprint is mutable router state, not an app resource.
     // Keeping it inside Contents would invalidate the completed bundle seal.
-    stamp: (root, home) => path.join(home, ".codex", "codex-router", "tray-build.json"),
+    stamp: (root, home, target) => path.join(target?.stateRoot || path.join(home, ".codex", "codex-router"), "tray-build.json"),
     // Companions built before the per-user move live inside the checkout.
     legacy: (root) =>
       path.join(root, "dist", "Model Router.app", "Contents", "MacOS", "ModelRouterTray"),
@@ -224,6 +227,14 @@ export function traySourceFingerprint(root = SOURCE_ROOT, platform = process.pla
       .map((file) => `${path.relative(root, file)}\0${readFile(file) ?? ""}`)
       .join("\0"),
   );
+}
+
+function resolvedTrayTarget({ root, platform, home, serviceTarget }) {
+  if (serviceTarget) return serviceTarget;
+  if (platform === "darwin" && root === SOURCE_ROOT && home === os.homedir()) {
+    return currentServiceTarget();
+  }
+  return undefined;
 }
 
 export const STEPS = {
@@ -281,16 +292,18 @@ export function trayRebuildPlan({
   root = SOURCE_ROOT,
   platform = process.platform,
   home = os.homedir(),
+  serviceTarget,
 } = {}) {
   const definition = TRAY_PLATFORMS[platform];
   if (!definition) return "unsupported";
-  if (!existsSync(definition.artifact(root, home))) {
+  const target = resolvedTrayTarget({ root, platform, home, serviceTarget });
+  if (!existsSync(definition.artifact(root, home, target))) {
     // A companion at a superseded location still counts as installed, so the
     // update migrates it rather than reading as "absent" and abandoning it.
     const legacy = definition.legacy?.(root);
     return legacy && existsSync(legacy) ? "rebuild" : "absent";
   }
-  const stamp = readFile(definition.stamp(root, home));
+  const stamp = readFile(definition.stamp(root, home, target));
   if (!stamp) return "rebuild";
   try {
     return JSON.parse(stamp)?.fingerprint === traySourceFingerprint(root, platform)
@@ -305,10 +318,12 @@ export function recordTrayBuild({
   root = SOURCE_ROOT,
   platform = process.platform,
   home = os.homedir(),
+  serviceTarget,
 } = {}) {
   const definition = TRAY_PLATFORMS[platform];
   if (!definition) throw new Error(`The desktop companion is not built on ${platform}.`);
-  const target = definition.stamp(root, home);
+  const resolvedTarget = resolvedTrayTarget({ root, platform, home, serviceTarget });
+  const target = definition.stamp(root, home, resolvedTarget);
   mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
   writeFileSync(
     target,
@@ -563,6 +578,10 @@ function main(argv) {
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   try {
+    const [command] = process.argv.slice(2);
+    if (["record", "record-tray"].includes(command) && refuseUnsupportedPlatform(`install-plan:${command}`)) {
+      process.exit(2);
+    }
     process.exit(main(process.argv.slice(2)));
   } catch (error) {
     console.error(error instanceof Error ? error.message : String(error));
