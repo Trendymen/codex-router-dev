@@ -114,6 +114,16 @@ test("the Swift command bridge zeroizes initialized input bytes before releasing
   assert.doesNotMatch(source, /buffer\.initialize\(/);
 });
 
+test("quota reset captions accept an injected clock and preserve the current format", () => {
+  const start = swiftSource.indexOf("func usageResetCaption");
+  const end = swiftSource.indexOf("func compactTokenCount", start);
+  assert.ok(start >= 0 && end > start, "usageResetCaption source is present");
+  const source = swiftSource.slice(start, end);
+  assert.match(source, /func usageResetCaption\(_ date: Date, now: Date = Date\(\)\)/);
+  assert.match(source, /date\.timeIntervalSince\(now\)/);
+  assert.match(source, /date\.formatted\(date: \.abbreviated, time: \.shortened\)/);
+});
+
 test("all Router mutations use the canonical Node bridge and observed schema version", () => {
   assert.match(swiftSource, /DesktopCommandBridge/);
   assert.match(swiftSource, /capabilitySchemaVersion: capabilitySnapshot\.capabilitySchemaVersion/);

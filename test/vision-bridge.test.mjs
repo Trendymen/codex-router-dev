@@ -155,15 +155,22 @@ test("vision cache purge uses the evidence owner and leaves an active download u
   assert.deepEqual(cache.purge(), { removed: 1 });
   assert.equal(cache.size, 0);
 
-  const purgePath = path.join(os.tmpdir(), `vision-purge-generation-${process.pid}.json`);
-  const owner = createEvidenceCache({ purgePath });
-  owner.set("data:image/png;base64,owner", "question", "answer");
-  assert.equal(owner.size, 1);
-  const request = requestVisionCachePurge(purgePath);
-  assert.equal(request.requested, true);
-  assert.equal(owner.size, 0);
-  assert.deepEqual(owner.purge(), { removed: 0 });
-  rmSync(purgePath, { force: true });
+  const generationState = mkdtempSync(path.join(os.tmpdir(), `vision-purge-generation-${process.pid}-`));
+  const purgePath = path.join(generationState, "vision-cache-purge.json");
+  try {
+    const owner = createEvidenceCache({ purgePath });
+    owner.set("data:image/png;base64,owner", "question", "answer");
+    assert.equal(owner.size, 1);
+    const request = requestVisionCachePurge(purgePath);
+    assert.equal(request.requested, true);
+    assert.equal(owner.size, 0);
+    assert.deepEqual(owner.purge(), { removed: 0 });
+  } finally {
+    // Keep private-file tests inside a private temporary directory. Removing
+    // a file directly under os.tmpdir() makes writePrivateJson try to chmod
+    // the shared /tmp directory on POSIX, which is correctly rejected.
+    rmSync(generationState, { recursive: true, force: true });
+  }
 
   const state = mkdtempSync(path.join(os.tmpdir(), "vision-purge-active-"));
   const download = path.join(state, "vision-download.json");
