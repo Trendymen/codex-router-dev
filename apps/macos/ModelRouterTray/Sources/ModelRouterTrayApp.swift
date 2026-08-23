@@ -1,5 +1,6 @@
 import AppKit
 import Combine
+import Darwin
 import Foundation
 import SwiftUI
 import UniformTypeIdentifiers
@@ -77,30 +78,6 @@ struct RouterActiveRequest: Decodable, Identifiable, Equatable {
 
 // MARK: - Versioned Node capability contract
 
-enum CapabilityCommandCatalog {
-  // This is deliberately checked against test/fixtures/required-capabilities.json.
-  // The fixture is independent; this list makes the native source auditable and
-  // prevents an accidental return to ad-hoc legacy command aliases.
-  static let canonicalCommandIDs: [String] = [
-    "lifecycle.status", "lifecycle.start", "lifecycle.stop", "lifecycle.restart", "lifecycle.logs",
-    "doctor.status", "doctor.fix", "maintenance.update", "maintenance.rollback",
-    "native.status", "native.account-usage",
-    "credential.status", "credential.set", "credential.remove",
-    "provider.enable", "model.visibility", "model.canary",
-    "protocol-proof.status", "protocol-proof.verify", "protocol-proof.revoke",
-    "picker.status", "picker.set", "picker.show-all", "catalog.status", "catalog.render-snippet",
-    "subagents.status", "subagents.mode", "subagents.model", "subagents.selection", "subagents.verify",
-    "failover.status", "failover.reset",
-    "tool-result-aging.status", "tool-result-aging.on", "tool-result-aging.off", "tool-result-aging.ttl", "tool-result-aging.purge",
-    "usage.router", "usage.provider", "usage.model",
-    "vision.status", "vision.on", "vision.off", "vision.engine", "vision.effort", "vision.probe", "vision.pull", "vision.purge-cache",
-    "presence.status", "presence.mode",
-    "cc-switch.status", "cc-switch.snippet"
-  ]
-
-  static let canonicalCommandSet = Set(canonicalCommandIDs)
-}
-
 struct CapabilityArgumentDefinition: Decodable {
   let type: String
   let required: Bool
@@ -135,32 +112,93 @@ struct CapabilityArgumentSchema: Decodable {
   private enum CodingKeys: String, CodingKey { case properties }
 }
 
+struct CapabilityFieldPresentation: Decodable {
+  let label: String
+  let type: String
+  let required: Bool
+  let enumValues: [String]
+
+  init(from decoder: Decoder) throws {
+    let values = try decoder.container(keyedBy: CodingKeys.self)
+    label = try values.decodeIfPresent(String.self, forKey: .label) ?? "Field"
+    if let single = try? values.decode(String.self, forKey: .type) {
+      type = single
+    } else {
+      type = (try values.decodeIfPresent([String].self, forKey: .type) ?? []).joined(separator: "|")
+    }
+    required = try values.decodeIfPresent(Bool.self, forKey: .required) ?? false
+    enumValues = try values.decodeIfPresent([String].self, forKey: .enumValues) ?? []
+  }
+
+  private enum CodingKeys: String, CodingKey { case label, type, required, enumValues = "enum" }
+}
+
+struct CapabilityUI: Decodable {
+  let title: String
+  let control: String
+  let confirmation: String
+  let quotaWarning: String
+  let resultKind: String
+  let protectedField: String?
+  let fields: [String: CapabilityFieldPresentation]
+
+  init(from decoder: Decoder) throws {
+    let values = try decoder.container(keyedBy: CodingKeys.self)
+    title = try values.decodeIfPresent(String.self, forKey: .title) ?? "Router command"
+    control = try values.decodeIfPresent(String.self, forKey: .control) ?? "read"
+    confirmation = try values.decodeIfPresent(String.self, forKey: .confirmation) ?? "none"
+    quotaWarning = try values.decodeIfPresent(String.self, forKey: .quotaWarning) ?? "none"
+    resultKind = try values.decodeIfPresent(String.self, forKey: .resultKind) ?? "json"
+    protectedField = try values.decodeIfPresent(String.self, forKey: .protectedField)
+    fields = try values.decodeIfPresent([String: CapabilityFieldPresentation].self, forKey: .fields) ?? [:]
+  }
+
+  private enum CodingKeys: String, CodingKey {
+    case title, control, confirmation, quotaWarning, resultKind, protectedField, fields
+  }
+}
+
 struct CapabilityCommand: Decodable, Identifiable {
   let name: String
   let arguments: CapabilityArgumentSchema
   let isMutating: Bool
-  let confirmation: String
-  let quotaWarning: String
+  let confirmation: Bool
+  let quotaWarning: Bool
   let protectedInput: Bool
   let resultKind: String
+  let ui: CapabilityUI
 
   var id: String { name }
-  var requiresConfirmation: Bool { confirmation != "none" }
-  var hasQuotaWarning: Bool { quotaWarning != "none" }
+  var requiresConfirmation: Bool { confirmation }
+  var hasQuotaWarning: Bool { quotaWarning }
 
   init(from decoder: Decoder) throws {
     let values = try decoder.container(keyedBy: CodingKeys.self)
     name = try values.decode(String.self, forKey: .name)
     arguments = try values.decodeIfPresent(CapabilityArgumentSchema.self, forKey: .arguments) ?? CapabilityArgumentSchema()
     isMutating = try values.decodeIfPresent(Bool.self, forKey: .mutationFlag) ?? false
-    confirmation = try values.decodeIfPresent(String.self, forKey: .confirmation) ?? "none"
-    quotaWarning = try values.decodeIfPresent(String.self, forKey: .quotaWarning) ?? "none"
+    confirmation = try values.decodeIfPresent(Bool.self, forKey: .confirmation) ?? false
+    quotaWarning = try values.decodeIfPresent(Bool.self, forKey: .quotaWarning) ?? false
     protectedInput = try values.decodeIfPresent(Bool.self, forKey: .protectedInput) ?? false
     resultKind = try values.decodeIfPresent(String.self, forKey: .resultKind) ?? "json"
+    ui = try values.decodeIfPresent(CapabilityUI.self, forKey: .ui)
+      ?? CapabilityUI(title: "Router command", control: "read", confirmation: "none", quotaWarning: "none", resultKind: "json", protectedField: nil, fields: [:])
   }
 
   private enum CodingKeys: String, CodingKey {
-    case name, arguments, mutationFlag = "mutating", confirmation, quotaWarning, protectedInput, resultKind
+    case name, arguments, mutationFlag = "mutating", confirmation, quotaWarning, protectedInput, resultKind, ui
+  }
+}
+
+extension CapabilityUI {
+  init(title: String, control: String, confirmation: String, quotaWarning: String, resultKind: String, protectedField: String?, fields: [String: CapabilityFieldPresentation]) {
+    self.title = title
+    self.control = control
+    self.confirmation = confirmation
+    self.quotaWarning = quotaWarning
+    self.resultKind = resultKind
+    self.protectedField = protectedField
+    self.fields = fields
   }
 }
 
@@ -266,6 +304,45 @@ struct CapabilitySnapshotV1: Decodable {
   }
 }
 
+// This envelope intentionally decodes a tiny, tolerant subset of the status
+// result. A malformed/unknown capability payload must not make health/version
+// disappear with it; the tray can still explain the compatibility state while
+// keeping every mutation disabled.
+struct HealthVersionEnvelope: Decodable {
+  let health: String
+  let version: String
+  let capabilitySchemaVersion: Int?
+  let compatibilityReason: String?
+
+  static let empty = HealthVersionEnvelope(
+    health: "unavailable",
+    version: "unknown",
+    capabilitySchemaVersion: nil,
+    compatibilityReason: "status_unavailable"
+  )
+
+  init(health: String, version: String, capabilitySchemaVersion: Int?, compatibilityReason: String?) {
+    self.health = health
+    self.version = version
+    self.capabilitySchemaVersion = capabilitySchemaVersion
+    self.compatibilityReason = compatibilityReason
+  }
+
+  init(from decoder: Decoder) throws {
+    let values = try decoder.container(keyedBy: CodingKeys.self)
+    health = (try? values.decode(String.self, forKey: .health)) ?? "available"
+    version = (try? values.decode(String.self, forKey: .version)) ?? "unknown"
+    capabilitySchemaVersion = (try? values.decode(Int.self, forKey: .capabilitySchemaVersion))
+      ?? ((try? values.decode(CapabilitySnapshotV1.self, forKey: .capabilities))?.capabilitySchemaVersion)
+    compatibilityReason = (try? values.decode(CapabilityCompatibility.self, forKey: .compatibility))?.reason
+      ?? ((try? values.decode(CapabilitySnapshotV1.self, forKey: .capabilities))?.compatibility.reason)
+  }
+
+  private enum CodingKeys: String, CodingKey {
+    case health, version, capabilitySchemaVersion, compatibility, capabilities
+  }
+}
+
 // A small JSON value type keeps command results opaque to the tray while still
 // allowing the status payload to be decoded into the presentation snapshot.
 enum JSONValue: Codable, Equatable {
@@ -324,6 +401,28 @@ struct DesktopCommandEnvelope<Value: Decodable>: Decodable {
   let error: DesktopCommandError?
 }
 
+struct CapabilityCommandResult: Identifiable {
+  let id = UUID()
+  let command: String
+  let resultKind: String
+  let value: JSONValue?
+  let error: DesktopCommandError?
+
+  var isError: Bool { error != nil }
+  var text: String? {
+    guard let value else { return nil }
+    switch value {
+    case .string(let text): return text
+    case .number(let number): return String(number)
+    case .bool(let flag): return flag ? "true" : "false"
+    case .null: return "null"
+    case .array, .object:
+      guard let data = try? JSONEncoder().encode(value) else { return nil }
+      return String(data: data, encoding: .utf8)
+    }
+  }
+}
+
 private struct RouterError: LocalizedError {
   let message: String
   init(_ message: String) { self.message = message }
@@ -331,62 +430,203 @@ private struct RouterError: LocalizedError {
 }
 
 private struct DesktopCommandBridge {
+  private static let outputLimit = 256 * 1024
+  private static let commandTimeout = Duration.seconds(120)
   private let root: URL?
+
+  private enum BridgeFailure: LocalizedError {
+    case missingRoot
+    case missingNode
+    case missingBridge
+    case timedOut
+    case outputLimit
+    case invalidOutput
+
+    var errorDescription: String? {
+      switch self {
+      case .missingRoot: return "Cannot find the signed Router checkout."
+      case .missingNode: return "Cannot find the validated Node runtime."
+      case .missingBridge: return "The Router command bridge is unavailable."
+      case .timedOut: return "The Router command timed out."
+      case .outputLimit: return "The Router command returned too much output."
+      case .invalidOutput: return "The Router command returned an unreadable response."
+      }
+    }
+  }
 
   init(root: URL? = nil) {
     self.root = root ?? Self.sealedSourceRoot()
   }
 
   private static func sealedSourceRoot() -> URL? {
-    guard let value = Bundle.main.object(forInfoDictionaryKey: "ModelRouterSourceRoot") as? String else {
-      return nil
-    }
+    guard let value = Bundle.main.object(forInfoDictionaryKey: "ModelRouterSourceRoot") as? String,
+      !value.isEmpty,
+      value.hasPrefix("/")
+    else { return nil }
     let resolvedRoot = URL(fileURLWithPath: value).standardizedFileURL.resolvingSymlinksInPath()
     let control = resolvedRoot.appendingPathComponent("bin/control")
     guard FileManager.default.isExecutableFile(atPath: control.path) else { return nil }
     return resolvedRoot
   }
 
+  private static func ownedExecutable(_ candidate: URL) -> URL? {
+    let resolved = candidate.standardizedFileURL.resolvingSymlinksInPath()
+    let fileManager = FileManager.default
+    guard fileManager.isExecutableFile(atPath: resolved.path),
+      let attributes = try? fileManager.attributesOfItem(atPath: resolved.path),
+      attributes[.type] as? FileAttributeType == .typeRegular,
+      let owner = attributes[.ownerAccountID] as? NSNumber
+    else { return nil }
+    let uid = NSNumber(value: Darwin.getuid())
+    guard owner == uid || owner.intValue == 0 else { return nil }
+    return resolved
+  }
+
+  private static func validatedNodeBinary(root: URL) -> URL? {
+    var candidates: [URL] = []
+    if let configured = ProcessInfo.processInfo.environment["CODEX_ROUTER_NODE_BIN"],
+      !configured.isEmpty,
+      configured.hasPrefix("/")
+    {
+      candidates.append(URL(fileURLWithPath: configured))
+    }
+    candidates.append(contentsOf: [
+      root.appendingPathComponent(".runtime/node/bin/node"),
+      root.appendingPathComponent(".node/bin/node"),
+      URL(fileURLWithPath: "/opt/homebrew/bin/node"),
+      URL(fileURLWithPath: "/usr/local/bin/node"),
+      URL(fileURLWithPath: "/usr/bin/node"),
+    ])
+    return candidates.lazy.compactMap(ownedExecutable).first
+  }
+
+  private static func boundedRead(
+    _ handle: FileHandle,
+    limit: Int,
+    terminate: @escaping () -> Void
+  ) -> Data {
+    var output = Data()
+    do {
+      while let chunk = try handle.read(upToCount: 16 * 1024), !chunk.isEmpty {
+        let remaining = limit - output.count
+        if remaining <= 0 {
+          terminate()
+          break
+        }
+        if chunk.count > remaining {
+          output.append(contentsOf: chunk.prefix(remaining))
+          terminate()
+          break
+        }
+        output.append(chunk)
+      }
+    } catch {
+      terminate()
+    }
+    return output
+  }
+
+  private static func zeroize(_ data: inout Data) {
+    data.withUnsafeMutableBytes { buffer in
+      buffer.initialize(repeating: 0)
+    }
+    data.removeAll(keepingCapacity: false)
+  }
+
+  private static func isEnvelope(_ data: Data) -> Bool {
+    guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }
+    return object["ok"] is Bool && (object["value"] != nil || object["error"] != nil)
+  }
+
+  private static func waitForProcess(_ process: Process) async -> Int32 {
+    await Task.detached(priority: .userInitiated) {
+      process.waitUntilExit()
+      return process.terminationStatus
+    }.value
+  }
+
   func execute(
     _ command: String,
     arguments: [String: Any],
-    protectedInput: String?
+    protectedInput: String?,
+    capabilitySchemaVersion: Int
   ) async throws -> Data {
-    guard let root else { throw RouterError("Cannot find the signed Router checkout.") }
-    let bridge = root.appendingPathComponent("src/desktop-command-bridge.mjs")
-    guard FileManager.default.fileExists(atPath: bridge.path) else {
-      throw RouterError("The Router command bridge is unavailable.")
+    guard let root else { throw BridgeFailure.missingRoot }
+    let resolvedRoot = root.standardizedFileURL.resolvingSymlinksInPath()
+    let bridge = resolvedRoot.appendingPathComponent("src/desktop-command-bridge.mjs")
+    let bridgePath = bridge.standardizedFileURL.resolvingSymlinksInPath().path
+    guard bridgePath == bridge.path, bridgePath.hasPrefix(resolvedRoot.path + "/"), FileManager.default.fileExists(atPath: bridgePath) else {
+      throw BridgeFailure.missingBridge
     }
-    var request: [String: Any] = ["args": arguments]
-    if let protectedInput { request["protectedInput"] = protectedInput }
-    let input = try JSONSerialization.data(withJSONObject: request, options: [])
+    guard let node = Self.validatedNodeBinary(root: resolvedRoot) else { throw BridgeFailure.missingNode }
 
-    return try await withCheckedThrowingContinuation { continuation in
-      let process = Process()
-      let stdin = Pipe()
-      let stdout = Pipe()
-      process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-      process.arguments = ["node", bridge.path, command]
-      process.currentDirectoryURL = root
-      process.standardInput = stdin
-      process.standardOutput = stdout
-      process.standardError = Pipe()
-      process.terminationHandler = { process in
-        let data = stdout.fileHandleForReading.readDataToEndOfFile()
-        if process.terminationStatus == 0 {
-          continuation.resume(returning: data)
-        } else {
-          continuation.resume(throwing: RouterError("The Router command failed."))
-        }
-      }
-      do {
-        try process.run()
-        stdin.fileHandleForWriting.write(input)
-        stdin.fileHandleForWriting.closeFile()
-      } catch {
-        continuation.resume(throwing: RouterError("The Router command could not start."))
-      }
+    var request: [String: Any] = [
+      "args": arguments,
+      "capabilitySchemaVersion": capabilitySchemaVersion,
+    ]
+    if let protectedInput { request["protectedInput"] = protectedInput }
+    var input = try JSONSerialization.data(withJSONObject: request, options: [])
+    request.removeValue(forKey: "protectedInput")
+
+    let process = Process()
+    let stdin = Pipe()
+    let stdout = Pipe()
+    let stderr = Pipe()
+    process.executableURL = node
+    process.arguments = [bridge.path, command]
+    process.currentDirectoryURL = resolvedRoot
+    process.standardInput = stdin
+    process.standardOutput = stdout
+    process.standardError = stderr
+    do {
+      try process.run()
+    } catch {
+      Self.zeroize(&input)
+      throw RouterError("The Router command could not start.")
     }
+
+    let stopProcess = { if process.isRunning { process.terminate() } }
+    let stdoutReader = Task.detached(priority: .userInitiated) {
+      Self.boundedRead(stdout.fileHandleForReading, limit: Self.outputLimit, terminate: stopProcess)
+    }
+    let stderrReader = Task.detached(priority: .userInitiated) {
+      Self.boundedRead(stderr.fileHandleForReading, limit: Self.outputLimit, terminate: stopProcess)
+    }
+    stdin.fileHandleForWriting.write(input)
+    stdin.fileHandleForWriting.closeFile()
+    Self.zeroize(&input)
+
+    let statusTask = Task.detached(priority: .userInitiated) { await Self.waitForProcess(process) }
+    let status: Int32
+    do {
+      status = try await withThrowingTaskGroup(of: Int32.self) { group in
+        group.addTask { await statusTask.value }
+        group.addTask {
+          try await Task.sleep(for: Self.commandTimeout)
+          throw BridgeFailure.timedOut
+        }
+        defer { group.cancelAll() }
+        return try await group.next()!
+      }
+    } catch {
+      stopProcess()
+      _ = await statusTask.value
+      _ = await stdoutReader.value
+      _ = await stderrReader.value
+      throw (error as? BridgeFailure) ?? BridgeFailure.timedOut
+    }
+
+    let output = await stdoutReader.value
+    _ = await stderrReader.value
+    if output.count >= Self.outputLimit {
+      throw BridgeFailure.outputLimit
+    }
+    // A canonical error envelope remains authoritative even when the helper
+    // exits non-zero (for example, malformed stdin). Never replace it with
+    // stderr text, which may contain provider-owned data.
+    if Self.isEnvelope(output) { return output }
+    if status != 0 { throw BridgeFailure.invalidOutput }
+    return output
   }
 }
 
@@ -693,11 +933,11 @@ struct RouterSnapshot: Decodable {
 
   init(from decoder: Decoder) throws {
     let values = try decoder.container(keyedBy: CodingKeys.self)
-    targets = try values.decodeIfPresent([String: RouterTarget].self, forKey: .targets) ?? [:]
-    presence = try values.decodeIfPresent(RouterPresence.self, forKey: .presence)
-    capabilities = try values.decodeIfPresent(CapabilitySnapshotV1.self, forKey: .capabilities)
-    accountUsage = try values.decodeIfPresent(CodexAccountUsage.self, forKey: .accountUsage)
-    providerUsage = try values.decodeIfPresent(ProviderUsageSnapshot.self, forKey: .providerUsage)
+    targets = (try? values.decode([String: RouterTarget].self, forKey: .targets)) ?? [:]
+    presence = try? values.decode(RouterPresence.self, forKey: .presence)
+    capabilities = try? values.decode(CapabilitySnapshotV1.self, forKey: .capabilities)
+    accountUsage = try? values.decode(CodexAccountUsage.self, forKey: .accountUsage)
+    providerUsage = try? values.decode(ProviderUsageSnapshot.self, forKey: .providerUsage)
   }
 
   private enum CodingKeys: String, CodingKey { case targets, presence, capabilities, accountUsage, providerUsage }
@@ -858,6 +1098,8 @@ final class RouterStore: ObservableObject {
 
   @Published private(set) var snapshot = RouterSnapshot.empty
   @Published private(set) var capabilitySnapshot = CapabilitySnapshotV1.empty
+  @Published private(set) var healthVersion = HealthVersionEnvelope.empty
+  @Published private(set) var commandResult: CapabilityCommandResult?
   @Published private(set) var isRefreshing = false
   @Published private(set) var message: String?
   @Published private(set) var lastUpdated: Date?
@@ -897,6 +1139,15 @@ final class RouterStore: ObservableObject {
   private var pendingServiceStop: Task<Void, Never>?
   private var bridge = DesktopCommandBridge()
   private var polling = false
+  private var statusPollingTask: Task<Void, Never>?
+  private var activityPollingTask: Task<Void, Never>?
+  private var accountUsagePollingTask: Task<Void, Never>?
+  private var providerUsagePollingTask: Task<Void, Never>?
+  private var hostObservationTask: Task<Void, Never>?
+  private var surfaceVisibilityTask: Task<Void, Never>?
+  private var workspaceObservers: [NSObjectProtocol] = []
+  private let hostAppBundleIDs = ["com.openai.codex", "com.openai.chat"]
+  nonisolated static let hostProcessNames = ["codex"]
 
   nonisolated static func resolveIslandMode(
     storedMode: String?,
@@ -998,6 +1249,49 @@ final class RouterStore: ObservableObject {
     } else {
       presenceMode = .always
     }
+  }
+
+  // NSWorkspace sees bundled desktop clients, while a terminal Codex process
+  // has no bundle. Keep the process scan pure and nonisolated so the host
+  // observation tests can exercise it without constructing the tray.
+  nonisolated static func anyProcessRunning(named names: [String]) -> Bool {
+    var request: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0]
+    var byteCount = 0
+    guard sysctl(&request, UInt32(request.count), nil, &byteCount, nil, 0) == 0, byteCount > 0 else { return false }
+    let stride = MemoryLayout<kinfo_proc>.stride
+    var entries = [kinfo_proc](repeating: kinfo_proc(), count: byteCount / stride + 32)
+    byteCount = entries.count * stride
+    let read = entries.withUnsafeMutableBytes { buffer -> Int32 in
+      sysctl(&request, UInt32(request.count), buffer.baseAddress, &byteCount, nil, 0)
+    }
+    guard read == 0 else { return false }
+    var parentOf: [pid_t: pid_t] = [:]
+    var matches: [pid_t] = []
+    for index in 0..<min(byteCount / stride, entries.count) {
+      let process = entries[index].kp_proc
+      let pid = process.p_pid
+      parentOf[pid] = entries[index].kp_eproc.e_ppid
+      let name = withUnsafeBytes(of: process.p_comm) { raw -> String in
+        var length = 0
+        while length < raw.count, raw[length] != 0 { length += 1 }
+        return String(decoding: raw[0..<length], as: UTF8.self)
+      }
+      if names.contains(where: { $0.compare(name, options: .caseInsensitive) == .orderedSame }) {
+        matches.append(pid)
+      }
+    }
+    let own = getpid()
+    return matches.contains { !isDescendant($0, of: own, parentOf: parentOf) }
+  }
+
+  nonisolated static func isDescendant(_ pid: pid_t, of ancestor: pid_t, parentOf: [pid_t: pid_t]) -> Bool {
+    var current = pid
+    for _ in 0..<64 {
+      if current == ancestor { return true }
+      guard let parent = parentOf[current], parent != 0, parent != current else { return false }
+      current = parent
+    }
+    return false
   }
 
   var codexActive: Bool { snapshot.targets["codex"]?.active == true }
@@ -1106,22 +1400,82 @@ final class RouterStore: ObservableObject {
   }
 
   func retireLoginItem() {}
-  func restoreServiceOnQuit() {}
-  func startHostAppObservation() { refreshHostAppRunning() }
+
+  func restoreServiceOnQuit() { stopPolling() }
+
+  func startHostAppObservation() {
+    let center = NSWorkspace.shared.notificationCenter
+    if workspaceObservers.isEmpty {
+      for name in [NSWorkspace.didLaunchApplicationNotification, NSWorkspace.didTerminateApplicationNotification] {
+        workspaceObservers.append(center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+          Task { @MainActor [weak self] in await self?.refreshHostAppRunning() }
+        })
+      }
+    }
+    hostObservationTask?.cancel()
+    hostObservationTask = Task { @MainActor [weak self] in
+      while !Task.isCancelled {
+        guard let self else { return }
+        await self.refreshHostAppRunning()
+        try? await Task.sleep(for: self.hostAppRecheckInterval)
+      }
+    }
+  }
+
+  func stopPolling() {
+    polling = false
+    statusPollingTask?.cancel()
+    activityPollingTask?.cancel()
+    accountUsagePollingTask?.cancel()
+    providerUsagePollingTask?.cancel()
+    hostObservationTask?.cancel()
+    surfaceVisibilityTask?.cancel()
+    pendingServiceStop?.cancel()
+    statusPollingTask = nil
+    activityPollingTask = nil
+    accountUsagePollingTask = nil
+    providerUsagePollingTask = nil
+    hostObservationTask = nil
+    surfaceVisibilityTask = nil
+    pendingServiceStop = nil
+    let center = NSWorkspace.shared.notificationCenter
+    for observer in workspaceObservers { center.removeObserver(observer) }
+    workspaceObservers.removeAll()
+    clearCommandResult()
+  }
+
+  private var effectivePresenceMode: TrayPresenceMode {
+    routerPinsServiceOn ? .always : presenceMode
+  }
 
   private func refreshSurfacesVisible() {
-    let next = presenceMode == .always || hostAppRunning || routerPinsServiceOn
+    let next = effectivePresenceMode == .always || hostAppRunning
     guard surfacesVisible != next else { return }
-    Task { @MainActor [weak self] in
+    surfaceVisibilityTask?.cancel()
+    surfaceVisibilityTask = Task { @MainActor [weak self] in
       try? await Task.sleep(nanoseconds: 1_000_000_000)
-      guard let self else { return }
+      guard let self, !Task.isCancelled, surfacesVisible != next else { return }
       surfacesVisible = next
     }
   }
 
-  private func refreshHostAppRunning() {
-    hostAppRunning = true
+  private func hostAppRunningNow() -> Bool {
+    if hostAppBundleIDs.contains(where: { identifier in
+      NSRunningApplication.runningApplications(withBundleIdentifier: identifier).contains { !$0.isTerminated }
+    }) { return true }
+    return Self.anyProcessRunning(named: Self.hostProcessNames)
+  }
+
+  private func refreshHostAppRunning() async {
+    let processRunning = hostAppRunningNow()
+    var routerPresence = false
+    if let value = try? await executeCanonicalCommand("presence.status"), case .object(let object) = value {
+      if case let .some(.bool(published)) = object["harnessPublished"], published { routerPresence = true }
+      if case let .some(.bool(terminal)) = object["terminalCodex"], terminal { routerPresence = true }
+    }
+    hostAppRunning = processRunning || routerPresence
     refreshSurfacesVisible()
+    if effectivePresenceMode == .followCodex, !hostAppRunning { schedulePresenceStop() }
   }
 
   private func schedulePresenceStop() {
@@ -1129,8 +1483,20 @@ final class RouterStore: ObservableObject {
     pendingServiceStop = Task { @MainActor [weak self] in
       guard let self else { return }
       try? await Task.sleep(for: hostAppAbsenceGrace)
-      self.refreshHostAppRunning()
-      guard activeRequestCount == 0 && activityState == .idle else { return }
+      await self.refreshHostAppRunning()
+      guard !Task.isCancelled, effectivePresenceMode == .followCodex, !hostAppRunning else {
+        pendingServiceStop = nil
+        return
+      }
+      while !Task.isCancelled && (activeRequestCount != 0 || activityState != .idle) {
+        try? await Task.sleep(for: hostAppRecheckInterval)
+        await self.refreshHostAppRunning()
+        guard !hostAppRunning else { pendingServiceStop = nil; return }
+      }
+      guard !Task.isCancelled, activeRequestCount == 0 && activityState == .idle, !hostAppRunning else {
+        pendingServiceStop = nil
+        return
+      }
       await runServiceCommand("stop")
       pendingServiceStop = nil
     }
@@ -1152,12 +1518,52 @@ final class RouterStore: ObservableObject {
   func startPolling() async {
     guard !polling else { return }
     polling = true
-    await refresh()
+    _ = await refresh()
+    statusPollingTask?.cancel()
+    statusPollingTask = Task { @MainActor [weak self] in
+      var failures = 0
+      while !Task.isCancelled {
+        guard let self else { return }
+        let healthy = await self.refresh()
+        failures = healthy ? 0 : min(failures + 1, 4)
+        let seconds = healthy ? 30 : min(30 * (1 << failures), 300)
+        try? await Task.sleep(for: .seconds(seconds))
+      }
+    }
   }
 
-  func startActivityPolling() async { await refreshActivity() }
-  func startAccountUsagePolling() async { await refreshAccountUsage() }
-  func startProviderPolling() async { await refreshProviderUsage() }
+  func startActivityPolling() async {
+    guard activityPollingTask == nil else { return }
+    activityPollingTask = Task { @MainActor [weak self] in
+      while !Task.isCancelled {
+        guard let self else { return }
+        await self.refreshActivity()
+        try? await Task.sleep(for: .seconds(5))
+      }
+    }
+  }
+
+  func startAccountUsagePolling() async {
+    guard accountUsagePollingTask == nil else { return }
+    accountUsagePollingTask = Task { @MainActor [weak self] in
+      while !Task.isCancelled {
+        guard let self else { return }
+        await self.refreshAccountUsage()
+        try? await Task.sleep(for: .seconds(30))
+      }
+    }
+  }
+
+  func startProviderPolling() async {
+    guard providerUsagePollingTask == nil else { return }
+    providerUsagePollingTask = Task { @MainActor [weak self] in
+      while !Task.isCancelled {
+        guard let self else { return }
+        await self.refreshProviderUsage()
+        try? await Task.sleep(for: .seconds(30))
+      }
+    }
+  }
 
   private func refreshActivity() async {
     do {
@@ -1188,41 +1594,91 @@ final class RouterStore: ObservableObject {
     }
   }
 
-  func refresh() async {
+  @discardableResult
+  func refresh() async -> Bool {
     isRefreshing = true
     defer { isRefreshing = false }
+    clearCapabilityState()
     do {
       guard let value = try await executeCanonicalCommand("lifecycle.status") else { throw RouterError("The Router returned no status.") }
       let data = try JSONEncoder().encode(value)
+      healthVersion = (try? JSONDecoder().decode(HealthVersionEnvelope.self, from: data)) ?? HealthVersionEnvelope.empty
+      if let reported = healthVersion.capabilitySchemaVersion, reported != 1 {
+        capabilitySnapshot = CapabilitySnapshotV1(
+          capabilitySchemaVersion: reported,
+          compatibility: CapabilityCompatibility(readOnly: true, reason: "unknown_major_version"),
+          mutationsEnabled: false,
+          commands: [],
+          capabilities: []
+        )
+      }
       let decoded = try JSONDecoder().decode(RouterSnapshot.self, from: data)
       snapshot = decoded
-      capabilitySnapshot = decoded.capabilities ?? CapabilitySnapshotV1.empty
+      if let capabilities = decoded.capabilities {
+        capabilitySnapshot = capabilities
+        healthVersion = HealthVersionEnvelope(
+          health: "available",
+          version: "schema \(capabilities.capabilitySchemaVersion)",
+          capabilitySchemaVersion: capabilities.capabilitySchemaVersion,
+          compatibilityReason: capabilities.compatibility.reason
+        )
+      }
       accountUsage = decoded.accountUsage ?? accountUsage
       providerUsage = decoded.providerUsage ?? providerUsage
       lastUpdated = Date()
       message = nil
+      return true
     } catch {
       message = error.localizedDescription
+      return false
     }
   }
+
+  private func clearCapabilityState() {
+    snapshot = .empty
+    capabilitySnapshot = .empty
+    healthVersion = .empty
+    commandResult = nil
+  }
+
+  func clearCommandResult() { commandResult = nil }
 
   func executeCanonicalCommand(
     _ command: String,
     arguments: [String: Any] = [:],
-    protectedInput: String? = nil
+    protectedInput: String? = nil,
+    recordResult: Bool = false
   ) async throws -> JSONValue? {
-    guard CapabilityCommandCatalog.canonicalCommandSet.contains(command) else {
-      throw RouterError("Unsupported Router command.")
-    }
     if command != "lifecycle.status" && !capabilitySnapshot.isCompatible {
       throw RouterError(capabilitySnapshot.incompatibilityText)
     }
-    let data = try await bridge.execute(command, arguments: arguments, protectedInput: protectedInput)
+    let data = try await bridge.execute(
+      command,
+      arguments: arguments,
+      protectedInput: protectedInput,
+      capabilitySchemaVersion: capabilitySnapshot.capabilitySchemaVersion
+    )
     let envelope = try JSONDecoder().decode(DesktopCommandEnvelope<JSONValue>.self, from: data)
     guard envelope.ok else {
       guard let error = envelope.error else { throw RouterError("The Router command failed.") }
+      if recordResult {
+        commandResult = CapabilityCommandResult(
+          command: command,
+          resultKind: capabilitySnapshot.command(command)?.resultKind ?? "json",
+          value: nil,
+          error: error
+        )
+      }
       let code = error.code
       throw RouterError("\(code): \(error.message)")
+    }
+    if recordResult {
+      commandResult = CapabilityCommandResult(
+        command: command,
+        resultKind: capabilitySnapshot.command(command)?.resultKind ?? "json",
+        value: envelope.value,
+        error: nil
+      )
     }
     return envelope.value
   }
@@ -1239,13 +1695,19 @@ final class RouterStore: ObservableObject {
         arguments[name] = value
       }
     }
+    var result: CapabilityCommandResult?
     do {
-      _ = try await executeCanonicalCommand(command.name, arguments: arguments, protectedInput: protectedInput)
+      _ = try await executeCanonicalCommand(command.name, arguments: arguments, protectedInput: protectedInput, recordResult: true)
+      result = commandResult
       message = "\(command.name) applied."
       if command.name == "credential.set" { await refreshProviderUsage() }
-      await refresh()
+      _ = await refresh()
+      commandResult = result
     } catch {
+      result = commandResult
       message = error.localizedDescription
+      _ = await refresh()
+      commandResult = result
     }
   }
 
@@ -1337,15 +1799,19 @@ private struct CapabilityTrayView: View {
             ForEach(store.capabilitySnapshot.capabilities) { capability in
               CapabilitySectionView(store: store, capability: capability)
             }
+            if store.commandResult != nil {
+              CapabilityResultView(store: store)
+            }
           }
           .padding(14)
         }
       } else {
-        IncompatibleCapabilityView(snapshot: store.capabilitySnapshot)
+        IncompatibleCapabilityView(snapshot: store.capabilitySnapshot, healthVersion: store.healthVersion)
       }
     }
     .frame(width: 370, height: 590)
     .background(.regularMaterial)
+    .onDisappear { store.clearCommandResult() }
   }
 
   private var header: some View {
@@ -1366,13 +1832,18 @@ private struct CapabilityTrayView: View {
 
 private struct IncompatibleCapabilityView: View {
   let snapshot: CapabilitySnapshotV1
+  let healthVersion: HealthVersionEnvelope
 
   var body: some View {
     VStack(alignment: .leading, spacing: 10) {
       Image(systemName: "exclamationmark.triangle").foregroundStyle(routerYellow)
       Text(routerLocalized("Router capability update required")).font(.headline)
       Text(snapshot.incompatibilityText).font(.subheadline).foregroundStyle(routerMuted)
-      Text(routerFormat("Capability schema %d", snapshot.capabilitySchemaVersion)).font(.caption.monospaced()).foregroundStyle(routerMuted)
+      Text(routerFormat("Health: %@", healthVersion.health)).font(.caption.monospaced()).foregroundStyle(routerMuted)
+      Text(routerFormat("Version: %@", healthVersion.version)).font(.caption.monospaced()).foregroundStyle(routerMuted)
+      if let schema = healthVersion.capabilitySchemaVersion {
+        Text(routerFormat("Capability schema %d", schema)).font(.caption.monospaced()).foregroundStyle(routerMuted)
+      }
       Text(routerLocalized("Refresh after updating the Router.")).font(.caption).foregroundStyle(routerMuted)
     }
     .padding(18)
@@ -1417,17 +1888,12 @@ private struct CapabilityCommandRow: View {
       HStack(spacing: 7) {
         Image(systemName: command.isMutating ? "slider.horizontal.3" : "waveform.path.ecg")
           .foregroundStyle(command.isMutating ? routerAccent : routerMuted)
-        Text(command.name).font(.caption.monospaced())
+        Text(command.ui.title).font(.caption.weight(.medium))
         Spacer()
         if command.hasQuotaWarning { Text(routerLocalized("Quota warning")).font(.caption2).foregroundStyle(routerYellow) }
       }
       ForEach(command.arguments.properties.keys.sorted(), id: \.self) { name in
-        TextField(name, text: Binding(
-          get: { fields[name, default: ""] },
-          set: { fields[name] = $0 }
-        ))
-        .textFieldStyle(.roundedBorder)
-        .font(.caption)
+        argumentField(name)
       }
       if command.protectedInput {
         SecureField(routerLocalized("Enter credential for this one-time operation"), text: $protectedValue)
@@ -1462,6 +1928,34 @@ private struct CapabilityCommandRow: View {
     }
   }
 
+  @ViewBuilder
+  private func argumentField(_ name: String) -> some View {
+    let presentation = command.ui.fields[name]
+    if let presentation, !presentation.enumValues.isEmpty {
+      Picker(presentation.label, selection: Binding(
+        get: { fields[name, default: ""] },
+        set: { fields[name] = $0 }
+      )) {
+        ForEach(presentation.enumValues, id: \.self) { value in
+          Text(value).tag(value)
+        }
+      }
+      .pickerStyle(.menu)
+    } else if presentation?.type.contains("boolean") == true {
+      Toggle(presentation?.label ?? name, isOn: Binding(
+        get: { fields[name, default: "true"] == "true" },
+        set: { fields[name] = $0 ? "true" : "false" }
+      ))
+    } else {
+      TextField(presentation?.label ?? name, text: Binding(
+        get: { fields[name, default: ""] },
+        set: { fields[name] = $0 }
+      ))
+      .textFieldStyle(.roundedBorder)
+      .font(.caption)
+    }
+  }
+
   private static func defaultValue(for name: String, type: String) -> String {
     if name == "provider" { return "deepseek" }
     if name == "slug" { return "deepseek/deepseek-v4-pro" }
@@ -1473,6 +1967,48 @@ private struct CapabilityCommandRow: View {
     if name == "days" { return "7" }
     if type.contains("boolean") { return "true" }
     return ""
+  }
+}
+
+private struct CapabilityResultView: View {
+  @ObservedObject var store: RouterStore
+
+  var body: some View {
+    if let result = store.commandResult {
+      VStack(alignment: .leading, spacing: 7) {
+        HStack {
+          Text(result.isError ? routerLocalized("Command failed") : routerLocalized("Command result"))
+            .font(.subheadline.weight(.semibold))
+          Spacer()
+          Button(routerLocalized("Clear")) { store.clearCommandResult() }
+            .buttonStyle(.borderless)
+            .accessibilityLabel(routerLocalized("Clear command result"))
+        }
+        Text(result.command).font(.caption.monospaced()).foregroundStyle(routerMuted)
+        if let error = result.error {
+          Text("\(error.code): \(error.message)")
+            .font(.caption)
+            .foregroundStyle(routerRed)
+            .textSelection(.enabled)
+            .accessibilityLabel(routerLocalized("Error details"))
+        } else if let text = result.text {
+          Text(text)
+            .font(.caption.monospaced())
+            .textSelection(.enabled)
+            .frame(maxWidth: .infinity, alignment: .leading)
+          if result.resultKind == "protected-text" {
+            Button(routerLocalized("Copy protected result")) {
+              NSPasteboard.general.clearContents()
+              NSPasteboard.general.setString(text, forType: .string)
+            }
+            .buttonStyle(.borderless)
+            .accessibilityLabel(routerLocalized("Copy protected result"))
+          }
+        }
+      }
+      .padding(10)
+      .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
   }
 }
 

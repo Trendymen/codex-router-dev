@@ -206,51 +206,35 @@ test("a read-only surface refuses only what it did not advertise", () => {
   assert.equal(readOnlyCapabilities({ capabilities: { readOnly: false } }), null);
 });
 
-test("the macOS tray tool-result-aging switch mirrors the same off default", () => {
+test("the macOS tray renders the shared capability surface instead of a legacy local switch", () => {
   const source = readFileSync(
     path.join(root, "apps", "macos", "ModelRouterTray", "Sources", "ModelRouterTrayApp.swift"),
     "utf8",
   );
-  assert.match(source, /toolResultAging\?\.enabled \?\? false/);
-  assert.doesNotMatch(source, /toolResultAging\?\.enabled \?\? true/);
+  assert.match(source, /CapabilitySnapshotV1/);
+  assert.match(source, /CapabilityCommandRow/);
+  assert.doesNotMatch(source, /toolResultAging\?\.enabled/);
 });
 
-test("native tray provider toggles use the atomic selection command", () => {
-  const rust = readFileSync(
-    path.join(root, "apps", "desktop", "src-tauri", "src", "main.rs"),
-    "utf8",
-  ).match(/fn update_provider_selection\([\s\S]*?\r?\n}\r?\n\r?\nfn run_control_json/)?.[0];
-  const swift = readFileSync(
-    path.join(root, "apps", "macos", "ModelRouterTray", "Sources", "ModelRouterTrayApp.swift"),
-    "utf8",
-  ).match(/private func updateProviderSelection[\s\S]*?\r?\n  }\r?\n\r?\n  private func refreshActivity/)?.[0];
-  assert.ok(rust, "Tauri provider-toggle helper should be readable");
-  assert.ok(swift, "macOS provider-toggle helper should be readable");
-  for (const source of [rust, swift]) {
-    assert.match(source, /["\[]set-apply/);
-    assert.match(source, /--activate/);
-    assert.doesNotMatch(source, /was_enabled|wasEnabled|["\[]apply["\]]/);
-  }
-});
-
-test("native credential actions do not race atomic selection publication", () => {
-  const rust = readFileSync(
-    path.join(root, "apps", "desktop", "src-tauri", "src", "main.rs"),
-    "utf8",
-  );
+test("native tray provider toggles use the shared manifest command bridge", () => {
   const swift = readFileSync(
     path.join(root, "apps", "macos", "ModelRouterTray", "Sources", "ModelRouterTrayApp.swift"),
     "utf8",
   );
-  const rustSave = rust.match(/async fn save_api_key[\s\S]*?\r?\n}\r?\n\r?\n\/\//)?.[0];
-  const rustRemove = rust.match(/async fn remove_api_key[\s\S]*?\r?\n}\r?\n\r?\n#\[tauri::command\]/)?.[0];
-  const swiftSave = swift.match(/func saveProviderKey[\s\S]*?\r?\n  }\r?\n\r?\n  \/\//)?.[0];
-  const swiftRemove = swift.match(/func removeProviderKey[\s\S]*?\r?\n  }\r?\n\r?\n  func dailyTokens/)?.[0];
-  for (const [name, source] of Object.entries({ rustSave, rustRemove, swiftSave, swiftRemove })) {
-    assert.ok(source, `${name} should be readable`);
-    assert.match(source, /credential/);
-    assert.doesNotMatch(source, /update_provider_selection|updateProviderSelection|["\[]apply["\]]/);
-  }
+  assert.match(swift, /CapabilityCommandRow/);
+  assert.match(swift, /executeCanonicalCommand\(command\.name/);
+  assert.doesNotMatch(swift, /set-apply|--activate/);
+});
+
+test("native credential actions use protected input without persistence", () => {
+  const swift = readFileSync(
+    path.join(root, "apps", "macos", "ModelRouterTray", "Sources", "ModelRouterTrayApp.swift"),
+    "utf8",
+  );
+  assert.match(swift, /credential\.set/);
+  assert.match(swift, /protectedInput/);
+  assert.match(swift, /SecureField/);
+  assert.doesNotMatch(swift, /UserDefaults[^\n]*(?:credential|apiKey|secret|token)/i);
 });
 
 // The disabled set is derived from data-command, so a control that drives a

@@ -41,4 +41,10 @@ struct HostProcessDetectionTests {
       #expect(name.count <= 16)
     }
   }
+
+  @Test("the terminal fallback stays bound to the canonical Codex executable")
+  func canonicalTerminalFallback() {
+    #expect(RouterStore.hostProcessNames == ["codex"])
+    #expect(RouterStore.hostProcessNames.allSatisfy { !$0.contains(".") })
+  }
 }

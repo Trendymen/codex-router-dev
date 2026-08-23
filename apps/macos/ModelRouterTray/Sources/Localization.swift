@@ -594,6 +594,11 @@ enum RouterChineseText {
     "Menu bar saved": "菜单栏设置已保存",
     "Only health and version information is available for this Router capability version.": "此路由能力版本仅提供健康状态和版本信息。",
     "Only health and version information is available until the Router capability snapshot is ready.": "在路由能力快照就绪前仅提供健康状态和版本信息。",
+    "Health: %@": "健康状态：%@",
+    "Version: %@": "版本：%@",
+    "Command failed": "命令失败",
+    "Clear command result": "清除命令结果",
+    "Copy protected result": "复制受保护结果",
     "Select": "选择",
   ]
 }

@@ -13,17 +13,13 @@ test("desktop subagent settings show native and unverified enabled models", () =
   assert.match(source, /selectedSubagents\.has\(model\.slug\)/);
 });
 
-test("macOS subagent settings show native and unverified enabled models", () => {
+test("macOS subagent settings are rendered from the shared capability manifest", () => {
   const source = readFileSync(
     path.join(root, "apps", "macos", "ModelRouterTray", "Sources", "ModelRouterTrayApp.swift"),
     "utf8",
   );
-  assert.match(source, /private var subagentModels: \[RouterModel\]/);
-  assert.match(source, /ForEach\(providerGroups\(subagentModels\)\)/);
-  const subagentList = source.slice(
-    source.indexOf("private var subagentModels"),
-    source.indexOf("private var enabledModels"),
-  );
-  assert.doesNotMatch(subagentList, /provider != "openai"/);
-  assert.match(source, /selectedSubagentSet\.contains\(model\.slug\)/);
+  assert.match(source, /CapabilitySnapshotV1/);
+  assert.match(source, /capability\.nodeCommands\.compactMap\(store\.capabilitySnapshot\.command\)/);
+  assert.match(source, /CapabilityCommandRow/);
+  assert.doesNotMatch(source, /subagentModels|selectedSubagentSet/);
 });

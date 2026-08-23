@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import path from "node:path";
+import { spawnSync } from "node:child_process";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
@@ -8,68 +9,175 @@ import fixture from "./fixtures/required-capabilities.json" with { type: "json" 
 import { buildCapabilityManifest } from "../src/capability-manifest.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const swiftSource = [
-  "apps/macos/ModelRouterTray/Sources/ModelRouterTrayApp.swift",
-  "apps/macos/ModelRouterTray/Sources/Localization.swift",
-].map((relative) => readFileSync(path.join(root, relative), "utf8")).join("\n");
+const swiftSource = readFileSync(path.join(root, "apps/macos/ModelRouterTray/Sources/ModelRouterTrayApp.swift"), "utf8");
+const bridgeSource = readFileSync(path.join(root, "src", "desktop-command-bridge.mjs"), "utf8");
+const localizationSources = [
+  "Localization.swift",
+  "RouterArabicText.swift",
+  "RouterHindiText.swift",
+  "RouterJapaneseText.swift",
+  "RouterKoreanText.swift",
+].map((name) => readFileSync(path.join(root, "apps/macos/ModelRouterTray/Sources", name), "utf8"));
 
-function canonicalSwiftCommands(source) {
-  const block = source.match(/canonicalCommandIDs:\s*\[String\]\s*=\s*\[(?<body>[\s\S]*?)\n\s*\]/);
-  assert.ok(block, "Swift must publish one canonical command-id list");
-  return [...block.groups.body.matchAll(/"([a-z0-9][a-z0-9._-]*)"/g)].map(([, id]) => id);
+function runBridge(command, payload, extraEnv = {}) {
+  const bridge = path.join(root, "src", "desktop-command-bridge.mjs");
+  const env = { ...process.env, PATH: path.join(root, "does-not-exist"), MODEL_ROUTER_SOURCE_ROOT: path.join(root, "decoy") , ...extraEnv };
+  const result = spawnSync(process.execPath, [bridge, command], {
+    cwd: root,
+    env,
+    input: payload === undefined ? "" : typeof payload === "string" ? payload : JSON.stringify(payload),
+    encoding: "utf8",
+    timeout: 10_000,
+    windowsHide: true,
+  });
+  let envelope;
+  try { envelope = JSON.parse(result.stdout); } catch { envelope = undefined; }
+  return { ...result, envelope };
 }
 
-test("Swift source advertises exactly the independent capability command oracle", () => {
-  assert.deepEqual(canonicalSwiftCommands(swiftSource).sort(), [...fixture.nodeCommands].sort());
+test("Swift renders the real swift capability set through manifest expressions", () => {
+  const manifest = buildCapabilityManifest();
+  const swiftCommands = manifest.capabilities.filter(({ swift }) => swift === "full").flatMap(({ nodeCommands }) => nodeCommands);
+  assert.deepEqual([...new Set(swiftCommands)].sort(), [...fixture.nodeCommands].sort());
+  assert.match(swiftSource, /ForEach\(capability\.nodeCommands\.compactMap\(store\.capabilitySnapshot\.command\)/);
+  assert.match(swiftSource, /CapabilityCommandRow\(store: store, command: command\)/);
+  assert.match(swiftSource, /executeCanonicalCommand\(command\.name/);
+  assert.match(swiftSource, /command\.ui\.title/);
+  assert.match(swiftSource, /command\.ui\.fields/);
   for (const forbidden of fixture.forbiddenCommands) {
     assert.doesNotMatch(swiftSource, new RegExp(forbidden.replaceAll(".", "\\.")), forbidden);
   }
 });
 
-test("Swift consumes the versioned snapshot and fails closed on unknown majors", () => {
-  assert.match(swiftSource, /struct\s+CapabilitySnapshotV1\b/);
-  assert.match(swiftSource, /capabilitySchemaVersion/);
-  assert.match(swiftSource, /unknown_major_version/);
-  assert.match(swiftSource, /mutationsEnabled/);
-  assert.match(swiftSource, /readOnly/);
-  assert.match(swiftSource, /only health and version|health.*version/is);
+test("the real Node manifest encodes Swift-decodable boolean metadata", () => {
+  const encoded = JSON.stringify(buildCapabilityManifest({ capabilitySchemaVersion: 1 }));
+  const manifest = JSON.parse(encoded);
+  assert.equal(manifest.capabilitySchemaVersion, 1);
+  assert.ok(manifest.commands.length > 0);
+  for (const command of manifest.commands) {
+    assert.equal(typeof command.confirmation, "boolean", command.name);
+    assert.equal(typeof command.quotaWarning, "boolean", command.name);
+    assert.equal(typeof command.protectedInput, "boolean", command.name);
+    assert.equal(typeof command.ui.title, "string", command.name);
+    for (const field of Object.values(command.ui.fields)) assert.equal(typeof field.label, "string", command.name);
+  }
+  assert.match(swiftSource, /decodeIfPresent\(Bool\.self, forKey: \.confirmation\)/);
+  assert.match(swiftSource, /decodeIfPresent\(Bool\.self, forKey: \.quotaWarning\)/);
+  assert.match(swiftSource, /struct\s+CapabilityUI\b/);
 });
 
-test("Swift command rows carry quota warnings, confirmations, and protected-input metadata", () => {
-  assert.match(swiftSource, /quotaWarning/);
-  assert.match(swiftSource, /confirmation/);
-  assert.match(swiftSource, /Quota warning|quota warning/i);
-  assert.match(swiftSource, /Confirm|confirmation/i);
-  assert.match(swiftSource, /protectedInput/);
-  assert.match(swiftSource, /SecureField/);
+test("unknown and invalid capability majors retain only a minimal health/version envelope", () => {
+  assert.match(swiftSource, /struct\s+HealthVersionEnvelope\b/);
+  assert.match(swiftSource, /try\? values\.decode\(Int\.self, forKey: \.capabilitySchemaVersion\)/);
+  assert.match(swiftSource, /clearCapabilityState\(\)/);
+  assert.match(swiftSource, /capabilitySnapshot = CapabilitySnapshotV1\.empty/);
+  assert.match(swiftSource, /healthVersion\.health/);
+  assert.match(swiftSource, /healthVersion\.version/);
+  assert.match(swiftSource, /Only health and version information/is);
+  const unknown = buildCapabilityManifest({ capabilitySchemaVersion: 99 });
+  assert.equal(unknown.mutationsEnabled, false);
+  assert.deepEqual(unknown.commands, []);
 });
 
-test("Swift decodes the stable Node error envelope and never persists credentials", () => {
-  assert.match(swiftSource, /DesktopCommandEnvelope/);
-  assert.match(swiftSource, /DesktopCommandError/);
-  assert.match(swiftSource, /error\.code/);
-  assert.match(swiftSource, /credential\.set/);
-  assert.match(swiftSource, /protectedInput/);
-  assert.doesNotMatch(swiftSource, /UserDefaults[^\n]*(?:credential|apiKey|secret|token)/i);
-  assert.doesNotMatch(swiftSource, /arguments[^\n]*apiKey/i);
-});
-
-test("all Router mutations use the canonical Node bridge while Dynamic Island stays local", () => {
+test("all Router mutations use the canonical Node bridge and observed schema version", () => {
   assert.match(swiftSource, /DesktopCommandBridge/);
-  assert.match(swiftSource, /executeCanonicalCommand/);
+  assert.match(swiftSource, /capabilitySchemaVersion: capabilitySnapshot\.capabilitySchemaVersion/);
+  assert.match(bridgeSource, /manifest: \{ capabilitySchemaVersion: suppliedVersion \}/);
   assert.doesNotMatch(swiftSource, /runControl\s*\(/);
   assert.match(swiftSource, /islandModeKey/);
   assert.match(swiftSource, /resolveIslandMode/);
   assert.doesNotMatch(swiftSource, /dynamic[- ]?island[^\n]*(?:command|bridge)/i);
 });
 
-test("the Node bridge keeps protected input ephemeral and returns the canonical envelope", () => {
-  const bridge = readFileSync(path.join(root, "src", "desktop-command-bridge.mjs"), "utf8");
-  assert.match(bridge, /runDesktopCommand/);
-  assert.match(bridge, /trustedProtectedContext/);
-  assert.match(bridge, /protectedInput/);
-  assert.match(bridge, /JSON\.stringify/);
-  assert.doesNotMatch(bridge, /writeFile|appendFile|UserDefaults|localStorage/);
+test("absolute Node execution rejects PATH/source-root redirects and validates ownership", () => {
+  assert.match(swiftSource, /CODEX_ROUTER_NODE_BIN/);
+  assert.match(swiftSource, /ownerAccountID/);
+  assert.match(swiftSource, /isExecutableFile/);
+  assert.match(swiftSource, /process\.executableURL = node/);
+  assert.doesNotMatch(swiftSource, /\/usr\/bin\/env/);
+  assert.doesNotMatch(swiftSource, /MODEL_ROUTER_SOURCE_ROOT/);
+  assert.match(bridgeSource, /BRIDGE_ROOT/);
+  assert.doesNotMatch(bridgeSource, /sourceRoot\(\)/);
+});
+
+test("Node process I/O drains both streams, bounds output, times out, and preserves envelopes", () => {
+  assert.match(swiftSource, /boundedRead/);
+  assert.match(swiftSource, /standardError = stderr/);
+  assert.match(swiftSource, /outputLimit/);
+  assert.match(swiftSource, /commandTimeout/);
+  assert.match(swiftSource, /process\.terminate\(\)/);
+  assert.match(swiftSource, /stdoutReader/);
+  assert.match(swiftSource, /stderrReader/);
+  const malformed = runBridge("lifecycle.status", "{");
+  assert.equal(malformed.envelope?.ok, false);
+  assert.equal(malformed.envelope?.error?.code, "invalid_command_arguments");
+  assert.notEqual(malformed.status, 0);
+  const nullRequest = runBridge("lifecycle.status", "null");
+  assert.equal(nullRequest.envelope?.ok, true);
+});
+
+test("bridge passes schema versions, ignores hostile environment redirects, and never echoes protected input", () => {
+  const unsupported = runBridge("presence.mode", {
+    args: { mode: "always" },
+    capabilitySchemaVersion: 99,
+  });
+  assert.equal(unsupported.envelope?.ok, false);
+  assert.equal(unsupported.envelope?.error?.code, "capability_schema_unsupported");
+
+  const secret = "swift-secret-decoy-4e4a";
+  const protectedInput = runBridge("credential.set", {
+    args: { provider: "deepseek", apiKey: secret },
+    capabilitySchemaVersion: 1,
+    protectedInput: secret,
+  });
+  assert.equal(protectedInput.envelope?.ok, false);
+  assert.equal(protectedInput.envelope?.error?.code, "protected_input_required");
+  assert.doesNotMatch(protectedInput.stdout, new RegExp(secret));
+  assert.doesNotMatch(protectedInput.stderr, new RegExp(secret));
+
+  const oversized = runBridge("lifecycle.status", "x".repeat(256 * 1024 + 1));
+  assert.equal(oversized.envelope?.ok, false);
+  assert.equal(oversized.envelope?.error?.code, "invalid_command_arguments");
+});
+
+test("result kind/status/error and ephemeral protected output are rendered accessibly", () => {
+  assert.match(swiftSource, /@Published private\(set\) var commandResult/);
+  assert.match(swiftSource, /result\.resultKind/);
+  assert.match(swiftSource, /result\.error/);
+  assert.match(swiftSource, /textSelection\(\.enabled\)/);
+  assert.match(swiftSource, /Copy protected result/);
+  assert.match(swiftSource, /clearCommandResult\(\)/);
+  assert.match(swiftSource, /onDisappear \{ store\.clearCommandResult\(\) \}/);
+  assert.doesNotMatch(swiftSource, /UserDefaults[^\n]*(?:credential|apiKey|secret|token)/i);
+  assert.doesNotMatch(swiftSource, /arguments[^\n]*apiKey/i);
+});
+
+test("status/activity/usage polling is cancellable and host observation rechecks absence", () => {
+  assert.match(swiftSource, /statusPollingTask/);
+  assert.match(swiftSource, /activityPollingTask/);
+  assert.match(swiftSource, /Task\.isCancelled/);
+  assert.match(swiftSource, /NSWorkspace\.shared\.notificationCenter/);
+  assert.match(swiftSource, /hostProcessNames/);
+  assert.match(swiftSource, /executeCanonicalCommand\("presence\.status"/);
+  assert.match(swiftSource, /hostAppAbsenceGrace = Duration\.seconds\(30\)/);
+  assert.match(swiftSource, /hostAppRecheckInterval = Duration\.seconds\(5\)/);
+  assert.match(swiftSource, /activeRequestCount == 0 && activityState == \.idle/);
+  assert.match(swiftSource, /runServiceCommand\("stop"\)/);
+});
+
+test("all localized capability literals keep exact key parity across language tables", () => {
+  const keySet = (source) => new Set([...source.matchAll(/^\s*"((?:[^"\\]|\\.)*)":\s*"/gm)].map(([, key]) => key));
+  const reference = keySet(localizationSources[0]);
+  for (const [index, source] of localizationSources.slice(1).entries()) {
+    assert.deepEqual(keySet(source), reference, `language table ${index + 1} drifted`);
+  }
+});
+
+test("host process source contract keeps the executable-name helper used by Swift tests", () => {
+  const source = readFileSync(path.join(root, "apps/macos/ModelRouterTray/Tests/HostProcessDetectionTests.swift"), "utf8");
+  assert.match(source, /anyProcessRunning/);
+  assert.match(source, /hostProcessNames/);
+  assert.match(swiftSource, /nonisolated static func anyProcessRunning/);
 });
 
 test("the published Node manifest keeps every capability available to Swift", () => {

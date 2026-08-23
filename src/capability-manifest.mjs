@@ -73,13 +73,19 @@ function uiMetadata(name, args, {
   resultKind = "json",
 } = {}) {
   const properties = args.properties || {};
+  const title = name
+    .split(".")
+    .map((part) => part.replaceAll("-", " ").replace(/\b\w/g, (letter) => letter.toUpperCase()))
+    .join(" · ");
   return deepFreeze({
+    title,
     control: resultKind === "protected-text" ? "protected-output" : protectedInput ? "protected-input" : mutating ? "mutation" : "read",
     confirmation: confirmation ? "server" : "none",
     quotaWarning: quotaWarning ? "cost-warning" : "none",
     resultKind,
     protectedField: protectedInput ? "apiKey" : null,
     fields: Object.fromEntries(Object.entries(properties).map(([key, schema]) => [key, {
+      label: key.replaceAll("-", " ").replace(/\b\w/g, (letter) => letter.toUpperCase()),
       type: schema.type,
       required: (args.required || []).includes(key),
       enum: schema.enum || null,
