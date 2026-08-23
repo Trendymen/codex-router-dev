@@ -35,6 +35,7 @@ process.env.MODEL_ROUTER_VISION_CACHE_PURGE = path.join(isolatedStateDir, "visio
 
 const {
   applyVisionBridge,
+  createVisionCachePurgeFileSystem,
   createEvidenceCache,
   requestVisionCachePurge,
   releaseVisionCachePurgeLock,
@@ -393,6 +394,214 @@ test("explicit legacy writeJson injection takes priority over prepareJson", () =
     assert.equal(result.requested, true);
     assert.equal(prepareCalls, 0);
     assert.equal(legacyCalls, 1);
+  } finally {
+    rmSync(state, { recursive: true, force: true });
+  }
+});
+
+test("a factory with only prepareJson injection uses the prepared writer despite its compatibility method", () => {
+  const state = mkdtempSync(path.join(os.tmpdir(), "vision-purge-factory-prepare-"));
+  const purgePath = path.join(state, "vision-cache-purge.json");
+  let prepareCalls = 0;
+  try {
+    const fs = createVisionCachePurgeFileSystem({
+      platform: "linux",
+      prepareJsonSystemCall(target) {
+        prepareCalls += 1;
+        return {
+          committed: false,
+          commit(value) {
+            writeFileSync(target, `${JSON.stringify(value)}\n`);
+            this.committed = true;
+          },
+          abort() {},
+        };
+      },
+    });
+    const result = requestVisionCachePurge(purgePath, {
+      fs,
+      now: () => 100,
+      processIdentity: () => "factory-prepare-identity",
+      monotonicNow: () => 0,
+    });
+    assert.equal(result.requested, true);
+    assert.equal(prepareCalls, 1);
+  } finally {
+    rmSync(state, { recursive: true, force: true });
+  }
+});
+
+test("a factory opts into the legacy writer only when writeJsonSystemCall is explicit", () => {
+  const state = mkdtempSync(path.join(os.tmpdir(), "vision-purge-factory-legacy-"));
+  const purgePath = path.join(state, "vision-cache-purge.json");
+  let prepareCalls = 0;
+  let legacyCalls = 0;
+  try {
+    const fs = createVisionCachePurgeFileSystem({
+      platform: "linux",
+      prepareJsonSystemCall() {
+        prepareCalls += 1;
+        throw new Error("prepared writer must not run for explicit legacy factory injection");
+      },
+      writeJsonSystemCall(target, value) {
+        legacyCalls += 1;
+        writeFileSync(target, `${JSON.stringify(value)}\n`);
+      },
+    });
+    const result = requestVisionCachePurge(purgePath, {
+      fs,
+      now: () => 100,
+      processIdentity: () => "factory-legacy-identity",
+      monotonicNow: () => 0,
+    });
+    assert.equal(result.requested, true);
+    assert.equal(prepareCalls, 0);
+    assert.equal(legacyCalls, 1);
+  } finally {
+    rmSync(state, { recursive: true, force: true });
+  }
+});
+
+function purgeOrderFileSystem(purgePath, events, preparedFactory) {
+  return {
+    platform: "linux",
+    prepareJson: preparedFactory,
+    mkdir(target, options) {
+      if (target.includes(".staging-")) events.push("lock");
+      return mkdirSync(target, options);
+    },
+    removeFile(target) {
+      if (target.includes("owner-")) events.push("release");
+      return unlinkSync(target);
+    },
+    removeDirectory(target) {
+      events.push("release");
+      return rmdirSync(target);
+    },
+  };
+}
+
+test("coalesced purge releases its lock before aborting the unused prepared file", () => {
+  const state = mkdtempSync(path.join(os.tmpdir(), "vision-purge-coalesce-order-"));
+  const purgePath = path.join(state, "vision-cache-purge.json");
+  const events = [];
+  try {
+    const preparedFactory = (target) => {
+      events.push("prepare");
+      return {
+        committed: false,
+        commit(value) {
+          events.push("commit");
+          writeFileSync(target, `${JSON.stringify(value)}\n`);
+          this.committed = true;
+        },
+        abort() { events.push("abort"); },
+      };
+    };
+    const fs = purgeOrderFileSystem(purgePath, events, preparedFactory);
+    requestVisionCachePurge(purgePath, {
+      fs,
+      now: () => 100,
+      processIdentity: () => "coalesce-order-identity",
+      monotonicNow: () => 0,
+    });
+    events.length = 0;
+    const result = requestVisionCachePurge(purgePath, {
+      fs,
+      now: () => 100,
+      processIdentity: () => "coalesce-order-identity",
+      monotonicNow: () => 0,
+    });
+    assert.equal(result.requested, true);
+    assert.deepEqual(events.filter((event) => event === "prepare" || event === "release" || event === "abort"), [
+      "prepare", "release", "release", "abort",
+    ]);
+    assert.equal(events.includes("commit"), false);
+  } finally {
+    rmSync(state, { recursive: true, force: true });
+  }
+});
+
+test("failed purge release happens before abort while preserving the commit error", () => {
+  const state = mkdtempSync(path.join(os.tmpdir(), "vision-purge-commit-failure-order-"));
+  const purgePath = path.join(state, "vision-cache-purge.json");
+  const events = [];
+  const commitError = new Error("commit failed");
+  try {
+    const fs = purgeOrderFileSystem(purgePath, events, (target) => {
+      events.push("prepare");
+      return {
+        committed: false,
+        commit() {
+          events.push("commit");
+          throw commitError;
+        },
+        abort() { events.push("abort"); },
+      };
+    });
+    assert.throws(
+      () => requestVisionCachePurge(purgePath, {
+        fs,
+        now: () => 100,
+        processIdentity: () => "commit-failure-order-identity",
+        monotonicNow: () => 0,
+      }),
+      (error) => error === commitError,
+    );
+    assert.deepEqual(events.filter((event) => ["prepare", "lock", "commit", "release", "abort"].includes(event)), [
+      "prepare", "lock", "commit", "release", "release", "abort",
+    ]);
+  } finally {
+    rmSync(state, { recursive: true, force: true });
+  }
+});
+
+test("release and abort errors are both attempted, with release winning without a primary error", () => {
+  const state = mkdtempSync(path.join(os.tmpdir(), "vision-purge-cleanup-errors-"));
+  const purgePath = path.join(state, "vision-cache-purge.json");
+  const releaseError = new Error("release failed");
+  const abortError = new Error("abort failed");
+  let calls = 0;
+  let failCleanup = false;
+  try {
+    const fs = {
+      platform: "linux",
+      prepareJson() {
+        return {
+          committed: false,
+          commit(value) {
+            writeFileSync(purgePath, `${JSON.stringify(value)}\n`);
+            this.committed = true;
+          },
+          abort() {
+            calls += 1;
+            throw abortError;
+          },
+        };
+      },
+      removeDirectory(target) {
+        if (!failCleanup) return rmdirSync(target);
+        calls += 1;
+        throw releaseError;
+      },
+    };
+    requestVisionCachePurge(purgePath, {
+      fs,
+      now: () => 100,
+      processIdentity: () => "cleanup-error-identity",
+      monotonicNow: () => 0,
+    });
+    failCleanup = true;
+    assert.throws(
+      () => requestVisionCachePurge(purgePath, {
+        fs,
+        now: () => 100,
+        processIdentity: () => "cleanup-error-identity",
+        monotonicNow: () => 0,
+      }),
+      (error) => error === releaseError,
+    );
+    assert.equal(calls, 2, "release and abort each run once");
   } finally {
     rmSync(state, { recursive: true, force: true });
   }

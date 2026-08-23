@@ -39,6 +39,7 @@ const PURGE_LOCK_READ_MAX_RETRY_MS = 80;
 const PURGE_LOCK_OWNER_FILE = "owner.json";
 const PURGE_LOCK_OWNER_PREFIX = "owner-";
 const PURGE_LOCK_OWNER_SUFFIX = ".json";
+const EXPLICIT_LEGACY_WRITE_JSON = Symbol("vision-cache-purge-explicit-legacy-write-json");
 const WINDOWS_TRANSIENT_LOCK_CODES = new Set(["EPERM", "EBUSY"]);
 const purgeLockWaiter = new Int32Array(new SharedArrayBuffer(4));
 let localProcessIdentityResolved = false;
@@ -54,22 +55,23 @@ function waitForPurgeLockRetry(milliseconds) {
  * the native calls; focused tests can exercise the retry contract without
  * changing the process-wide test scheduler.
  */
-export function createVisionCachePurgeFileSystem({
-  platform = process.platform,
-  mkdirSystemCall = mkdirSync,
-  existsSystemCall = existsSync,
-  readDirectorySystemCall = readdirSync,
-  readFileSystemCall = readFileSync,
-  statSystemCall = statSync,
-  removeDirectorySystemCall = rmdirSync,
-  removeFileSystemCall = unlinkSync,
-  renameSystemCall = renameSync,
-  writeFileSystemCall = writeFileSync,
-  prepareJsonSystemCall = preparePrivateJson,
-  writeJsonSystemCall = writePrivateJson,
-  wait = waitForPurgeLockRetry,
-} = {}) {
-  return {
+export function createVisionCachePurgeFileSystem(options = {}) {
+  const {
+    platform = process.platform,
+    mkdirSystemCall = mkdirSync,
+    existsSystemCall = existsSync,
+    readDirectorySystemCall = readdirSync,
+    readFileSystemCall = readFileSync,
+    statSystemCall = statSync,
+    removeDirectorySystemCall = rmdirSync,
+    removeFileSystemCall = unlinkSync,
+    renameSystemCall = renameSync,
+    writeFileSystemCall = writeFileSync,
+    prepareJsonSystemCall = preparePrivateJson,
+    writeJsonSystemCall = writePrivateJson,
+    wait = waitForPurgeLockRetry,
+  } = options;
+  const fileSystem = {
     platform,
     mkdir: mkdirSystemCall,
     exists: existsSystemCall,
@@ -84,6 +86,11 @@ export function createVisionCachePurgeFileSystem({
     writeJson: writeJsonSystemCall,
     wait,
   };
+  Object.defineProperty(fileSystem, EXPLICIT_LEGACY_WRITE_JSON, {
+    value: Object.prototype.hasOwnProperty.call(options, "writeJsonSystemCall"),
+    enumerable: false,
+  });
+  return fileSystem;
 }
 
 function defaultPurgeFileSystem() {
@@ -411,7 +418,13 @@ export function requestVisionCachePurge(
   const lockWait = wait || fs.wait || waitForPurgeLockRetry;
   const lockPath = `${purgePath}.lock`;
   const hasExplicitLegacyWriter = Boolean(
-    fsOverrides && Object.prototype.hasOwnProperty.call(fsOverrides, "writeJson"),
+    fsOverrides && (
+      fsOverrides[EXPLICIT_LEGACY_WRITE_JSON] === true ||
+      (
+        !Object.prototype.hasOwnProperty.call(fsOverrides, EXPLICIT_LEGACY_WRITE_JSON) &&
+        Object.prototype.hasOwnProperty.call(fsOverrides, "writeJson")
+      )
+    ),
   );
   const ownerRecord = purgeOwnerRecord(now, processIdentity);
   // Prepare the protected staging file before entering the cross-process
@@ -532,15 +545,6 @@ export function requestVisionCachePurge(
     operationError = error;
   }
 
-  let abortError;
-  if (preparedJson && !preparedCommitted) {
-    try {
-      preparedJson.abort();
-    } catch (error) {
-      abortError = error;
-    }
-  }
-
   let releaseError;
   if (lockOwned) {
     try {
@@ -555,9 +559,25 @@ export function requestVisionCachePurge(
       releaseError = error;
     }
   }
+
+  // The lock is the cross-process authority.  Release it before cleaning the
+  // independent prepared file so a waiting process never observes a holder
+  // whose private staging cleanup is still running.  Both cleanup paths are
+  // attempted exactly once even if the first one fails.
+  let abortError;
+  if (preparedJson && !preparedCommitted) {
+    try {
+      preparedJson.abort();
+    } catch (error) {
+      abortError = error;
+    }
+  }
+
+  // Preserve the primary operation error first.  Without one, release is the
+  // first cleanup authority and abort is the second, matching the order above.
   if (operationError) throw operationError;
-  if (abortError) throw abortError;
   if (releaseError) throw releaseError;
+  if (abortError) throw abortError;
 
   return result;
 }

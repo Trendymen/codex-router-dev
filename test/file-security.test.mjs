@@ -49,6 +49,35 @@ test("prepared private files protect an empty same-directory staging file and co
   }
 });
 
+test("prepared staging, committed target, and compatibility JSON wrapper stay private", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "codex-router-private-visibility-"));
+  const target = path.join(directory, "prepared.json");
+  const wrapperTarget = path.join(directory, "wrapper.json");
+  try {
+    const prepared = preparePrivateFile(target, { directoryMode: 0o700 });
+    if (process.platform === "win32") {
+      assert.equal(privateFileIsProtected(prepared.temporary), true, "prepared staging ACL is not private");
+    } else {
+      assert.equal(statSync(prepared.temporary).mode & 0o777, 0o600);
+    }
+    prepared.commit("prepared\n");
+    if (process.platform === "win32") {
+      assert.equal(privateFileIsProtected(target), true, "renamed target ACL is not private");
+    } else {
+      assert.equal(statSync(target).mode & 0o777, 0o600);
+    }
+
+    writePrivateJson(wrapperTarget, { version: 1 }, { directoryMode: 0o700 });
+    if (process.platform === "win32") {
+      assert.equal(privateFileIsProtected(wrapperTarget), true, "compatibility wrapper target ACL is not private");
+    } else {
+      assert.equal(statSync(wrapperTarget).mode & 0o777, 0o600);
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("prepared private JSON aborts idempotently and rejects commit after abort", () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "codex-router-private-json-prepare-"));
   const target = path.join(directory, "state.json");
