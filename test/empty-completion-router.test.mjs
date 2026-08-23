@@ -293,6 +293,10 @@ function run(env) {
       KIMI_INTERNAL_KEY: INTERNAL_KEY,
       CODEX_ROUTER_SHOW_ALL_MODELS: "1",
       CODEX_ROUTER_QUIET: "1",
+      // Empty-completion repair belongs to the retained gateway path. Direct
+      // default/no-snapshot behavior is covered by the Task 6 whole-router
+      // fixture, so select the explicit rollback path for this legacy suite.
+      CODEX_ROUTER_DIRECT_DISPATCH: "0",
       ...env,
     },
     stdio: ["ignore", "ignore", "pipe"],

@@ -83,28 +83,33 @@ function reasoningItem(shape) {
 
 function protocolFixtureFetch(shape, { failCheck } = {}) {
   const calls = [];
+  let wireBytes = 0;
+  const reply = (body, init) => {
+    wireBytes += Buffer.byteLength(body);
+    return new Response(body, init);
+  };
   const fetchImpl = async (_url, init) => {
     const body = JSON.parse(Buffer.from(init.body).toString("utf8"));
     calls.push(body);
     assert.equal(body.model, model.upstreamModel, "the proof substituted the exact target slug");
     const input = JSON.stringify(body.input);
     const failed = (name) => failCheck === name
-      ? new Response(JSON.stringify({ error: { message: `${name} failed` } }), { status: 422, headers: { "content-type": "application/json" } })
+      ? reply(JSON.stringify({ error: { message: `${name} failed` } }), { status: 422, headers: { "content-type": "application/json" } })
       : undefined;
-    if (input.includes("PROBE_BASIC_OK")) return failed("nonstream") || new Response(JSON.stringify({ id: "basic", output: [{ type: "message", content: [{ type: "output_text", text: "PROBE_BASIC_OK" }] }], usage: { input_tokens: 2, output_tokens: 1, total_tokens: 3 } }), { status: 200, headers: { "content-type": "application/json" } });
-    if (input.includes("PROBE_REASONING_RAW") && body.stream === false) return failed("stream-reasoning") || new Response(JSON.stringify({ id: "reasoning-json", output: [reasoningItem(shape)], usage: { input_tokens: 2, output_tokens: 2, total_tokens: 4 } }), { status: 200, headers: { "content-type": "application/json" } });
-    if (input.includes("PROBE_REASONING_STREAM")) return failed("stream-reasoning") || new Response(sse([
+    if (input.includes("PROBE_BASIC_OK")) return failed("nonstream") || reply(JSON.stringify({ id: "basic", output: [{ type: "message", content: [{ type: "output_text", text: "PROBE_BASIC_OK" }] }], usage: { input_tokens: 2, output_tokens: 1, total_tokens: 3 } }), { status: 200, headers: { "content-type": "application/json" } });
+    if (input.includes("PROBE_REASONING_RAW") && body.stream === false) return failed("stream-reasoning") || reply(JSON.stringify({ id: "reasoning-json", output: [reasoningItem(shape)], usage: { input_tokens: 2, output_tokens: 2, total_tokens: 4 } }), { status: 200, headers: { "content-type": "application/json" } });
+    if (input.includes("PROBE_REASONING_STREAM")) return failed("stream-reasoning") || reply(sse([
       { type: "response.output_item.added", output_index: 0, item: { type: "reasoning", id: "rs_probe", summary: [], content: [] } },
       { type: "response.reasoning_summary_text.delta", output_index: 0, item_id: "rs_probe", summary_index: 0, delta: "raw" },
       { type: "response.completed", response: { id: "reasoning-stream", output: [reasoningItem(shape)], usage: { input_tokens: 2, output_tokens: 2, total_tokens: 4 } } },
     ]), { status: 200, headers: { "content-type": "text/event-stream" } });
-    if (input.includes("PROBE_CONTINUATION_START")) return failed("continuation") || new Response(JSON.stringify({ id: "cont-call", output: [{ type: "function_call", id: "fc_cont", call_id: "call_cont", name: "codex_router_probe", arguments: "{\"value\":\"ok\"}" }] }), { status: 200, headers: { "content-type": "application/json" } });
-    if (input.includes("function_call_output")) return failed("continuation") || new Response(JSON.stringify({ id: "cont-answer", output: [{ type: "message", content: [{ type: "output_text", text: "PROBE_CONTINUATION_OK" }] }] }), { status: 200, headers: { "content-type": "application/json" } });
-    if (input.includes("PROBE_AUTO_TOOL")) return failed("auto-tool") || new Response(JSON.stringify({ id: "auto-call", output: [{ type: "function_call", id: "fc_auto", call_id: "call_auto", name: "codex_router_probe", arguments: "{\"value\":\"ok\"}" }] }), { status: 200, headers: { "content-type": "application/json" } });
-    if (input.includes("PROBE_USAGE")) return failed("usage") || new Response(JSON.stringify({ id: "usage", output: [{ type: "message", content: [{ type: "output_text", text: "ok" }] }], usage: { input_tokens: 7, output_tokens: 3, total_tokens: 10, input_tokens_details: { cached_tokens: 2 } } }), { status: 200, headers: { "content-type": "application/json" } });
+    if (input.includes("PROBE_CONTINUATION_START")) return failed("continuation") || reply(JSON.stringify({ id: "cont-call", output: [{ type: "function_call", id: "fc_cont", call_id: "call_cont", name: "codex_router_probe", arguments: "{\"value\":\"ok\"}" }] }), { status: 200, headers: { "content-type": "application/json" } });
+    if (input.includes("function_call_output")) return failed("continuation") || reply(JSON.stringify({ id: "cont-answer", output: [{ type: "message", content: [{ type: "output_text", text: "PROBE_CONTINUATION_OK" }] }] }), { status: 200, headers: { "content-type": "application/json" } });
+    if (input.includes("PROBE_AUTO_TOOL")) return failed("auto-tool") || reply(JSON.stringify({ id: "auto-call", output: [{ type: "function_call", id: "fc_auto", call_id: "call_auto", name: "codex_router_probe", arguments: "{\"value\":\"ok\"}" }] }), { status: 200, headers: { "content-type": "application/json" } });
+    if (input.includes("PROBE_USAGE")) return failed("usage") || reply(JSON.stringify({ id: "usage", output: [{ type: "message", content: [{ type: "output_text", text: "ok" }] }], usage: { input_tokens: 7, output_tokens: 3, total_tokens: 10, input_tokens_details: { cached_tokens: 2 } } }), { status: 200, headers: { "content-type": "application/json" } });
     throw new Error(`unexpected proof request: ${input}`);
   };
-  return { fetchImpl, calls };
+  return { fetchImpl, calls, wireBytes: () => wireBytes };
 }
 
 for (const shape of ["provider-summary", "raw-content", "hybrid-summary"]) {
@@ -185,6 +190,94 @@ test("internal exact-slug proof derives anthropic-thinking from raw Messages wir
   assert.ok(evidence.checks.every((check) => check.ok && Object.keys(check.observed).length > 0));
 });
 
+test("protocol proof enforces one exact total raw-byte limit across all seven requests", async () => {
+  const measured = protocolFixtureFetch("raw-content");
+  const baseline = await dispatchProtocolProbe(model, {
+    retry: false, failover: false, confirmed: true, baseUrl: model.baseUrl,
+    credential: "proof-secret", fetchImpl: measured.fetchImpl,
+  });
+  assert.equal(baseline.verdict, "passing");
+  const exactBytes = measured.wireBytes();
+
+  const exact = protocolFixtureFetch("raw-content");
+  const exactEvidence = await dispatchProtocolProbe(model, {
+    retry: false, failover: false, confirmed: true, baseUrl: model.baseUrl,
+    credential: "proof-secret", fetchImpl: exact.fetchImpl, maxRawBytes: exactBytes,
+  });
+  assert.equal(exactEvidence.verdict, "passing");
+  assert.equal(exact.wireBytes(), exactBytes);
+
+  const plusOne = protocolFixtureFetch("raw-content");
+  const rejected = await dispatchProtocolProbe(model, {
+    retry: false, failover: false, confirmed: true, baseUrl: model.baseUrl,
+    credential: "proof-secret", fetchImpl: plusOne.fetchImpl, maxRawBytes: exactBytes - 1,
+  });
+  assert.equal(rejected.verdict, "failed");
+  assert.match(JSON.stringify(rejected), /protocol_probe_resource_limit/);
+  assert.doesNotMatch(JSON.stringify(rejected), /proof-secret/);
+});
+
+test("protocol proof bounds total incremental reader work independently of bytes", async () => {
+  let pulls = 0;
+  const bytes = Buffer.from(JSON.stringify({ id: "basic", output: [{ type: "message", content: [{ type: "output_text", text: "PROBE_BASIC_OK" }] }] }));
+  const evidence = await dispatchProtocolProbe(model, {
+    retry: false, failover: false, confirmed: true, baseUrl: model.baseUrl,
+    credential: "proof-secret", maxRawBytes: 1024, maxWork: 4,
+    fetchImpl: async () => new Response(new ReadableStream({
+      pull(controller) {
+        pulls += 1;
+        if (pulls > bytes.length) { controller.close(); return; }
+        controller.enqueue(bytes.subarray(pulls - 1, pulls));
+      },
+    }), { status: 200, headers: { "content-type": "application/json" } }),
+  });
+  assert.equal(evidence.verdict, "failed");
+  assert.match(JSON.stringify(evidence), /protocol_probe_resource_limit/);
+  assert.ok(pulls <= 5, `reader continued after work exhaustion: ${pulls}`);
+});
+
+test("protocol proof shared deadline aborts a stalled fetch with safe evidence", { timeout: 1_000 }, async () => {
+  let aborts = 0;
+  const evidence = await Promise.race([
+    dispatchProtocolProbe(model, {
+      retry: false, failover: false, confirmed: true, baseUrl: model.baseUrl,
+      credential: "FETCH_SECRET_MUST_NOT_LEAK", timeoutMs: 20,
+      fetchImpl: async (_url, init) => new Promise((resolve) => {
+        init.signal.addEventListener("abort", () => { aborts += 1; resolve(new Response("late")); }, { once: true });
+      }),
+    }),
+    new Promise((_, reject) => setTimeout(() => reject(new Error("proof fetch deadline was not shared")), 500)),
+  ]);
+  assert.equal(evidence.verdict, "failed");
+  assert.equal(aborts, 1);
+  assert.match(JSON.stringify(evidence), /protocol_probe_timeout/);
+  assert.doesNotMatch(JSON.stringify(evidence), /FETCH_SECRET_MUST_NOT_LEAK|late/);
+});
+
+test("protocol proof shared deadline cancels a stalled raw body exactly once", { timeout: 1_000 }, async () => {
+  let cancels = 0;
+  let aborts = 0;
+  const evidence = await Promise.race([
+    dispatchProtocolProbe(model, {
+      retry: false, failover: false, confirmed: true, baseUrl: model.baseUrl,
+      credential: "BODY_SECRET_MUST_NOT_LEAK", timeoutMs: 20,
+      fetchImpl: async (_url, init) => {
+        init.signal.addEventListener("abort", () => { aborts += 1; }, { once: true });
+        return new Response(new ReadableStream({
+          start(controller) { controller.enqueue(Buffer.from("{\"secret\":\"BODY_SECRET_MUST_NOT_LEAK\"")); },
+          cancel() { cancels += 1; },
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      },
+    }),
+    new Promise((_, reject) => setTimeout(() => reject(new Error("proof body deadline was not shared")), 500)),
+  ]);
+  assert.equal(evidence.verdict, "failed");
+  assert.equal(aborts, 1);
+  assert.equal(cancels, 1);
+  assert.match(JSON.stringify(evidence), /protocol_probe_timeout/);
+  assert.doesNotMatch(JSON.stringify(evidence), /BODY_SECRET_MUST_NOT_LEAK/);
+});
+
 for (const failed of ["nonstream", "stream-reasoning", "auto-tool", "continuation", "usage"]) {
   test(`internal proof reports ${failed} failure without substituting another target`, async () => {
     const fixture = protocolFixtureFetch("raw-content", { failCheck: failed });
@@ -238,6 +331,291 @@ test("Appendix D failover swaps only a long rate limit and keeps the pristine re
   assert.equal(calls.length, 2);
   assert.equal(result.model.slug, fallback.slug);
   assert.deepEqual(calls[0].body.input, calls[1].body.input);
+});
+
+const APPENDIX_D_RETRY_STATUSES = [502, 503, 504, 520, 521, 522, 523, 524];
+const APPENDIX_D_TRANSPORT_CODES = [
+  "EADDRNOTAVAIL", "ECONNABORTED", "ECONNREFUSED", "ECONNRESET", "EAI_AGAIN",
+  "EHOSTUNREACH", "ENETDOWN", "ENETUNREACH", "ENOBUFS", "ENOTFOUND", "EPIPE",
+  "ETIMEDOUT", "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_HEADERS_TIMEOUT", "UND_ERR_SOCKET",
+];
+
+test("direct Appendix D retries every and only retryable status with exact 250/750 delays", async () => {
+  for (const status of APPENDIX_D_RETRY_STATUSES) {
+    const delays = [];
+    let calls = 0;
+    const built = buildRoutedRequest({ input: `status-${status}` }, model, { credential: "A" });
+    const result = await dispatchRoutedRequest(built, {
+      fetchImpl: async () => {
+        calls += 1;
+        return calls <= 2
+          ? new Response(`retry-${status}`, { status })
+          : new Response(JSON.stringify({ id: "ok", output: [] }), { status: 200, headers: { "content-type": "application/json" } });
+      },
+      sleepImpl: async (delay) => { delays.push(delay); },
+      now: () => 0,
+      failoverCandidates: [{ ...model, slug: "must-not-failover/status", provider: "must-not-failover" }],
+      credentialFor: () => "B",
+    });
+    assert.equal(result.response.status, 200, `status ${status}`);
+    assert.equal(calls, 3, `status ${status}`);
+    assert.deepEqual(delays, [250, 750], `status ${status}`);
+    assert.equal(result.hops, 0, `status ${status}`);
+  }
+});
+
+test("direct Appendix D retries every closed connect/DNS/socket code and no other transport error", async () => {
+  for (const code of APPENDIX_D_TRANSPORT_CODES) {
+    const delays = [];
+    let calls = 0;
+    const built = buildRoutedRequest({ input: `transport-${code}` }, model, { credential: "A" });
+    const result = await dispatchRoutedRequest(built, {
+      fetchImpl: async () => {
+        calls += 1;
+        if (calls <= 2) throw Object.assign(new TypeError("private transport detail"), { cause: { code } });
+        return new Response(JSON.stringify({ id: "ok", output: [] }), { status: 200, headers: { "content-type": "application/json" } });
+      },
+      sleepImpl: async (delay) => { delays.push(delay); },
+      now: () => 0,
+    });
+    assert.equal(result.response.status, 200, code);
+    assert.equal(calls, 3, code);
+    assert.deepEqual(delays, [250, 750], code);
+  }
+
+  for (const failure of [
+    Object.assign(new Error("permission"), { code: "EACCES" }),
+    Object.assign(new Error("unknown"), { cause: { code: "PRIVATE_UNKNOWN_CODE" } }),
+    Object.assign(new Error("router-side"), { code: "ECONNRESET", status: 422 }),
+  ]) {
+    let calls = 0;
+    const built = buildRoutedRequest({ input: "forbidden-transport" }, model, { credential: "A" });
+    await assert.rejects(() => dispatchRoutedRequest(built, {
+      fetchImpl: async () => { calls += 1; throw failure; },
+      sleepImpl: async () => assert.fail("forbidden transport error slept"),
+    }), (error) => error === failure);
+    assert.equal(calls, 1);
+  }
+});
+
+test("direct Appendix D exhaustively returns all forbidden HTTP statuses without retry or failover", async () => {
+  const forbidden = [];
+  for (let status = 400; status <= 599; status += 1) {
+    if (status === 402 || APPENDIX_D_RETRY_STATUSES.includes(status)) continue;
+    forbidden.push(status);
+  }
+  for (const status of forbidden) {
+    let calls = 0;
+    const built = buildRoutedRequest({ input: `forbidden-${status}` }, model, { credential: "A" });
+    const result = await dispatchRoutedRequest(built, {
+      fetchImpl: async () => {
+        calls += 1;
+        return new Response("ordinary provider failure", {
+          status,
+          ...(status === 429 ? { headers: { "retry-after": "60" } } : {}),
+        });
+      },
+      sleepImpl: async () => assert.fail(`forbidden status ${status} slept`),
+      failoverCandidates: [{ ...model, slug: `forbidden-candidate/${status}`, provider: `forbidden-candidate-${status}` }],
+      credentialFor: () => "B",
+    });
+    assert.equal(calls, 1, `status ${status}`);
+    assert.equal(result.response.status, status, `status ${status}`);
+    assert.equal(result.hops, 0, `status ${status}`);
+  }
+
+  for (const retryAfter of [undefined, "", "invalid", "0", "30", "60"] ) {
+    let calls = 0;
+    const built = buildRoutedRequest({ input: "short-429" }, model, { credential: "A" });
+    const result = await dispatchRoutedRequest(built, {
+      fetchImpl: async () => {
+        calls += 1;
+        return new Response("short rate limit", { status: 429, ...(retryAfter === undefined ? {} : { headers: { "retry-after": retryAfter } }) });
+      },
+      sleepImpl: async () => assert.fail("short 429 slept"),
+      failoverCandidates: [{ ...model, slug: "short-429/candidate", provider: "short-429-candidate" }],
+      credentialFor: () => "B",
+    });
+    assert.equal(calls, 1, `Retry-After ${retryAfter}`);
+    assert.equal(result.response.status, 429);
+    assert.equal(result.hops, 0);
+  }
+});
+
+test("direct Appendix D five-second retry budget is exact and abort-aware", async () => {
+  for (const [elapsed, wantCalls, wantDelays] of [[4_999, 3, [250, 750]], [5_000, 1, []]]) {
+    let calls = 0;
+    let clockReads = 0;
+    const delays = [];
+    const built = buildRoutedRequest({ input: `budget-${elapsed}` }, model, { credential: "A" });
+    const result = await dispatchRoutedRequest(built, {
+      fetchImpl: async () => { calls += 1; return new Response("edge", { status: 503 }); },
+      sleepImpl: async (delay) => { delays.push(delay); },
+      now: () => clockReads++ < 2 ? 0 : elapsed,
+      failoverCandidates: [],
+    });
+    assert.equal(calls, wantCalls, `elapsed ${elapsed}`);
+    assert.deepEqual(delays, wantDelays, `elapsed ${elapsed}`);
+    assert.equal(result.response.status, 503);
+  }
+
+  const controller = new AbortController();
+  let calls = 0;
+  const reason = new DOMException("caller left", "AbortError");
+  const built = buildRoutedRequest({ input: "abort-aware-retry" }, model, { credential: "A" });
+  await assert.rejects(() => dispatchRoutedRequest(built, {
+    signal: controller.signal,
+    fetchImpl: async () => { calls += 1; return new Response("edge", { status: 503 }); },
+    sleepImpl: async () => { controller.abort(reason); },
+    now: () => 0,
+  }), (error) => error === reason);
+  assert.equal(calls, 1);
+});
+
+test("direct Appendix D failover-only rows never retry and restore the original error", async () => {
+  const cases = [
+    { name: "long-429", status: 429, body: "rate limited", headers: { "retry-after": "61" } },
+    { name: "402", status: 402, body: "payment required" },
+    { name: "classified-out-of-usage", status: 400, body: JSON.stringify({ error: { type: "insufficient_quota", message: "quota exhausted" } }) },
+  ];
+  for (const fixture of cases) {
+    const candidate = { ...model, slug: `${fixture.name}/candidate`, provider: `${fixture.name}-candidate`, upstreamModel: "candidate-model", baseUrl: "http://127.0.0.1:9998/v1" };
+    const calls = [];
+    const built = buildRoutedRequest({ input: fixture.name }, model, { credential: "A" });
+    const result = await dispatchRoutedRequest(built, {
+      fetchImpl: async (url) => {
+        calls.push(url);
+        if (calls.length === 1) return new Response(fixture.body, { status: fixture.status, headers: fixture.headers });
+        return new Response("candidate forbidden", { status: 401 });
+      },
+      sleepImpl: async () => assert.fail(`${fixture.name} retried`),
+      failoverCandidates: [candidate], credentialFor: () => "B", baseUrlFor: (entry) => entry.baseUrl,
+    });
+    assert.equal(calls.length, 2, fixture.name);
+    assert.equal(result.hops, 1, fixture.name);
+    assert.equal(result.response.status, fixture.status, fixture.name);
+    assert.equal(await result.response.text(), fixture.body, fixture.name);
+  }
+});
+
+test("direct Appendix D starts the 30-second failover budget after the qualifying primary failure", async () => {
+  const candidate = { ...model, slug: "candidate-only-budget/model", provider: "candidate-only-budget", upstreamModel: "candidate", baseUrl: "http://127.0.0.1:9998/v1" };
+  let now = 0;
+  let calls = 0;
+  const built = buildRoutedRequest({ input: "slow primary" }, model, { credential: "A" });
+  const result = await dispatchRoutedRequest(built, {
+    fetchImpl: async () => {
+      calls += 1;
+      if (calls === 1) {
+        now = 30_000;
+        return new Response("primary spent thirty seconds", { status: 402 });
+      }
+      return new Response(JSON.stringify({ id: "candidate", output: [] }), { status: 200, headers: { "content-type": "application/json" } });
+    },
+    retries: 0,
+    now: () => now,
+    failoverBudgetMs: 30_000,
+    failoverCandidates: [candidate],
+    credentialFor: () => "B",
+    baseUrlFor: (entry) => entry.baseUrl,
+  });
+  assert.equal(calls, 2);
+  assert.equal(result.model.slug, candidate.slug);
+});
+
+test("direct Appendix D enforces two hops, one 30-second candidate budget, six-hour cooldown, and original error", async () => {
+  clearAllProviderCooldowns();
+  const candidates = [1, 2, 3].map((index) => ({
+    ...model,
+    slug: `budget-candidate-${index}/model`,
+    provider: `budget-candidate-${index}`,
+    upstreamModel: `candidate-${index}`,
+    baseUrl: `http://127.0.0.1:${9990 + index}/v1`,
+  }));
+  let elapsed = 1_000;
+  const calls = [];
+  const built = buildRoutedRequest({ input: "bounded failover" }, model, { credential: "A" });
+  const result = await dispatchRoutedRequest(built, {
+    fetchImpl: async (url) => {
+      calls.push(url);
+      if (calls.length === 2) elapsed = 31_000;
+      return new Response(calls.length === 1 ? "ORIGINAL_SAFE_ERROR" : `candidate-${calls.length}`, { status: calls.length === 1 ? 429 : 402, headers: calls.length === 1 ? { "retry-after": String(7 * 60 * 60) } : undefined });
+    },
+    retries: 0,
+    now: () => elapsed,
+    failoverBudgetMs: 30_000,
+    failoverCandidates: candidates,
+    credentialFor: () => "candidate-secret",
+    baseUrlFor: (entry) => entry.baseUrl,
+  });
+  assert.equal(calls.length, 2, "the shared candidate deadline admitted work after 30 seconds");
+  assert.equal(result.hops, 1);
+  assert.equal(result.response.status, 429);
+  assert.equal(await result.response.text(), "ORIGINAL_SAFE_ERROR");
+  const cooled = (await import("../src/model-failover.mjs")).providerCooldown(model.provider, { now: 1_000 });
+  assert.equal(cooled.until, new Date(1_000 + 6 * 60 * 60 * 1_000).toISOString());
+  clearAllProviderCooldowns();
+
+  let hopCalls = 0;
+  const hopBuilt = buildRoutedRequest({ input: "two hops" }, model, { credential: "A" });
+  const hopResult = await dispatchRoutedRequest(hopBuilt, {
+    fetchImpl: async () => { hopCalls += 1; return new Response(hopCalls === 1 ? "FIRST_ERROR" : `hop-${hopCalls}`, { status: 402 }); },
+    retries: 0, now: () => 0, failoverCandidates: candidates,
+    credentialFor: () => "candidate-secret", baseUrlFor: (entry) => entry.baseUrl,
+  });
+  assert.equal(hopCalls, 3);
+  assert.equal(hopResult.hops, 2);
+  assert.equal(await hopResult.response.text(), "FIRST_ERROR");
+});
+
+test("direct Appendix D excludes every incompatible candidate before a second request", async () => {
+  clearAllProviderCooldowns();
+  const base = { ...model, slug: "eligible/model", provider: "eligible", baseUrl: "http://127.0.0.1:9998/v1", priority: 1, routable: true, listed: true, visible: true, contextWindow: 1_000_000, inputModalities: ["text", "image"], multiAgentVersion: "v2" };
+  const rows = [
+    ["same slug", { ...base, slug: model.slug }],
+    ["same family", { ...base, provider: model.provider }],
+    ["native", { ...base, effectiveTransport: "native-openai" }],
+    ["transport", { ...base, effectiveTransport: "anthropic-messages" }],
+    ["dialect", { ...base, toolDialect: "responses-native" }],
+    ["context", { ...base, contextWindow: 1 }],
+    ["hidden", { ...base, visible: false }],
+    ["unlisted", { ...base, listed: false }],
+    ["unroutable", { ...base, routable: false }],
+    ["unproved canary", { ...base, rolloutState: "experimental" }],
+    ["image", { ...base, inputModalities: ["text"], visionBridge: false }],
+    ["collaboration v2", { ...base, multiAgentVersion: "v1" }],
+  ];
+  for (const [name, candidate] of rows) {
+    const payload = name === "context"
+      ? { input: "x".repeat(20_000) }
+      : name === "image"
+        ? { input: [{ type: "message", role: "user", content: [{ type: "input_image", image_url: "data:image/png;base64,AAAA" }] }] }
+        : name === "collaboration v2"
+          ? { input: "delegate", tools: [{ type: "namespace", name: "collaboration", tools: [{ type: "function", name: "spawn_agent", inputSchema: { type: "object" } }, { type: "function", name: "interrupt_agent", inputSchema: { type: "object" } }] }] }
+          : { input: "ordinary" };
+    let calls = 0;
+    const built = buildRoutedRequest(payload, model, { credential: "A" });
+    const result = await dispatchRoutedRequest(built, {
+      fetchImpl: async () => { calls += 1; return new Response("ORIGINAL", { status: 402 }); },
+      retries: 0, failoverCandidates: [candidate], credentialFor: () => "B", baseUrlFor: (entry) => entry.baseUrl,
+    });
+    assert.equal(calls, 1, name);
+    assert.equal(result.hops, 0, name);
+    assert.equal(await result.response.text(), "ORIGINAL", name);
+  }
+
+  const cooldownCandidate = { ...base, slug: "cooled/model", provider: "cooled" };
+  const { recordProviderCooldown } = await import("../src/model-failover.mjs");
+  recordProviderCooldown(cooldownCandidate.provider, { reason: "rate_limited", until: new Date(Date.now() + 60_000).toISOString() });
+  let cooledCalls = 0;
+  const cooledBuilt = buildRoutedRequest({ input: "ordinary" }, model, { credential: "A" });
+  const cooledResult = await dispatchRoutedRequest(cooledBuilt, {
+    fetchImpl: async () => { cooledCalls += 1; return new Response("ORIGINAL", { status: 402 }); },
+    retries: 0, failoverCandidates: [cooldownCandidate], credentialFor: () => "B",
+  });
+  assert.equal(cooledCalls, 1);
+  assert.equal(cooledResult.hops, 0);
+  clearAllProviderCooldowns();
 });
 
 test("a 429 without a long Retry-After is returned without retry or failover", async () => {

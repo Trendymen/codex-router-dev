@@ -23,6 +23,105 @@ const PROTOCOL_PROBE_BYPASS = Symbol("protocol-probe-bypass");
 export const DIRECT_RETRY_LIMIT = 2;
 export const DIRECT_RETRY_BACKOFF_MS = 250;
 export const DIRECT_RETRY_BUDGET_MS = 5_000;
+export const PROTOCOL_PROOF_TIMEOUT_MS = 180_000;
+export const PROTOCOL_PROOF_MAX_RAW_BYTES = 8 * 1024 * 1024;
+export const PROTOCOL_PROOF_MAX_WORK = 3 * PROTOCOL_PROOF_MAX_RAW_BYTES + 65_536;
+
+function probeLimit(value, fallback, maximum, label) {
+  if (value === undefined) return fallback;
+  if (!Number.isSafeInteger(value) || value <= 0 || value > maximum) {
+    throw new TypeError(`invalid protocol proof ${label}`);
+  }
+  return value;
+}
+
+function probeResourceError(code, status) {
+  return Object.assign(new Error(code), { code, status });
+}
+
+function callerAbortReason(signal) {
+  if (signal?.reason instanceof Error) return signal.reason;
+  return new DOMException("The protocol proof was aborted by the caller.", "AbortError");
+}
+
+function createProtocolProbeResources(options) {
+  const timeoutMs = probeLimit(options.timeoutMs, PROTOCOL_PROOF_TIMEOUT_MS, PROTOCOL_PROOF_TIMEOUT_MS, "timeout");
+  const maxRawBytes = probeLimit(options.maxRawBytes, PROTOCOL_PROOF_MAX_RAW_BYTES, PROTOCOL_PROOF_MAX_RAW_BYTES, "raw byte limit");
+  const maxWork = probeLimit(options.maxWork, PROTOCOL_PROOF_MAX_WORK, PROTOCOL_PROOF_MAX_WORK, "work limit");
+  const callerSignal = options.signal;
+  const controller = new AbortController();
+  let rawBytes = 0;
+  let work = 0;
+  let abortKind;
+  let abortReason;
+  let callerListener;
+
+  const abort = (kind, reason) => {
+    if (controller.signal.aborted) return false;
+    abortKind = kind;
+    abortReason = reason;
+    controller.abort(reason);
+    return true;
+  };
+  if (callerSignal) {
+    callerListener = () => abort("caller", callerAbortReason(callerSignal));
+    if (callerSignal.aborted) callerListener();
+    else callerSignal.addEventListener("abort", callerListener, { once: true });
+  }
+  const timer = setTimeout(
+    () => abort("deadline", probeResourceError("protocol_probe_timeout", 504)),
+    timeoutMs,
+  );
+
+  const failResource = () => {
+    const error = probeResourceError("protocol_probe_resource_limit", 413);
+    abort("resource", error);
+    throw error;
+  };
+  return {
+    signal: controller.signal,
+    consumeBytes(count) {
+      if (!Number.isSafeInteger(count) || count < 0) failResource();
+      rawBytes += count;
+      if (!Number.isSafeInteger(rawBytes) || rawBytes > maxRawBytes) failResource();
+    },
+    consumeWork(count = 1) {
+      if (!Number.isSafeInteger(count) || count < 0) failResource();
+      work += count;
+      if (!Number.isSafeInteger(work) || work > maxWork) failResource();
+    },
+    throwIfAborted() {
+      if (controller.signal.aborted) throw abortReason || probeResourceError("protocol_probe_timeout", 504);
+    },
+    wait(operation) {
+      this.throwIfAborted();
+      return new Promise((resolve, reject) => {
+        let settled = false;
+        const finish = (callback, value) => {
+          if (settled) return;
+          settled = true;
+          controller.signal.removeEventListener("abort", onAbort);
+          callback(value);
+        };
+        const onAbort = () => finish(reject, abortReason || probeResourceError("protocol_probe_timeout", 504));
+        controller.signal.addEventListener("abort", onAbort, { once: true });
+        Promise.resolve(operation).then(
+          (value) => finish(resolve, value),
+          (error) => finish(reject, error),
+        );
+      });
+    },
+    isCallerAbort() { return abortKind === "caller"; },
+    safeErrorCode(error) {
+      if (error?.code === "protocol_probe_timeout" || error?.code === "protocol_probe_resource_limit") return error.code;
+      return "protocol_probe_transport_error";
+    },
+    close() {
+      clearTimeout(timer);
+      if (callerListener) callerSignal.removeEventListener("abort", callerListener);
+    },
+  };
+}
 
 export function parseRetryAfter(value) {
   const text = String(value ?? "").trim();
@@ -244,6 +343,7 @@ export async function dispatchRoutedRequest(built, options = {}) {
   const usedModels = new Set([currentModel.slug]);
   const usedProviderFamilies = new Set([canonicalProviderId(currentModel.provider)]);
   let originalFailure;
+  let failoverStartedAt;
   try {
    for (;;) {
     const attempted = await fetchWithRetry(currentBuilt.url, {
@@ -275,12 +375,17 @@ export async function dispatchRoutedRequest(built, options = {}) {
     const bodyText = await upstream.text().catch(() => "");
     originalFailure ??= { status: upstream.status, bodyText, headers: upstream.headers };
     failures.push({ model: currentModel, providerFamily: canonicalProviderId(currentModel.provider), kind: "response", status: upstream.status });
+    const failureNow = options.now ? options.now() : Date.now();
     const verdict = classifyRoutedFailure({
       status: upstream.status,
       bodyText,
       retryAfterSeconds: parseRetryAfter(upstream.headers?.get?.("retry-after")),
+      now: failureNow,
     });
-    if (verdict.swap) recordProviderCooldown(currentModel.provider, verdict);
+    if (verdict.swap) {
+      failoverStartedAt ??= failureNow;
+      recordProviderCooldown(currentModel.provider, { ...verdict, now: failureNow });
+    }
     if (!verdict.swap || hops >= MAX_FAILOVER_HOPS) {
       const finalFailure = hops ? originalFailure : { status: upstream.status, bodyText, headers: upstream.headers };
       return Object.freeze({
@@ -293,8 +398,11 @@ export async function dispatchRoutedRequest(built, options = {}) {
         elapsedMs: (options.now ? options.now() : Date.now()) - startedAt,
       });
     }
-    const elapsed = (options.now ? options.now() : Date.now()) - startedAt;
-    if (elapsed >= (options.failoverBudgetMs ?? FAILOVER_BUDGET_MS)) {
+    const currentNow = options.now ? options.now() : Date.now();
+    const elapsed = currentNow - startedAt;
+    const failoverElapsed = currentNow - (failoverStartedAt ?? currentNow);
+    const failoverBudgetMs = options.failoverBudgetMs ?? FAILOVER_BUDGET_MS;
+    if (failoverElapsed >= failoverBudgetMs) {
       return Object.freeze({ response: new Response(originalFailure.bodyText, { status: originalFailure.status, headers: originalFailure.headers }), model: built.model, built, retries, hops, failures, elapsedMs: elapsed });
     }
     const candidate = rankRoutedCandidates(
@@ -311,7 +419,7 @@ export async function dispatchRoutedRequest(built, options = {}) {
     }
     if (!deadlineController) {
       deadlineController = new AbortController();
-      deadlineTimer = setTimeout(() => deadlineController.abort(new Error("routed failover budget exceeded")), options.failoverBudgetMs ?? FAILOVER_BUDGET_MS);
+      deadlineTimer = setTimeout(() => deadlineController.abort(new Error("routed failover budget exceeded")), failoverBudgetMs - failoverElapsed);
       signal = callerSignal
         ? (AbortSignal.any ? AbortSignal.any([callerSignal, deadlineController.signal]) : callerSignal)
         : deadlineController.signal;
@@ -501,10 +609,42 @@ function probeRuntime(model, options) {
   if (!credential && endpoint?.authMode !== "anonymous" && endpoint?.keyless !== true && model?.authMode !== "anonymous" && model?.keyless !== true) {
     throw Object.assign(new Error("protocol probe credential is unavailable"), { code: "protocol_probe_credential_missing", status: 503 });
   }
-  return { baseUrl, credential, internalKey: options.internalKey, fetchImpl: options.fetchImpl, signal: options.signal };
+  return { baseUrl, credential, internalKey: options.internalKey, fetchImpl: options.fetchImpl, signal: options.signal, resources: options.resources };
+}
+
+async function readRawProbeBody(response, resources) {
+  if (!response?.body) return "";
+  const reader = response.body.getReader();
+  const chunks = [];
+  let cancelled = false;
+  const cancelOnce = async (reason) => {
+    if (cancelled) return;
+    cancelled = true;
+    try { await reader.cancel(reason); } catch {}
+  };
+  try {
+    for (;;) {
+      resources.consumeWork();
+      const { done, value } = await resources.wait(reader.read());
+      if (done) break;
+      if (!(value instanceof Uint8Array)) throw probeResourceError("protocol_probe_resource_limit", 413);
+      resources.consumeBytes(value.byteLength);
+      resources.consumeWork(value.byteLength);
+      chunks.push(Buffer.from(value));
+    }
+    const raw = Buffer.concat(chunks).toString("utf8");
+    resources.consumeWork(Buffer.byteLength(raw));
+    return raw;
+  } catch (error) {
+    await cancelOnce(error);
+    throw error;
+  } finally {
+    try { reader.releaseLock(); } catch {}
+  }
 }
 
 async function rawProbeRequest(model, payload, runtime) {
+  runtime.resources.throwIfAborted();
   const built = buildRoutedRequest(payload, model, {
     baseUrl: runtime.baseUrl,
     credential: runtime.credential,
@@ -512,14 +652,14 @@ async function rawProbeRequest(model, payload, runtime) {
     signal: runtime.signal,
     protocolProbeBypass: PROTOCOL_PROBE_BYPASS,
   });
-  const result = await dispatchRoutedRequest(built, {
+  const result = await runtime.resources.wait(dispatchRoutedRequest(built, {
     fetchImpl: runtime.fetchImpl,
     signal: runtime.signal,
     retries: 0,
     failoverCandidates: [],
-  });
+  }));
   const contentType = result.response.headers.get("content-type") || "application/json";
-  const raw = await result.response.text();
+  const raw = await readRawProbeBody(result.response, runtime.resources);
   return { ok: result.response.ok, status: result.response.status, contentType, raw, document: rawDocument(raw, contentType), request: JSON.parse(Buffer.from(built.body).toString("utf8")) };
 }
 
@@ -548,7 +688,8 @@ export async function dispatchProtocolProbe(model, options = {}) {
   if (options.allowLive === false && typeof options.fetchImpl !== "function") {
     throw Object.assign(new Error("protocol probe is unavailable without an injected transport"), { code: "protocol_probe_not_implemented", status: 501 });
   }
-  const runtime = probeRuntime(model, options);
+  const resources = createProtocolProbeResources(options);
+  const runtime = probeRuntime(model, { ...options, signal: resources.signal, resources });
   const checks = [];
   let measuredFinalReasoningShape = "unverified";
   const capture = async (name, operation) => {
@@ -556,9 +697,11 @@ export async function dispatchProtocolProbe(model, options = {}) {
       const result = await operation();
       checks.push({ name, ...result });
     } catch (error) {
-      checks.push({ name, ok: false, status: Number(error?.status) || 502, detail: "diagnostic transport failed", observed: observedDetail({ errorCode: error?.code || error?.cause?.code || error?.name }) });
+      if (resources.isCallerAbort()) throw error;
+      checks.push({ name, ok: false, status: Number(error?.status) || 502, detail: "diagnostic transport failed", observed: { errorCode: resources.safeErrorCode(error) } });
     }
   };
+  try {
   await capture("nonstream", async () => {
     const response = await rawProbeRequest(model, { model: model.slug, stream: false, input: "Reply with exactly PROBE_BASIC_OK." }, runtime);
     const text = textFromRaw(response.document);
@@ -592,6 +735,9 @@ export async function dispatchProtocolProbe(model, options = {}) {
     const usage = rawUsage(response.document);
     return { ok: response.ok && Boolean(usage), status: response.status, detail: usage ? "authoritative raw usage fields observed" : "authoritative usage missing", observed: observedDetail({ ...usage, rawBytes: Buffer.byteLength(response.raw) }) };
   });
-  const verdict = checks.length === 5 && checks.every((check) => check.ok) ? "passing" : "failed";
-  return Object.freeze({ model: model.slug, transport: model.effectiveTransport, verdict, measuredFinalReasoningShape, checks: Object.freeze(checks), ok: verdict === "passing" });
+    const verdict = checks.length === 5 && checks.every((check) => check.ok) ? "passing" : "failed";
+    return Object.freeze({ model: model.slug, transport: model.effectiveTransport, verdict, measuredFinalReasoningShape, checks: Object.freeze(checks), ok: verdict === "passing" });
+  } finally {
+    resources.close();
+  }
 }

@@ -47,6 +47,7 @@ function run(script, env) {
       CODEX_ROUTER_INTERNAL_KEY: INTERNAL_KEY,
       KIMI_INTERNAL_KEY: INTERNAL_KEY,
       CODEX_ROUTER_SHOW_ALL_MODELS: "1",
+      ...(script === "router.mjs" ? { CODEX_ROUTER_DIRECT_DISPATCH: "0" } : {}),
       ...env,
     },
     stdio: ["ignore", "ignore", "pipe"],

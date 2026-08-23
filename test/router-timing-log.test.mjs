@@ -37,6 +37,7 @@ function run(env) {
       // The production LaunchAgent hard-sets CODEX_ROUTER_QUIET=1; the timing
       // line must fire anyway, so the test runs in that exact mode.
       CODEX_ROUTER_QUIET: "1",
+      CODEX_ROUTER_DIRECT_DISPATCH: "0",
       ...env,
     },
     stdio: ["ignore", "ignore", "pipe"],

@@ -5,7 +5,7 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { callerBaseUrl } from "../src/caller-auth.mjs";
 import { MODEL_BY_SLUG } from "../src/model-registry.mjs";
@@ -110,7 +110,7 @@ function bodyJson(request) {
   });
 }
 
-function run(env, { chain = [FALLBACK.slug], enabled = true, cooldowns, nodeRoutes, protocolProofs } = {}) {
+function run(env, { chain = [FALLBACK.slug], enabled = true, cooldowns, nodeRoutes, protocolProofs, importFile } = {}) {
   const stateDir = mkdtempSync(path.join(os.tmpdir(), "model-failover-router-state-"));
   if (chain !== null) {
     writeFileSync(
@@ -147,7 +147,7 @@ function run(env, { chain = [FALLBACK.slug], enabled = true, cooldowns, nodeRout
     encoding: "utf8",
     mode: 0o600,
   });
-  const child = spawn(process.execPath, [path.join(root, "src", "router.mjs")], {
+  const child = spawn(process.execPath, [...(importFile ? ["--import", pathToFileURL(importFile).href] : []), path.join(root, "src", "router.mjs")], {
     cwd: root,
     env: {
       ...process.env,
@@ -175,14 +175,25 @@ function run(env, { chain = [FALLBACK.slug], enabled = true, cooldowns, nodeRout
   return child;
 }
 
-function routerEnv(gatewayPort, routerPort) {
+function routerEnv(gatewayPort, routerPort, { legacyKillSwitch = true } = {}) {
   return {
     CODEX_ROUTER_PORT: String(routerPort),
     CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${gatewayPort}/v1`,
     CODEX_ROUTER_OAUTH_HEALTH_URL: `http://127.0.0.1:${gatewayPort}/health`,
     CODEX_ROUTER_API_HEALTH_URL: `http://127.0.0.1:${gatewayPort}/health`,
     CODEX_ROUTER_GATEWAY_HEALTH_URL: `http://127.0.0.1:${gatewayPort}/health`,
+    ...(legacyKillSwitch ? { CODEX_ROUTER_DIRECT_DISPATCH: "0" } : {}),
   };
+}
+
+function acceleratedForcedDeadlinePreload(delayMs = 200) {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "task6-forced-deadline-"));
+  const preload = path.join(directory, "preload.mjs");
+  writeFileSync(preload, `
+const nativeSetTimeout = globalThis.setTimeout;
+globalThis.setTimeout = (callback, delay, ...args) => nativeSetTimeout(callback, delay === 30_001 ? ${delayMs} : delay, ...args);
+`, "utf8");
+  return preload;
 }
 
 function usageEvents(stateDir) {
@@ -498,6 +509,7 @@ test("with nothing eligible the original failure is returned unchanged", async (
 
 test("default direct router covers summary/raw/compaction, exact Retry-After, trusted pipeline errors, native, legacy, and proven canary", async () => {
   const seen = [];
+  let stalledBodyCancels = 0;
   const gw = await gateway(async (request, response) => {
     const body = await bodyJson(request);
     seen.push({ url: request.url, body });
@@ -513,9 +525,31 @@ test("default direct router covers summary/raw/compaction, exact Retry-After, tr
         response.end(`{"id":"oversize","output_text":"${"x".repeat(8 * 1024 * 1024)}"}`);
         return;
       }
-      if (input.includes("TERMINAL_THEN_BAD")) {
+      if (input.includes("FORCED_BODY_STALL")) {
         response.writeHead(200, { "Content-Type": "text/event-stream" });
-        response.end(sseWithTerminalThenMalformed());
+        response.flushHeaders();
+        response.write(`data: ${JSON.stringify({ type: "response.created", sequence_number: 1, response: { id: "resp_stalled", model: PRIMARY.slug, output: [] } })}\n\n`);
+        response.once("close", () => { stalledBodyCancels += 1; });
+        return;
+      }
+      if (input.includes("FORCED_A_REASONING_FAIL")) {
+        const name = body.tools?.[0]?.name;
+        const call = { type: "function_call", id: "fc_forced_a", call_id: "call_forced_a", name, arguments: "{}" };
+        const events = [
+          { type: "response.created", sequence_number: 1, response: { id: "resp_forced_a", model: PRIMARY.slug, output: [] } },
+          { type: "response.output_item.added", sequence_number: 2, output_index: 0, item: { ...call, arguments: "" } },
+          { type: "response.function_call_arguments.done", sequence_number: 3, output_index: 0, item_id: call.id, arguments: call.arguments },
+          { type: "response.output_item.done", sequence_number: 4, output_index: 0, item: call },
+          { type: "response.reasoning_summary_text.delta", sequence_number: 5, output_index: 1, item_id: "missing_reasoning_item", summary_index: 0, delta: "PRIVATE_REASONING_MUST_NOT_LEAK" },
+          { type: "response.completed", sequence_number: 6, response: { id: "resp_forced_a", model: PRIMARY.slug, status: "completed", output: [call], usage: { input_tokens: 31, output_tokens: 7, total_tokens: 38 } } },
+        ];
+        response.writeHead(200, { "Content-Type": "text/event-stream" });
+        response.end(`${events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("")}data: [DONE]\n\n`);
+        return;
+      }
+      if (input.includes("FORCED_B_PREVALIDATION_FAIL")) {
+        response.writeHead(200, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ type: "response.completed", sequence_number: 1, response: { id: "resp_forced_b", model: PRIMARY.slug, status: "completed", output: [], usage: { input_tokens: 19, output_tokens: 3, total_tokens: 22 } } }));
         return;
       }
       const isCompact = input.includes("Summarize the conversation") || input.includes("compact");
@@ -545,14 +579,6 @@ test("default direct router covers summary/raw/compaction, exact Retry-After, tr
     response.writeHead(599, { "Content-Type": "application/json" });
     response.end(JSON.stringify({ error: { message: `unexpected path ${request.url}` } }));
   });
-  const sseWithTerminalThenMalformed = () => [
-    `data: ${JSON.stringify({ type: "response.created", sequence_number: 1, response: { id: "resp_terminal", model: PRIMARY.slug, output: [], usage: { input_tokens: 11, output_tokens: 5, total_tokens: 16 } } })}`,
-    "",
-    `data: ${JSON.stringify({ type: "response.completed", sequence_number: 2, response: { id: "resp_terminal", model: PRIMARY.slug, status: "completed", output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "done" }] }], usage: { input_tokens: 11, output_tokens: 5, total_tokens: 16 } } })}`,
-    "",
-    "data: {malformed",
-    "",
-  ].join("\n");
   const directRoutes = [
     { ...MODEL_BY_SLUG.get(PRIMARY.slug), effectiveTransport: "openai-responses", reasoningDisplayMode: "summary-compat", effectiveFinalReasoningShape: "raw-content", routable: true, visible: true },
     { ...MODEL_BY_SLUG.get("deepseek/deepseek-v4-flash"), effectiveTransport: "openai-responses", reasoningDisplayMode: "raw-preserve", effectiveFinalReasoningShape: "raw-content", routable: true, visible: true },
@@ -574,15 +600,15 @@ test("default direct router covers summary/raw/compaction, exact Retry-After, tr
     verifiedAt: "2026-08-23T00:00:00.000Z",
   };
   const routerPort = await openPort();
+  const forcedDeadlinePreload = acceleratedForcedDeadlinePreload();
   const child = run({
-    ...routerEnv(gw.port, routerPort),
-    CODEX_ROUTER_DIRECT_DISPATCH: "1",
+    ...routerEnv(gw.port, routerPort, { legacyKillSwitch: false }),
     DEEPSEEK_API_BASE_URL: `http://127.0.0.1:${gw.port}/direct`,
     DEEPSEEK_API_KEY: "direct-deepseek-key",
     QWEN_PLAN_BASE_URL: `http://127.0.0.1:${gw.port}/qwen`,
     QWEN_PLAN_API_KEY: "direct-qwen-key",
     CODEX_NATIVE_BASE_URL: `http://127.0.0.1:${gw.port}/native`,
-  }, { chain: [], nodeRoutes: directRoutes, protocolProofs: { [canaryModel.slug]: proof } });
+  }, { chain: [], nodeRoutes: directRoutes, protocolProofs: { [canaryModel.slug]: proof }, importFile: forcedDeadlinePreload });
   try {
     await waitFor(`http://127.0.0.1:${routerPort}/health`, child);
 
@@ -609,19 +635,38 @@ test("default direct router covers summary/raw/compaction, exact Retry-After, tr
     assert.equal(oversize.status, 413, oversize.body.slice(0, 300));
     assert.equal(JSON.parse(oversize.body).error.code, "forced_tool_buffer_limit");
 
-    const terminal = await readRouted(routerPort, { model: PRIMARY.slug, stream: true, input: "TERMINAL_THEN_BAD" });
-    assert.equal(terminal.status, 200, terminal.body);
-    assert.equal((terminal.body.match(/response\.completed/g) || []).length, 1);
-    assert.equal((terminal.body.match(/response\.failed/g) || []).length, 0);
-    assert.equal((terminal.body.match(/data: \[DONE\]/g) || []).length, 1);
+    const forcedTool = [{ type: "function", name: "run", parameters: { type: "object", properties: {}, additionalProperties: false } }];
+    const forcedA = await readRouted(routerPort, { model: PRIMARY.slug, stream: true, input: "FORCED_A_REASONING_FAIL", tools: forcedTool, tool_choice: "required" });
+    assert.equal(forcedA.status, 200, forcedA.body);
+    assert.equal((forcedA.body.match(/response\.failed/g) || []).length, 1);
+    assert.equal((forcedA.body.match(/data: \[DONE\]/g) || []).length, 1);
+    assert.doesNotMatch(forcedA.body, /PRIVATE_REASONING_MUST_NOT_LEAK|input_tokens|_codexRouter/);
+    assert.equal(forcedA.headers["x-codex-router-usage-owner"], undefined);
+
+    const forcedB = await readRouted(routerPort, { model: PRIMARY.slug, stream: true, input: "FORCED_B_PREVALIDATION_FAIL", tools: forcedTool, tool_choice: "required" });
+    assert.equal(forcedB.status, 422, forcedB.body);
+    assert.equal(JSON.parse(forcedB.body).error.code, "required_tool_not_called");
+    assert.doesNotMatch(forcedB.body, /input_tokens|_codexRouter/);
+    assert.equal(forcedB.headers["x-codex-router-usage-owner"], undefined);
+
+    const stalled = await readRouted(routerPort, { model: PRIMARY.slug, stream: true, input: "FORCED_BODY_STALL", tools: forcedTool, tool_choice: "required" });
+    assert.equal(stalled.status, 504, stalled.body);
+    assert.equal((stalled.body.match(/response\.failed/g) || []).length, 1);
+    assert.equal((stalled.body.match(/data: \[DONE\]/g) || []).length, 1);
+    assert.match(stalled.body, /forced_tool_buffer_timeout/);
+    assert.match(stalled.body, /Forced-tool validation exceeded time limit\./);
+    assert.doesNotMatch(stalled.body, /resp_stalled|_codexRouter|input_tokens/);
+    assert.equal(stalledBodyCancels, 1);
 
     const native = await readRouted(routerPort, { model: "gpt-native-fixture", stream: false, input: "native branch" });
     assert.equal(native.status, 200, native.body);
     assert.match(native.body, /NATIVE_OK/);
 
+    const beforeLegacyRequests = seen.length;
     const legacy = await readRouted(routerPort, { model: "zai-api/glm-5.2", stream: false, input: "legacy branch" });
     assert.equal(legacy.status, 404, legacy.body);
     assert.equal(JSON.parse(legacy.body).error.code, "provider_not_available_in_node_build");
+    assert.equal(seen.length, beforeLegacyRequests, "the absent Node snapshot reached the legacy gateway");
 
     const canary = await readRouted(routerPort, { model: canaryModel.slug, stream: false, input: "canary branch" });
     assert.equal(canary.status, 200, canary.body);
@@ -633,9 +678,12 @@ test("default direct router covers summary/raw/compaction, exact Retry-After, tr
     assert.ok(directPaths.includes("/native/responses"));
     assert.equal(directPaths.includes("/v1/responses"), false, "a resolved direct route fell through to the legacy gateway");
 
-    const events = await waitForUsageEvents(child.stateDir, 8, child);
-    const terminalRows = events.filter((event) => event.model === PRIMARY.slug && event.inputTokens === 11 && event.outputTokens === 5);
-    assert.equal(terminalRows.length, 1, "terminal pipeline usage was recorded more than once");
+    const events = await waitForUsageEvents(child.stateDir, 11, child);
+    const forcedARows = events.filter((event) => event.model === PRIMARY.slug && event.inputTokens === 31 && event.outputTokens === 7);
+    assert.equal(forcedARows.length, 1, "validated forced usage was not retained exactly once after reasoning failure");
+    const forcedBRows = events.filter((event) => event.model === PRIMARY.slug && event.inputTokens === 19 && event.outputTokens === 3);
+    assert.equal(forcedBRows.length, 1, "pre-validation forced usage was not recorded exactly once");
+    assert.doesNotMatch(child.testErrors(), /PRIVATE_REASONING_MUST_NOT_LEAK|_codexRouterForcedTimeout|"input_tokens":31|"input_tokens":19/);
   } finally {
     await stopChild(child);
     await closeServer(gw.server);

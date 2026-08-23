@@ -72,6 +72,10 @@ function run(script, env) {
       CODEX_ROUTER_INTERNAL_KEY: INTERNAL_KEY,
       KIMI_INTERNAL_KEY: INTERNAL_KEY,
       CODEX_ROUTER_SHOW_ALL_MODELS: "1",
+      // This suite is the legacy gateway contract. Direct-default behavior,
+      // including the no-snapshot fail-closed gate, has its own whole-router
+      // fixture in model-failover-router.test.mjs.
+      ...(script === "router.mjs" ? { CODEX_ROUTER_DIRECT_DISPATCH: "0" } : {}),
       ...env,
     },
     stdio: ["ignore", "ignore", "pipe"],

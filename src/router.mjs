@@ -2315,10 +2315,10 @@ function readResolvedNodeRoute(slug) {
   }
 }
 
-// A resolved node-routes snapshot selects the direct path by default. The
-// explicit `=1` form is useful for isolated fixtures without a snapshot and
-// `=0` is the documented emergency kill switch while the legacy gateway stays
-// available for rollback.
+// A resolved node-routes snapshot selects the direct path by default. A
+// registered third-party slug without that protected resolution must fail
+// closed instead of falling through to the legacy gateway. `=0` remains the
+// explicit emergency kill switch while that gateway is retained for rollback.
 async function handleDirectRoutedRequest(request, response, payload, route, controller, startedAt) {
   const signal = controller.signal;
   if (!["native-openai", "openai-responses", "anthropic-messages"].includes(route?.effectiveTransport)) {
@@ -2359,7 +2359,11 @@ async function handleDirectRoutedRequest(request, response, payload, route, cont
     const forcedBuffer = createForcedToolBuffer({
       build: built.toolBuild,
       signal,
-      abort: (reason) => controller.abort(reason),
+      // A transform failure is already the pipeline's cancellation owner. Do
+      // not independently abort the same Web-stream with an untyped reason;
+      // Node's adapter can replace the trusted ToolDialectError with an
+      // internal cancellation failure before the safe boundary sees it.
+      abort: () => {},
       clock: () => forcedStartedAt,
       onUsage: (usage) => forcedUsageObserver.observeAuthoritativeUsage(usage),
     });
@@ -2398,8 +2402,9 @@ async function handleDirectRoutedRequest(request, response, payload, route, cont
   } catch (error) {
     forcedDeadline?.clear();
     if (response._codexRouterForcedTimeout && !response.headersSent) {
-      writeJson(response, 504, { error: { type: "router_error", code: "forced_tool_buffer_timeout", message: "The forced tool dispatch exceeded its time limit." } });
-      recordUsageEvent({ model: route.slug, provider: canonicalProviderId(route.provider), status: 504, durationMs: Date.now() - startedAt, ...(forcedUsage?.tokenUsage?.() || {}) });
+      const safe = routerError("forced_tool_buffer_timeout");
+      writeJson(response, safe.status, safe.body);
+      recordUsageEvent({ model: route.slug, provider: canonicalProviderId(route.provider), status: safe.status, durationMs: Date.now() - startedAt, ...(forcedUsage?.tokenUsage?.() || {}) });
       return;
     }
     throw error;
@@ -2426,7 +2431,12 @@ async function handleDirectRoutedRequest(request, response, payload, route, cont
   try {
     await pipeResponse(upstream, response, HOP_BY_HOP_HEADERS, [...result.transforms, usageObserver]);
   } catch (error) {
-    const candidate = typeof error?.code === "string" && ERROR_DEFINITIONS[error.code]
+    // This marker is owned by the request-local forced deadline. Check it
+    // before AbortError/code classification: aborting a stalled provider body
+    // is the mechanism, while the trusted forced timeout is the public cause.
+    const candidate = response._codexRouterForcedTimeout === true
+      ? "forced_tool_buffer_timeout"
+      : typeof error?.code === "string" && ERROR_DEFINITIONS[error.code]
       ? error.code
       : "reasoning_protocol_error";
     const safe = routerError(candidate, { internalReason: error?.code || error?.name });
@@ -2437,8 +2447,13 @@ async function handleDirectRoutedRequest(request, response, payload, route, cont
         relayContext.doneSeen = true;
       }
       if (!response.writableEnded && !response.destroyed) response.end();
-    } else if (response.headersSent) {
+    } else if (response.headersSent || (candidate === "forced_tool_buffer_timeout" && payload.stream !== false)) {
       if (!response.writableEnded && !response.destroyed) {
+        // Forced validation owns the whole streamed body before relay. A
+        // body-stage timeout can therefore still choose its registered 504
+        // status while speaking the Responses terminal framing the caller
+        // requested. Committed streams keep their already-sent status.
+        if (!response.headersSent) response.statusCode = safe.status;
         response.write(formatTerminalFrames(failedResponseEvent({
           responseId: relayContext?.responseId ?? "resp_direct_adapter",
           model: relayContext?.model ?? result.model.slug,
@@ -2630,6 +2645,21 @@ async function handleResponses(request, response, requestUrl) {
       }
     });
 
+    if (route && !resolvedNodeRoute && process.env.CODEX_ROUTER_DIRECT_DISPATCH !== "0") {
+      const safe = routerError("provider_not_available_in_node_build");
+      writeJson(response, safe.status, safe.body);
+      recordUsageEvent({
+        model: route.slug,
+        provider: canonicalProviderId(route.provider),
+        status: safe.status,
+        durationMs: Date.now() - startedAt,
+      });
+      finalStatus = safe.status;
+      activityStatus = safe.status;
+      usageRecorded = true;
+      return;
+    }
+
     if (route && (compactV1 || compactV2)) {
       const compaction = resolvedNodeRoute && process.env.CODEX_ROUTER_DIRECT_DISPATCH !== "0"
         ? await (async () => {
@@ -2710,7 +2740,7 @@ async function handleResponses(request, response, requestUrl) {
 
     if (
       route &&
-      (resolvedNodeRoute || process.env.CODEX_ROUTER_DIRECT_DISPATCH === "1") &&
+      resolvedNodeRoute &&
       process.env.CODEX_ROUTER_DIRECT_DISPATCH !== "0"
     ) {
       await handleDirectRoutedRequest(request, response, payload, route, controller, startedAt);

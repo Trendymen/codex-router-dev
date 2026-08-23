@@ -43,6 +43,7 @@ function run(env) {
       KIMI_INTERNAL_KEY: INTERNAL_KEY,
       CODEX_ROUTER_SHOW_ALL_MODELS: "1",
       CODEX_ROUTER_QUIET: "1",
+      CODEX_ROUTER_DIRECT_DISPATCH: "0",
       ...env,
     },
     stdio: ["ignore", "ignore", "pipe"],
