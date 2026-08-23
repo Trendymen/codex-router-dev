@@ -612,6 +612,15 @@ test("a prepared purge aborts exactly once when lock acquisition times out", () 
   const purgePath = path.join(state, "vision-cache-purge.json");
   const lockPath = `${purgePath}.lock`;
   mkdirSync(lockPath);
+  const liveToken = "timeout-live-owner";
+  writeFileSync(
+    path.join(lockPath, `owner-${liveToken}.json`),
+    `${JSON.stringify({
+      pid: process.pid,
+      processIdentity: "timeout-test-identity",
+      token: liveToken,
+    })}\n`,
+  );
   let abortCalls = 0;
   let clockReads = 0;
   try {
