@@ -10,6 +10,9 @@ process.env.CODEX_ROUTER_STATE_DIR = path.join(testRoot, "state");
 process.env.KIMI_CODE_HOME = path.join(testRoot, "kimi-code");
 process.env.GROK_AUTH_PATH = path.join(testRoot, "grok", "auth.json");
 const { PROVIDERS } = await import("../src/model-registry.mjs");
+const CHAT_PROVIDERS = [...PROVIDERS.values()]
+  .filter((provider) => provider.visionOnly !== true && provider.chatEnabled !== false)
+  .map((provider) => provider.id);
 // Clearing every registry-declared credential variable keeps the "no provider
 // is configured yet" assertions deterministic on a developer machine that has
 // real keys exported, and stays correct as providers are added.
@@ -45,7 +48,7 @@ test("provider selection keeps backward compatibility and can hide the final pro
   try {
     // No selection file means every registry provider stays visible; the
     // credential-aware catalog is what hides providers that cannot authenticate.
-    assert.deepEqual(readProviderSelection(), [...PROVIDERS.keys()]);
+    assert.deepEqual(readProviderSelection(), CHAT_PROVIDERS);
     process.env.KIMI_API_KEY = "TEST_ENVIRONMENT_ONLY_KEY";
     // Local backends are keyless: they serve from this machine, so there is no
     // credential to configure and they are always available. Everything else
@@ -53,22 +56,18 @@ test("provider selection keeps backward compatibility and can hide the final pro
     assert.deepEqual(configuredProviderIds(), [
       "custom",
       "kilo-free",
-      "lmstudio",
-      "local",
       "opencode-free",
     ]);
-    assert.deepEqual(defaultProviderIds(), ["lmstudio", "local"]);
+    assert.deepEqual(defaultProviderIds(), []);
     delete process.env.KIMI_API_KEY;
     writeProviderCredential("deepseek", "TEST_DEEPSEEK_SELECTION_KEY");
     assert.deepEqual(configuredProviderIds(), [
       "custom",
       "deepseek",
       "kilo-free",
-      "lmstudio",
-      "local",
       "opencode-free",
     ]);
-    assert.deepEqual(defaultProviderIds(), ["deepseek", "lmstudio", "local"]);
+    assert.deepEqual(defaultProviderIds(), ["deepseek"]);
 
     writeProviderSelection(["chatgpt-oauth"]);
     assert.deepEqual(readProviderSelection(), ["grok-oauth"]);
@@ -228,7 +227,7 @@ test("a selection naming only unknown providers falls back to the no-file defaul
       })}\n`,
     );
 
-    assert.deepEqual(readProviderSelection(), [...PROVIDERS.keys()]);
+    assert.deepEqual(readProviderSelection(), CHAT_PROVIDERS);
     const detail = readProviderSelectionDetail();
     assert.deepEqual(detail.ignored, [
       "provider-from-a-newer-build",
@@ -259,11 +258,11 @@ test("an explicitly empty selection still hides every provider", () => {
 test("an unreadable or wrong-version selection file degrades instead of throwing", () => {
   try {
     stageSelectionFile("{ not json at all");
-    assert.deepEqual(readProviderSelection(), [...PROVIDERS.keys()]);
+    assert.deepEqual(readProviderSelection(), CHAT_PROVIDERS);
     assert.match(readProviderSelectionDetail().degraded, /Unreadable provider selection/);
 
     stageSelectionFile(`${JSON.stringify({ version: 99, providers: ["deepseek"] })}\n`);
-    assert.deepEqual(readProviderSelection(), [...PROVIDERS.keys()]);
+    assert.deepEqual(readProviderSelection(), CHAT_PROVIDERS);
     assert.match(readProviderSelectionDetail().degraded, /version\/providers are invalid/);
   } finally {
     rmSync(testRoot, { recursive: true, force: true });

@@ -12,13 +12,8 @@ import os from "node:os";
 import path from "node:path";
 
 import { protectPrivateFile } from "./file-security.mjs";
-import {
-  disableProvider,
-  enableProvider,
-  readProviderSelection,
-} from "./provider-selection.mjs";
 import { STATE_DIR } from "./paths.mjs";
-import { readUserModels, userModelEntry, writeUserModels } from "./user-models.mjs";
+import { readUserModels, writeUserModels } from "./user-models.mjs";
 import {
   canonicalLocalModelTag,
   localModelDisplayName,
@@ -111,10 +106,9 @@ const LOCAL_MODEL_PRIORITY = 900;
 const LOCAL_CONTEXT_WINDOW = 32768;
 const LOCAL_AUTO_COMPACT = 28000;
 
-// Checking a model publishes it: it joins the user-model overlay, which the
-// registry, gateway config, and Codex catalog already consume, so a local
-// model reaches the picker through exactly the same path as any curated cloud
-// model. Unchecking withdraws it again without touching the download.
+  // Checking a model only records local Vision availability.  Local models are
+  // never published as Codex chat routes; the weights and Ollama runtime stay
+  // untouched so the same tag can be used by the Vision Bridge.
 export function setLocalModelEnabled(tag, enabled, { capabilitiesFor } = {}) {
   const value = String(tag || "").trim();
   if (!value) throw new Error("A model tag is required.");
@@ -129,10 +123,6 @@ export function setLocalModelEnabled(tag, enabled, { capabilitiesFor } = {}) {
   const current = new Set(enabled ? [...remaining, canonical] : remaining);
   const selection = writeSelection({ version: 1, enabled: [...current].sort() });
   syncLocalUserModels({ enabled: selection.enabled, ...(capabilitiesFor ? { capabilitiesFor } : {}) });
-  // Checking a model is the operator saying they want it available, so the
-  // provider follows the models rather than being a second switch to find:
-  // it turns on with the first check and off when the last one clears.
-  syncLocalProviderSelection(selection.enabled.length > 0);
   return selection;
 }
 
@@ -141,14 +131,9 @@ export function setLocalModelEnabled(tag, enabled, { capabilitiesFor } = {}) {
 // and the operator can enable the provider by hand, which beats failing the
 // checkbox.
 export function syncLocalProviderSelection(shouldEnable) {
-  try {
-    const enabled = readProviderSelection().includes(LOCAL_PROVIDER_ID);
-    if (shouldEnable && !enabled) enableProvider(LOCAL_PROVIDER_ID);
-    if (!shouldEnable && enabled) disableProvider(LOCAL_PROVIDER_ID);
-    return shouldEnable;
-  } catch {
-    return undefined;
-  }
+  // Retained as a compatibility seam for older callers.  It intentionally
+  // performs no provider mutation now that local is Vision-only.
+  return false;
 }
 
 // Rebuilds the overlay's local entries from the checked set, leaving every
@@ -160,55 +145,11 @@ export function syncLocalUserModels({
   capabilitiesFor = (tag) => localModelCapabilities(tag),
 } = {}) {
   const others = readUserModels().filter((model) => model.provider !== LOCAL_PROVIDER_ID);
-  // Codex drives every turn through tool calls. A model without them is not a
-  // weaker chat model, it is a broken one: the first request comes back "does
-  // not support tools". Such a model stays installed and stays usable as a
-  // vision reader, but it is never published into the picker.
-  const publishable = enabled.filter((tag) => capabilitiesFor(tag).includes("tools"));
-  const entries = publishable.map((tag, index) => {
-    const capabilities = capabilitiesFor(tag);
-    let displayName;
-    try {
-      displayName = localModelDisplayName(tag);
-    } catch {
-      displayName = String(tag);
-    }
-    return {
-      ...userModelEntry({
-        providerId: LOCAL_PROVIDER_ID,
-        upstreamId: tag,
-        priority: LOCAL_MODEL_PRIORITY + index,
-        metadata: {
-          // Reported by Ollama, so the entry claims image input only when the
-          // model genuinely has it -- the same standard the checked-in
-          // registry is held to.
-          inputModalities: capabilities.includes("vision") ? ["text", "image"] : ["text"],
-          contextWindow: LOCAL_CONTEXT_WINDOW,
-          autoCompact: LOCAL_AUTO_COMPACT,
-          description: `${displayName} running locally through Ollama on this machine.`,
-        },
-      }),
-      // Marked experimental in the picker itself. Vision is proven -- a local
-      // model transcribes an image accurately every time -- but driving a
-      // Codex turn is not: a model can pass this check and fail the same one
-      // minutes later, and the label has to say so where the choice is made,
-      // not only in a doc nobody opens mid-task.
-      displayName: `${displayName} (local, experimental)`,
-      // Codex's apply_patch is a freeform custom tool, which has no
-      // representation in Ollama's tool schema: it arrives mangled or not at
-      // all, and the model is left guessing at a toolset it cannot see. Opting
-      // out keeps every tool a plain function, which Ollama does support.
-      // Observed without this: llama3.2:3b inventing a `create_goal` call and
-      // emitting it as prose.
-      supportsApplyPatchTool: false,
-      // Driving subagents is a harder job than answering a turn, and no local
-      // model has been shown to do it here. Claiming v2 would offer them as
-      // spawn targets on that untested basis.
-      multiAgentVersion: "v1",
-    };
-  });
-  writeUserModels([...others, ...entries]);
-  return entries;
+  // Remove stale local chat entries from the user overlay, but never touch
+  // LOCAL_MODELS_STATE_PATH, Ollama's model directory, downloads, probes, or
+  // benchmarks.  The selected tags remain available to Vision controls.
+  writeUserModels(others);
+  return [];
 }
 
 const REGISTRY_BASE =
@@ -429,21 +370,14 @@ export function isLocalModelEnabled(tag, selection = readLocalModelSelection()) 
   return selection.enabled.some((entry) => canonicalLocalModelTag(entry) === canonical);
 }
 
-// Deleting reclaims gigabytes and cannot be undone without downloading again,
-// so the caller must pass explicit consent rather than this inferring it.
+// Local weights belong to the operator and are retained by this router.  The
+// old helper used `ollama rm`, which made an innocuous route withdrawal
+// destructive and broke Vision-only reuse of the same installed reader.
 export function removeLocalModel(tag, { spawn = spawnSync, confirmed = false, capabilitiesFor } = {}) {
   const value = String(tag || "").trim();
   if (!value) throw new Error("A model tag is required.");
-  if (!confirmed) {
-    throw new Error(`Removing ${value} deletes it from disk. Pass --yes to confirm.`);
-  }
-  const result = spawn(localOllamaBinary(spawn), ["rm", value], { encoding: "utf8" });
-  if (result.status !== 0) {
-    const detail = String(result.stderr || "").trim();
-    throw new Error(`\`ollama rm ${value}\` failed${detail ? `: ${detail}` : "."}`);
-  }
-  // A deleted model cannot stay checked, or the picker would offer something
-  // that is no longer on disk.
+  // Keep the old confirmation argument source-compatible, but do not perform
+  // a destructive runtime call even when it is supplied.
   setLocalModelEnabled(value, false, capabilitiesFor ? { capabilitiesFor } : undefined);
   return value;
 }
@@ -568,17 +502,32 @@ export function localModelsSnapshot({
     path: LOCAL_MODELS_STATE_PATH,
     installed: models.length,
     enabled: models.filter((model) => model.enabled).length,
-    usableAsChat: models.filter((model) => model.tools).length,
     totalGb: Math.round(models.reduce((sum, model) => sum + model.sizeGb, 0) * 10) / 10,
-    models,
-    available,
-    availableVision,
-    availableExplore,
-    families: [...families.values()].sort((left, right) => left.family.localeCompare(right.family)),
-    catalog: {
-      mode: "ollama-tags",
-      note: "Any valid Ollama tag is supported. Paste an ollama.com model URL or enter a tag to inspect and install it.",
-    },
+    // The snapshot is a Vision inventory, not a coding-model catalog.  Keep
+    // measured image-reader state and weights/runtime facts, but do not expose
+    // tool, subagent, context-window, speed, or coding-fit claims.
+    models: models.map(({
+      tools: _tools,
+      agent: _agent,
+      agentCapable: _agentCapable,
+      capabilities: _capabilities,
+      context: _context,
+      tokensPerSecond: _tokensPerSecond,
+      speedStatus: _speedStatus,
+      codex: _codex,
+      fit: _fit,
+      diskFit: _diskFit,
+      researchStatus: _researchStatus,
+      researchCapabilities: _researchCapabilities,
+      researchNote: _researchNote,
+      ...model
+    }) => model),
+    availableVision: availableVision.map(({
+      fit: _fit,
+      diskFit: _diskFit,
+      recommended: _recommended,
+      ...reader
+    }) => reader),
     runtime,
     download,
     machine: describeMachine(capacity),
@@ -981,93 +930,35 @@ function contextLabel(tokens) {
 }
 
 export function renderLocalModels(snapshot) {
-  const lines = [`Local models · ${snapshot.machine || "this machine"}`, ""];
+  const lines = [`Vision readers · ${snapshot.machine || "this machine"}`, ""];
   if (snapshot.models.length === 0) {
     lines.push("Installed: none yet");
   } else {
     lines.push(`Installed: ${snapshot.installed} · ${snapshot.totalGb} GB`);
     const width = Math.max(...snapshot.models.map((model) => model.tag.length));
     for (const model of snapshot.models) {
-      const role = model.tools ? (model.vision ? "code + images" : "code") : "images only";
       lines.push(
         `  ${model.enabled ? "[x]" : "[ ]"} ${model.tag.padEnd(width)} ` +
-          `${`${model.sizeGb.toFixed(1)} GB`.padStart(8)}  ${role}` +
-          `${model.tokensPerSecond ? ` · ${model.tokensPerSecond.toFixed(1)} tok/s` : ""}` +
+          `${`${model.sizeGb.toFixed(1)} GB`.padStart(8)}  ` +
+          `${model.vision ? "image reader" : "text-only"}` +
           `${model.running ? "  · loaded" : ""}`,
       );
     }
   }
-  const coding = snapshot.available || [];
   const vision = snapshot.availableVision || [];
-  const explore = snapshot.availableExplore || [];
-  if (coding.length) {
-    // The honest framing: Codex's own prompt takes most of the window before
-    // any code is added, and only a verified model is known to drive a turn.
-    const room = Math.max(0, LOCAL_CONTEXT_WINDOW - CODEX_PROMPT_TOKENS);
-    lines.push(
-      "",
-      "For coding — experimental. Codex's prompt uses about " +
-        `${Math.round(CODEX_PROMPT_TOKENS / 1000)}K of the ${contextLabel(LOCAL_CONTEXT_WINDOW)} ` +
-        `window, leaving roughly ${Math.round(room / 1000)}K to work in.`,
-      "",
-    );
-    const width = Math.max(...coding.map((entry) => entry.tag.length));
-    for (const entry of coding) {
-      lines.push(
-        `  ${entry.tag.padEnd(width)} ${`${entry.sizeGb.toFixed(1)} GB`.padStart(8)} ` +
-          `${entry.codex.padEnd(9)} ${entry.note}${entry.fit === "tight" ? " (memory tight)" : ""}` +
-          `${entry.diskFit === "tight" ? " (disk tight)" : ""}`,
-      );
-    }
-    lines.push("", "  Test one yourself:  ./bin/control local-models agent-check <tag>");
-  }
   if (vision.length) {
-    lines.push("", "For reading images only — cannot code:", "");
+    lines.push("", "Available image readers:", "");
     const width = Math.max(...vision.map((entry) => entry.tag.length));
     for (const entry of vision) {
       lines.push(
         `  ${entry.tag.padEnd(width)} ${`${entry.sizeGb.toFixed(1)} GB`.padStart(8)}  ${entry.accuracy}`,
       );
     }
-  }
-  if (explore.length) {
     lines.push(
       "",
-      "Explore Ollama tags (fit is shown; capabilities are checked after pull):",
-    );
-    for (const entry of explore) {
-      if (entry.downloadable === false) {
-        lines.push(`  ${entry.tag.padEnd(42)} cloud only · not downloadable`);
-      } else {
-        const fit = entry.fit === "too-large" ? "won't fit" : entry.fit || "fit unknown";
-        lines.push(`  ${entry.tag.padEnd(42)} ${`${entry.sizeGb.toFixed(1)} GB`.padStart(8)} · ${fit}`);
-      }
-    }
-  }
-  if (coding.length || vision.length) {
-    lines.push(
-      "",
-      `  ./bin/control local-models install ${(coding[0] || vision[0]).tag} --yes`,
+      `  ./bin/control local-models install ${vision[0].tag} --yes`,
       "  Any valid Ollama tag or ollama.com model URL also works.",
     );
-  }
-  // Present whenever the snapshot carries it, including the not-running case:
-  // an LM Studio user who stopped the server should read "not running", not
-  // watch the whole section vanish as if support had gone away.
-  const lmstudio = snapshot.lmstudio;
-  if (lmstudio) {
-    lines.push("", `${lmstudio.displayName || "LM Studio"}:`);
-    if (!lmstudio.reachable && lmstudio.models.length === 0) {
-      lines.push("  Not running. Start LM Studio's local server to list its models.");
-    } else {
-      for (const model of lmstudio.models) {
-        lines.push(
-          `  ${model.enabled ? "[x]" : "[ ]"} ${model.id}` +
-            `${model.served ? "" : "  · not currently served"}`,
-        );
-      }
-      lines.push("  Toggle one:  ./bin/control local-models lmstudio-set <id> on|off");
-    }
   }
   return lines.join("\n");
 }

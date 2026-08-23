@@ -1,30 +1,17 @@
-import { useMemo, useState, type FormEvent } from "react";
-import {
-  Box,
-  ChevronDown,
-  Download,
-  Eye,
-  Gauge,
-  HardDrive,
-  Play,
-  RefreshCw,
-  SearchX,
-  Trash2,
-} from "lucide-react";
+import { useState, type FormEvent } from "react";
+import { Download, Eye, Gauge, HardDrive, Play, RefreshCw, SearchX } from "lucide-react";
 import {
   Badge,
   Button,
-  Dialog,
   EmptyState,
   InlineNotice,
   PageHeader,
-  SearchField,
   SectionHeading,
   StatStrip,
   Toggle,
 } from "../components";
-import { compactNumber, formatBytesGb } from "../lib";
-import type { LocalModel, LocalModelsSnapshot, RouterControlApi, RouterTarget, VisionEngine } from "../types";
+import { formatBytesGb } from "../lib";
+import type { LocalModel, RouterControlApi, RouterTarget, VisionEngine } from "../types";
 import "./local-harness-context.css";
 
 type RunAction = (label: string, action: () => Promise<unknown>) => Promise<void>;
@@ -37,24 +24,17 @@ interface LocalPageProps {
   runAction: RunAction;
 }
 
+/** Local is intentionally a Vision-only surface. */
 export function LocalPage({ target, api, refreshing, onRefresh, runAction }: LocalPageProps) {
   const [installRef, setInstallRef] = useState("");
   const [forceInstall, setForceInstall] = useState(false);
-  const [pendingRemoval, setPendingRemoval] = useState<string | null>(null);
-  const [catalogQuery, setCatalogQuery] = useState("");
-  const [expandedFamilies, setExpandedFamilies] = useState<Set<string>>(new Set());
   const local = target?.modelSettings?.localModels;
   const bridge = target?.modelSettings?.visionBridge;
   const installed = local?.models?.filter((model) => model.installed !== false) ?? [];
-  const installedCount = typeof local?.installed === "number"
-    ? local.installed
-    : Array.isArray(local?.installed)
-      ? local.installed.length
-      : installed.length;
+  const installedCount = typeof local?.installed === "number" ? local.installed : installed.length;
   const enabledTags = Array.isArray(local?.enabled)
     ? local.enabled
     : installed.filter((model) => model.enabled === true).map((model) => model.tag);
-  const enabledCount = typeof local?.enabled === "number" ? local.enabled : enabledTags.length;
   const localReaders = bridge?.localModels ?? local?.availableVision ?? [];
   const readerDownloadActive = bridge?.download?.status === "downloading";
   const engines: Array<VisionEngine & { group: string }> = [
@@ -66,44 +46,32 @@ export function LocalPage({ target, api, refreshing, onRefresh, runAction }: Loc
   const effortOptions = selectedEngineMeta?.efforts?.length
     ? selectedEngineMeta.efforts
     : bridge?.availableEfforts ?? [];
-  const catalogModels = local?.availableExplore ?? [];
-  const quickPicks = useMemo(
-    () => [
-      ...(Array.isArray(local?.available) ? local.available : []),
-      ...(local?.availableVision ?? []),
-    ].slice(0, 8),
-    [local?.available, local?.availableVision],
-  );
-  const catalogFamilies = useMemo(
-    () => groupCatalogModels(catalogModels, local?.families, catalogQuery),
-    [catalogModels, catalogQuery, local?.families],
-  );
 
   async function installLocal(event: FormEvent) {
     event.preventDefault();
     const model = installRef.trim();
     if (!model || !api) return;
     setInstallRef("");
-    await runAction(`Install ${model}`, () => api.installLocalModel(model, forceInstall));
+    await runAction(`Install Vision reader ${model}`, () => api.installLocalModel(model, forceInstall));
   }
 
   if (!target) {
-    return <EmptyState icon={<SearchX size={22} />} title="Local runtime unavailable" body="Start the router or refresh after setup completes." />;
+    return <EmptyState icon={<SearchX size={22} />} title="Vision runtime unavailable" body="Start the router or refresh after setup completes." />;
   }
 
   return (
     <div className="local-page">
       <PageHeader
-        eyebrow="On-device inference"
-        title="Local"
-        description="Run, install, measure, and expose Ollama models without leaving the control center."
+        eyebrow="On-device Vision"
+        title="Vision readers"
+        description="Install, measure, and pin local Ollama readers for pasted-image transcription. Local weights are never removed by the router."
         onRefresh={onRefresh}
         refreshing={refreshing}
       />
 
       <StatStrip items={[
         { label: "Runtime", value: local?.runtime?.running ? "Online" : "Offline", detail: local?.runtime?.version ? `Ollama ${local.runtime.version}` : "Ollama" },
-        { label: "Installed", value: installedCount, detail: `${enabledCount} in Codex` },
+        { label: "Installed", value: installedCount, detail: `${enabledTags.length} available to Vision` },
         { label: "Model storage", value: formatBytesGb(local?.totalGb), detail: local?.runtime?.modelsPath || "Location managed by Ollama" },
         { label: "Image reader", value: bridge?.engine === "local" ? "Local" : bridge?.resolvedEngineName || "Automatic", detail: bridge?.enabled ? "Bridge enabled" : "Bridge disabled" },
       ]} />
@@ -115,8 +83,8 @@ export function LocalPage({ target, api, refreshing, onRefresh, runAction }: Loc
       <div className="lhc-local-grid">
         <section className="panel-section lhc-local-installed">
           <SectionHeading
-            title="Installed models"
-            description="Enabled models appear in Codex after the picker catalog refreshes."
+            title="Installed Vision weights"
+            description="Installed models remain local inventory. Selecting one below only controls the Vision reader; it never adds a Codex chat route."
             action={
               <div className="row-actions">
                 {!local?.runtime?.running ? (
@@ -135,19 +103,18 @@ export function LocalPage({ target, api, refreshing, onRefresh, runAction }: Loc
           {installed.length ? (
             <div className="table-list">
               {installed.map((model) => (
-                <LocalModelRow
+                <InstalledVisionRow
                   key={model.tag}
                   model={model}
                   enabled={enabledTags.includes(model.tag) || model.enabled === true}
                   disabled={!api}
-                  onToggle={(next) => api && void runAction(`${next ? "Enable" : "Disable"} ${model.tag}`, () => api.setLocalModelEnabled(model.tag, next))}
-                  onBenchmark={() => api && void runAction(`Benchmark ${model.tag}`, () => api.benchmarkLocalModel(model.tag))}
-                  onRemove={() => setPendingRemoval(model.tag)}
+                  onToggle={(next) => api && void runAction(`${next ? "Make available" : "Hide"} ${model.tag} from Vision`, () => api.setLocalModelEnabled(model.tag, next))}
+                  onBenchmark={() => api && void runAction(`Measure ${model.tag}`, () => api.benchmarkVisionModel(model.tag))}
                 />
               ))}
             </div>
           ) : (
-            <EmptyState icon={<HardDrive size={21} />} title="No local models installed" body="Install an Ollama model below. Progress remains visible while the download runs." />
+            <EmptyState icon={<HardDrive size={21} />} title="No local Vision weights installed" body="Install a reader below. Progress remains visible while the download runs." />
           )}
         </section>
 
@@ -157,81 +124,36 @@ export function LocalPage({ target, api, refreshing, onRefresh, runAction }: Loc
             <div><dt>State</dt><dd>{local?.runtime?.running ? "Running" : local?.runtime?.installed ? "Stopped" : "Not installed"}</dd></div>
             <div><dt>Version</dt><dd>{local?.runtime?.version || "Not reported"}</dd></div>
             <div><dt>Managed</dt><dd>{local?.runtime?.managed ? "Router managed" : "External runtime"}</dd></div>
-            <div><dt>Models path</dt><dd title={local?.runtime?.modelsPath}>{local?.runtime?.modelsPath || "Ollama default"}</dd></div>
+            <div><dt>Weights path</dt><dd title={local?.runtime?.modelsPath}>{local?.runtime?.modelsPath || "Ollama default"}</dd></div>
           </dl>
         </section>
       </div>
 
       <section className="panel-section">
-        <SectionHeading title="Install a model" description="Enter an Ollama tag or an HTTPS ollama.com model page. The runtime is installed only after this explicit action." />
+        <SectionHeading title="Install a Vision reader" description="Enter an Ollama tag or an HTTPS ollama.com model page. Installing is explicit and does not publish a chat model." />
         <form className="install-form" onSubmit={(event) => void installLocal(event)}>
           <label htmlFor="local-model-ref">Model tag or Ollama URL</label>
           <div>
-            <input id="local-model-ref" value={installRef} onChange={(event) => setInstallRef(event.target.value)} placeholder="qwen3.5:9b" spellCheck={false} />
+            <input id="local-model-ref" value={installRef} onChange={(event) => setInstallRef(event.target.value)} placeholder="qwen2.5vl:3b" spellCheck={false} />
             <Button variant="primary" disabled={!api || !installRef.trim()} type="submit"><Download aria-hidden size={14} strokeWidth={1.7} /> Install</Button>
           </div>
         </form>
-        <label className="check-label install-override"><input type="checkbox" checked={forceInstall} onChange={(event) => setForceInstall(event.target.checked)} /> Allow a model larger than the router recommends for this machine</label>
+        <label className="check-label install-override"><input type="checkbox" checked={forceInstall} onChange={(event) => setForceInstall(event.target.checked)} /> Allow a reader larger than the router recommends</label>
         {local?.download?.status && local.download.status !== "done" ? (
           <DownloadProgress tag={local.download.tag} percent={local.download.percent} detail={local.download.detail || local.download.status} />
         ) : null}
-        {quickPicks.length ? (
+        {localReaders.length ? (
           <div className="lhc-local-quick-picks">
-            <div className="lhc-local-subheading"><strong>Quick picks</strong><span>Shortlist for this machine</span></div>
+            <div className="lhc-local-subheading"><strong>Measured readers</strong><span>Vision-only shortlist</span></div>
             <div className="lhc-recommendations">
-              {quickPicks.map((model) => (
-                <button key={model.tag} type="button" disabled={model.downloadable === false} onClick={() => setInstallRef(model.tag)}>
-                  <Box aria-hidden size={14} strokeWidth={1.7} />
-                  <span><strong>{model.displayName || model.label || model.tag}</strong><small>{formatBytesGb(model.sizeGb)} · {model.fit || "fit unknown"}</small></span>
-                  {model.downloadable === false ? <Badge tone="neutral">Cloud only</Badge> : model.recommended ? <Badge tone="accent">Recommended</Badge> : null}
+              {localReaders.slice(0, 8).map((reader) => (
+                <button key={reader.tag} type="button" disabled={reader.downloadable === false} onClick={() => setInstallRef(reader.tag)}>
+                  <Eye aria-hidden size={14} strokeWidth={1.7} />
+                  <span><strong>{reader.displayName || reader.label || reader.tag}</strong><small>{formatBytesGb(reader.sizeGb)} · {reader.accuracy || "untested"}</small></span>
+                  {reader.downloadable === false ? <Badge tone="neutral">Unavailable</Badge> : null}
                 </button>
               ))}
             </div>
-          </div>
-        ) : null}
-        {catalogModels.length ? (
-          <div className="lhc-catalog-browser">
-            <div className="lhc-catalog-toolbar">
-              <SearchField value={catalogQuery} onChange={setCatalogQuery} placeholder="Search Ollama families or tags" />
-              <span>{catalogFamilies.length} famil{catalogFamilies.length === 1 ? "y" : "ies"} · {catalogVisibleTagCount(catalogFamilies)} {catalogQuery.trim() ? "matches" : "tags"}</span>
-            </div>
-            {catalogFamilies.length ? catalogFamilies.map((family) => {
-              const expanded = expandedFamilies.has(family.id);
-              return (
-                <section className="lhc-catalog-family" key={family.id} data-expanded={expanded}>
-                  <button
-                    type="button"
-                    className="lhc-catalog-family-trigger"
-                    aria-expanded={expanded}
-                    onClick={() => setExpandedFamilies((current) => {
-                      const next = new Set(current);
-                      if (next.has(family.id)) next.delete(family.id);
-                      else next.add(family.id);
-                      return next;
-                    })}
-                  >
-                    <div>
-                      <strong>{family.displayName}</strong>
-                      <small>{family.models.length} tags · {familySummary(family.models)}</small>
-                    </div>
-                    <ChevronDown aria-hidden size={15} strokeWidth={1.7} />
-                  </button>
-                  {expanded ? (
-                    <div className="lhc-catalog-family-panel">
-                      {family.researchStatus ? <small className="lhc-catalog-research">{family.researchStatus}{family.researchCapabilities.length ? ` · ${family.researchCapabilities.join(" · ")}` : ""}</small> : null}
-                      {family.researchNote ? <p className="lhc-catalog-note">{family.researchNote}</p> : null}
-                      <div className="lhc-catalog-model-list">
-                        {family.models.map((model) => (
-                          <CatalogModelRow key={model.tag} model={model} onSelect={() => setInstallRef(model.tag)} />
-                        ))}
-                      </div>
-                    </div>
-                  ) : null}
-                </section>
-              );
-            }) : (
-              <EmptyState icon={<SearchX size={18} />} title="No Ollama tags match" body="Try a family name, size, or exact tag." />
-            )}
           </div>
         ) : null}
       </section>
@@ -258,7 +180,7 @@ export function LocalPage({ target, api, refreshing, onRefresh, runAction }: Loc
                     {engines.filter((engine) => engine.group === "Connected provider").map((engine) => <option key={engine.slug} value={engine.slug}>{engine.displayName}</option>)}
                   </optgroup>
                 ) : null}
-                {bridge?.local ? <option value="local">Local: {bridge.local.model || "configured runtime"}</option> : null}
+                {bridge?.local ? <option value="local">Local: {bridge.local.model || "configured reader"}</option> : null}
               </select>
             </label>
             <label>
@@ -270,7 +192,7 @@ export function LocalPage({ target, api, refreshing, onRefresh, runAction }: Loc
             </label>
           </div>
           <InlineNotice tone={bridge?.resolvedEngine ? "success" : "warning"} title={bridge?.resolvedEngine ? "Reader resolved" : "No reader available"}>
-            {bridge?.resolvedEngineName ? `${bridge.resolvedEngineName} will transcribe images.` : "Connect a vision provider or download a local image reader."}
+            {bridge?.resolvedEngineName ? `${bridge.resolvedEngineName} will transcribe images.` : "Connect a vision provider or install a local image reader."}
           </InlineNotice>
         </div>
 
@@ -284,7 +206,7 @@ export function LocalPage({ target, api, refreshing, onRefresh, runAction }: Loc
                   <header>
                     <span className="model-glyph"><HardDrive aria-hidden size={14} strokeWidth={1.7} /></span>
                     <div><strong>{reader.label || reader.displayName || reader.tag}</strong><small>{formatBytesGb(reader.sizeGb)} · {reader.accuracy || "untested"}</small></div>
-                    {active ? <Badge tone="success">Active</Badge> : reader.recommended ? <Badge tone="accent">Recommended</Badge> : null}
+                    {active ? <Badge tone="success">In use</Badge> : null}
                   </header>
                   <p>{reader.note || "Local model for pasted-image transcription."}</p>
                   {reader.measured?.percent !== undefined ? <small className="reader-score">Reference score {Math.round(reader.measured.percent)}%{reader.measuredLocally ? " · measured here" : ""}</small> : null}
@@ -302,141 +224,29 @@ export function LocalPage({ target, api, refreshing, onRefresh, runAction }: Loc
               );
             })}
           </div>
-        ) : <EmptyState title="No local image readers listed" body="Refresh after Ollama and the local vision catalog are available." />}
+        ) : <EmptyState title="No local image readers listed" body="Refresh after Ollama and the local Vision catalog are available." />}
       </section>
-
-      <Dialog open={Boolean(pendingRemoval)} title="Remove local model" description="This deletes the model weights from this machine." onClose={() => setPendingRemoval(null)}>
-        <p className="dialog-copy">Remove <strong>{pendingRemoval}</strong>? You can download it again later.</p>
-        <div className="dialog-actions">
-          <Button variant="secondary" onClick={() => setPendingRemoval(null)}>Cancel</Button>
-          <Button variant="danger" onClick={() => {
-            const tag = pendingRemoval;
-            setPendingRemoval(null);
-            if (tag && api) void runAction(`Remove ${tag}`, () => api.uninstallLocalModel(tag));
-          }}><Trash2 aria-hidden size={14} strokeWidth={1.7} /> Remove</Button>
-        </div>
-      </Dialog>
     </div>
-  );
-}
-
-interface CatalogFamily {
-  id: string;
-  displayName: string;
-  models: LocalModel[];
-  researchStatus?: string;
-  researchCapabilities: string[];
-  researchNote?: string;
-}
-
-function groupCatalogModels(
-  models: LocalModel[],
-  knownFamilies: LocalModelsSnapshot["families"] | undefined,
-  query: string,
-): CatalogFamily[] {
-  const needle = query.trim().toLocaleLowerCase();
-  const groups = new Map<string, CatalogFamily>();
-  for (const model of models) {
-    const familyId = model.family || model.tag.split(":", 1)[0] || model.tag;
-    const searchable = `${model.tag} ${model.displayName || ""} ${model.family || ""}`.toLocaleLowerCase();
-    if (needle && !searchable.includes(needle)) continue;
-    const known = knownFamilies?.find((family) => family.family === familyId);
-    const current = groups.get(familyId) || {
-      id: familyId,
-      displayName: (known?.displayName || model.displayName || familyId).split(" · ")[0],
-      models: [],
-      researchStatus: model.researchStatus,
-      researchCapabilities: model.researchCapabilities || [],
-      researchNote: model.researchNote,
-    };
-    current.models.push(model);
-    if (!current.researchStatus && model.researchStatus) current.researchStatus = model.researchStatus;
-    if (!current.researchCapabilities.length && model.researchCapabilities?.length) current.researchCapabilities = model.researchCapabilities;
-    if (!current.researchNote && model.researchNote) current.researchNote = model.researchNote;
-    groups.set(familyId, current);
-  }
-  return [...groups.values()]
-    .map((family) => ({
-      ...family,
-      models: [...family.models].sort(catalogModelSort),
-    }))
-    .sort((left, right) => left.displayName.localeCompare(right.displayName));
-}
-
-function catalogModelSort(left: LocalModel, right: LocalModel): number {
-  const leftLatest = left.variant === "latest";
-  const rightLatest = right.variant === "latest";
-  if (leftLatest !== rightLatest) return leftLatest ? -1 : 1;
-  const leftFit = localModelFits(left);
-  const rightFit = localModelFits(right);
-  if (leftFit !== rightFit) return leftFit ? -1 : 1;
-  return (left.tag || "").localeCompare(right.tag || "");
-}
-
-function localModelFits(model: LocalModel): boolean {
-  return model.downloadable !== false && model.fit !== "too-large" && model.diskFit !== "too-large";
-}
-
-function catalogVisibleTagCount(families: CatalogFamily[]): number {
-  return families.reduce((count, family) => count + family.models.length, 0);
-}
-
-function familySummary(models: LocalModel[]): string {
-  const fit = models.filter(localModelFits).length;
-  const cloud = models.filter((model) => model.downloadable === false).length;
-  if (cloud === models.length) return "cloud only";
-  if (fit === models.length) return "all fit this machine";
-  if (fit && cloud) return `${fit} fit · ${cloud} cloud`;
-  if (fit) return `${fit} fit`;
-  if (cloud) return `${cloud} cloud`;
-  return "no local variant fits";
-}
-
-function CatalogModelRow({ model, onSelect }: { model: LocalModel; onSelect: () => void }) {
-  const downloadable = model.downloadable !== false;
-  const tooLarge = model.fit === "too-large" || model.diskFit === "too-large";
-  const fitLabel = model.downloadable === false
-    ? "Cloud only"
-    : tooLarge
-      ? "Too large"
-      : model.fit === "tight" || model.diskFit === "tight"
-        ? "Memory tight"
-        : "Fits this machine";
-  const tone = model.downloadable === false ? "neutral" : tooLarge ? "danger" : model.fit === "tight" ? "warning" : "success";
-  return (
-    <article className="lhc-catalog-model">
-      <Box aria-hidden size={14} strokeWidth={1.7} />
-      <div className="lhc-catalog-model-identity">
-        <strong>{model.displayName || model.label || model.tag}</strong>
-        <small>{model.tag}{model.sizeGb !== undefined ? ` · ${formatBytesGb(model.sizeGb)}` : ""}{model.context ? ` · ${compactNumber(model.context)} context` : ""}</small>
-      </div>
-      <Badge tone={tone}>{fitLabel}</Badge>
-      <Button variant="ghost" disabled={!downloadable || tooLarge} onClick={onSelect}>
-        <Download aria-hidden size={13} strokeWidth={1.7} /> Select
-      </Button>
-    </article>
   );
 }
 
 function DownloadProgress({ tag, percent, detail }: { tag?: string; percent?: number; detail?: string }) {
   return (
     <div className="download-progress">
-      <div><strong>{tag || "Local model"}</strong><span>{Math.round(percent || 0)}%</span></div>
+      <div><strong>{tag || "Vision reader"}</strong><span>{Math.round(percent || 0)}%</span></div>
       <progress max="100" value={percent || 0} />
       <small>{detail || "Preparing download"}</small>
     </div>
   );
 }
 
-function LocalModelRow({ model, enabled, disabled, onToggle, onBenchmark, onRemove }: {
+function InstalledVisionRow({ model, enabled, disabled, onToggle, onBenchmark }: {
   model: LocalModel;
   enabled: boolean;
   disabled: boolean;
   onToggle: (enabled: boolean) => void;
   onBenchmark: () => void;
-  onRemove: () => void;
 }) {
-  const speed = model.observedTokensPerSecond ?? model.speed;
   return (
     <article className="local-model-row">
       <div className="model-identity">
@@ -445,13 +255,12 @@ function LocalModelRow({ model, enabled, disabled, onToggle, onBenchmark, onRemo
       </div>
       <div className="local-model-facts">
         <span>{formatBytesGb(model.sizeGb)}</span>
-        <span>{model.context ? `${compactNumber(model.context)} context` : "Context unreported"}</span>
-        <span>{Number.isFinite(Number(speed)) ? `${Number(speed).toFixed(1)} tok/s` : "Speed unmeasured"}</span>
+        <span>{model.vision ? "Image input" : "Text-only"}</span>
+        <span>{model.running ? "Loaded" : "Not loaded"}</span>
       </div>
       <div className="row-actions">
-        <Button variant="ghost" disabled={disabled} onClick={onBenchmark}><Gauge aria-hidden size={14} strokeWidth={1.7} /> Measure</Button>
-        <Button variant="ghost" disabled={disabled} aria-label={`Remove ${model.tag}`} onClick={onRemove}><Trash2 aria-hidden size={14} strokeWidth={1.7} /></Button>
-        <Toggle checked={enabled} disabled={disabled} label={`Enable ${model.tag} for Codex`} onChange={onToggle} />
+        <Button variant="ghost" disabled={disabled || !model.vision} onClick={onBenchmark}><Gauge aria-hidden size={14} strokeWidth={1.7} /> Measure</Button>
+        <Toggle checked={enabled} disabled={disabled || !model.vision} label={`Make ${model.tag} available to Vision`} onChange={onToggle} />
       </div>
     </article>
   );

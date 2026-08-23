@@ -904,9 +904,24 @@ function main() {
     hidden: hiddenModels,
     authorized: openaiAuthenticated && !loginFree,
   });
+  const configuredProviders = new Set(configuredProviderIds());
+  // Vision readers come from the same verified Node route set as dispatch.
+  // Legacy registry models may still exist in an operator's old user-models
+  // file, but they are not an Appendix-H reader merely because they declare
+  // image input.
+  const selectedVisionModels = nodeRoutableModels({
+    enabledProviders: configuredProviders,
+    hiddenModels: hiddenModels,
+  });
   const visionEngine = resolveVisionEngine(
-    () => [...selectedModels, ...nativeEngines],
+    () => [...selectedVisionModels, ...nativeEngines],
     readVisionBridgeSettings(),
+    {
+      strict: true,
+      callerSession: { usable: openaiAuthenticated && !loginFree },
+      enabledProviders: configuredProviders,
+      credentialedProviders: configuredProviders,
+    },
   );
   const catalogModels = applyVisionBridge(routedModels, visionEngine);
   const { models: merged, aliases } = loginFree

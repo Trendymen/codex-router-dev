@@ -178,12 +178,9 @@ test("codex probe includes native GPT models and the configured default", () => 
   assert.ok(["all", "selected", "proven"].includes(slice.modelSettings.subagents.mode));
   // Compaction is opt-in, so an unconfigured probe reports it off.
   assert.equal(slice.modelSettings.toolResultAging.enabled, false);
-  // The panel's periodic refresh reads this snapshot, not `local-models
-  // list`, so the LM Studio section has to ride here or it paints once and
-  // vanishes on the next poll.
-  assert.equal(slice.modelSettings.localModels.lmstudio.provider, "lmstudio");
-  assert.equal(typeof slice.modelSettings.localModels.lmstudio.reachable, "boolean");
-  assert.ok(Array.isArray(slice.modelSettings.localModels.lmstudio.models));
+  // Local inventory is Vision-only; stale LM Studio chat sections are absent.
+  assert.equal("lmstudio" in slice.modelSettings.localModels, false);
+  assert.ok(Array.isArray(slice.modelSettings.localModels.availableVision));
 });
 
 // The row is the whole feature: an entry the operator cannot find is an entry

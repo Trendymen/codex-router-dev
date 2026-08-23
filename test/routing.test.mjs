@@ -118,6 +118,63 @@ async function closeServer(server) {
   await new Promise((resolve) => server.close(resolve));
 }
 
+test("API forwarder rejects stale local and LM Studio user-model routes", async () => {
+  const testRoot = mkdtempSync(path.join(os.tmpdir(), "api-forwarder-local-boundary-"));
+  const userModels = path.join(testRoot, "user-models.json");
+  writeFileSync(
+    userModels,
+    `${JSON.stringify({
+      version: 1,
+      models: [
+        {
+          slug: "local/qwen2.5vl",
+          gatewayModel: "local-qwen2-5vl",
+          upstreamModel: "qwen2.5vl",
+          provider: "local",
+          listed: true,
+          inputModalities: ["text", "image"],
+        },
+        {
+          slug: "lmstudio/qwen2.5vl",
+          gatewayModel: "lmstudio-qwen2-5vl",
+          upstreamModel: "qwen2.5vl",
+          provider: "lmstudio",
+          listed: true,
+          inputModalities: ["text", "image"],
+        },
+      ],
+    })}\n`,
+    { mode: 0o600 },
+  );
+  const forwarderPort = await openPort();
+  const forwarder = run("api-forwarder.mjs", {
+    MODEL_ROUTER_USER_MODELS: userModels,
+    CODEX_ROUTER_API_PORT: String(forwarderPort),
+  });
+  try {
+    await waitFor(`http://127.0.0.1:${forwarderPort}/health`, forwarder, {
+      Authorization: `Bearer ${INTERNAL_KEY}`,
+    });
+    for (const model of ["local-qwen2-5vl", "lmstudio-qwen2-5vl"]) {
+      const response = await fetch(`http://127.0.0.1:${forwarderPort}/v1/chat/completions`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${INTERNAL_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ model, messages: [{ role: "user", content: "hello" }] }),
+      });
+      assert.equal(response.status, 400);
+      const body = await response.text();
+      assert.match(body, /provider_api_proxy_error/);
+      assert.doesNotMatch(body, /local-qwen|lmstudio-qwen|Unknown API gateway model/);
+    }
+  } finally {
+    await stopChild(forwarder);
+    rmSync(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("router health waits for enabled dependencies and ignores disabled forwarders", async () => {
   const testRoot = mkdtempSync(path.join(os.tmpdir(), "router-health-selection-"));
   writeFileSync(

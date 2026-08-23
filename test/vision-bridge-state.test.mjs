@@ -20,6 +20,7 @@ const {
   visionBridgeSnapshot,
 } = await import("../src/vision-bridge-state.mjs");
 const { resolveVisionEngine } = await import("../src/vision-bridge.mjs");
+const { resolveVisionReader } = await import("../src/vision-reader-policy.mjs");
 
 function forgetState() {
   rmSync(VISION_BRIDGE_STATE_PATH, { force: true });
@@ -161,4 +162,21 @@ test("a reasoning effort is pinned and cleared on its own, without touching the 
   setVisionBridgeEffort(null);
   assert.equal(readVisionBridgeSettings().effort, null);
   assert.equal(readVisionBridgeSettings().engine, "gpt-5.6-luna");
+});
+
+test("a stale legacy reader pin fails closed instead of becoming a chat provider", () => {
+  const legacy = {
+    slug: "deepseek/deepseek-legacy-vision",
+    provider: "deepseek",
+    inputModalities: ["text", "image"],
+  };
+  assert.equal(
+    resolveVisionReader(legacy.slug, {
+      strict: true,
+      selectedNodeModels: [legacy],
+      enabledProviders: new Set(["deepseek"]),
+      credentialedProviders: new Set(["deepseek"]),
+    }),
+    null,
+  );
 });

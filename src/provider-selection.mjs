@@ -12,7 +12,12 @@ import { fileURLToPath } from "node:url";
 import { discoveryDisabled } from "./discovery-mode.mjs";
 import { protectPrivateFile } from "./file-security.mjs";
 import { PROVIDER_SELECTION_PATH, STATE_DIR, TARGET } from "./paths.mjs";
-import { LISTED_MODELS, PROVIDERS, providerNeedsNoKey } from "./model-registry.mjs";
+import {
+  LISTED_MODELS,
+  PROVIDERS,
+  isChatProvider,
+  providerNeedsNoKey,
+} from "./model-registry.mjs";
 import { targetCli } from "./target-integration.mjs";
 import { kimiOAuthStatus } from "./oauth-status.mjs";
 import { grokOAuthStatus } from "./grok-oauth-status.mjs";
@@ -22,7 +27,7 @@ import { transactNodeMutationAndRefreshTargets } from "./node-snapshot-triggers.
 const RETIRED_PROVIDER_ALIASES = new Map([["chatgpt-oauth", "grok-oauth"]]);
 
 function providerIds() {
-  return [...PROVIDERS.keys()];
+  return [...PROVIDERS.values()].filter(isChatProvider).map((provider) => provider.id);
 }
 
 // Protocol variants (registry `variantOf`) share their parent's credential and
@@ -60,6 +65,9 @@ export function validateProviderIds(values) {
   const named = resolveProviderIds(values);
   for (const id of named) {
     if (!PROVIDERS.has(id)) throw new Error(`Unknown provider: ${id}`);
+    if (!isChatProvider(PROVIDERS.get(id))) {
+      throw new Error(`Provider ${id} is vision-only and cannot be enabled for chat.`);
+    }
   }
   return [...new Set(named.map((id) => canonicalProviderId(id)))];
 }
@@ -74,7 +82,7 @@ function filterKnownProviderIds(values) {
   const known = [];
   const unknown = [];
   for (const id of resolveProviderIds(values)) {
-    if (PROVIDERS.has(id)) known.push(canonicalProviderId(id));
+    if (PROVIDERS.has(id) && isChatProvider(PROVIDERS.get(id))) known.push(canonicalProviderId(id));
     else unknown.push(id);
   }
   return { known: [...new Set(known)], unknown: [...new Set(unknown)] };
@@ -88,6 +96,7 @@ export function configuredProviderIds() {
   if (discoveryDisabled()) return [];
   const configured = [];
   for (const provider of PROVIDERS.values()) {
+    if (!isChatProvider(provider)) continue;
     if (provider.kind === "oauth") {
       if (provider.id === "kimi-oauth" && kimiOAuthStatus().configured) {
         configured.push(provider.id);

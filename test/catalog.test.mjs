@@ -1134,6 +1134,44 @@ test("a bridged text-only model advertises image input, and only through the bri
   assert.equal(entry.supports_image_detail_original, false);
 });
 
+test("stale local and LM Studio user models cannot enter chat registry artifacts", async () => {
+  const {
+    API_MODELS,
+    LISTED_MODELS,
+    MODEL_BY_GATEWAY_ID,
+    MODELS,
+    PROVIDERS,
+  } = await import("../src/model-registry.mjs");
+  for (const providerId of ["local", "lmstudio"]) {
+    assert.equal(PROVIDERS.get(providerId)?.visionOnly, true, `${providerId} must be vision-only`);
+    assert.equal(LISTED_MODELS.some((model) => model.provider === providerId), false);
+    assert.equal(API_MODELS.some((model) => model.provider === providerId), false);
+    assert.equal(MODELS.some((model) => model.provider === providerId), false);
+  }
+  for (const model of MODEL_BY_GATEWAY_ID.values()) {
+    assert.notEqual(model.provider, "local");
+    assert.notEqual(model.provider, "lmstudio");
+  }
+});
+
+test("local model weight paths remain outside router deletion targets", async () => {
+  const { readFileSync } = await import("node:fs");
+  const source = readFileSync(new URL("../src/local-uninstall.mjs", import.meta.url), "utf8");
+  assert.doesNotMatch(source, /ollama["'`,\s]+\[?[^\n]*["']rm["']/i);
+  assert.doesNotMatch(source, /removeLocalModelFromDisk/);
+});
+
+test("Control Center local surface is Vision-only and cannot publish chat models", async () => {
+  const { readFileSync } = await import("node:fs");
+  const page = readFileSync(
+    new URL("../apps/control-center/src/pages/LocalPage.tsx", import.meta.url),
+    "utf8",
+  );
+  const ipc = readFileSync(new URL("../apps/control-center/electron/ipc.mjs", import.meta.url), "utf8");
+  assert.doesNotMatch(page, /availableExplore|For coding|Enable .*Codex|Remove local model|uninstallLocalModel/);
+  assert.doesNotMatch(ipc, /handleAction\("uninstallLocalModel"|handleAction\("benchmarkLocalModel"/);
+});
+
 
 test("efficient routed execution closes a RED behavior area before switching", () => {
   const model = routedModel(template, { ...grok, instructionOverlay: "efficient-agentic" });

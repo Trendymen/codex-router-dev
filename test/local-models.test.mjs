@@ -10,6 +10,7 @@ const stateDir = mkdtempSync(path.join(os.tmpdir(), "local-models-test-"));
 // that mutates the selection injects this stub instead.
 const NO_OLLAMA = { capabilitiesFor: () => ["completion", "tools"] };
 process.env.CODEX_ROUTER_STATE_DIR = stateDir;
+process.env.MODEL_ROUTER_USER_MODELS = path.join(stateDir, "user-models.json");
 
 const {
   CODEX_PROMPT_TOKENS,
@@ -90,41 +91,25 @@ test("the snapshot joins installed, checked, loaded, and vision state", () => {
   // even though nothing in its name says so.
   assert.equal(byTag["qwen2.5vl:3b"].vision, true);
   assert.equal(byTag["gemma3:4b"].vision, true);
-  // None of these can call tools, so none can be a Codex chat model.
-  assert.equal(snapshot.usableAsChat, 0);
+  assert.equal("usableAsChat" in snapshot, false);
+  assert.equal("tools" in byTag["gemma3:4b"], false);
   assert.deepEqual(snapshot.runtime, { installed: true, running: true, version: "0.1.0" });
 });
 
-test("removing a model needs explicit consent and unchecks it", () => {
+test("withdrawing a model never deletes its local weights", () => {
   setLocalModelEnabled("doomed:latest", true, NO_OLLAMA);
-  assert.throws(
-    () => removeLocalModel("doomed:latest", { spawn: () => ({ status: 0 }) }),
-    /deletes it from disk/,
-  );
-  // Refused without consent, so it is still checked and still on disk.
-  assert.ok(readLocalModelSelection().enabled.includes("doomed:latest"));
-
   let called;
   removeLocalModel("doomed:latest", {
-    ...NO_OLLAMA,
-    confirmed: true,
     spawn: (bin, args) => { called = { bin, args }; return { status: 0 }; },
   });
-  assert.deepEqual(called, { bin: "ollama", args: ["rm", "doomed:latest"] });
-  // A model that is gone must not stay checked.
+  assert.equal(called, undefined);
   assert.ok(!readLocalModelSelection().enabled.includes("doomed:latest"));
 });
 
-test("a failed removal surfaces ollama's own message", () => {
-  assert.throws(
-    () =>
-      removeLocalModel("missing", {
-        ...NO_OLLAMA,
-        confirmed: true,
-        spawn: () => ({ status: 1, stderr: "model 'missing' not found" }),
-      }),
-    /model 'missing' not found/,
-  );
+test("withdrawing an unknown model is idempotent and does not call Ollama rm", () => {
+  let called = false;
+  assert.equal(removeLocalModel("missing", { spawn: () => { called = true; return { status: 1 }; } }), "missing");
+  assert.equal(called, false);
 });
 
 test("ollama's reported capabilities are parsed, not guessed from the name", async () => {
@@ -146,7 +131,7 @@ test("ollama's reported capabilities are parsed, not guessed from the name", asy
   assert.deepEqual(parseOllamaCapabilities("no capabilities section here"), []);
 });
 
-test("a model without tool support is never published to the Codex picker", async () => {
+test("local model checks never publish a Codex picker entry", async () => {
   const { syncLocalUserModels } = await import("../src/local-models.mjs");
   const caps = {
     "qwen3:4b": ["completion", "tools"],
@@ -158,16 +143,10 @@ test("a model without tool support is never published to the Codex picker", asyn
     enabled: ["qwen3:4b", "qwen2.5vl:3b", "gemma3:4b", "moondream:latest"],
     capabilitiesFor: (tag) => caps[tag] || [],
   });
-  // Codex cannot drive a toolless model, so publishing one hands the operator
-  // a picker entry that fails on its first turn.
-  assert.deepEqual(entries.map((e) => e.upstreamModel), ["qwen3:4b", "qwen2.5vl:3b"]);
-  // Image input is claimed only where Ollama reports vision.
-  const byId = Object.fromEntries(entries.map((e) => [e.upstreamModel, e]));
-  assert.deepEqual(byId["qwen3:4b"].inputModalities, ["text"]);
-  assert.deepEqual(byId["qwen2.5vl:3b"].inputModalities, ["text", "image"]);
+  assert.deepEqual(entries, []);
 });
 
-test("the snapshot reports how many checked models Codex can actually drive", async () => {
+test("the snapshot does not report local chat capability", async () => {
   const { localModelsSnapshot, parseOllamaList } = await import("../src/local-models.mjs");
   const snapshot = localModelsSnapshot({
     inventory: parseOllamaList(
@@ -178,9 +157,9 @@ test("the snapshot reports how many checked models Codex can actually drive", as
     capabilities: { "qwen3:4b": ["completion", "tools"], "gemma3:4b": ["completion", "vision"] },
   });
   assert.equal(snapshot.enabled, 2);
-  assert.equal(snapshot.usableAsChat, 1);
+  assert.equal("usableAsChat" in snapshot, false);
   const byTag = Object.fromEntries(snapshot.models.map((m) => [m.tag, m]));
-  assert.equal(byTag["gemma3:4b"].tools, false);
+  assert.equal("tools" in byTag["gemma3:4b"], false);
   assert.equal(byTag["gemma3:4b"].vision, true);
 });
 
@@ -418,15 +397,9 @@ test("the listing renders for a person, not only for the tray", () => {
   });
   const rendered = renderLocalModels(snapshot);
 
-  // The checkbox is what offers a model to Codex, so it leads each row.
-  assert.match(rendered, /\[x\] llama3\.2:3b\s+2\.0 GB\s+code\s+· loaded/);
-  // A model Codex cannot drive must say so where the choice is made.
-  assert.match(rendered, /\[ \] gemma3:4b\s+3\.3 GB\s+images only/);
-  // The two groups answer different questions and are never merged.
-  assert.match(rendered, /For coding — experimental/);
-  assert.match(rendered, /For reading images only — cannot code:/);
-  assert.match(rendered, /Explore Ollama tags/);
-  assert.match(rendered, /qwen3\.5:cloud\s+cloud only · not downloadable/);
+  assert.match(rendered, /\[x\] llama3\.2:3b\s+2\.0 GB\s+text-only\s+· loaded/);
+  assert.match(rendered, /\[ \] gemma3:4b\s+3\.3 GB\s+image reader/);
+  assert.doesNotMatch(rendered, /For coding|Explore Ollama tags|agent-check|tok\/s/);
   assert.match(rendered, /control local-models install .* --yes/);
 });
 
@@ -436,7 +409,7 @@ test("an empty machine reads as empty rather than as a broken table", () => {
   );
   assert.match(rendered, /Installed: none yet/);
   // The whole point of the empty state is that it says what to do next.
-  assert.match(rendered, /For coding/);
+  assert.doesNotMatch(rendered, /For coding|codex|agent-check/);
 });
 
 test("coding models are separated from image readers", () => {
@@ -648,16 +621,9 @@ test("only a model observed driving Codex is marked verified", () => {
   assert.ok(suggestions[1].sizeGb < suggestions[0].sizeGb);
 });
 
-test("the listing says how little room Codex leaves in the window", () => {
+test("the listing does not expose coding context or agent claims", () => {
   const rendered = renderLocalModels(
     localModelsSnapshot({ inventory: [], running: [], selection: { version: 1, enabled: [] } }),
   );
-  // Native context above the advertised cap buys nothing, so the number that
-  // matters is what is left after Codex's own prompt.
-  assert.match(rendered, /For coding — experimental/);
-  // Derived from the measured constant rather than restated, so the copy and
-  // the measurement cannot drift apart.
-  assert.match(rendered, new RegExp(`${Math.round(CODEX_PROMPT_TOKENS / 1000)}K of the 32K window`));
-  assert.match(rendered, /agent-check/);
+  assert.doesNotMatch(rendered, /For coding|window|agent-check|Codex/);
 });
-

@@ -16,6 +16,7 @@ import {
   API_MODELS,
   MODEL_BY_GATEWAY_ID,
   PROVIDERS,
+  isChatProvider,
   providerForModel,
   endpointForModel,
   resolveProviderBaseUrl,
@@ -549,7 +550,7 @@ function normalizeBody(buffer, contentType, route) {
     MODEL_BY_GATEWAY_ID.get(requestedModel.replace(/^responses\//, "")) ||
     MODEL_BY_GATEWAY_ID.get(requestedModel);
   const provider = model && providerForModel(model);
-  if (!model || provider?.kind !== "openai-compatible") {
+  if (!model || !isChatProvider(provider) || provider?.kind !== "openai-compatible") {
     const error = new Error(`Unknown API gateway model: ${String(payload.model || "missing")}`);
     error.status = 400;
     throw error;
@@ -926,7 +927,7 @@ function healthPayload() {
   const providers = {};
   const enabled = new Set(readProviderSelection());
   for (const provider of PROVIDERS.values()) {
-    if (provider.kind !== "openai-compatible" || !enabled.has(provider.id)) continue;
+    if (!isChatProvider(provider) || provider.kind !== "openai-compatible" || !enabled.has(provider.id)) continue;
     const status = credentialStatus(provider);
     providers[provider.id] = {
       credential_present: status.configured,

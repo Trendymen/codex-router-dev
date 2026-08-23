@@ -84,9 +84,7 @@ export interface RouterControl {
   setPickerModel(slug: string, visible: boolean): Promise<unknown>;
   setPickerModels(showAll: boolean): Promise<unknown>;
   installLocalModel(model: string, force?: boolean): Promise<unknown>;
-  uninstallLocalModel(model: string): Promise<unknown>;
   setLocalModelEnabled(model: string, enabled: boolean): Promise<unknown>;
-  benchmarkLocalModel(model: string): Promise<unknown>;
   controlLocalRuntime(action: "start" | "update"): Promise<unknown>;
   setVisionBridgeEnabled(enabled: boolean): Promise<unknown>;
   setVisionBridgeEngine(engine: string, effort?: VisionEffort): Promise<unknown>;

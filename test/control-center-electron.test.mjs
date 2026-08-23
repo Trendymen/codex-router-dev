@@ -380,9 +380,7 @@ test("preload constructs exact positional IPC payloads", async () => {
     ["setPickerModel", ["model", false], { slug: "model", visible: false }],
     ["setPickerModels", [true], { showAll: true }],
     ["installLocalModel", ["model:latest", true], { tag: "model:latest", force: true, yes: true }],
-    ["uninstallLocalModel", ["model:latest"], { tag: "model:latest" }],
     ["setLocalModelEnabled", ["model:latest", false], { tag: "model:latest", enabled: false }],
-    ["benchmarkLocalModel", ["model:latest"], { tag: "model:latest" }],
     ["controlLocalRuntime", ["start"], { action: "start" }],
     ["setVisionBridgeEnabled", [true], { enabled: true }],
     ["setVisionBridgeEngine", ["auto", "high"], { engine: "auto", effort: "high" }],
@@ -596,7 +594,7 @@ test("local model mutations cover service readiness and validate consent flags",
   assert.match(source, /typeof yes !== "boolean"/);
   assert.match(source, /typeof force !== "boolean"/);
   assert.match(source, /local-models", "install"[\s\S]{0,260}timeoutMs: 330_000/);
-  assert.match(source, /local-models", "uninstall"[\s\S]{0,180}timeoutMs: 330_000/);
+  assert.doesNotMatch(source, /local-models", "uninstall"/);
   assert.match(source, /local-models", "set"[\s\S]{0,240}timeoutMs: 330_000/);
 });
 

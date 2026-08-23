@@ -48,34 +48,20 @@ export interface LocalModel {
   sizeGb?: number;
   enabled?: boolean;
   installed?: boolean;
-  tools?: boolean;
-  context?: number;
   inputModalities?: string[];
-  speed?: number;
-  observedTokensPerSecond?: number;
-  codex?: string;
-  fit?: string;
-  diskFit?: string;
   accuracy?: string;
-  recommended?: boolean;
   fits?: boolean;
   downloadable?: boolean;
   measured?: { percent?: number; textPercent?: number; seconds?: number };
   measuredLocally?: boolean;
   note?: string;
-  researchStatus?: string;
-  researchCapabilities?: string[];
-  researchNote?: string;
 }
 
 export interface LocalModelsSnapshot {
-  available?: boolean | LocalModel[];
   installed?: string[] | number;
   enabled?: string[] | number;
   models?: LocalModel[];
-  availableExplore?: LocalModel[];
   availableVision?: LocalModel[];
-  families?: Array<{ family: string; displayName: string; variants?: string[] }>;
   machine?: string;
   totalGb?: number;
   runtime?: {
@@ -464,9 +450,7 @@ export interface RouterControlApi {
   setPickerModel(slug: string, visible: boolean): Promise<unknown>;
   setPickerModels(showAll: boolean): Promise<unknown>;
   installLocalModel(model: string, force?: boolean): Promise<unknown>;
-  uninstallLocalModel(model: string): Promise<unknown>;
   setLocalModelEnabled(model: string, enabled: boolean): Promise<unknown>;
-  benchmarkLocalModel(model: string): Promise<unknown>;
   controlLocalRuntime(action: "start" | "update"): Promise<unknown>;
   setVisionBridgeEnabled(enabled: boolean): Promise<VisionBridgeSnapshot>;
   setVisionBridgeEngine(engine: string, effort?: string): Promise<VisionBridgeSnapshot>;

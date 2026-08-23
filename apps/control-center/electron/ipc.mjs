@@ -761,12 +761,10 @@ export function registerIpcHandlers({ ipcMain, BrowserWindow, shell, fetchImpl =
     if (force) args.push("--force");
     return runJson(args, { timeoutMs: 330_000 });
   });
-  handleAction("uninstallLocalModel", async ({ tag } = {}) => runJson(["local-models", "uninstall", validateLocalTag(tag), "--yes"], { timeoutMs: 330_000 }));
   handleAction("setLocalModelEnabled", async ({ tag, enabled } = {}) => {
     if (typeof enabled !== "boolean") throw new Error("enabled must be boolean.");
     return runJson(["local-models", "set", validateLocalTag(tag), enabled ? "on" : "off"], { timeoutMs: 330_000 });
   });
-  handleAction("benchmarkLocalModel", async ({ tag } = {}) => runJson(["local-models", "benchmark", validateLocalTag(tag)], { timeoutMs: 5 * 60_000 }));
   handleAction("controlLocalRuntime", async ({ action } = {}) => {
     const value = oneOf(action, LOCAL_RUNTIME_COMMANDS, "Local runtime action");
     return runJson(["local-models", "runtime", value, "--yes"], { timeoutMs: 5 * 60_000 });

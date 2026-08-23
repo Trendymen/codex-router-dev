@@ -1,10 +1,5 @@
 import { PROVIDERS, resolveProviderBaseUrl } from "./model-registry.mjs";
-import {
-  disableProvider,
-  enableProvider,
-  readProviderSelection,
-} from "./provider-selection.mjs";
-import { readUserModels, userModelEntry, writeUserModels } from "./user-models.mjs";
+import { readUserModels, writeUserModels } from "./user-models.mjs";
 
 // LM Studio is the operator's own software serving models it already manages,
 // so the router only ever reads and reports what the server offers -- the same
@@ -34,7 +29,10 @@ function lmstudioProvider() {
 }
 
 export function curatedLmstudioModels(models = readUserModels()) {
-  return models.filter((model) => model.provider === LMSTUDIO_PROVIDER_ID);
+  // LM Studio remains a possible Vision reader, never a Codex chat route.
+  // Stale user-model entries are deliberately ignored and are withdrawn by
+  // setLmstudioModelEnabled below without touching LM Studio's weights.
+  return [];
 }
 
 export function isLmstudioModelEnabled(id, models = readUserModels()) {
@@ -91,19 +89,15 @@ export async function lmstudioSnapshot({
       .filter((model) => !servedSet.has(model.upstreamModel))
       .map((model) => ({ id: model.upstreamModel, enabled: true, served: false })),
   ].sort((left, right) => (left.id < right.id ? -1 : left.id > right.id ? 1 : 0));
-  let providerEnabled;
-  try {
-    providerEnabled = readProviderSelection().includes(LMSTUDIO_PROVIDER_ID);
-  } catch {
-    providerEnabled = undefined;
-  }
   return {
     provider: LMSTUDIO_PROVIDER_ID,
     displayName: provider?.displayName || "LM Studio",
     reachable: served.reachable,
     baseUrl: served.baseUrl,
     enabled: models.filter((model) => model.enabled).length,
-    providerEnabled,
+    providerEnabled: false,
+    visionOnly: true,
+    chatEnabled: false,
     models,
   };
 }
@@ -112,63 +106,16 @@ export async function lmstudioSnapshot({
 // selection file is shared state, and a checkbox that publishes the model but
 // cannot flip the provider beats one that fails outright.
 export function syncLmstudioProviderSelection(shouldEnable) {
-  try {
-    const enabled = readProviderSelection().includes(LMSTUDIO_PROVIDER_ID);
-    if (shouldEnable && !enabled) enableProvider(LMSTUDIO_PROVIDER_ID);
-    if (!shouldEnable && enabled) disableProvider(LMSTUDIO_PROVIDER_ID);
-    return shouldEnable;
-  } catch {
-    return undefined;
-  }
+  return false;
 }
 
-// Checking a model publishes it through the same user-model overlay that
-// `curate-models lmstudio` writes, so the panel and the interactive CLI are
-// two doors to one state -- neither can strand the other's entries.
+// Checking a model only withdraws any stale chat overlay.  LM Studio's own
+// model store remains intact for an explicit Vision reader pin.
 export function setLmstudioModelEnabled(id, enabled) {
   const value = String(id || "").trim();
   if (!value) throw new Error("A model id is required.");
   const existing = readUserModels();
   const others = existing.filter((model) => model.provider !== LMSTUDIO_PROVIDER_ID);
-  const mine = existing.filter(
-    (model) => model.provider === LMSTUDIO_PROVIDER_ID && model.upstreamModel !== value,
-  );
-  const next = enabled
-    ? [
-        ...mine,
-        {
-          ...userModelEntry({
-            providerId: LMSTUDIO_PROVIDER_ID,
-            upstreamId: value,
-            priority: LMSTUDIO_MODEL_PRIORITY,
-            metadata: {
-              contextWindow: LMSTUDIO_CONTEXT_WINDOW,
-              autoCompact: LMSTUDIO_AUTO_COMPACT,
-              description: `${value} served by LM Studio on this machine.`,
-            },
-          }),
-          // "experimental" is a promise AGENTS.md forbids dropping: driving a
-          // Codex turn locally is unproven per-model, and nothing here has
-          // verified this one can dispatch tool calls at all.
-          displayName: `${value} (LM Studio, experimental)`,
-          // The same conservative choices the Ollama publish path makes, for
-          // the same reasons: apply_patch is a freeform custom tool with no
-          // clean representation in an OpenAI-compatible tool schema, and no
-          // local model has been shown here to drive subagents.
-          supportsApplyPatchTool: false,
-          multiAgentVersion: "v1",
-        },
-      ]
-    : mine;
-  // Renumbered on every write rather than assigned once: a priority derived
-  // from the list length at toggle time collides after a disable/re-enable
-  // cycle (enable A,B,C; disable B; re-enable B lands on C's number). Kept as
-  // a renumber, not a rebuild, so metadata curate-models asked for survives.
-  const entries = next.map((entry, index) => ({
-    ...entry,
-    priority: LMSTUDIO_MODEL_PRIORITY + index,
-  }));
-  writeUserModels([...others, ...entries]);
-  syncLmstudioProviderSelection(entries.length > 0);
-  return entries;
+  writeUserModels(others);
+  return [];
 }

@@ -187,7 +187,7 @@ async function emitProbe() {
   const { CONFIG_PATH, NATIVE_CATALOG_PATH, TARGET, PROVIDER_SELECTION_PATH } =
     await import("./paths.mjs");
   const { canonicalProviderId, readProviderSelection } = await import("./provider-selection.mjs");
-  const { LISTED_MODELS, PROVIDERS } = await import("./model-registry.mjs");
+  const { LISTED_MODELS, PROVIDERS, isChatProvider } = await import("./model-registry.mjs");
   const { readNativeAliases } = await import("./native-alias.mjs");
   const { subagentSettingsSnapshot } = await import("./multi-agent-state.mjs");
   const { modelPickerSnapshot } = await import("./model-picker-state.mjs");
@@ -214,7 +214,9 @@ async function emitProbe() {
     "./local-models.mjs",
   );
   const { localOllamaRuntimeSnapshot } = await import("./ollama-runtime.mjs");
-  const { selectedConfiguredListedModels } = await import("./provider-selection.mjs");
+  const { selectedConfiguredListedModels, configuredProviderIds } = await import("./provider-selection.mjs");
+  const { nodeRoutableModels } = await import("./model-contract.mjs");
+  const { codexAuthStatus } = await import("./codex-binary.mjs");
   // Bounded and weekly: the tray reads this snapshot constantly, so a fresh
   // cache costs nothing and a stale one costs one short, failure-tolerant pass.
   if (TARGET === "codex") await refreshVisionModelSizesIfStale();
@@ -287,6 +289,7 @@ async function emitProbe() {
       enabledProviders,
       providers: [...PROVIDERS.values()]
         .filter((provider) => !provider.variantOf)
+        .filter((provider) => isChatProvider(provider))
         .map((provider) => ({
           id: provider.id,
           displayName: provider.displayName,
@@ -327,13 +330,13 @@ async function emitProbe() {
                   runtime: localRuntime,
                   benchmarks: localAndVisionBenchmarks,
                 }),
-                // The panel's periodic refresh reads this snapshot, not
-                // `local-models list`, so the LM Studio section must ride
-                // here too or it paints once and vanishes on the next poll.
-                lmstudio: await (await import("./lmstudio-models.mjs")).lmstudioSnapshot(),
               },
               visionBridge: (() => {
-                const candidates = selectedConfiguredListedModels();
+                const configured = new Set(configuredProviderIds());
+                const candidates = nodeRoutableModels({
+                  enabledProviders: new Set(enabledProviders),
+                  hiddenModels,
+                }).filter((model) => configured.has(model.provider));
                 // Only the native models that actually shipped into the picker.
                 // A signed-out or login-free install has none, and offering one
                 // there would pin an engine the router cannot reach. Same rule
@@ -344,6 +347,14 @@ async function emitProbe() {
                 const resolved = resolveVisionEngine(
                   () => [...candidates, ...natives],
                   readVisionBridgeSettings(),
+                  {
+                    strict: true,
+                    callerSession: {
+                      usable: codexAuthStatus().authenticated === true && !codexConfig?.login_free,
+                    },
+                    enabledProviders: new Set(enabledProviders),
+                    credentialedProviders: configured,
+                  },
                 );
                 return {
                   ...visionBridgeSnapshot(),
@@ -1445,12 +1456,27 @@ async function handleVisionBridge(action, value, extra) {
     resolveVisionEngine,
     visionEngineEfforts,
   } = await import("./vision-bridge.mjs");
-  const { selectedConfiguredListedModels } = await import("./provider-selection.mjs");
+  const { configuredProviderIds, readProviderSelection } = await import("./provider-selection.mjs");
+  const { nodeRoutableModels } = await import("./model-contract.mjs");
+  const { codexAuthStatus } = await import("./codex-binary.mjs");
+  const { visionEngineNotSupportedError } = await import("./vision-reader-policy.mjs");
   const nativeEngines = await shippedNativeVisionEngines();
   const snapshot = () => {
-    const candidates = [...selectedConfiguredListedModels(), ...nativeEngines];
+    const configured = new Set(configuredProviderIds());
+    const candidates = [
+      ...nodeRoutableModels({
+        enabledProviders: new Set(readProviderSelection()),
+        hiddenModels: new Set(),
+      }).filter((model) => configured.has(model.provider)),
+      ...(codexAuthStatus().authenticated === true ? nativeEngines : []),
+    ];
     const settings = readVisionBridgeSettings();
-    const resolved = resolveVisionEngine(() => candidates, settings);
+    const resolved = resolveVisionEngine(() => candidates, settings, {
+      strict: true,
+      callerSession: { usable: codexAuthStatus().authenticated === true },
+      enabledProviders: new Set(readProviderSelection()),
+      credentialedProviders: configured,
+    });
     return {
       ...visionBridgeSnapshot(),
       // The local engine is a real answer even when no paid vision model is
@@ -1636,19 +1662,18 @@ async function handleVisionBridge(action, value, extra) {
   } else if (action === "engine") {
     const slug = String(value || "").trim();
     if (slug && slug !== "auto" && slug !== LOCAL_ENGINE_SLUG) {
-      // Must accept everything the picker offers. Validating against the routed
-      // models alone rejected every native slug, so choosing one from the tray
-      // silently left the previous engine in place.
-      const available = rankVisionEngines([
-        ...selectedConfiguredListedModels(),
-        ...nativeEngines,
-      ]);
+      const configured = new Set(configuredProviderIds());
+      const available = rankVisionEngines(
+        nodeRoutableModels({
+          enabledProviders: new Set(readProviderSelection()),
+          hiddenModels: new Set(),
+        }).filter((model) => configured.has(model.provider)),
+      );
+      if (codexAuthStatus().authenticated === true) {
+        available.push(...rankVisionEngines(nativeEngines));
+      }
       if (!available.some((model) => model.slug === slug)) {
-        throw new Error(
-          `${slug} is not an enabled model that reads images. Choose one of: ${
-            available.map((model) => model.slug).join(", ") || "(none enabled)"
-          }, or "local" for a local vision model, or "auto".`,
-        );
+        throw visionEngineNotSupportedError(slug);
       }
     }
     const engine = slug && slug !== "auto" ? slug : null;
@@ -1703,15 +1728,7 @@ async function handleLocalModels(action, value, ...rest) {
     [...new Set([...Object.keys(visionBenchmarks), ...Object.keys(localBenchmarks)])]
       .map((tag) => [tag, { ...visionBenchmarks[tag], ...localBenchmarks[tag] }]),
   );
-  // The LM Studio section rides along with every snapshot so the panel's one
-  // `local_models` read covers both local runtimes. Its probe is a loopback
-  // HTTP call with a short timeout, so an LM Studio that is simply off costs
-  // the snapshot a bounded wait, not an error.
-  const { lmstudioSnapshot } = await import("./lmstudio-models.mjs");
-  const snapshot = async () => ({
-    ...localModelsSnapshot({ benchmarks: localAndVisionBenchmarks }),
-    lmstudio: await lmstudioSnapshot(),
-  });
+  const snapshot = async () => localModelsSnapshot({ benchmarks: localAndVisionBenchmarks });
   if (action === "list" || action === "status" || !action) {
     const current = await snapshot();
     // The tray and any script read JSON; a person at a terminal was handed a
@@ -1726,58 +1743,23 @@ async function handleLocalModels(action, value, ...rest) {
     process.stdout.write(`${renderLocalModels(current)}\n`);
     return;
   }
-  if (action === "agent-check") {
-    // Runs the real Codex client against the model. Slow by design: every
-    // cheaper approximation tried here disagreed with reality.
-    const { checkAgentCapability } = await import("./agent-check.mjs");
-    const { readLocalModelSelection, saveAgentCheck } = await import("./local-models.mjs");
-    const tags = value ? [String(value).trim()] : readLocalModelSelection().enabled;
-    if (!tags.length) throw new Error("No local models are checked.");
-    const results = [];
-    for (const tag of tags) {
-      const result = checkAgentCapability(`local/${tag}`);
-      saveAgentCheck(tag, result);
-      results.push({ tag, ...result });
-    }
-    process.stdout.write(`${JSON.stringify({ results })}\n`);
-    return;
-  }
   if (action === "inspect") {
-    // Answers "can Codex drive this?" for a few kilobytes instead of a
-    // multi-gigabyte download.
-    // normalizeLocalModelTag throws on an empty or malformed reference, so
-    // there is no separate emptiness check to make here.
+    // Inspect only the local Vision capability; no chat/tool/context claim is
+    // produced and no local model is added to the registry.
     const { normalizeLocalModelTag } = await import("./local-model-ref.mjs");
     const tag = normalizeLocalModelTag(value);
-    const {
-      fetchRegistryCapabilities,
-      fetchRegistryContext,
-      describeMachine,
-      detectMachine,
-      rateDiskFit,
-      rateModelFit,
-    } = await import("./local-models.mjs");
-    // Both are read from the model's own files rather than assumed: the chat
-    // template says whether it can call tools, the GGUF header says how much
-    // context it holds. One megabyte of ranged reads, no download.
-    const [info, context] = await Promise.all([
-      fetchRegistryCapabilities(tag),
-      fetchRegistryContext(tag),
-    ]);
-    // Whether the machine can run it is as decisive as whether Codex can
-    // drive it, and the manifest already carries the size.
-    const capacity = detectMachine();
+    const { fetchRegistryCapabilities, localModelCapabilities } = await import("./local-models.mjs");
+    const info = await fetchRegistryCapabilities(tag);
+    const capabilities = localModelCapabilities(tag);
     process.stdout.write(
       `${JSON.stringify(
         info
           ? {
-              ...info,
-              context: context ?? null,
-              fit: rateModelFit(info.sizeGb, capacity) ?? null,
-              diskFit: rateDiskFit(info.sizeGb, capacity) ?? null,
-              machine: describeMachine(capacity),
+              tag,
+              sizeGb: info.sizeGb ?? null,
+              vision: capabilities.includes("vision"),
             }
-          : { tag, unknown: true, context: context ?? null, machine: describeMachine(capacity) },
+          : { tag, unknown: true },
       )}\n`,
     );
     return;
@@ -1807,14 +1789,6 @@ async function handleLocalModels(action, value, ...rest) {
     }
     throw new Error("Usage: control local-models runtime status|start [--yes]|update --yes");
   }
-  if (action === "benchmark") {
-    const { benchmarkLocalModel } = await import("./local-benchmark.mjs");
-    const tag = String(value || "").trim();
-    if (!tag) throw new Error("Usage: control local-models benchmark <model-tag>");
-    const result = await benchmarkLocalModel(tag);
-    process.stdout.write(`${JSON.stringify(result)}\n`);
-    return;
-  }
   if (action === "cancel") {
     const { cancelLocalDownload } = await import("./local-download.mjs");
     const result = cancelLocalDownload(value);
@@ -1822,9 +1796,8 @@ async function handleLocalModels(action, value, ...rest) {
     return;
   }
   if (action === "install" || action === "install-and-use") {
-    // Same detached-worker principle as the vision picker, but this worker is
-    // for Codex chat models: successful completion checks the model on and
-    // publishes the route automatically.
+    // Same detached-worker principle as the Vision picker. Successful
+    // completion records local availability only; it never publishes chat.
     const { normalizeLocalModelTag, splitLocalModelTag } = await import("./local-model-ref.mjs");
     const tag = normalizeLocalModelTag(value);
     const identity = splitLocalModelTag(tag);
@@ -1904,10 +1877,9 @@ async function handleLocalModels(action, value, ...rest) {
         await import("./local-models.mjs");
       const advertised = await fetchRegistryCapabilities(tag);
       if (cancelled()) return;
-      // A missing tool template costs nothing to discover afterwards; gigabytes
-      // that cannot run cost the download and the disk. So the tool note stays
-      // advisory while a model too large for this machine is refused unless the
-      // operator overrides it deliberately.
+      // A model too large for this machine is refused unless the operator
+      // overrides it deliberately. This is an install safety check, not a
+      // chat-model capability claim.
       const capacity = detectMachine();
       const fit = advertised ? rateModelFit(advertised.sizeGb, capacity) : undefined;
       const diskFit = advertised ? rateDiskFit(advertised.sizeGb, capacity) : undefined;
@@ -1953,28 +1925,19 @@ async function handleLocalModels(action, value, ...rest) {
         controllerPid: null,
         workerPid: child.pid,
       });
-      // Advisory, never blocking: the operator may well want a vision-only
-      // model, but they should know before the gigabytes land.
+      // The result is deliberately limited to download identity and runtime;
+      // tool/speed/context claims are not part of the local Vision contract.
       process.stdout.write(
         `${JSON.stringify({
           started: true,
           tag,
           family: advertised?.family || identity.family,
           variant: advertised?.variant || identity.variant,
-          tools: advertised?.tools ?? null,
-          fit: fit ?? null,
-          diskFit: diskFit ?? null,
           runtime: "headless",
         })}\n`,
       );
       const fitNote = advertised ? fitAdvisory(tag, advertised.sizeGb, capacity) : undefined;
       if (fitNote) process.stderr.write(`Note: ${fitNote}\n`);
-      if (advertised && !advertised.tools) {
-        process.stderr.write(
-          `Note: ${tag} does not advertise tool calling, so Codex cannot use it as a chat model. ` +
-            `It can still serve as a vision reader.\n`,
-        );
-      }
       return;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -2007,124 +1970,7 @@ async function handleLocalModels(action, value, ...rest) {
     })}\n`);
     return;
   }
-  if (action === "uninstall") {
-    const rawTag = String(value || "").trim();
-    if (!rawTag) throw new Error("Usage: control local-models uninstall <model-tag> --yes");
-    if (!flags.has("--yes")) {
-      throw new Error(`Removing ${rawTag} deletes it from disk. Pass --yes to confirm.`);
-    }
-    const { normalizeLocalModelTag } = await import("./local-model-ref.mjs");
-    const tag = normalizeLocalModelTag(rawTag);
-    const {
-      claimLocalOperation,
-      isLocalOperationActive,
-      readLocalDownload,
-      writeLocalDownload,
-    } = await import("./local-download.mjs");
-    const claim = claimLocalOperation(tag, "uninstall");
-    if (!claim.acquired) {
-      const active = readLocalDownload();
-      if (isLocalOperationActive(active) && active.tag === tag) {
-        process.stdout.write(`${JSON.stringify({
-          started: false,
-          existing: true,
-          tag,
-          kind: active.kind || (active.status === "uninstalling" ? "uninstall" : "download"),
-          status: active.status,
-        })}\n`);
-        return;
-      }
-      throw new Error("Another local model operation is starting. Try again shortly.");
-    }
-    try {
-    const active = readLocalDownload();
-    if (isLocalOperationActive(active) && active.tag !== tag) {
-      throw new Error(
-        active.status === "uninstalling"
-          ? `${active.tag} is already being removed.`
-          : `${active.tag} is already downloading (${active.percent || 0}%).`,
-      );
-    }
-    if (isLocalOperationActive(active) && active.tag === tag) {
-      process.stdout.write(`${JSON.stringify({
-        started: false,
-        existing: true,
-        tag,
-        kind: active.kind || (active.status === "uninstalling" ? "uninstall" : "download"),
-        status: active.status,
-      })}\n`);
-      return;
-    }
-    if (flags.has("--async")) {
-      const startedAt = Date.now();
-      writeLocalDownload({
-        version: 1,
-        kind: "uninstall",
-        tag,
-        status: "uninstalling",
-        detail: "Starting model removal",
-        percent: 0,
-        startedAt,
-        updatedAt: startedAt,
-        controllerPid: process.pid,
-        workerPid: null,
-      });
-      try {
-        const child = spawn(
-          process.execPath,
-          [path.join(REPO_ROOT, "src", "local-uninstall.mjs"), tag],
-          { detached: true, stdio: "ignore", windowsHide: true },
-        );
-        child.unref();
-        writeLocalDownload({
-          ...readLocalDownload(),
-          controllerPid: null,
-          workerPid: child.pid,
-          updatedAt: Date.now(),
-        });
-      } catch (error) {
-        writeLocalDownload({
-          ...readLocalDownload(),
-          status: "error",
-          detail: "Removal failed to start",
-          updatedAt: Date.now(),
-          controllerPid: null,
-          error: error instanceof Error ? error.message : String(error),
-        });
-        throw error;
-      }
-      process.stdout.write(`${JSON.stringify({ started: true, tag, kind: "uninstall" })}\n`);
-      return;
-    }
-    const { uninstallLocalModelTransaction } = await import("./local-uninstall.mjs");
-    await uninstallLocalModelTransaction(tag, {
-      restartService: restartRouterForLocalRoutes,
-    });
-    const warnings = await finalizeLocalModelPublication();
-    const finishedAt = Date.now();
-    writeLocalDownload({
-      version: 1,
-      kind: "uninstall",
-      tag,
-      status: "done",
-      detail: warnings.catalogError
-        ? "Model removed · catalog refresh needed"
-        : warnings.restartError
-          ? "Model removed · router restart needed"
-          : "Model removed",
-      percent: 100,
-      startedAt: finishedAt,
-      updatedAt: finishedAt,
-      workerPid: null,
-      controllerPid: null,
-      ...(warnings.catalogError ? { catalogError: warnings.catalogError } : {}),
-      ...(warnings.restartError ? { restartError: warnings.restartError } : {}),
-      error: undefined,
-    });
-    } finally {
-      claim.release();
-    }
-  } else if (action === "set") {
+  if (action === "set") {
     if (!["on", "off"].includes(positional)) {
       throw new Error("Usage: control local-models set <model-tag> <on|off>");
     }
@@ -2144,30 +1990,12 @@ async function handleLocalModels(action, value, ...rest) {
       restart: () => isLocalModelEnabled(value) !== enabled,
       restartService: restartRouterForLocalRoutes,
     });
-  } else if (action === "lmstudio-set") {
-    if (!["on", "off"].includes(positional)) {
-      throw new Error("Usage: control local-models lmstudio-set <model-id> <on|off>");
-    }
-    // The panel's checkbox for a model LM Studio serves. Publishing goes
-    // through the same user-model overlay `curate-models lmstudio` writes,
-    // and the same restart that makes an Ollama toggle live makes this one.
-    const { isLmstudioModelEnabled, setLmstudioModelEnabled } = await import(
-      "./lmstudio-models.mjs"
-    );
-    const enabled = positional === "on";
-    await transactModelOverlayMutation({
-      files: [USER_MODELS_PATH, PROVIDER_SELECTION_PATH],
-      mutate: () => setLmstudioModelEnabled(value, enabled),
-      restart: () => isLmstudioModelEnabled(value) !== enabled,
-      restartService: restartRouterForLocalRoutes,
-    });
   } else {
     throw new Error(
       "Usage: control local-models list [--json]|inspect <tag-or-url>|" +
-        "install <tag-or-url> [--yes] [--force]|benchmark <tag>|" +
+        "install <tag-or-url> [--yes] [--force]|" +
         "runtime status|runtime start [--yes]|runtime update --yes|" +
-        "uninstall <tag> --yes|cancel [<tag>]|set <tag> <on|off>|" +
-        "lmstudio-set <id> <on|off>\n" +
+        "cancel [<tag>]|set <tag> <on|off>\n" +
         "  --yes    consent to installing/starting Ollama itself (headless)\n" +
         "  --force  download a model rated too large for this machine anyway",
     );

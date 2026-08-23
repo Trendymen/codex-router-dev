@@ -44,6 +44,7 @@ import {
   MODEL_BY_SLUG,
   PROVIDERS,
   endpointForModel,
+  isChatProvider,
   providerForModel,
   resolveProviderBaseUrl,
 } from "./model-registry.mjs";
@@ -54,6 +55,7 @@ import { nativeContextVariantBase } from "./native-context-variants.mjs";
 import { readNativeRedirect } from "./native-redirect.mjs";
 import {
   canonicalProviderId,
+  configuredProviderIds,
   readProviderSelection,
   selectedConfiguredListedModels,
 } from "./provider-selection.mjs";
@@ -132,7 +134,7 @@ import {
   readDispatchBody,
   parseRetryAfter,
 } from "./provider-dispatch.mjs";
-import { proofMatchesModel } from "./model-contract.mjs";
+import { nodeRoutableModels, proofMatchesModel } from "./model-contract.mjs";
 import { readProtocolProof } from "./protocol-proof.mjs";
 import { resolveProviderCredential } from "./provider-credentials.mjs";
 import { createForcedDispatchDeadline } from "./forced-dispatch-deadline.mjs";
@@ -768,7 +770,14 @@ function logUpstreamRetry({ attempt, retries, status, error, delayMs }, model, r
 function catalogModels() {
   try {
     const parsed = JSON.parse(readFileSync(CATALOG_PATH, "utf8"));
-    return Array.isArray(parsed.models) ? parsed.models : [];
+    return Array.isArray(parsed.models)
+      ? parsed.models.filter((model) => {
+          const slug = String(model?.slug || "");
+          if (/^(?:local|lmstudio)\//.test(slug)) return false;
+          const provider = PROVIDERS.get(String(model?.provider || ""));
+          return !provider || isChatProvider(provider);
+        })
+      : [];
   } catch {
     return [];
   }
@@ -1402,14 +1411,29 @@ async function bridgeVisionInput(input, route, request) {
   // cannot be stale, so it has to hold too: without one there is no native
   // engine to nominate, and a pin naming one stops resolving on the very next
   // paste rather than at the next catalog rebuild.
+  let enabledProviders;
+  let credentialedProviders;
   const engines = resolveVisionEngines(
-    () => [
-      ...selectedConfiguredListedModels(),
-      ...(request && hasNativeSession(nativeHeaders(request))
-        ? installedNativeVisionEngines({ hidden: readHiddenModels() })
-        : []),
-    ],
+    () => {
+      enabledProviders = new Set(readProviderSelection());
+      credentialedProviders = new Set(configuredProviderIds());
+      return [
+        ...nodeRoutableModels({
+          enabledProviders,
+          hiddenModels: readHiddenModels(),
+        }).filter((model) => credentialedProviders.has(model.provider)),
+        ...(request && hasNativeSession(nativeHeaders(request))
+          ? installedNativeVisionEngines({ hidden: readHiddenModels() })
+          : []),
+      ];
+    },
     settings,
+    {
+      strict: true,
+      callerSession: { usable: Boolean(request && hasNativeSession(nativeHeaders(request))) },
+      enabledProviders: () => enabledProviders,
+      credentialedProviders: () => credentialedProviders,
+    },
   );
   if (!engines.length) {
     // The catalog only advertises image input while an engine resolves, so

@@ -34,14 +34,13 @@ writeFileSync(
 const { MODELS, PROVIDERS } = await import("../src/model-registry.mjs");
 const { renderLiteLlmConfig } = await import("../src/litellm-config.mjs");
 
-test("LM Studio models use the generic OpenAI-compatible local route", () => {
+test("stale LM Studio models are excluded from chat registry and gateway config", () => {
   const model = MODELS.find((entry) => entry.slug === "lmstudio/qwen2.5-coder");
-  assert.ok(model);
+  assert.equal(model, undefined);
   assert.equal(PROVIDERS.get("lmstudio").protocol, "openai");
 
   const rendered = renderLiteLlmConfig();
-  assert.match(rendered, /model_name: "lmstudio-qwen2-5-coder"/);
-  assert.match(rendered, /model: "openai\/lmstudio-qwen2-5-coder"/);
+  assert.doesNotMatch(rendered, /lmstudio-qwen2-5-coder/);
   assert.doesNotMatch(rendered, /ollama_chat\/qwen2\.5-coder/);
   assert.match(rendered, /os\.environ\/CODEX_ROUTER_API_FORWARD_BASE_URL/);
 });

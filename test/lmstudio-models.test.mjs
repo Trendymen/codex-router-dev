@@ -47,7 +47,7 @@ test("a server that is off reads as unreachable, not as an error", async () => {
   assert.deepEqual(served.models, []);
 });
 
-test("the snapshot merges served models with curated ones, keeping stale entries visible", async () => {
+test("the snapshot reports served models as Vision-only inventory without chat curation", async () => {
   const userModels = [
     userModelEntry({ providerId: "lmstudio", upstreamId: "alpha", priority: 950 }),
     userModelEntry({ providerId: "lmstudio", upstreamId: "gone-model", priority: 951 }),
@@ -58,26 +58,25 @@ test("the snapshot merges served models with curated ones, keeping stale entries
     userModels,
   });
   assert.equal(snapshot.reachable, true);
-  assert.equal(snapshot.enabled, 2);
+  assert.equal(snapshot.enabled, 0);
+  assert.equal(snapshot.visionOnly, true);
+  assert.equal(snapshot.chatEnabled, false);
   assert.deepEqual(snapshot.models, [
-    { id: "alpha", enabled: true, served: true },
+    { id: "alpha", enabled: false, served: true },
     { id: "beta", enabled: false, served: true },
-    // Curated but no longer served: hiding it would strand a picker route
-    // with no way to see or clear it from the panel.
-    { id: "gone-model", enabled: true, served: false },
   ]);
 });
 
-test("an unreachable server still reports curated models", async () => {
+test("an unreachable server reports no chat-curated LM Studio models", async () => {
   const userModels = [
     userModelEntry({ providerId: "lmstudio", upstreamId: "alpha", priority: 950 }),
   ];
   const snapshot = await lmstudioSnapshot({ fetchImpl: fetchDown, userModels });
   assert.equal(snapshot.reachable, false);
-  assert.deepEqual(snapshot.models, [{ id: "alpha", enabled: true, served: false }]);
+  assert.deepEqual(snapshot.models, []);
 });
 
-test("checking a model publishes it through the same overlay curate-models writes", () => {
+test("checking a model withdraws stale chat overlay without touching other providers", () => {
   writeUserModels([
     userModelEntry({ providerId: "kimi-api", upstreamId: "other", priority: 100 }),
   ]);
@@ -85,29 +84,20 @@ test("checking a model publishes it through the same overlay curate-models write
 
   const stored = readUserModels();
   const mine = stored.filter((model) => model.provider === "lmstudio");
-  assert.equal(mine.length, 1);
-  assert.equal(mine[0].upstreamModel, "qwen/qwen3-4b");
-  assert.equal(mine[0].displayName, "qwen/qwen3-4b (LM Studio, experimental)");
-  assert.equal(mine[0].supportsApplyPatchTool, false);
-  assert.equal(mine[0].multiAgentVersion, "v1");
-  // The KV-cache reasoning from the Ollama path applies to any local model.
-  assert.equal(mine[0].contextWindow, 32768);
+  assert.deepEqual(mine, []);
   // Other providers' curated entries survive untouched.
   assert.ok(stored.some((model) => model.provider === "kimi-api"));
-  assert.equal(isLmstudioModelEnabled("qwen/qwen3-4b"), true);
-  // The provider follows the models: first check turns it on.
-  assert.ok(readProviderSelection().includes("lmstudio"));
+  assert.equal(isLmstudioModelEnabled("qwen/qwen3-4b"), false);
 
   setLmstudioModelEnabled("qwen/qwen3-4b", false);
   assert.equal(isLmstudioModelEnabled("qwen/qwen3-4b"), false);
   assert.ok(readUserModels().some((model) => model.provider === "kimi-api"));
-  // ...and the last uncheck turns it back off.
   assert.ok(!readProviderSelection().includes("lmstudio"));
   const raw = JSON.parse(readFileSync(process.env.MODEL_ROUTER_USER_MODELS, "utf8"));
   assert.ok(Array.isArray(raw.models));
 });
 
-test("a disable/re-enable cycle cannot land two models on one priority", () => {
+test("a disable/re-enable cycle never creates a chat overlay", () => {
   writeUserModels([]);
   setLmstudioModelEnabled("alpha", true);
   setLmstudioModelEnabled("beta", true);
@@ -115,16 +105,15 @@ test("a disable/re-enable cycle cannot land two models on one priority", () => {
   setLmstudioModelEnabled("beta", false);
   setLmstudioModelEnabled("beta", true);
   const mine = readUserModels().filter((model) => model.provider === "lmstudio");
-  const priorities = mine.map((model) => model.priority);
-  assert.equal(new Set(priorities).size, priorities.length, `collision in ${priorities}`);
+  assert.deepEqual(mine, []);
 });
 
-test("toggling one model leaves the other curated LM Studio entries alone", () => {
+test("toggling one model leaves no LM Studio chat entries", () => {
   writeUserModels([]);
   setLmstudioModelEnabled("alpha", true);
   setLmstudioModelEnabled("beta", true);
   setLmstudioModelEnabled("alpha", false);
   const mine = readUserModels().filter((model) => model.provider === "lmstudio");
-  assert.deepEqual(mine.map((model) => model.upstreamModel), ["beta"]);
-  assert.ok(readProviderSelection().includes("lmstudio"));
+  assert.deepEqual(mine, []);
+  assert.ok(!readProviderSelection().includes("lmstudio"));
 });

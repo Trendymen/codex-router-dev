@@ -17,6 +17,11 @@ import {
 import { writePrivateJson } from "./file-security.mjs";
 import { STATE_DIR } from "./paths.mjs";
 import { processStartIdentity } from "./process-identity.mjs";
+import {
+  allowedVisionReaders,
+  isLoopbackVisionReader,
+  resolveVisionReader,
+} from "./vision-reader-policy.mjs";
 
 export const VISION_CACHE_PURGE_PATH = process.env.MODEL_ROUTER_VISION_CACHE_PURGE || `${STATE_DIR}/vision-cache-purge.json`;
 let purgeGeneration = 0;
@@ -799,8 +804,7 @@ export function nativeVisionCandidates(models, hidden = new Set()) {
 // them, because a deliberate choice carries the knowledge that the server has
 // to be up.
 export function isLoopbackEngine(model) {
-  if (model?.local === true) return true;
-  return Boolean(PROVIDERS.get(String(model?.provider || ""))?.keyless);
+  return isLoopbackVisionReader(model, { providers: PROVIDERS });
 }
 
 // `listCandidates` must return the selected and credentialed set: an engine the
@@ -824,7 +828,7 @@ export function isLoopbackEngine(model) {
 // ranked is still exactly the selected, credentialed, listed set. Refusing an
 // array as well is what stops a future call site from quietly reintroducing the
 // eager scan -- there is no cheaper-looking overload to reach for.
-export function resolveVisionEngine(listCandidates, settings) {
+export function resolveVisionEngine(listCandidates, settings, context = {}) {
   if (typeof listCandidates !== "function") {
     throw new TypeError(
       "resolveVisionEngine takes a function returning the selected, credentialed candidates, " +
@@ -832,15 +836,39 @@ export function resolveVisionEngine(listCandidates, settings) {
     );
   }
   if (!settings?.enabled) return undefined;
-  if (settings.engine === LOCAL_ENGINE_SLUG) return localVisionEngine(settings);
-  const ranked = rankVisionEngines(listCandidates());
+  const localPin = settings.engine === LOCAL_ENGINE_SLUG ? localVisionEngine(settings) : undefined;
+  if (localPin) {
+    const local = resolveVisionReader(LOCAL_ENGINE_SLUG, {
+      ...context,
+      localPin,
+      strict: context.strict === true ? true : false,
+    });
+    return local || localPin;
+  }
+  const candidates = listCandidates();
+  const policyReaders = allowedVisionReaders({
+    ...context,
+    selectedNodeModels: candidates.filter((model) => !model?.native),
+    nativeReaders: candidates.filter((model) => model?.native),
+    // Existing bridge unit callers pass a pre-curated list. Production callers
+    // set `strict` and provide the live provider/session gates explicitly.
+    strict: context.strict === true,
+    callerSession: context.callerSession ?? (context.strict ? undefined : { usable: true }),
+  });
+  const ranked = rankVisionEngines(policyReaders);
   if (settings.engine) {
-    const pinned = ranked.find((model) => model.slug === settings.engine);
+    const pinned = resolveVisionReader(settings.engine, {
+      ...context,
+      selectedNodeModels: candidates.filter((model) => !model?.native),
+      nativeReaders: candidates.filter((model) => model?.native),
+      strict: context.strict === true,
+      callerSession: context.callerSession ?? (context.strict ? undefined : { usable: true }),
+    });
     // A pin that no longer resolves is an operator-visible problem, not a
     // reason to silently describe images with a different model. A *default*
     // that does not resolve is different: nobody chose it, so an install
     // without the default engine available still reads images.
-    if (pinned || !settings.defaulted) return pinned;
+    if (pinned || !settings.defaulted) return pinned || undefined;
   }
   return ranked.find((model) => !isLoopbackEngine(model));
 }
@@ -863,7 +891,7 @@ const VISION_ENGINE_ATTEMPTS = 3;
 // the first has failed and exhausted its retries. It is not silent either --
 // the evidence header names whichever engine actually did the reading, and the
 // per-turn log line says a fallback happened.
-export function resolveVisionEngines(listCandidates, settings) {
+export function resolveVisionEngines(listCandidates, settings, context = {}) {
   if (typeof listCandidates !== "function") {
     throw new TypeError(
       "resolveVisionEngines takes a function returning the selected, credentialed candidates, " +
@@ -876,14 +904,20 @@ export function resolveVisionEngines(listCandidates, settings) {
   // stopped -- so asking twice would double the cost of every pasted image.
   let candidates;
   const once = () => (candidates ??= listCandidates());
-  const primary = resolveVisionEngine(once, settings);
+  const primary = resolveVisionEngine(once, settings, context);
   if (!primary) return [];
   // A pinned local engine is the operator naming their own machine; falling
   // back off it would spend a provider's quota they did not ask to spend here.
   if (primary.local) return [primary];
-  const alternates = rankVisionEngines(once()).filter(
-    (model) => model.slug !== primary.slug && !isLoopbackEngine(model),
-  );
+  const alternates = rankVisionEngines(
+    allowedVisionReaders({
+      ...context,
+      selectedNodeModels: once().filter((model) => !model?.native),
+      nativeReaders: once().filter((model) => model?.native),
+      strict: context.strict === true,
+      callerSession: context.callerSession ?? (context.strict ? undefined : { usable: true }),
+    }),
+  ).filter((model) => model.slug !== primary.slug && !isLoopbackEngine(model));
   return [primary, ...alternates].slice(0, VISION_ENGINE_ATTEMPTS);
 }
 

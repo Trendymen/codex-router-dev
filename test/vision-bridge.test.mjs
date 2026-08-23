@@ -67,6 +67,12 @@ const {
   VISION_RECORD_MAX_CHARS,
 } = await import("../src/vision-bridge.mjs");
 const { nativeVisionEngines } = await import("../src/vision-engines.mjs");
+// Task 5 TDD contract: this import is intentionally added before the policy
+// exists so the focused gate proves the Appendix H matrix starts RED.
+const {
+  allowedVisionReaders,
+  resolveVisionReader,
+} = await import("../src/vision-reader-policy.mjs");
 
 after(() => {
   if (livePurgeBefore.exists) {
@@ -2220,6 +2226,70 @@ test("the pinned vision engine resolves to mimo v2.5 under the test configuratio
   const engine = resolveVisionEngine(() => [MIMO_VISION, FLASH_VISION, TEXT_ONLY], settings);
   assert.equal(engine?.slug, "opencode-go/mimo-v2.5");
   assert.equal(engine?.gatewayModel, "opencode-go-mimo-v2-5");
+});
+
+test("Appendix H allows only usable native, credentialed Node, and explicit local readers", () => {
+  const native = {
+    slug: "gpt-5.6-luna",
+    native: true,
+    inputModalities: ["text", "image"],
+  };
+  const node = {
+    slug: "deepseek/deepseek-v4-vision",
+    provider: "deepseek",
+    inputModalities: ["text", "image"],
+    effectiveTransport: "openai-responses",
+    toolDialect: "responses-functions",
+    routable: true,
+  };
+  const local = {
+    slug: "local",
+    local: true,
+    provider: "local",
+    gatewayModel: "qwen2.5vl:3b",
+    inputModalities: ["text", "image"],
+    baseUrl: "http://127.0.0.1:11434/v1",
+  };
+  const context = {
+    strict: true,
+    callerSession: { usable: true },
+    nativeReaders: [native],
+    selectedNodeModels: [node],
+    localPin: local,
+    enabledProviders: new Set(["deepseek"]),
+    credentialedProviders: new Set(["deepseek"]),
+  };
+  assert.deepEqual(
+    allowedVisionReaders(context).map((reader) => reader.slug),
+    [native.slug, node.slug, local.slug],
+  );
+  assert.equal(resolveVisionReader(local.slug, context), local);
+
+  const signedOut = allowedVisionReaders({ ...context, callerSession: { usable: false } });
+  assert.deepEqual(signedOut.map((reader) => reader.slug), [node.slug, local.slug]);
+});
+
+test("Appendix H rejects loopback auto candidates and legacy cloud pins", () => {
+  const loopback = {
+    slug: "local/qwen2.5vl:3b",
+    provider: "local",
+    inputModalities: ["text", "image"],
+    gatewayModel: "qwen2.5vl:3b",
+  };
+  const legacy = {
+    slug: "deepseek/deepseek-legacy-vision",
+    provider: "deepseek",
+    inputModalities: ["text", "image"],
+  };
+  const context = {
+    strict: true,
+    selectedNodeModels: [loopback, legacy],
+    enabledProviders: new Set(["local", "deepseek"]),
+    credentialedProviders: new Set(["local", "deepseek"]),
+  };
+  assert.deepEqual(allowedVisionReaders(context), []);
+  assert.equal(resolveVisionReader(loopback.slug, context), null);
+  assert.equal(resolveVisionReader(legacy.slug, context), null);
 });
 
 test("substituteImages replaces an image part with the engine's caption", async () => {

@@ -267,6 +267,15 @@ function loadRegistry() {
         fail(`provider ${provider.id} requires ${field}`);
       }
     }
+    if (provider.visionOnly !== undefined && typeof provider.visionOnly !== "boolean") {
+      fail(`provider ${provider.id} has an invalid visionOnly flag`);
+    }
+    if (provider.chatEnabled !== undefined && typeof provider.chatEnabled !== "boolean") {
+      fail(`provider ${provider.id} has an invalid chatEnabled flag`);
+    }
+    if (provider.visionOnly === true && provider.chatEnabled !== false) {
+      fail(`vision-only provider ${provider.id} must set chatEnabled to false`);
+    }
     if (
       provider.authProfile !== undefined &&
       !["github-copilot"].includes(provider.authProfile)
@@ -773,6 +782,11 @@ function mergeUserModels(base) {
       warnings.push(`Skipped user model: ${problem}`);
       continue;
     }
+    const provider = base.providers.get(model.provider);
+    if (provider?.visionOnly === true || provider?.chatEnabled === false) {
+      warnings.push(`Skipped user model: provider ${model.provider} is vision-only and cannot publish a chat route`);
+      continue;
+    }
     slugs.add(model.slug);
     gatewayModels.add(model.gatewayModel);
     const frozen = normalizedModel(model, base.providers.get(model.provider));
@@ -800,15 +814,28 @@ const merged = mergeUserModels(registry);
 export const PROVIDERS = registry.providers;
 export const MODELS = merged.models;
 export const USER_MODEL_WARNINGS = merged.warnings;
-export const LISTED_MODELS = Object.freeze(MODELS.filter((model) => model.listed));
+export const LISTED_MODELS = Object.freeze(
+  MODELS.filter((model) => model.listed && isChatProvider(model)),
+);
 export const API_MODELS = Object.freeze(
-  MODELS.filter((model) => PROVIDERS.get(model.provider)?.kind === "openai-compatible"),
+  MODELS.filter(
+    (model) =>
+      isChatProvider(model) &&
+      PROVIDERS.get(model.provider)?.kind === "openai-compatible",
+  ),
 );
 export const MODEL_BY_SLUG = new Map(MODELS.map((model) => [model.slug, model]));
 export const MODEL_BY_GATEWAY_ID = new Map(
-  MODELS.map((model) => [model.gatewayModel, model]),
+  MODELS.filter(isChatProvider).map((model) => [model.gatewayModel, model]),
 );
 
 export function providerForModel(model) {
   return PROVIDERS.get(model.provider);
+}
+
+export function isChatProvider(providerOrModel) {
+  const provider = providerOrModel?.kind
+    ? providerOrModel
+    : PROVIDERS.get(providerOrModel?.provider);
+  return Boolean(provider && provider.visionOnly !== true && provider.chatEnabled !== false);
 }
