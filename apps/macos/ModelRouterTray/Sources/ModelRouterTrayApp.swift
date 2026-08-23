@@ -2516,9 +2516,13 @@ func formattedAccountMetric(_ metric: ProviderAccountMetric) -> String {
   return "—"
 }
 
-func usageResetCaption(_ date: Date, now: Date = Date()) -> String {
+func usageResetCaption(
+  _ date: Date,
+  now: Date = Date(),
+  localize: (String) -> String = routerLocalized
+) -> String {
   let seconds = date.timeIntervalSince(now)
-  if seconds <= 0 { return routerLocalized("resets soon") }
+  if seconds <= 0 { return localize("resets soon") }
   return date.formatted(date: .abbreviated, time: .shortened)
 }
 

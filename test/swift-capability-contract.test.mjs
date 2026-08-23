@@ -10,6 +10,7 @@ import { buildCapabilityManifest } from "../src/capability-manifest.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const swiftSource = readFileSync(path.join(root, "apps/macos/ModelRouterTray/Sources/ModelRouterTrayApp.swift"), "utf8");
+const quotaResetTests = readFileSync(path.join(root, "apps/macos/ModelRouterTray/Tests/QuotaResetLabelTests.swift"), "utf8");
 const bridgeSource = readFileSync(path.join(root, "src", "desktop-command-bridge.mjs"), "utf8");
 const controlSource = readFileSync(path.join(root, "src", "control.mjs"), "utf8");
 const localizationSources = [
@@ -119,9 +120,19 @@ test("quota reset captions accept an injected clock and preserve the current for
   const end = swiftSource.indexOf("func compactTokenCount", start);
   assert.ok(start >= 0 && end > start, "usageResetCaption source is present");
   const source = swiftSource.slice(start, end);
-  assert.match(source, /func usageResetCaption\(_ date: Date, now: Date = Date\(\)\)/);
+  assert.match(
+    source,
+    /func usageResetCaption\(\s*_ date: Date,\s*now: Date = Date\(\),\s*localize: \(String\) -> String = routerLocalized\s*\)/,
+  );
   assert.match(source, /date\.timeIntervalSince\(now\)/);
   assert.match(source, /date\.formatted\(date: \.abbreviated, time: \.shortened\)/);
+  assert.match(
+    quotaResetTests,
+    /usageResetCaption\(\s*now\.addingTimeInterval\(-5\),\s*now: now,\s*localize:/,
+  );
+  assert.match(quotaResetTests, /usageResetCaption\(\s*reset,\s*now: now,\s*localize:/);
+  assert.doesNotMatch(quotaResetTests, /resetCountdownLabel|resetClockLabel/);
+  assert.doesNotMatch(quotaResetTests, /RouterLanguage\.(?:selection|setSelection)/);
 });
 
 test("all Router mutations use the canonical Node bridge and observed schema version", () => {
