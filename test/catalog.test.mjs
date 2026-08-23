@@ -1182,6 +1182,33 @@ test("catalog Vision candidates distinguish selection from credential state", as
   assert.match(source, /credentialedProviders: configuredProviders/);
 });
 
+test("catalog publication turns a saved native pin loss into no reader", async () => {
+  const { resolveCatalogVisionEngine } = await import("../src/catalog.mjs");
+  const native = {
+    slug: "gpt-5.6-luna",
+    native: true,
+    inputModalities: ["text", "image"],
+  };
+  const settings = { version: 1, enabled: true, engine: native.slug, effort: null, local: null };
+  const context = {
+    strict: true,
+    callerSession: { usable: false },
+    enabledProviders: new Set(),
+    credentialedProviders: new Set(),
+  };
+  const result = resolveCatalogVisionEngine({ candidates: [native], settings, context });
+  assert.equal(result.rejected, true);
+  assert.equal(result.engine, undefined);
+  assert.equal(result.selection, native.slug);
+
+  const loginFree = resolveCatalogVisionEngine({
+    candidates: [native],
+    settings,
+    context: { ...context, callerSession: { usable: false } },
+  });
+  assert.equal(loginFree.rejected, true, "login-free publication must remain no-reader when native is not usable");
+});
+
 
 test("efficient routed execution closes a RED behavior area before switching", () => {
   const model = routedModel(template, { ...grok, instructionOverlay: "efficient-agentic" });

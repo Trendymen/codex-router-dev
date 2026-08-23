@@ -172,6 +172,33 @@ export function visionEngineNotSupportedError(selection) {
   return error;
 }
 
+/**
+ * Observation/publication callers must be able to report "no reader" after a
+ * live session disappears without turning a catalog refresh into a process
+ * failure. Request handlers intentionally do not use this helper: they keep
+ * the strict public 400 boundary for the same rejection.
+ */
+export function observeVisionResolution(resolve, selection) {
+  if (typeof resolve !== "function") throw new TypeError("Vision resolution observer requires a resolver function.");
+  try {
+    return Object.freeze({
+      ok: true,
+      rejected: false,
+      engine: resolve(),
+      selection: typeof selection === "string" && selection ? selection : null,
+    });
+  } catch (error) {
+    if (error?.code !== "vision_engine_not_supported") throw error;
+    return Object.freeze({
+      ok: false,
+      rejected: true,
+      engine: undefined,
+      code: error.code,
+      selection: typeof selection === "string" && selection ? selection : null,
+    });
+  }
+}
+
 export function isReservedVisionOnlySlug(value) {
   return /^(?:local|lmstudio)(?:\/|$)/i.test(String(value || "").trim());
 }

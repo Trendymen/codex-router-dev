@@ -44,6 +44,7 @@ import {
 import { assertStateOwnership } from "./state-owner.mjs";
 import { scanTomlDocument, tomlStringValue } from "./toml-structure.mjs";
 import { applyVisionBridge, resolveVisionEngine } from "./vision-bridge.mjs";
+import { observeVisionResolution } from "./vision-reader-policy.mjs";
 import { readVisionBridgeSettings } from "./vision-bridge-state.mjs";
 import { nativeVisionEngines } from "./vision-engines.mjs";
 import {
@@ -830,6 +831,13 @@ export function buildLoginFreeCatalog(native, routedModelsList) {
   return { models: sortCatalogModels(models), aliases };
 }
 
+export function resolveCatalogVisionEngine({ candidates, settings, context }) {
+  return observeVisionResolution(
+    () => resolveVisionEngine(() => candidates, settings, { ...(context || {}), strict: true }),
+    settings?.engine,
+  );
+}
+
 function main() {
   // The catalog is what Codex offers in its picker. Writing it from a checkout
   // that does not own this state directory is how the picker ends up
@@ -918,16 +926,18 @@ function main() {
     enabledProviders,
     hiddenModels: hiddenModels,
   });
-  const visionEngine = resolveVisionEngine(
-    () => [...selectedVisionModels, ...nativeEngines],
-    readVisionBridgeSettings(),
-    {
+  const visionSettings = readVisionBridgeSettings();
+  const visionResolution = resolveCatalogVisionEngine({
+    candidates: [...selectedVisionModels, ...nativeEngines],
+    settings: visionSettings,
+    context: {
       strict: true,
       callerSession: { usable: openaiAuthenticated && !loginFree },
       enabledProviders,
       credentialedProviders: configuredProviders,
     },
-  );
+  });
+  const visionEngine = visionResolution.engine;
   const catalogModels = applyVisionBridge(routedModels, visionEngine);
   const { models: merged, aliases } = loginFree
     ? buildLoginFreeCatalog(native, catalogModels)

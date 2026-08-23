@@ -56,6 +56,13 @@ function probe(target, providers, usageEvents = [], options = {}) {
       { mode: 0o600 },
     );
   }
+  if (options.visionSettings) {
+    writeFileSync(
+      path.join(stateDir, "vision-bridge.json"),
+      `${JSON.stringify(options.visionSettings)}\n`,
+      { mode: 0o600 },
+    );
+  }
   if (options.loginFree) {
     writeFileSync(
       path.join(stateDir, "config.toml"),
@@ -90,11 +97,49 @@ function probe(target, providers, usageEvents = [], options = {}) {
   }
 }
 
+function visionStatus(settings, { loginFree = false } = {}) {
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), "control-vision-status-"));
+  writeFileSync(path.join(stateDir, "vision-bridge.json"), `${JSON.stringify(settings)}\n`, { mode: 0o600 });
+  if (loginFree) {
+    writeFileSync(path.join(stateDir, "config.toml"), 'model_provider = "codex-router"\n', { mode: 0o600 });
+    writeFileSync(path.join(stateDir, "codex-provider-mode.json"), `${JSON.stringify({ version: 1 })}\n`, { mode: 0o600 });
+  }
+  try {
+    const output = execFileSync(
+      process.execPath,
+      [path.join(root, "src", "control.mjs"), "vision-bridge", "status"],
+      {
+        cwd: root,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          CODEX_HOME: stateDir,
+          MODEL_ROUTER_TARGET: "codex",
+          MODEL_ROUTER_STATE_DIR: stateDir,
+        },
+      },
+    );
+    return JSON.parse(output);
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+}
+
 test("codex probe reports enabled models", () => {
   const slice = probe("codex", ["deepseek"]);
   assert.equal(slice.target, "codex");
   const deepseek = slice.models.filter((m) => m.provider === "deepseek");
   assert.ok(deepseek.length > 0 && deepseek.every((m) => m.enabled));
+});
+
+test("control probe and current status publish no reader after native session loss", () => {
+  const settings = { version: 1, enabled: true, engine: "gpt-5.6-luna", effort: null, local: null };
+  const slice = probe("codex", [], [], { visionSettings: settings, loginFree: true });
+  assert.equal(slice.modelSettings.visionBridge.resolvedEngine, null);
+  assert.deepEqual(slice.modelSettings.visionBridge.nativeEngines, []);
+  const status = visionStatus(settings, { loginFree: true });
+  assert.equal(status.resolvedEngine, null);
+  assert.equal(status.rejectedEngine, "gpt-5.6-luna");
 });
 
 test("codex probe folds protocol variants into one provider family", () => {

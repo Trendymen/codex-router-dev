@@ -198,6 +198,7 @@ async function emitProbe() {
   const { rankVisionEngines, resolveVisionEngine, visionEngineEfforts } = await import(
     "./vision-bridge.mjs"
   );
+  const { observeVisionResolution } = await import("./vision-reader-policy.mjs");
   const { installedNativeVisionEngines } = await import("./vision-engines.mjs");
   const { annotateLocalModels, hostVisionProfile, refreshVisionModelSizesIfStale } =
     await import("./vision-host.mjs");
@@ -346,22 +347,28 @@ async function emitProbe() {
                 const natives = installedNativeVisionEngines({ hidden: hiddenModels });
                 const nativeUsable = nativeSessionStatus().usable === true && !codexConfig?.login_free;
                 const visibleNatives = nativeUsable ? natives : [];
-                const resolved = resolveVisionEngine(
-                  () => [...candidates, ...visibleNatives],
-                  readVisionBridgeSettings(),
-                  {
-                    strict: true,
-                    callerSession: {
-                      usable: nativeUsable,
+                const visionSettings = readVisionBridgeSettings();
+                const visionResolution = observeVisionResolution(
+                  () => resolveVisionEngine(
+                    () => [...candidates, ...visibleNatives],
+                    visionSettings,
+                    {
+                      strict: true,
+                      callerSession: {
+                        usable: nativeUsable,
+                      },
+                      enabledProviders: new Set(enabledProviders),
+                      credentialedProviders: configured,
                     },
-                    enabledProviders: new Set(enabledProviders),
-                    credentialedProviders: configured,
-                  },
+                  ),
+                  visionSettings.engine,
                 );
+                const resolved = visionResolution.engine;
                 return {
                   ...visionBridgeSnapshot(),
                   resolvedEngine: resolved?.slug || null,
                   resolvedEngineName: resolved?.displayName || null,
+                  ...(visionResolution.rejected ? { rejectedEngine: visionResolution.selection } : {}),
                   hostMemGib: localProfile.memGib,
                   // Cloud vision models the operator already pays for -- the
                   // default engines. Auto picks the cheapest of these.
@@ -1461,7 +1468,7 @@ async function handleVisionBridge(action, value, extra) {
   const { configuredProviderIds, readProviderSelection } = await import("./provider-selection.mjs");
   const { nodeRoutableModels } = await import("./model-contract.mjs");
   const { nativeSessionStatus } = await import("./codex-native-session.mjs");
-  const { resolveVisionReader, visionEngineNotSupportedError } = await import("./vision-reader-policy.mjs");
+  const { observeVisionResolution, resolveVisionReader, visionEngineNotSupportedError } = await import("./vision-reader-policy.mjs");
   const nativeEngines = await shippedNativeVisionEngines();
   const codexConfig = codexConfigSnapshot();
   const strictVisionCandidates = () => {
@@ -1488,13 +1495,18 @@ async function handleVisionBridge(action, value, extra) {
   const snapshot = () => {
     const { candidates, context } = strictVisionCandidates();
     const settings = readVisionBridgeSettings();
-    const resolved = resolveVisionEngine(() => candidates, settings, context);
+    const visionResolution = observeVisionResolution(
+      () => resolveVisionEngine(() => candidates, settings, context),
+      settings.engine,
+    );
+    const resolved = visionResolution.engine;
     return {
       ...visionBridgeSnapshot(),
       // The local engine is a real answer even when no paid vision model is
       // enabled, so it is offered alongside the registry engines.
       resolvedEngine: resolved?.slug || null,
       resolvedEngineName: resolved?.displayName || null,
+      ...(visionResolution.rejected ? { rejectedEngine: visionResolution.selection } : {}),
       availableEngines: [
         ...rankVisionEngines(candidates).map((model) => model.slug),
         LOCAL_ENGINE_SLUG,

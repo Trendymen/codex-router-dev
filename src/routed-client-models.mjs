@@ -22,6 +22,7 @@ import { applySubagentProofs, subagentProofSnapshot } from "./subagent-proofs.mj
 import { applyVisionBridge, resolveVisionEngine } from "./vision-bridge.mjs";
 import { readVisionBridgeSettings } from "./vision-bridge-state.mjs";
 import { nodeRoutableModels } from "./model-contract.mjs";
+import { observeVisionResolution } from "./vision-reader-policy.mjs";
 
 // The native catalog Codex itself published, captured by `catalog.mjs`. Read
 // rather than re-derived: it is the same document the Codex picker is built
@@ -65,6 +66,13 @@ export function nativeClientModels(nativeCatalogModels) {
     }));
 }
 
+export function resolveRoutedClientVisionEngine({ candidates, settings, context }) {
+  return observeVisionResolution(
+    () => resolveVisionEngine(() => candidates, settings, { ...(context || {}), strict: true }),
+    settings?.engine,
+  );
+}
+
 /** The routed models a published client should be offered, vision bridge included. */
 export function routedClientModels() {
   const hidden = readHiddenModels();
@@ -95,15 +103,17 @@ export function routedClientModels() {
     enabledProviders,
     hiddenModels: hidden,
   }).filter((model) => credentialedProviders.has(model.provider));
-  const engine = resolveVisionEngine(
-    () => selectedVision,
-    readVisionBridgeSettings(),
-    {
+  const visionSettings = readVisionBridgeSettings();
+  const visionResolution = resolveRoutedClientVisionEngine({
+    candidates: selectedVision,
+    settings: visionSettings,
+    context: {
       strict: true,
       callerSession: { usable: nativeUsable },
       enabledProviders,
       credentialedProviders,
     },
-  );
+  });
+  const engine = visionResolution.engine;
   return { models: [...applyVisionBridge(selected, engine), ...native], engine };
 }
