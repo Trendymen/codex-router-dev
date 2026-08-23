@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url";
 import {
   applyVisionBridge,
   createEvidenceCache,
+  requestVisionCachePurge,
   describeImage,
   DEFAULT_LOCAL_VISION_MODEL,
   evidenceBlock,
@@ -81,6 +82,16 @@ test("vision cache purge uses the evidence owner and leaves an active download u
   assert.equal(cache.size, 1);
   assert.deepEqual(cache.purge(), { removed: 1 });
   assert.equal(cache.size, 0);
+
+  const purgePath = path.join(os.tmpdir(), `vision-purge-generation-${process.pid}.json`);
+  const owner = createEvidenceCache({ purgePath });
+  owner.set("data:image/png;base64,owner", "question", "answer");
+  assert.equal(owner.size, 1);
+  const request = requestVisionCachePurge(purgePath);
+  assert.equal(request.requested, true);
+  assert.equal(owner.size, 0);
+  assert.deepEqual(owner.purge(), { removed: 0 });
+  rmSync(purgePath, { force: true });
 
   const state = mkdtempSync(path.join(os.tmpdir(), "vision-purge-active-"));
   const download = path.join(state, "vision-download.json");

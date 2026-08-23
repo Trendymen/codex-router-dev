@@ -297,7 +297,7 @@ const CONTROL_ARGS = {
   "subagents.status": () => ["subagents", "status"], "subagents.mode": ({ mode }) => ["subagents", "mode", mode], "subagents.model": ({ slug: id, enabled }) => ["subagents", "set", id, enabled ? "on" : "off"], "subagents.selection": ({ selection }) => ["subagents", selection], "subagents.verify": ({ slug: id }) => ["subagents", "verify", id],
   "failover.status": () => ["failover", "status"], "failover.reset": () => ["failover", "reset"],
   "tool-result-aging.status": () => ["tool-result-aging", "status"], "tool-result-aging.on": () => ["tool-result-aging", "on"], "tool-result-aging.off": () => ["tool-result-aging", "off"], "tool-result-aging.ttl": ({ days }) => ["tool-result-aging", "ttl", days == null ? "off" : String(days)], "tool-result-aging.purge": ({ expiredOnly }) => ["tool-result-aging", "purge", ...(expiredOnly ? ["--expired"] : []), "--yes"],
-  "usage.router": () => ["usage", "router"], "usage.provider": ({ provider: id }) => ["provider-usage", id], "usage.model": ({ slug: id }) => ["usage", "model", id],
+  "usage.router": () => ["usage", "router"], "usage.provider": ({ provider: id }) => ["provider-usage", ...(id ? [id] : [])], "usage.model": ({ slug: id }) => ["usage", "model", id],
   "vision.status": () => ["vision-bridge", "status"], "vision.on": () => ["vision-bridge", "on"], "vision.off": () => ["vision-bridge", "off"], "vision.engine": ({ engine, effort }) => ["vision-bridge", "engine", engine, ...(effort ? [effort] : [])], "vision.effort": ({ effort }) => ["vision-bridge", "effort", effort], "vision.probe": () => ["vision-bridge", "probe"], "vision.pull": ({ tag }) => ["vision-bridge", "pull", tag], "vision.purge-cache": () => ["vision-purge-cache"],
   "presence.status": () => ["presence", "status"], "presence.mode": ({ mode }) => ["presence", "set", mode], "cc-switch.status": () => ["catalog", "status"], "cc-switch.snippet": () => ["catalog", "render-snippet"],
 };
@@ -322,6 +322,10 @@ const COMMAND_ERROR_CODES = Object.freeze({
   capability_schema_unsupported: true,
   protected_output_required: true,
 });
+const PROTECTED_CHANNEL = Symbol("trusted-desktop-protected-channel");
+export function trustedProtectedContext(context = {}) {
+  return Object.freeze({ ...context, protectedChannel: PROTECTED_CHANNEL });
+}
 function errorEnvelope(code) {
   const messages = {
     command_not_supported: "This desktop command is not supported.",
@@ -481,7 +485,7 @@ export async function runDesktopCommand(command, args = {}, context = {}) {
       if (typeof protectedValue !== "string" || !protectedValue) return errorEnvelope("protected_input_required");
     }
     const protectedChannelDescriptor = Object.getOwnPropertyDescriptor(safeContext, "protectedChannel");
-    const protectedChannel = protectedChannelDescriptor && Object.hasOwn(protectedChannelDescriptor, "value") && protectedChannelDescriptor.value === true;
+    const protectedChannel = protectedChannelDescriptor && Object.hasOwn(protectedChannelDescriptor, "value") && protectedChannelDescriptor.value === PROTECTED_CHANNEL;
     if (definition.resultKind === "protected-text" && !protectedChannel) return errorEnvelope("protected_output_required");
     let value;
     const executeDescriptor = Object.getOwnPropertyDescriptor(safeContext, "execute");

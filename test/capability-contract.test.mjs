@@ -10,6 +10,7 @@ import {
 import {
   desktopCommandDefinitions,
   runDesktopCommand,
+  trustedProtectedContext,
 } from "../src/desktop-commands.mjs";
 
 test("Node command table exactly covers the independent oracle", () => {
@@ -24,6 +25,19 @@ test("Node command table exactly covers the independent oracle", () => {
   assert.deepEqual([...commands.values()].filter(({ quotaWarning }) => quotaWarning).map(({ name }) => name), metadata.quotaWarning);
   assert.deepEqual(Object.fromEntries([...commands.values()].filter(({ resultKind }) => resultKind !== "json").map(({ name, resultKind }) => [name, resultKind])), metadata.resultKind);
   assert.ok(fixture.capabilities.find(({ id }) => id === "provider-credentials").browser === "protected");
+  const manifestRows = buildCapabilityManifest().capabilities.map(({ id, schemaVersion, nodeCommands, swift, browser, confirmation, quotaWarning, protectedInput, resultKind }) => ({ id, schemaVersion, nodeCommands, swift, browser, confirmation, quotaWarning, protectedInput, resultKind }));
+  const fixtureRows = fixture.capabilities.map((row) => ({
+    id: row.id,
+    schemaVersion: metadata.schemaVersion,
+    nodeCommands: row.nodeCommands,
+    swift: row.swift,
+    browser: row.browser,
+    confirmation: row.confirmation,
+    quotaWarning: row.quotaWarning,
+    protectedInput: row.id === "provider-credentials" ? ["credential.set"] : [],
+    resultKind: Object.fromEntries(row.nodeCommands.filter((name) => Object.hasOwn(metadata.resultKind, name)).map((name) => [name, metadata.resultKind[name]])),
+  }));
+  assert.deepEqual(manifestRows, fixtureRows);
 });
 
 test("capability manifest publishes the independent command metadata", () => {
@@ -46,6 +60,16 @@ test("unknown major capability snapshots are explicitly read-only", () => {
   assert.equal(manifest.mutationsEnabled, false);
   assert.equal(manifest.commands.length, 0);
   assert.equal(isMutationCommand("lifecycle.status"), false);
+  for (const input of [
+    { capabilitySchemaVersion: 0 },
+    { capabilitySchemaVersion: "1" },
+    Object.defineProperty({}, "capabilitySchemaVersion", { get() { throw new Error("must not execute"); }, enumerable: true }),
+    new Proxy({ capabilitySchemaVersion: 1 }, {}),
+  ]) {
+    const incompatible = buildCapabilityManifest(input);
+    assert.equal(incompatible.compatibility.readOnly, true);
+    assert.equal(incompatible.mutationsEnabled, false);
+  }
 });
 
 test("command execution returns the stable envelope and validates arguments in Node", async () => {
@@ -201,7 +225,7 @@ test("every canonical command has a real control-bridge invocation and result ki
     const definition = desktopCommandDefinitions().get(name);
     const result = await runDesktopCommand(name, argsByCommand[name], {
       protectedInput: name === "credential.set" ? "protected" : undefined,
-      protectedChannel: definition.resultKind === "protected-text",
+      ...(definition.resultKind === "protected-text" ? trustedProtectedContext() : {}),
       runControl: async (_root, argv) => {
         invoked.push([name, argv]);
         return definition.resultKind === "text" || definition.resultKind === "protected-text"
@@ -248,7 +272,7 @@ test("snippet output requires an authorized channel and preserves deterministic 
   const refused = await runDesktopCommand("cc-switch.snippet", {}, { execute });
   assert.equal(refused.ok, false);
   assert.equal(refused.error.code, "protected_output_required");
-  const allowed = await runDesktopCommand("cc-switch.snippet", {}, { execute, protectedChannel: true });
+  const allowed = await runDesktopCommand("cc-switch.snippet", {}, trustedProtectedContext({ execute }));
   assert.equal(allowed.ok, true);
   assert.match(allowed.value, /_codex-router\/\[REDACTED\]\/v1/);
   assert.doesNotMatch(allowed.value, /caller-secret/);

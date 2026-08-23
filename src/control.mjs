@@ -619,8 +619,8 @@ async function setCanary(slug, enabled) {
 }
 
 async function purgeVisionCache() {
-  const { evidenceCache } = await import("./vision-bridge.mjs");
-  process.stdout.write(`${JSON.stringify({ purged: true, ...evidenceCache.purge() })}\n`);
+  const { requestVisionCachePurge } = await import("./vision-bridge.mjs");
+  process.stdout.write(`${JSON.stringify(requestVisionCachePurge())}\n`);
 }
 
 async function printProviderOnboarding() {

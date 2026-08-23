@@ -98,7 +98,7 @@ function routerHealth() {
 }
 
 async function handleInvoke(command, args) {
-  const { runDesktopCommand } = await loadBridge();
+  const { runDesktopCommand, trustedProtectedContext } = await loadBridge();
 
   if (command === "router_health") return routerHealth();
   if (command === "platform_info") return platformInfo();
@@ -131,7 +131,10 @@ async function handleInvoke(command, args) {
 
   // The shared runner, so the shell adds a window and an IPC hop and nothing
   // else. Behaviour lives in src/desktop-commands.mjs for every surface.
-  return runDesktopCommand(command, args ?? {}, { root });
+  const canonical = { service_start: "lifecycle.start", service_stop: "lifecycle.stop", presence_status: "presence.status" }[command] || command;
+  const result = await runDesktopCommand(canonical, args ?? {}, trustedProtectedContext({ root }));
+  if (result?.ok === false) throw new Error(result.error?.message || "The router command failed.");
+  return result?.ok === true ? result.value : result;
 }
 
 // The shape the shared UI actually reads -- the camelCase serialization of the
@@ -203,11 +206,13 @@ async function setPresenceService(action) {
   if (serviceIntent === desired) return;
   serviceIntent = desired;
   try {
-    await (await loadBridge()).runDesktopCommand(
-      action === "stop" ? "service_stop" : "service_start",
+    const bridge = await loadBridge();
+    const result = await bridge.runDesktopCommand(
+      action === "stop" ? "lifecycle.stop" : "lifecycle.start",
       {},
-      { root },
+      bridge.trustedProtectedContext({ root }),
     );
+    if (result?.ok === false) throw new Error(result.error?.message || "The router command failed.");
   } catch {
     serviceIntent = "unknown";
   }
@@ -217,7 +222,10 @@ async function reconcilePresence() {
   if (process.platform !== "win32") return;
   let mode = presenceMode;
   try {
-    const snapshot = await (await loadBridge()).runDesktopCommand("presence_status", {}, { root });
+    const bridge = await loadBridge();
+    const result = await bridge.runDesktopCommand("presence.status", {}, bridge.trustedProtectedContext({ root }));
+    if (result?.ok === false) throw new Error(result.error?.message || "The router command failed.");
+    const snapshot = result?.ok === true ? result.value : result;
     mode = snapshot?.mode === "follow-codex" ? "follow-codex" : "always";
   } catch {
     mode = "always";

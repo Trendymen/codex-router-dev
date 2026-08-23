@@ -189,7 +189,7 @@ test("a shell that is not the browser panel still carries the full table", () =>
   // gate, which is what keeps the read-only posture local to the browser.
   const electron = readFileSync(new URL("../apps/electron/main.js", import.meta.url), "utf8");
   assert.doesNotMatch(electron, /panelCommandAllowed/);
-  assert.match(electron, /runDesktopCommand\(command, args \?\? \{\}, \{ root \}\)/);
+  assert.match(electron, /runDesktopCommand\(canonical, args \?\? \{\}, trustedProtectedContext\(\{ root \}\)\)/);
 });
 
 test("an unknown command is refused rather than shelled out", async () => {

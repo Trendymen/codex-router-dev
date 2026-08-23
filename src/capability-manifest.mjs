@@ -62,12 +62,20 @@ const capabilities = [
   ["vision", ["vision.status", "vision.on", "vision.off", "vision.engine", "vision.effort", "vision.probe", "vision.pull", "vision.purge-cache"]],
   ["presence", ["presence.status", "presence.mode"]],
   ["cc-switch", ["cc-switch.status", "cc-switch.snippet"]],
-].map(([id, nodeCommands]) => Object.freeze({
-  id,
-  nodeCommands: Object.freeze(nodeCommands),
-  swift: "full",
-  browser: id === "provider-credentials" ? "protected" : id === "native-session-usage" || id === "picker-catalog" || id === "usage" || id === "presence" || id === "cc-switch" ? "full" : "write-session",
-}));
+].map(([id, nodeCommands]) => {
+  const rows = nodeCommands.map((name) => commandRows.find((entry) => entry.name === name));
+  return Object.freeze({
+    id,
+    schemaVersion: CAPABILITY_SCHEMA_VERSION,
+    nodeCommands: Object.freeze(nodeCommands),
+    swift: "full",
+    browser: id === "provider-credentials" ? "protected" : id === "native-session-usage" || id === "picker-catalog" || id === "usage" || id === "presence" || id === "cc-switch" ? "full" : "write-session",
+    confirmation: Object.freeze(rows.filter((entry) => entry.confirmation).map((entry) => entry.name)),
+    quotaWarning: Object.freeze(rows.filter((entry) => entry.quotaWarning).map((entry) => entry.name)),
+    protectedInput: Object.freeze(rows.filter((entry) => entry.protectedInput).map((entry) => entry.name)),
+    resultKind: Object.freeze(Object.fromEntries(rows.filter((entry) => entry.resultKind !== "json").map((entry) => [entry.name, entry.resultKind]))),
+  });
+});
 
 function deepFreeze(value, seen = new WeakSet()) {
   if (!value || typeof value !== "object" || seen.has(value)) return value;
@@ -134,9 +142,14 @@ function safeSnapshot(value, state = { seen: new WeakSet(), work: SNAPSHOT_MAX_W
 }
 
 export function buildCapabilityManifest(snapshot = {}) {
-  const source = snapshot && typeof snapshot === "object" && !Array.isArray(snapshot) && !util.types.isProxy(snapshot) ? snapshot : {};
+  const hostileSource = !snapshot || typeof snapshot !== "object" || Array.isArray(snapshot) || util.types.isProxy(snapshot);
+  const source = hostileSource ? {} : snapshot;
   const versionDescriptor = Object.getOwnPropertyDescriptor(source, "capabilitySchemaVersion");
-  const version = versionDescriptor && Object.hasOwn(versionDescriptor, "value") ? versionDescriptor.value : CAPABILITY_SCHEMA_VERSION;
+  const version = hostileSource
+    ? undefined
+    : versionDescriptor
+      ? Object.hasOwn(versionDescriptor, "value") ? versionDescriptor.value : undefined
+      : CAPABILITY_SCHEMA_VERSION;
   if (version !== CAPABILITY_SCHEMA_VERSION) {
     const reported = Number.isSafeInteger(version) && version >= 0 ? version : CAPABILITY_SCHEMA_VERSION;
     return deepFreeze({

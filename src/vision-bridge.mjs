@@ -1,6 +1,31 @@
 import { createHash } from "node:crypto";
 
 import { PROVIDERS } from "./model-registry.mjs";
+import { readFileSync, existsSync } from "node:fs";
+import { writePrivateJson } from "./file-security.mjs";
+import { STATE_DIR } from "./paths.mjs";
+
+export const VISION_CACHE_PURGE_PATH = process.env.MODEL_ROUTER_VISION_CACHE_PURGE || `${STATE_DIR}/vision-cache-purge.json`;
+let purgeGeneration = 0;
+
+function purgeRequestGeneration(purgePath = VISION_CACHE_PURGE_PATH) {
+  if (!existsSync(purgePath)) return 0;
+  try {
+    const parsed = JSON.parse(readFileSync(purgePath, "utf8"));
+    return parsed?.version === 1 && Number.isSafeInteger(parsed.generation) && parsed.generation > 0
+      ? parsed.generation
+      : 0;
+  } catch {
+    return 0;
+  }
+}
+
+export function requestVisionCachePurge(purgePath = VISION_CACHE_PURGE_PATH) {
+  const generation = Math.max(Date.now(), purgeGeneration + 1);
+  purgeGeneration = generation;
+  writePrivateJson(purgePath, { version: 1, generation }, { space: 0, directoryMode: 0o700 });
+  return { requested: true, generation };
+}
 
 // A text-only model cannot read a pasted screenshot, so the router reads it on
 // the model's behalf: every image part is sent to a vision-capable model the
@@ -697,9 +722,23 @@ export function renderEvidenceRecord(readings) {
   return rendered.join("\n\n");
 }
 
-function createEvidenceCache() {
+function createEvidenceCache({ purgePath = VISION_CACHE_PURGE_PATH } = {}) {
   const entries = new Map();
   let bytes = 0;
+  let consumedGeneration = purgeRequestGeneration(purgePath);
+  function consumePurge() {
+    const generation = purgeRequestGeneration(purgePath);
+    if (generation > consumedGeneration) {
+      consumedGeneration = generation;
+      purgeInternal();
+    }
+  }
+  function purgeInternal() {
+    const removed = entries.size;
+    entries.clear();
+    bytes = 0;
+    return { removed };
+  }
   function evict() {
     while (entries.size > EVIDENCE_CACHE_MAX_ENTRIES || bytes > EVIDENCE_CACHE_MAX_BYTES) {
       const oldestKey = entries.keys().next().value;
@@ -723,6 +762,7 @@ function createEvidenceCache() {
     // whole record: the reading that answers this question and every other one
     // bought for the same image.
     get(url, question = "", now = Date.now()) {
+      consumePurge();
       const key = imageCacheKey(url);
       const entry = live(key, now);
       if (!entry) return undefined;
@@ -732,6 +772,7 @@ function createEvidenceCache() {
       return renderEvidenceRecord(entry.readings);
     },
     set(url, question, text, now = Date.now()) {
+      consumePurge();
       const key = imageCacheKey(url);
       const entry = live(key, now);
       if (entry) bytes -= entry.bytes;
@@ -755,13 +796,11 @@ function createEvidenceCache() {
       return renderEvidenceRecord(readings);
     },
     get size() {
+      consumePurge();
       return entries.size;
     },
     purge() {
-      const removed = entries.size;
-      entries.clear();
-      bytes = 0;
-      return { removed };
+      return purgeInternal();
     },
   };
 }
