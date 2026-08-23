@@ -33,6 +33,9 @@ const PURGE_LOCK_POLL_MS = 10;
 const PURGE_LOCK_RELEASE_ATTEMPTS = 4;
 const PURGE_LOCK_RELEASE_RETRY_MS = 10;
 const PURGE_LOCK_RELEASE_MAX_RETRY_MS = 80;
+const PURGE_LOCK_EMPTY_RETRY_ATTEMPTS = 4;
+const PURGE_LOCK_EMPTY_RETRY_MS = 10;
+const PURGE_LOCK_EMPTY_RETRY_MAX_MS = 80;
 const PURGE_LOCK_READ_ATTEMPTS = 4;
 const PURGE_LOCK_READ_RETRY_MS = 10;
 const PURGE_LOCK_READ_MAX_RETRY_MS = 80;
@@ -236,26 +239,47 @@ function removePurgeLockDirectory(lockPath, fs, {
   wait,
   ownerToken,
 } = {}) {
-  try {
-    removeWithRetry(fs.removeDirectory, lockPath, { platform, wait });
-    return true;
-  } catch (error) {
-    if (error?.code !== "ENOTEMPTY") throw error;
-    // A owns the marker path but another process may have removed the empty
-    // directory and atomically published a complete successor before A's
-    // fixed-path rmdir.  Inspect only after that contention error, and never
-    // let an unreadable or ambiguous directory turn into permission to delete
-    // an unknown owner.  Keep the original OS error for every inconclusive
-    // result so callers still fail closed.
-    let successor;
+  let firstError;
+  let delay = PURGE_LOCK_EMPTY_RETRY_MS;
+  for (let attempt = 0; attempt < PURGE_LOCK_EMPTY_RETRY_ATTEMPTS; attempt += 1) {
     try {
-      successor = readPurgeLockOwner(lockPath, fs, { platform, wait });
-    } catch {
-      throw error;
+      removeWithRetry(fs.removeDirectory, lockPath, { platform, wait });
+      return true;
+    } catch (error) {
+      if (error?.code !== "ENOTEMPTY") throw error;
+      firstError ||= error;
+      // The new protocol never publishes an empty lock directory. An explicit
+      // empty re-read is therefore the only state that authorizes a bounded
+      // second rmdir while a successor finishes releasing its owner marker.
+      let successor;
+      try {
+        successor = readPurgeLockOwner(lockPath, fs, { platform, wait });
+      } catch {
+        throw firstError;
+      }
+      // ENOENT/ownership gone is idempotent. A validated non-empty successor
+      // remains somebody else's lock and must never be removed by retrying.
+      if (successor === undefined) return false;
+      if (isConfirmedPurgeSuccessor(lockPath, ownerToken, successor)) return false;
+      if (
+        successor.ambiguous ||
+        !Array.isArray(successor.directoryEntries) ||
+        successor.directoryEntries.length !== 0
+      ) {
+        // Unknown, legacy, ambiguous, malformed, and otherwise non-empty
+        // directories all preserve the first ENOTEMPTY identity.
+        throw firstError;
+      }
+      if (attempt === PURGE_LOCK_EMPTY_RETRY_ATTEMPTS - 1) throw firstError;
+      try {
+        wait(delay);
+      } catch {
+        throw firstError;
+      }
+      delay = Math.min(PURGE_LOCK_EMPTY_RETRY_MAX_MS, delay * 2);
     }
-    if (isConfirmedPurgeSuccessor(lockPath, ownerToken, successor)) return false;
-    throw error;
   }
+  throw firstError;
 }
 
 /**

@@ -1029,6 +1029,167 @@ test("owner release treats ENOTEMPTY from one validated successor as contention"
   }
 });
 
+test("owner release retries rmdir after ENOTEMPTY re-reads an empty successor directory", () => {
+  const state = mkdtempSync(path.join(os.tmpdir(), "vision-purge-empty-successor-"));
+  const purgePath = path.join(state, "vision-cache-purge.json");
+  const lockPath = `${purgePath}.lock`;
+  const ownerToken = "owner-a-token";
+  const ownerPath = path.join(lockPath, `owner-${ownerToken}.json`);
+  const ownerText = `${JSON.stringify({ pid: process.pid, token: ownerToken })}\n`;
+  let directoryReads = 0;
+  let removeAttempts = 0;
+  const waits = [];
+  try {
+    mkdirSync(lockPath);
+    writeFileSync(ownerPath, ownerText);
+    const result = releaseVisionCachePurgeLock(lockPath, {
+      platform: "darwin",
+      ownerPath,
+      ownerToken,
+      wait(milliseconds) { waits.push(milliseconds); },
+      fs: {
+        readDirectory(target) {
+          assert.equal(target, lockPath);
+          directoryReads += 1;
+          return directoryReads === 1 ? [path.basename(ownerPath)] : [];
+        },
+        readFile(target) {
+          if (target === ownerPath) return ownerText;
+          const error = new Error("empty successor has no owner marker");
+          error.code = "ENOENT";
+          throw error;
+        },
+        removeFile(target) {
+          assert.equal(target, ownerPath);
+          unlinkSync(target);
+        },
+        removeDirectory(target) {
+          assert.equal(target, lockPath);
+          removeAttempts += 1;
+          if (removeAttempts === 1) {
+            const error = new Error("successor released its owner marker during rmdir");
+            error.code = "ENOTEMPTY";
+            throw error;
+          }
+        },
+      },
+    });
+    assert.equal(result, true);
+    assert.equal(removeAttempts, 2);
+    assert.deepEqual(waits, [10]);
+  } finally {
+    rmSync(state, { recursive: true, force: true });
+  }
+});
+
+test("an empty re-read never authorizes deleting a successor that appears before the retry", () => {
+  const state = mkdtempSync(path.join(os.tmpdir(), "vision-purge-empty-successor-replaced-"));
+  const purgePath = path.join(state, "vision-cache-purge.json");
+  const lockPath = `${purgePath}.lock`;
+  const ownerToken = "owner-a-token";
+  const successorToken = "owner-b-token";
+  const ownerPath = path.join(lockPath, `owner-${ownerToken}.json`);
+  const successorPath = path.join(lockPath, `owner-${successorToken}.json`);
+  const ownerText = `${JSON.stringify({ pid: process.pid, token: ownerToken })}\n`;
+  const successorText = `${JSON.stringify({ pid: process.pid, token: successorToken })}\n`;
+  let directoryReads = 0;
+  let removeAttempts = 0;
+  try {
+    mkdirSync(lockPath);
+    writeFileSync(ownerPath, ownerText);
+    const result = releaseVisionCachePurgeLock(lockPath, {
+      platform: "darwin",
+      ownerPath,
+      ownerToken,
+      fs: {
+        readDirectory(target) {
+          assert.equal(target, lockPath);
+          directoryReads += 1;
+          if (directoryReads === 1) return [path.basename(ownerPath)];
+          if (directoryReads === 2) return [];
+          return [path.basename(successorPath)];
+        },
+        readFile(target) {
+          if (target === ownerPath) return ownerText;
+          return successorText;
+        },
+        removeFile(target) {
+          assert.equal(target, ownerPath);
+          unlinkSync(target);
+        },
+        removeDirectory(target) {
+          assert.equal(target, lockPath);
+          removeAttempts += 1;
+          if (removeAttempts === 1) {
+            const error = new Error("successor appeared after an empty observation");
+            error.code = "ENOTEMPTY";
+            throw error;
+          }
+          writeFileSync(successorPath, successorText);
+          throw Object.assign(new Error("successor owns the lock"), { code: "ENOTEMPTY" });
+        },
+      },
+    });
+    assert.equal(result, false);
+    assert.equal(removeAttempts, 2, "a successor observed after an empty retry must stop further rmdir calls");
+  } finally {
+    rmSync(state, { recursive: true, force: true });
+  }
+});
+
+test("an empty re-read never authorizes retrying an unknown successor directory", () => {
+  const state = mkdtempSync(path.join(os.tmpdir(), "vision-purge-empty-unknown-"));
+  const purgePath = path.join(state, "vision-cache-purge.json");
+  const lockPath = `${purgePath}.lock`;
+  const ownerToken = "owner-a-token";
+  const ownerPath = path.join(lockPath, `owner-${ownerToken}.json`);
+  const ownerText = `${JSON.stringify({ pid: process.pid, token: ownerToken })}\n`;
+  const firstError = Object.assign(new Error("unknown successor appeared"), { code: "ENOTEMPTY" });
+  let directoryReads = 0;
+  let removeAttempts = 0;
+  try {
+    mkdirSync(lockPath);
+    writeFileSync(ownerPath, ownerText);
+    assert.throws(
+      () => releaseVisionCachePurgeLock(lockPath, {
+        platform: "darwin",
+        ownerPath,
+        ownerToken,
+        fs: {
+          readDirectory(target) {
+            assert.equal(target, lockPath);
+            directoryReads += 1;
+            if (directoryReads === 1) return [path.basename(ownerPath)];
+            if (directoryReads === 2) return [];
+            return ["mystery.json"];
+          },
+          readFile(target) {
+            if (target === ownerPath) return ownerText;
+            const error = new Error("unknown marker is not readable");
+            error.code = "ENOENT";
+            throw error;
+          },
+          removeFile(target) {
+            assert.equal(target, ownerPath);
+            unlinkSync(target);
+          },
+          removeDirectory(target) {
+            assert.equal(target, lockPath);
+            removeAttempts += 1;
+            if (removeAttempts === 1) throw firstError;
+            throw Object.assign(new Error("must not retry unknown successor"), { code: "ENOTEMPTY" });
+          },
+        },
+      }),
+      (error) => error === firstError,
+    );
+    assert.equal(removeAttempts, 2, "the retry is allowed only for the explicitly empty observation");
+    assert.equal(directoryReads, 3, "the empty observation must be followed by one guarded unknown re-read");
+  } finally {
+    rmSync(state, { recursive: true, force: true });
+  }
+});
+
 function assertSuccessorExtraEntryPreservesRemovalError(extraEntryName, testName) {
   test(testName, () => {
     const state = mkdtempSync(path.join(os.tmpdir(), "vision-purge-successor-extra-entry-"));
