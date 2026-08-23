@@ -151,6 +151,12 @@ test("real router and launcher keep the caller key out of clean browser bootstra
     assert.equal(bootstrap.headers.get("location"), "/panel/");
     assert.match(bootstrap.headers.get("set-cookie"), /HttpOnly; SameSite=Strict; Path=\/panel$/);
     const cookie = bootstrap.headers.get("set-cookie").split(";", 1)[0];
+    const page = await fetch(`http://127.0.0.1:${port}/panel/`, { headers: { cookie } });
+    assert.equal(page.status, 200);
+    const html = await page.text();
+    assert.match(html, /window\.__TAURI__/);
+    assert.match(page.headers.get("content-security-policy"), /frame-ancestors 'none'/);
+    assert.equal(html.includes(caller), false);
     const session = await fetch(`http://127.0.0.1:${port}/panel/session`, { headers: { cookie } });
     assert.equal(session.status, 200);
     const { csrfToken } = await session.json();

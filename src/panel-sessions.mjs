@@ -146,14 +146,14 @@ export function createPanelSessionStore({
     return result.session;
   }
 
-  function logout(sessionId, requestId) {
+  function logout(sessionId, requestId, { tombstone = true } = {}) {
     const session = sessions.get(sessionId);
     if (!session) return;
     session.revoked = true;
     const replay = new Map();
     if (requestId && session.replay.has(requestId)) replay.set(requestId, session.replay.get(requestId));
     session.replay = replay;
-    tombstones.set(sessionId, { csrfToken: session.csrfToken, replay, expiresAt: now() + TOMBSTONE_TTL_MS });
+    if (tombstone) tombstones.set(sessionId, { csrfToken: session.csrfToken, replay, expiresAt: now() + TOMBSTONE_TTL_MS });
     sessions.delete(sessionId);
   }
 

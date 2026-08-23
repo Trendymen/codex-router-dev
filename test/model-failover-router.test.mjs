@@ -581,7 +581,7 @@ test("default direct router covers summary/raw/compaction, exact Retry-After, tr
   });
   const directRoutes = [
     { ...MODEL_BY_SLUG.get(PRIMARY.slug), effectiveTransport: "openai-responses", reasoningDisplayMode: "summary-compat", effectiveFinalReasoningShape: "raw-content", routable: true, visible: true },
-    { ...MODEL_BY_SLUG.get("deepseek/deepseek-v4-flash"), effectiveTransport: "openai-responses", reasoningDisplayMode: "raw-preserve", effectiveFinalReasoningShape: "raw-content", routable: true, visible: true },
+    { ...MODEL_BY_SLUG.get("deepseek/deepseek-v4-flash"), effectiveTransport: "openai-responses", reasoningDisplayMode: "summary-compat", effectiveFinalReasoningShape: "raw-content", routable: true, visible: true },
   ];
   const canaryModel = MODEL_BY_SLUG.get("qwen-plan/qwen3.7-max");
   const canaryRoute = { ...canaryModel, effectiveFinalReasoningShape: "hybrid-summary", routable: true, visible: true };
@@ -620,7 +620,7 @@ test("default direct router covers summary/raw/compaction, exact Retry-After, tr
 
     const raw = await readRouted(routerPort, { model: "deepseek/deepseek-v4-flash", stream: false, input: "raw branch" });
     assert.equal(raw.status, 200, raw.body);
-    assert.ok(JSON.parse(raw.body).output.find((item) => item.type === "reasoning")?.content?.length > 0);
+    assert.ok(JSON.parse(raw.body).output.find((item) => item.type === "reasoning")?.summary?.length > 0);
 
     const compact = await readRouted(routerPort, { model: PRIMARY.slug, input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "compact me" }] }] }, "/responses/compact");
     assert.equal(compact.status, 200, compact.body);
@@ -789,6 +789,14 @@ test("experimental authorization is proof-gated before the direct-dispatch trans
       name: "default transport with an authorized route",
       legacyKillSwitch: false,
       nodeRoutes: [resolved],
+      protocolProofs: { [canary.slug]: validProof },
+      expectedStatus: 200,
+      expectedPath: "/qwen/responses",
+    });
+    await exercise({
+      name: "listed hidden route remains authorized when routable and proof-valid",
+      legacyKillSwitch: false,
+      nodeRoutes: [{ ...resolved, visible: false }],
       protocolProofs: { [canary.slug]: validProof },
       expectedStatus: 200,
       expectedPath: "/qwen/responses",

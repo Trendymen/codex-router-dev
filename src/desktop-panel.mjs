@@ -344,11 +344,11 @@ export async function handlePanelRequest(request, response, route, {
       sendStoredResult(response, writeJson, completed);
       return true;
     } catch (error) {
-      if (logoutSessionId && reservation?.status !== "mismatch") sessionStore.logout(logoutSessionId, undefined);
+      if (logoutSessionId) sessionStore.logout(logoutSessionId, undefined, { tombstone: false });
       const safe = publicPanelError(error, commandPhase ? "invalid_command_arguments" : "panel_auth_required");
       const completed = { status: safe.status, payload: safe.body };
       if (reservation?.status === "reserved") reservation.complete(completed);
-      sendStoredResult(response, writeJson, completed);
+      sendStoredResult(response, writeJson, completed, { logout: Boolean(logoutSessionId) });
       return true;
     }
   }

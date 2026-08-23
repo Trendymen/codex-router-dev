@@ -2307,6 +2307,7 @@ const NODE_ROUTE_REQUIRED_FIELDS = Object.freeze([
   "requestProfile", "reasoningDisplayMode", "declaredFinalReasoningShape",
   "effectiveFinalReasoningShape", "rolloutState", "purpose",
 ]);
+const NODE_ROUTE_FINAL_SHAPES = new Set(["provider-summary", "raw-content", "hybrid-summary", "anthropic-thinking"]);
 const NODE_ROUTE_REGISTRY_ONLY_FIELDS = new Set([
   "gatewayModel", "baseUrl", "endpoint", "credential", "behavior", "credentialOwner",
   "displayName", "description", "priority", "defaultEffort", "reasoningLevels", "contextWindow",
@@ -2327,8 +2328,10 @@ function validNodeRouteSnapshot(document, route, slug, registered) {
   if (route.slug !== slug || route.routable !== true || !registered) return false;
   const expectedListed = registered.listed === true;
   if (route.listed !== expectedListed) return false;
+  if (!NODE_ROUTE_FINAL_SHAPES.has(route.effectiveFinalReasoningShape)) return false;
+  if (registered.rolloutState !== "experimental" && route.effectiveFinalReasoningShape !== registered.declaredFinalReasoningShape) return false;
   for (const field of NODE_ROUTE_REQUIRED_FIELDS) {
-    if (field === "effectiveFinalReasoningShape" || field === "reasoningDisplayMode") continue;
+    if (field === "effectiveFinalReasoningShape") continue;
     if (route[field] !== registered[field]) return false;
   }
   for (const field of NODE_ROUTE_REGISTRY_ONLY_FIELDS) {
@@ -2357,7 +2360,6 @@ function readResolvedNodeRoute(slug) {
       // Every provider/model/transport/endpoint/credential/behavior binding
       // remains the immutable registry value above.
       effectiveFinalReasoningShape: route.effectiveFinalReasoningShape,
-      reasoningDisplayMode: route.reasoningDisplayMode,
       routable: route.routable,
       listed: route.listed,
       visible: route.visible,
