@@ -22,7 +22,7 @@ test("the retired legacy command table is absent instead of offering setup and l
 test("canonical mappings preserve the control CLI contract", () => {
   const definitions = desktopCommands.desktopCommandDefinitions();
   assert.deepEqual(definitions.get("provider.enable").execute({ provider: "deepseek", enabled: true }), [
-    "set-apply", "deepseek", "on", "--targets", "codex", "--activate",
+    "set-apply", "deepseek", "on", "--targets", "codex",
   ]);
   assert.deepEqual(definitions.get("presence.mode").execute({ mode: "follow-codex" }), [
     "presence", "set", "follow-codex",

@@ -25,7 +25,10 @@ const string = (pattern = undefined) => deepFreeze({ type: "string", ...(pattern
 const boolean = deepFreeze({ type: "boolean" });
 const slug = string("^[A-Za-z0-9][A-Za-z0-9._/-]{0,255}$");
 const provider = string("^[a-z0-9][a-z0-9-]{0,63}$");
-const credentialProvider = deepFreeze({ ...provider, enum: ["deepseek", "qwen-plan"] });
+// Provider toggles are a deliberately closed capability. Keep the enum in one
+// immutable value so the manifest and the execution boundary cannot drift.
+export const SUPPORTED_PROVIDER_IDS = Object.freeze(["deepseek", "qwen-plan"]);
+const supportedProvider = deepFreeze({ ...provider, enum: SUPPORTED_PROVIDER_IDS });
 const noArgs = objectSchema();
 
 // This is the one immutable schema source consumed by both the desktop
@@ -36,10 +39,10 @@ export const CAPABILITY_ARGUMENTS = deepFreeze({
   "lifecycle.status": noArgs, "lifecycle.start": noArgs, "lifecycle.stop": noArgs, "lifecycle.restart": noArgs, "lifecycle.logs": noArgs,
   "doctor.status": noArgs, "doctor.fix": noArgs, "maintenance.update": noArgs, "maintenance.rollback": noArgs,
   "native.status": noArgs, "native.account-usage": noArgs,
-  "credential.status": objectSchema({ provider: credentialProvider }, ["provider"]),
-  "credential.set": objectSchema({ provider: credentialProvider }, ["provider"]),
-  "credential.remove": objectSchema({ provider: credentialProvider }, ["provider"]),
-  "provider.enable": objectSchema({ provider, enabled: boolean }, ["provider", "enabled"]),
+  "credential.status": objectSchema({ provider: supportedProvider }, ["provider"]),
+  "credential.set": objectSchema({ provider: supportedProvider }, ["provider"]),
+  "credential.remove": objectSchema({ provider: supportedProvider }, ["provider"]),
+  "provider.enable": objectSchema({ provider: supportedProvider, enabled: boolean }, ["provider", "enabled"]),
   "model.visibility": objectSchema({ slug, visible: boolean }, ["slug", "visible"]),
   "model.canary": objectSchema({ slug, enabled: boolean }, ["slug", "enabled"]),
   "protocol-proof.status": objectSchema({ slug }, ["slug"]),

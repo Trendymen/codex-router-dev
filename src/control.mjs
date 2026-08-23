@@ -25,7 +25,7 @@ import {
 import { presenceSnapshot } from "./presence-state.mjs";
 import { harnessSnapshotWithWeb } from "./dsh-install.mjs";
 import { USER_MODELS_PATH } from "./user-models.mjs";
-import { buildCapabilityManifest } from "./capability-manifest.mjs";
+import { buildCapabilityManifest, SUPPORTED_PROVIDER_IDS } from "./capability-manifest.mjs";
 
 // Cross-target control plane for a tray/UI (e.g. the planned pane fork). It
 // reads which registry models are enabled per target and toggles them. Toggling
@@ -47,6 +47,12 @@ const TARGETS = [
   ...(existsSync(GEMINI_PUBLISHED) ? ["gemini"] : []),
 ];
 const args = process.argv.slice(2);
+
+function assertSupportedProviderEnable(provider) {
+  if (!SUPPORTED_PROVIDER_IDS.includes(provider)) {
+    throw new Error(`Unsupported provider.enable provider: ${provider}`);
+  }
+}
 
 function targetIsActive(target) {
   // One service serves every client, so "is this target active" cannot be the
@@ -561,11 +567,12 @@ async function applyProviderSelectionForTargets(selected, { activate = false } =
   const applied = [];
   const skipped = [];
   for (const target of selected) {
-    if (!targetIsActive(target) && !activate) {
+    const active = targetIsActive(target);
+    if (!active && !activate) {
       skipped.push(target);
       continue;
     }
-    if (targetIsActive(target)) {
+    if (active) {
       refreshActiveTarget(target);
     } else {
       // `bin/enable` is a POSIX shell script; spawning it on Windows failed
@@ -609,6 +616,10 @@ async function runApply() {
 // successful selection change. Rollback restores the selection and republishes
 // it before the lock is released.
 async function runSetApply(provider, desired) {
+  // This is the execution boundary for the canonical provider.enable command.
+  // Reject before target selection, transaction locks, or probe children so a
+  // stale/hostile UI value cannot reach provider-selection side effects.
+  assertSupportedProviderEnable(provider);
   const selected = requestedControlTargets();
   const activate = args.includes("--activate");
   let publication;

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -493,6 +493,128 @@ test("toggle on adds a provider; toggle off removes it", () => {
 
 test("toggle rejects an unknown provider", () => {
   assert.throws(() => probeSet("codex", ["deepseek"], "not-a-provider", "on"));
+});
+
+test("set-apply rejects unsupported provider.enable values before spawning target work", () => {
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), "control-set-apply-unsupported-"));
+  try {
+    const result = spawnSync(
+      process.execPath,
+      [path.join(root, "src", "control.mjs"), "set-apply", "kimi-api", "on", "--targets", "codex"],
+      {
+        cwd: root,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          MODEL_ROUTER_TARGET: "codex",
+          MODEL_ROUTER_STATE_DIR: stateDir,
+          CODEX_HOME: stateDir,
+        },
+      },
+    );
+    assert.notEqual(result.status, 0);
+    assert.match(`${result.stderr}\n${result.stdout}`, /unsupported provider|provider\.enable/i);
+    assert.equal(existsSync(path.join(stateDir, "enabled-providers.json")), false);
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("set-apply mutates shared selection and skips an inactive Codex target without installing it", () => {
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), "control-set-apply-inactive-"));
+  const selectionPath = path.join(stateDir, "enabled-providers.json");
+  const codexConfigPath = path.join(stateDir, "config.toml");
+  const codexConfig = 'model = "gpt-5.6-sol"\nmodel_provider = "openai"\n';
+  writeFileSync(selectionPath, `${JSON.stringify({ version: 1, providers: ["deepseek"] }, null, 2)}\n`, { mode: 0o600 });
+  writeFileSync(codexConfigPath, codexConfig, { mode: 0o600 });
+  try {
+    const result = spawnSync(
+      process.execPath,
+      [path.join(root, "src", "control.mjs"), "set-apply", "qwen-plan", "on", "--targets", "codex"],
+      {
+        cwd: root,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          MODEL_ROUTER_TARGET: "codex",
+          MODEL_ROUTER_STATE_DIR: stateDir,
+          CODEX_HOME: stateDir,
+        },
+      },
+    );
+    assert.equal(result.status, 0, `${result.stderr}\n${result.stdout}`);
+    const payload = JSON.parse(result.stdout.trim().split(/\r?\n/).at(-1));
+    assert.deepEqual(payload.publication.applied, []);
+    assert.deepEqual(payload.publication.skipped, ["codex"]);
+    assert.deepEqual(JSON.parse(readFileSync(selectionPath, "utf8")).providers, ["deepseek", "qwen-plan"]);
+    assert.equal(readFileSync(codexConfigPath, "utf8"), codexConfig);
+    assert.equal(existsSync(path.join(stateDir, "install-manifest.json")), false);
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("apply samples an active target once and never falls through to its installer", () => {
+  const fixtureRoot = mkdtempSync(path.join(os.tmpdir(), "control-active-snapshot-"));
+  const stateDir = path.join(fixtureRoot, "state");
+  const binDir = path.join(fixtureRoot, "bin");
+  const serviceStatusTrace = path.join(fixtureRoot, "service-status-count");
+  const installerTrace = path.join(fixtureRoot, "installer-invoked");
+  mkdirSync(stateDir, { recursive: true });
+  mkdirSync(binDir, { recursive: true });
+  mkdirSync(path.join(fixtureRoot, "src"), { recursive: true });
+  // The service wrapper uses CODEX_ROUTER_SOURCE_ROOT to select this fixture
+  // status child, while control.mjs itself remains the real production entry.
+  writeFileSync(
+    path.join(fixtureRoot, "src", "service-linux.mjs"),
+    `import { existsSync, readFileSync, writeFileSync } from "node:fs";\n` +
+      `const trace = process.env.CONTROL_SERVICE_STATUS_TRACE;\n` +
+      `const count = (existsSync(trace) ? Number(readFileSync(trace, "utf8")) : 0) + 1;\n` +
+      `writeFileSync(trace, String(count));\n` +
+      `process.stdout.write(JSON.stringify(count === 1 ? { installed: true, loaded: true, state: "active" } : { installed: false, loaded: false, state: "stopped" }) + "\\n");\n`,
+    { mode: 0o600 },
+  );
+  const installer = process.platform === "win32"
+    ? path.join(fixtureRoot, "install.ps1")
+    : path.join(binDir, "enable");
+  writeFileSync(
+    installer,
+    process.platform === "win32"
+      ? `Add-Content -Path $env:CONTROL_INSTALLER_TRACE -Value invoked\nexit 0\n`
+      : `#!/bin/sh\nprintf invoked >> "$CONTROL_INSTALLER_TRACE"\nexit 0\n`,
+    { mode: 0o700 },
+  );
+  if (process.platform !== "win32") chmodSync(installer, 0o700);
+  try {
+    const result = spawnSync(
+      process.execPath,
+      [path.join(root, "src", "control.mjs"), "apply", "--targets", "codex"],
+      {
+        cwd: root,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          MODEL_ROUTER_TARGET: "codex",
+          MODEL_ROUTER_STATE_DIR: stateDir,
+          CODEX_HOME: stateDir,
+          CODEX_ROUTER_SOURCE_ROOT: fixtureRoot,
+          MODEL_ROUTER_SOURCE_ROOT: fixtureRoot,
+          MODEL_ROUTER_REGISTRY: path.join(root, "config"),
+          CODEX_ROUTER_REGISTRY: path.join(root, "config"),
+          CODEX_ROUTER_SERVICE_PLATFORM: "linux",
+          CONTROL_SERVICE_STATUS_TRACE: serviceStatusTrace,
+          CONTROL_INSTALLER_TRACE: installerTrace,
+        },
+      },
+    );
+    assert.equal(result.status, 0, `${result.stderr}\n${result.stdout}`);
+    assert.match(result.stderr, /Applied: codex/);
+    assert.equal(existsSync(serviceStatusTrace), true, `${result.stderr}\n${result.stdout}`);
+    assert.equal(Number(readFileSync(serviceStatusTrace, "utf8")), 1, "each target must have one active snapshot");
+    assert.equal(existsSync(installerTrace), false, "an active snapshot must refresh, never install");
+  } finally {
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  }
 });
 
 test("set-apply delegates provider mutation to the Router state-and-generation transaction", () => {

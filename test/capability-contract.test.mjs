@@ -138,6 +138,56 @@ test("command execution returns the stable envelope and validates arguments in N
   assert.equal(invalid.error.code, "invalid_command_arguments");
 });
 
+test("provider.enable publishes and enforces the closed supported-provider enum", async () => {
+  const definition = desktopCommandDefinitions().get("provider.enable");
+  assert.deepEqual(definition.arguments.properties.provider.enum, ["deepseek", "qwen-plan"]);
+
+  for (const provider of ["kimi-api", "local", "lmstudio", "not-a-provider", "deepseek.constructor"]) {
+    let invoked = false;
+    const result = await runDesktopCommand("provider.enable", { provider, enabled: true }, {
+      execute: async () => {
+        invoked = true;
+        return { changed: true };
+      },
+    });
+    assert.equal(result.ok, false, provider);
+    assert.equal(result.error.code, "invalid_command_arguments", provider);
+    assert.equal(invoked, false, `${provider} must be rejected before execution`);
+  }
+
+  const accessorArgs = {};
+  Object.defineProperty(accessorArgs, "provider", {
+    enumerable: true,
+    get() {
+      throw new Error("provider accessor must not run");
+    },
+  });
+  Object.defineProperty(accessorArgs, "enabled", { value: true, enumerable: true });
+  const accessorResult = await runDesktopCommand("provider.enable", accessorArgs, {
+    execute: async () => ({ changed: true }),
+  });
+  assert.equal(accessorResult.ok, false);
+  assert.equal(accessorResult.error.code, "invalid_command_arguments");
+
+  const proxyResult = await runDesktopCommand("provider.enable", new Proxy({ provider: "deepseek", enabled: true }, {}), {
+    execute: async () => ({ changed: true }),
+  });
+  assert.equal(proxyResult.ok, false);
+  assert.equal(proxyResult.error.code, "invalid_command_arguments");
+
+  for (const provider of ["deepseek", "qwen-plan"]) {
+    const calls = [];
+    const result = await runDesktopCommand("provider.enable", { provider, enabled: true }, {
+      execute: async (name, args) => {
+        calls.push([name, args]);
+        return { changed: true };
+      },
+    });
+    assert.equal(result.ok, true, provider);
+    assert.deepEqual(calls, [["provider.enable", { provider, enabled: true }]], provider);
+  }
+});
+
 test("credentials require protected input and are never accepted in command arguments", async () => {
   const exposed = await runDesktopCommand("credential.set", { provider: "deepseek", credential: "decoy-secret" }, {
     execute: async () => ({ ok: true }),
