@@ -11,7 +11,7 @@
 import { execFile } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 
-import { assertCallerSecret, panelUrl, redactCallerUrl } from "./caller-auth.mjs";
+import { assertCallerSecret, panelBootstrapUrl, panelSessionUrl, redactCallerUrl } from "./caller-auth.mjs";
 import { CALLER_SECRET_PATH, PORTS } from "./paths.mjs";
 
 const args = process.argv.slice(2);
@@ -75,13 +75,24 @@ function openInBrowser(url) {
   });
 }
 
-async function main() {
-  const url = panelUrl(PORTS.router, callerSecret());
-
-  if (printOnly) {
-    process.stdout.write(`${url}\n`);
-    return;
+async function mintPanelBootstrapUrl(secret) {
+  const response = await fetch(panelSessionUrl(PORTS.router, secret), {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: `Bearer ${secret}` },
+    body: "{}",
+    signal: AbortSignal.timeout(2000),
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok || typeof payload.nonce !== "string") {
+    const error = new Error("The router could not create a browser panel session.");
+    error.status = response.status;
+    throw error;
   }
+  return panelBootstrapUrl(PORTS.router, payload.nonce);
+}
+
+async function main() {
+  const secret = callerSecret();
 
   if (!(await routerIsRunning())) {
     process.stdout.write(
@@ -92,10 +103,14 @@ async function main() {
     return;
   }
 
+  const url = await mintPanelBootstrapUrl(secret);
+  if (printOnly) {
+    process.stdout.write(`${url}\n`);
+    return;
+  }
+
   await openInBrowser(url);
-  // Redacted on purpose: enough to confirm what opened and where, without
-  // reproducing the capability in the terminal.
-  process.stdout.write(`Opened the companion at ${redactCallerUrl(url)}\n`);
+  process.stdout.write("Opened the companion in a clean browser session.\n");
 }
 
 main().catch((error) => {

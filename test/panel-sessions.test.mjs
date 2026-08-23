@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import test from "node:test";
+import { jcsBytes } from "../src/jcs.mjs";
 
 import {
   createPanelSessionStore,
@@ -7,8 +9,9 @@ import {
   validatePanelRequest,
 } from "../src/panel-sessions.mjs";
 
-function randomBytes(fill = 0x11) {
-  return (size) => Buffer.alloc(size, fill);
+function sequenceRandomBytes() {
+  let value = 1;
+  return (size) => Buffer.alloc(size, value++);
 }
 
 function request(overrides = {}) {
@@ -29,7 +32,7 @@ function request(overrides = {}) {
 
 test("bootstrap nonce is 256-bit, 30-second, atomically single use", async () => {
   let now = 1_000;
-  const store = createPanelSessionStore({ clock: () => now, randomBytes: randomBytes(0x22) });
+  const store = createPanelSessionStore({ clock: () => now, randomBytes: sequenceRandomBytes() });
   const minted = store.mintNonce();
   assert.equal(Buffer.from(minted.nonce, "base64url").length, 32);
   assert.equal(minted.expiresAt, now + 30_000);
@@ -73,7 +76,7 @@ test("sessions enforce idle/absolute TTL, cap eviction, logout and restart revoc
 });
 
 test("request replay returns the previous result and never repeats mutation", () => {
-  const store = createPanelSessionStore({ randomBytes: randomBytes(0x33) });
+  const store = createPanelSessionStore({ randomBytes: sequenceRandomBytes() });
   const session = store.consumeNonce(store.mintNonce().nonce);
   const id = "11111111-1111-4111-8111-111111111111";
   assert.equal(store.replay(session.sessionId, id), undefined);
@@ -84,7 +87,7 @@ test("request replay returns the previous result and never repeats mutation", ()
 
 test("confirmation is bound to session, exact command, canonical args hash and one use", () => {
   let now = 1_000;
-  const store = createPanelSessionStore({ clock: () => now, randomBytes: randomBytes(0x44) });
+  const store = createPanelSessionStore({ clock: () => now, randomBytes: sequenceRandomBytes() });
   const session = store.consumeNonce(store.mintNonce().nonce);
   const args = { z: 1, a: "x" };
   const hash = canonicalArgumentsHash(args);
@@ -107,4 +110,47 @@ test("panel request validation checks peer, host, origin, method and JSON before
   assert.throws(() => validatePanelRequest(request({ method: "GET" }), policy), /method/i);
   assert.throws(() => validatePanelRequest(request({ headers: { ...request().headers, "content-type": "text/plain" } }), policy), /json/i);
   assert.throws(() => validatePanelRequest(request({ headers: { ...request().headers, origin: undefined } }), policy), /origin/i);
+});
+
+test("concurrent reservation shares one in-flight result", async () => {
+  const store = createPanelSessionStore({ randomBytes: sequenceRandomBytes() });
+  const session = store.consumeNonce(store.mintNonce().nonce);
+  const requestId = "11111111-1111-4111-8111-111111111111";
+  const first = store.reserve(session.sessionId, requestId);
+  const second = store.reserve(session.sessionId, requestId);
+  assert.equal(first.status, "reserved");
+  assert.equal(second.status, "in-flight");
+  const result = { status: 204, payload: {} };
+  first.complete(result);
+  assert.deepEqual(await second.promise, result);
+  assert.deepEqual(store.reserve(session.sessionId, requestId).result, result);
+});
+
+test("confirmation hashing uses shared JCS and rejects hostile values", () => {
+  const args = { z: 1, a: "x" };
+  const expected = createHash("sha256").update(jcsBytes(args)).digest("base64url");
+  assert.equal(canonicalArgumentsHash(args), expected);
+  const hostile = {};
+  Object.defineProperty(hostile, "secret", { enumerable: true, get() { throw new Error("getter"); } });
+  assert.throws(() => canonicalArgumentsHash(hostile), /JCS|canonical/i);
+  assert.throws(() => canonicalArgumentsHash("\ud800"), /JCS|surrogate/i);
+});
+
+test("logout keeps an idempotent tombstone for the completed request", () => {
+  const store = createPanelSessionStore({ randomBytes: sequenceRandomBytes() });
+  const session = store.consumeNonce(store.mintNonce().nonce);
+  const requestId = "11111111-1111-4111-8111-111111111111";
+  const result = { status: 204, payload: {} };
+  store.remember(session.sessionId, requestId, result);
+  store.logout(session.sessionId);
+  const replay = store.reserve(session.sessionId, requestId);
+  assert.equal(replay.status, "completed");
+  assert.deepEqual(replay.result, result);
+});
+
+test("random token collisions resample and fail closed without deterministic derivation", () => {
+  let calls = 0;
+  const store = createPanelSessionStore({ randomBytes: (size) => { calls += 1; return Buffer.alloc(size, 0x77); } });
+  assert.throws(() => store.consumeNonce(store.mintNonce().nonce), /collision|allocate/i);
+  assert.ok(calls >= 17);
 });

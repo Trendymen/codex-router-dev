@@ -11,16 +11,17 @@ import { createHash } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { secretEqual } from "./caller-auth.mjs";
 import { desktopCommandDefinitions, runDesktopCommand, sourceRoot, trustedProtectedContext } from "./desktop-commands.mjs";
 import {
   canonicalArgumentsHash,
   createPanelSessionStore,
+  EXPIRED_PANEL_SESSION_COOKIE,
   PANEL_SESSION_COOKIE,
   panelSecurityHeaders,
   parsePanelCookie,
   validatePanelRequest,
 } from "./panel-sessions.mjs";
+import { ERROR_DEFINITIONS, routerError } from "./public-error.mjs";
 
 const UI_DIR = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -92,11 +93,10 @@ export function isPanelRoute(route) {
   );
 }
 
-// Commands the panel may run. The mutating half of the table is deliberately
-// absent: a browser tab is reachable by any page that learns the capability,
-// and "save this API key" is not something to expose on that assumption. The
-// tray and the Electron shell keep the full table because reaching them means
-// already running code on the machine.
+// Read commands remain available to the legacy direct handler used by the
+// embedded shell tests. A browser request routed through the session gate uses
+// the full canonical table only after cookie, CSRF, replay, and confirmation
+// validation have completed.
 const CANONICAL_PANEL_COMMANDS = new Set([
   "lifecycle.status",
   "native.account-usage",
@@ -161,44 +161,47 @@ async function readBody(request, limit = 64 * 1024) {
 
 const DEFAULT_SESSION_STORE = createPanelSessionStore();
 
-function panelError(error) {
-  const code = typeof error?.code === "string" ? error.code : "panel_invalid_request";
-  const safe = {
-    panel_nonce_invalid: [404, "The panel bootstrap nonce is invalid."],
-    panel_nonce_expired: [410, "The panel bootstrap nonce has expired."],
-    panel_auth_required: [401, "The panel write session is missing or expired."],
-    panel_csrf_invalid: [403, "The panel mutation proof is invalid."],
-    panel_confirmation_required: [409, "Operation-bound confirmation is required."],
-    panel_confirmation_invalid: [400, "The panel confirmation request is invalid."],
-    panel_peer_invalid: [403, "The panel peer is not allowed."],
-    panel_host_invalid: [421, "The panel Host is invalid."],
-    panel_origin_invalid: [403, "The panel Origin is invalid."],
-    panel_method_invalid: [405, "The panel method is not allowed."],
-    panel_content_type_invalid: [415, "Panel mutations require application/json."],
-    panel_request_id_invalid: [400, "The panel request ID is invalid."],
-  }[code] || [400, "The panel request was invalid."];
-  return { status: safe[0], payload: { error: { type: "router_error", code, message: safe[1], param: null } } };
+function publicPanelError(error, fallback = "panel_auth_required") {
+  const candidate = typeof error?.code === "string" ? error.code : fallback;
+  const code = Object.hasOwn(ERROR_DEFINITIONS, candidate)
+    ? candidate
+    : candidate === "panel_confirmation_invalid" ? "panel_confirmation_required"
+      : candidate === "panel_csrf_invalid" ? "panel_csrf_invalid"
+        : "panel_auth_required";
+  return routerError(code);
 }
 
 function applyHeaders(response, options = {}) {
   for (const [name, value] of Object.entries(panelSecurityHeaders(options))) response.setHeader(name, value);
 }
 
-function rememberAndSend(response, writeJson, sessionStore, sessionId, requestId, status, payload) {
-  const result = { status, payload };
-  if (sessionId && requestId) sessionStore.remember(sessionId, requestId, result);
-  writeJson(response, status, payload);
+function sendStoredResult(response, writeJson, result, { logout = false } = {}) {
+  applyHeaders(response);
+  if (logout) response.setHeader("set-cookie", EXPIRED_PANEL_SESSION_COOKIE);
+  if (result.status === 204) {
+    response.writeHead(204);
+    response.end();
+  } else {
+    writeJson(response, result.status, result.payload);
+  }
+}
+
+function commandResult(result) {
+  if (result?.ok !== false) return { status: 200, payload: { value: result?.ok === true ? result.value : result } };
+  const code = result?.error?.code;
+  const safe = Object.hasOwn(ERROR_DEFINITIONS, code) ? routerError(code) : routerError("invalid_command_arguments");
+  return { status: safe.status, payload: safe.body };
 }
 
 function mutationContext(request, policy, sessionStore) {
   const context = validatePanelRequest(request, { ...policy, mutation: true });
-  const session = sessionStore.getSession(context.sessionId, { touch: true });
-  if (!session.valid || !secretEqual(context.csrfToken, session.session.csrfToken)) {
+  const session = sessionStore.mutationSession(context.sessionId, context.csrfToken, context.requestId);
+  if (!session.valid) {
     const invalid = new Error("The panel mutation proof is invalid.");
-    invalid.code = "panel_csrf_invalid";
+    invalid.code = sessionStore.getSession(context.sessionId).valid ? "panel_csrf_invalid" : "panel_auth_required";
     throw invalid;
   }
-  return context;
+  return { ...context, tombstone: Boolean(session.tombstone) };
 }
 
 export async function handlePanelRequest(request, response, route, {
@@ -210,15 +213,17 @@ export async function handlePanelRequest(request, response, route, {
 }) {
   const secured = Boolean(policy);
   const fail = (error) => {
-    const result = panelError(error);
+    const result = publicPanelError(error);
     applyHeaders(response);
-    writeJson(response, result.status, result.payload);
+    writeJson(response, result.status, result.body);
     return true;
   };
 
   if (secured && !/^\/panel-bootstrap\//.test(route) && route !== "/panel-session" && route !== "/panel/session" && route !== "/panel/logout" && route !== "/panel/confirmations" && route !== "/panel/invoke") {
     try {
       validatePanelRequest(request, { ...policy, mutation: false, method: request.method === "HEAD" ? "HEAD" : "GET", requireRequestId: false });
+      const sessionId = parsePanelCookie(request.headers?.cookie);
+      if (!sessionStore.getSession(sessionId).valid) throw Object.assign(new Error("The panel write session is missing or expired."), { code: "panel_auth_required" });
     } catch (error) {
       return fail(error);
     }
@@ -254,21 +259,32 @@ export async function handlePanelRequest(request, response, route, {
   }
 
   if (secured && (route === "/panel/logout" || route === "/panel/confirmations" || route === "/panel/invoke")) {
+    let reservation;
+    let commandPhase = false;
     try {
       const context = mutationContext(request, policy, sessionStore);
-      const prior = sessionStore.replay(context.sessionId, context.requestId);
-      if (prior) {
-        applyHeaders(response);
-        writeJson(response, prior.status, prior.payload);
+      reservation = sessionStore.reserve(context.sessionId, context.requestId);
+      if (reservation.status === "completed") {
+        sendStoredResult(response, writeJson, reservation.result, { logout: route === "/panel/logout" });
         return true;
       }
-      const body = JSON.parse(await readBody(request) || "{}");
+      if (reservation.status === "in-flight") {
+        sendStoredResult(response, writeJson, await reservation.promise, { logout: route === "/panel/logout" });
+        return true;
+      }
+      if (reservation.status !== "reserved") throw Object.assign(new Error("The panel write session is missing or expired."), { code: "panel_auth_required" });
+      commandPhase = true;
+      let body;
+      try {
+        body = JSON.parse(await readBody(request) || "{}");
+      } catch {
+        throw Object.assign(new Error("The panel request was not valid JSON."), { code: "invalid_command_arguments" });
+      }
       if (route === "/panel/logout") {
-        sessionStore.remember(context.sessionId, context.requestId, { status: 204, payload: {} });
+        const result = { status: 204, payload: {} };
+        reservation.complete(result);
         sessionStore.logout(context.sessionId);
-        applyHeaders(response);
-        response.writeHead(204);
-        response.end();
+        sendStoredResult(response, writeJson, result, { logout: true });
         return true;
       }
       if (route === "/panel/confirmations") {
@@ -276,20 +292,20 @@ export async function handlePanelRequest(request, response, route, {
         const definition = desktopCommandDefinitions().get(command);
         if (!definition?.confirmation) throw Object.assign(new Error("confirmation required"), { code: "panel_confirmation_invalid" });
         const hash = typeof body.argumentsHash === "string" ? body.argumentsHash : canonicalArgumentsHash(body.args ?? {});
+        if (!/^[A-Za-z0-9_-]{43}$/.test(hash)) throw Object.assign(new Error("invalid argument hash"), { code: "invalid_command_arguments" });
         const confirmation = sessionStore.mintConfirmation(context.sessionId, command, hash);
-        applyHeaders(response);
-        rememberAndSend(response, writeJson, sessionStore, context.sessionId, context.requestId, 200, confirmation);
+        const result = { status: 200, payload: confirmation };
+        reservation.complete(result);
+        sendStoredResult(response, writeJson, result);
         return true;
       }
       const { command, args } = body || {};
       const local = panelLocalCommand(command);
       if (local) {
-        applyHeaders(response);
-        rememberAndSend(response, writeJson, sessionStore, context.sessionId, context.requestId, 200, { value: local() });
+        const result = { status: 200, payload: { value: local() } };
+        reservation.complete(result);
+        sendStoredResult(response, writeJson, result);
         return true;
-      }
-      if (!panelCommandAllowed(command, { readOnly: false })) {
-        throw Object.assign(new Error("command unavailable"), { code: "panel_invalid_request" });
       }
       const definition = desktopCommandDefinitions().get(command);
       const protectedInput = definition?.protectedInput && typeof args?.apiKey === "string" ? args.apiKey : undefined;
@@ -303,17 +319,20 @@ export async function handlePanelRequest(request, response, route, {
           throw Object.assign(new Error("confirmation required"), { code: "panel_confirmation_required" });
         }
       }
-      const commandContext = definition.protectedInput
+      const commandContext = definition?.protectedInput
         ? { root, protectedInput: async () => protectedInput }
-        : definition.resultKind === "protected-text" ? trustedProtectedContext({ root }) : { root };
-      const result = await runCommand(command, canonicalArgs, commandContext);
-      const payload = result?.ok === false ? { error: result.error } : { value: result?.ok === true ? result.value : result };
-      const status = result?.ok === false ? 502 : 200;
-      applyHeaders(response);
-      rememberAndSend(response, writeJson, sessionStore, context.sessionId, context.requestId, status, payload);
+        : definition?.resultKind === "protected-text" ? trustedProtectedContext({ root }) : { root };
+      const result = definition ? await runCommand(command, canonicalArgs, commandContext) : await runDesktopCommand(command, canonicalArgs, {});
+      const completed = commandResult(result);
+      reservation.complete(completed);
+      sendStoredResult(response, writeJson, completed);
       return true;
     } catch (error) {
-      return fail(error);
+      const safe = publicPanelError(error, commandPhase ? "invalid_command_arguments" : "panel_auth_required");
+      const completed = { status: safe.status, payload: safe.body };
+      if (reservation?.status === "reserved") reservation.complete(completed);
+      sendStoredResult(response, writeJson, completed);
+      return true;
     }
   }
 

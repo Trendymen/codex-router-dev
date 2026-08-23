@@ -63,6 +63,15 @@ export function panelUrl(port, secret) {
   return `http://127.0.0.1:${port}${panelPath(secret)}`;
 }
 
+export function panelSessionUrl(port, secret) {
+  return `http://127.0.0.1:${port}${CALLER_PATH_PREFIX}/${assertCallerSecret(secret)}/panel-sessions`;
+}
+
+export function panelBootstrapUrl(port, nonce) {
+  if (typeof nonce !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(nonce)) throw new Error("The panel bootstrap nonce is invalid.");
+  return `http://127.0.0.1:${port}/panel-bootstrap/${nonce}`;
+}
+
 export function authenticatedRoute(pathname, expectedSecret) {
   if (typeof pathname !== "string") return undefined;
   const prefix = `${CALLER_PATH_PREFIX}/`;
@@ -122,7 +131,7 @@ export function isManagedGeminiBaseUrl(value, port) {
 export function redactCallerUrl(value) {
   if (typeof value !== "string") return value;
   return value.replace(
-    new RegExp(`(${CALLER_PATH_PREFIX}/)[A-Za-z0-9_-]+(?=/(?:v1|panel|gemini)(?:/|$))`, "g"),
+    new RegExp(`(${CALLER_PATH_PREFIX}/)[A-Za-z0-9_-]+(?=/(?:v1|panel|panel-sessions|gemini)(?:/|$))`, "g"),
     "$1[REDACTED]",
   );
 }

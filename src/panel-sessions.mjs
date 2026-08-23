@@ -1,4 +1,5 @@
 import { createHash, randomBytes as cryptoRandomBytes, timingSafeEqual } from "node:crypto";
+import { jcsBytes } from "./jcs.mjs";
 
 export const BOOTSTRAP_NONCE_TTL_MS = 30_000;
 export const SESSION_IDLE_TTL_MS = 15 * 60_000;
@@ -32,28 +33,8 @@ function sameSecret(actual, expected) {
   return left.length === right.length && timingSafeEqual(left, right);
 }
 
-function canonicalize(value, seen = new WeakSet()) {
-  if (value === null) return "null";
-  if (value === true) return "true";
-  if (value === false) return "false";
-  if (typeof value === "string") return JSON.stringify(value);
-  if (typeof value === "number") {
-    if (!Number.isFinite(value)) throw new TypeError("arguments must be JSON values");
-    return JSON.stringify(value);
-  }
-  if (typeof value !== "object" || seen.has(value)) throw new TypeError("arguments must be a finite JSON value");
-  seen.add(value);
-  if (Array.isArray(value)) return `[${value.map((entry) => canonicalize(entry, seen)).join(",")}]`;
-  const keys = Object.keys(value).sort();
-  return `{${keys.map((key) => {
-    const descriptor = Object.getOwnPropertyDescriptor(value, key);
-    if (!descriptor || !Object.hasOwn(descriptor, "value")) throw new TypeError("arguments must contain data properties only");
-    return `${JSON.stringify(key)}:${canonicalize(descriptor.value, seen)}`;
-  }).join(",")}}`;
-}
-
 export function canonicalArgumentsHash(args) {
-  return createHash("sha256").update(canonicalize(args), "utf8").digest("base64url");
+  return createHash("sha256").update(jcsBytes(args)).digest("base64url");
 }
 
 function error(code, message) {
@@ -87,16 +68,14 @@ export function createPanelSessionStore({
   const now = monotonicClock(clock);
   const nonces = new Map();
   const sessions = new Map();
+  const tombstones = new Map();
 
   function uniqueToken(collection) {
     for (let attempt = 0; attempt < 16; attempt += 1) {
-      let value = token(randomBytes);
-      if (collection.has(value)) {
-        value = createHash("sha256").update(`${value}:${attempt}:${collection.size}`, "utf8").digest("base64url");
-      }
+      const value = token(randomBytes);
       if (!collection.has(value)) return value;
     }
-    throw new Error("could not allocate a unique panel security token");
+    throw error("panel_entropy_collision", "could not allocate a unique panel security token");
   }
 
   function purgeExpired(at = now()) {
@@ -106,6 +85,7 @@ export function createPanelSessionStore({
         sessions.delete(id);
       }
     }
+    while (tombstones.size > 64) tombstones.delete(tombstones.keys().next().value);
   }
 
   function mintNonce() {
@@ -131,13 +111,14 @@ export function createPanelSessionStore({
       if (oldest) sessions.delete(oldest[0]);
     }
     const sessionId = uniqueToken(sessions);
-    const csrfToken = uniqueToken(new Map([[sessionId, true]]));
+    const csrfToken = uniqueToken(new Map([...sessions.keys(), sessionId].map((id) => [id, true])));
     sessions.set(sessionId, {
       sessionId,
       csrfToken,
       createdAt: at,
       lastUsedAt: at,
       replay: new Map(),
+      inFlight: new Map(),
       confirmations: new Map(),
       revoked: false,
     });
@@ -161,25 +142,66 @@ export function createPanelSessionStore({
 
   function logout(sessionId) {
     const session = sessions.get(sessionId);
-    if (session) session.revoked = true;
+    if (!session) return;
+    session.revoked = true;
+    tombstones.set(sessionId, { csrfToken: session.csrfToken, replay: session.replay });
     sessions.delete(sessionId);
   }
 
   function revokeAll() {
     sessions.clear();
     nonces.clear();
+    tombstones.clear();
   }
 
   function replay(sessionId, requestId) {
     const session = getSession(sessionId).session;
-    if (!session) return undefined;
-    return session.replay.get(requestId);
+    if (session) return session.replay.get(requestId);
+    return tombstones.get(sessionId)?.replay.get(requestId);
   }
 
   function remember(sessionId, requestId, result) {
     const session = touchSession(sessionId);
     session.replay.set(requestId, result);
     while (session.replay.size > MAX_REPLAY_ENTRIES) session.replay.delete(session.replay.keys().next().value);
+  }
+
+  function reserve(sessionId, requestId) {
+    const active = getSession(sessionId, { touch: true }).session;
+    if (!active) {
+      const result = tombstones.get(sessionId)?.replay.get(requestId);
+      return result ? { status: "completed", result } : { status: "invalid" };
+    }
+    const completed = active.replay.get(requestId);
+    if (completed) return { status: "completed", result: completed };
+    const running = active.inFlight.get(requestId);
+    if (running) return { status: "in-flight", promise: running.promise };
+    let resolve;
+    let settled = false;
+    const promise = new Promise((done) => { resolve = done; });
+    const reservation = {
+      status: "reserved",
+      promise,
+      complete(result) {
+        if (settled) return;
+        settled = true;
+        active.inFlight.delete(requestId);
+        active.replay.set(requestId, result);
+        while (active.replay.size > MAX_REPLAY_ENTRIES) active.replay.delete(active.replay.keys().next().value);
+        resolve(result);
+      },
+    };
+    active.inFlight.set(requestId, { promise, reservation });
+    return reservation;
+  }
+
+  function mutationSession(sessionId, csrfToken, requestId) {
+    const active = getSession(sessionId, { touch: true }).session;
+    if (active) return sameSecret(active.csrfToken, csrfToken) ? { valid: true, session: active } : { valid: false };
+    const tombstone = tombstones.get(sessionId);
+    return tombstone && tombstone.replay.has(requestId) && sameSecret(tombstone.csrfToken, csrfToken)
+      ? { valid: true, tombstone }
+      : { valid: false };
   }
 
   function mintConfirmation(sessionId, command, argumentsHash) {
@@ -212,6 +234,8 @@ export function createPanelSessionStore({
     revokeAll,
     replay,
     remember,
+    reserve,
+    mutationSession,
     mintConfirmation,
     consumeConfirmation,
   });
@@ -277,3 +301,4 @@ export function panelSecurityHeaders({ staticAsset = false } = {}) {
 }
 
 export const PANEL_SESSION_COOKIE = "HttpOnly; SameSite=Strict; Path=/panel";
+export const EXPIRED_PANEL_SESSION_COOKIE = "panel_session=; Max-Age=0; HttpOnly; SameSite=Strict; Path=/panel";

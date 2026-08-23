@@ -442,7 +442,8 @@ test("the bare panel path redirects to the directory form", async () => {
 });
 
 test("secured panel bootstrap, CSRF and request replay are enforced before command execution", async () => {
-  const store = createPanelSessionStore({ randomBytes: (size) => Buffer.alloc(size, 0x55) });
+  let randomValue = 0x55;
+  const store = createPanelSessionStore({ randomBytes: (size) => Buffer.alloc(size, randomValue++) });
   const minted = store.mintNonce();
   let calls = 0;
   const server = http.createServer(async (request, response) => {
@@ -454,6 +455,7 @@ test("secured panel bootstrap, CSRF and request replay are enforced before comma
         sessionStore: store,
         runCommand: async () => {
           calls += 1;
+          await new Promise((resolve) => setTimeout(resolve, 25));
           return { ok: true, value: { calls } };
         },
       });
@@ -488,14 +490,33 @@ test("secured panel bootstrap, CSRF and request replay are enforced before comma
     assert.equal((await second.json()).value.calls, 1);
     assert.equal(calls, 1);
 
+    const concurrentHeaders = { ...headers, "x-request-id": "22222222-2222-4222-8222-222222222222" };
+    const concurrent = await Promise.all([
+      fetch(`${base}/panel/invoke`, { method: "POST", headers: concurrentHeaders, body: JSON.stringify({ command: "presence.mode", args: { mode: "always" } }) }),
+      fetch(`${base}/panel/invoke`, { method: "POST", headers: concurrentHeaders, body: JSON.stringify({ command: "presence.mode", args: { mode: "never" } }) }),
+    ]);
+    assert.deepEqual(concurrent.map((response) => response.status), [200, 200]);
+    assert.equal(calls, 2);
+
+    const unknown = await fetch(`${base}/panel/invoke`, { method: "POST", headers: { ...headers, "x-request-id": "33333333-3333-4333-8333-333333333333" }, body: JSON.stringify({ command: "does.not.exist", args: {} }) });
+    assert.equal(unknown.status, 404);
+    assert.equal((await unknown.json()).error.code, "command_not_supported");
+
     const badOrigin = await fetch(`${base}/panel/invoke`, { method: "POST", headers: { ...headers, origin: "http://localhost:" + port }, body: "{}" });
-    assert.equal(badOrigin.status, 403);
+    assert.equal(badOrigin.status, 401);
     const badHost = await new Promise((resolve, reject) => {
       const req = http.request({ hostname: "127.0.0.1", port, path: "/panel/", headers: { host: `localhost:${port}` } }, resolve);
       req.on("error", reject);
       req.end();
     });
-    assert.equal(badHost.statusCode, 421);
+    assert.equal(badHost.statusCode, 401);
+
+    const logoutHeaders = { ...headers, "x-request-id": "44444444-4444-4444-8444-444444444444" };
+    const logout = await fetch(`${base}/panel/logout`, { method: "POST", headers: logoutHeaders, body: "{}" });
+    assert.equal(logout.status, 204);
+    assert.match(logout.headers.get("set-cookie"), /Max-Age=0; HttpOnly; SameSite=Strict; Path=\/panel/);
+    const logoutRetry = await fetch(`${base}/panel/logout`, { method: "POST", headers: logoutHeaders, body: "{}" });
+    assert.equal(logoutRetry.status, 204);
   } finally {
     await new Promise((resolve) => server.close(resolve));
   }

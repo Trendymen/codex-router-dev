@@ -2307,12 +2307,26 @@ const NODE_ROUTE_REQUIRED_FIELDS = Object.freeze([
   "requestProfile", "reasoningDisplayMode", "declaredFinalReasoningShape",
   "effectiveFinalReasoningShape", "rolloutState", "purpose",
 ]);
-function validNodeRouteSnapshot(document, route, slug) {
+const NODE_ROUTE_REGISTRY_ONLY_FIELDS = new Set([
+  "gatewayModel", "baseUrl", "endpoint", "credential", "behavior", "credentialOwner",
+  "displayName", "description", "priority", "defaultEffort", "reasoningLevels", "contextWindow",
+  "autoCompact", "inputModalities", "supportsReasoningSummaries", "supportsImageDetailOriginal",
+  "supportsParallelToolCalls", "supportsApplyPatchTool", "searchTool", "compHash", "availabilityNux",
+  "behaviorTemplate", "instructionOverlay", "experimentalSupportedTools", "multiAgentVersion",
+  "requiresTrailingUserTurn", "defaultReasoningSummary", "upgradeTo",
+]);
+const NODE_ROUTE_ALLOWED_FIELDS = new Set([
+  ...NODE_ROUTE_REQUIRED_FIELDS, "routable", "listed", "visible", ...NODE_ROUTE_REGISTRY_ONLY_FIELDS,
+]);
+function validNodeRouteSnapshot(document, route, slug, registered) {
   if (!document || typeof document !== "object" || Array.isArray(document) || document.version !== 1 || !Array.isArray(document.routes)) return false;
   if (!route || typeof route !== "object" || Array.isArray(route)) return false;
+  if (Reflect.ownKeys(route).some((key) => typeof key !== "string" || !NODE_ROUTE_ALLOWED_FIELDS.has(key))) return false;
   if (!NODE_ROUTE_REQUIRED_FIELDS.every((field) => Object.hasOwn(route, field) && typeof route[field] === "string" && route[field].length > 0)) return false;
   if (!["routable", "listed", "visible"].every((field) => Object.hasOwn(route, field) && typeof route[field] === "boolean")) return false;
-  if (route.slug !== slug || route.routable !== true || route.listed !== true || route.visible !== true) return false;
+  if (route.slug !== slug || route.routable !== true || !registered) return false;
+  const expectedListed = registered.listed === true;
+  if (route.listed !== expectedListed || route.visible !== expectedListed) return false;
   return true;
 }
 
@@ -2323,14 +2337,29 @@ function readResolvedNodeRoute(slug) {
     const route = Array.isArray(document?.routes)
       ? document.routes.find((entry) => entry?.slug === slug)
       : undefined;
-    if (!validNodeRouteSnapshot(document, route, slug)) return undefined;
     const registered = MODEL_BY_SLUG.get(slug);
-    if (!registered) return undefined;
+    if (!validNodeRouteSnapshot(document, route, slug, registered) || !registered) return undefined;
     // The raw protected entry is the authorization proof. Registry metadata is
     // merged only after the entry has proved its own version, shape, binding,
     // and visible/listed/routable facts; never fill those facts from a stale
     // registry row and never force a false snapshot value to true.
-    return { ...registered, ...route };
+    return {
+      ...registered,
+      slug: route.slug,
+      provider: route.provider,
+      upstreamModel: route.upstreamModel,
+      effectiveTransport: route.effectiveTransport,
+      toolDialect: route.toolDialect,
+      requestProfile: route.requestProfile,
+      reasoningDisplayMode: route.reasoningDisplayMode,
+      declaredFinalReasoningShape: route.declaredFinalReasoningShape,
+      effectiveFinalReasoningShape: route.effectiveFinalReasoningShape,
+      rolloutState: route.rolloutState,
+      purpose: route.purpose,
+      routable: route.routable,
+      listed: route.listed,
+      visible: route.visible,
+    };
   } catch {
     return undefined;
   }
@@ -2352,6 +2381,8 @@ const NODE_ROUTE_BINDING_FIELDS = Object.freeze([
   "toolDialect",
   "requestProfile",
   "reasoningDisplayMode",
+  "declaredFinalReasoningShape",
+  "rolloutState",
   "purpose",
 ]);
 
@@ -3599,6 +3630,17 @@ async function handleRequest(request, response) {
     return;
   }
 
+  // Browser bootstrap and the cookie-authenticated panel are intentionally
+  // clean paths. The caller capability is used only by the launcher POST that
+  // mints the one-use nonce; it must never enter browser history or referrers.
+  if (isPanelRoute(requestUrl.pathname)) {
+    if (await handlePanelRequest(request, response, requestUrl.pathname, {
+      writeJson,
+      policy: { port: LISTEN_PORT },
+      sessionStore: PANEL_SESSIONS,
+    })) return;
+  }
+
   const route = authenticatedRoute(requestUrl.pathname, CALLER_KEY);
   if (!route) {
     writeJson(response, 401, {
@@ -3618,7 +3660,8 @@ async function handleRequest(request, response) {
       const presented = typeof authorization === "string" && /^Bearer\s+(.+)$/i.exec(authorization)?.[1];
       if (!secretEqual(presented || "", CALLER_KEY || "")) {
         for (const [name, value] of Object.entries(panelSecurityHeaders())) response.setHeader(name, value);
-        writeJson(response, 401, { error: { type: "authentication_error", message: "The caller capability is invalid." } });
+        const safe = routerError("panel_auth_required");
+        writeJson(response, safe.status, safe.body);
         return;
       }
       if (route === "/panel-sessions/revoke") {
@@ -3637,9 +3680,10 @@ async function handleRequest(request, response) {
       for (const [name, value] of Object.entries(panelSecurityHeaders())) response.setHeader(name, value);
       writeJson(response, 200, result);
     } catch (error) {
-      const status = error?.status || (error?.code === "panel_host_invalid" ? 421 : error?.code === "panel_peer_invalid" ? 403 : error?.code === "panel_method_invalid" ? 405 : error?.code === "panel_content_type_invalid" ? 415 : 400);
+      const safeCode = Object.hasOwn(ERROR_DEFINITIONS, error?.code) ? error.code : "panel_auth_required";
+      const safe = routerError(safeCode);
       for (const [name, value] of Object.entries(panelSecurityHeaders())) response.setHeader(name, value);
-      writeJson(response, status, { error: { type: "router_error", code: error?.code || "panel_invalid_request", message: "The panel bootstrap request is invalid.", param: null } });
+      writeJson(response, safe.status, safe.body);
     }
     return;
   }

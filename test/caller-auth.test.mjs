@@ -17,6 +17,8 @@ import {
   geminiBaseUrl,
   isManagedCallerBaseUrl,
   isManagedGeminiBaseUrl,
+  panelBootstrapUrl,
+  panelSessionUrl,
   redactCallerUrl,
 } from "../src/caller-auth.mjs";
 import { privateFileIsProtected } from "../src/file-security.mjs";
@@ -134,4 +136,15 @@ test("secret setup creates stable, separate, current-user-only keys", () => {
   } finally {
     rmSync(testRoot, { recursive: true, force: true });
   }
+});
+
+test("panel session minting carries the capability while bootstrap navigation is clean", () => {
+  assert.equal(panelSessionUrl(46192, CALLER_KEY), `http://127.0.0.1:46192/_codex-router/${CALLER_KEY}/panel-sessions`);
+  const nonce = "a".repeat(43);
+  assert.equal(panelBootstrapUrl(46192, nonce), `http://127.0.0.1:46192/panel-bootstrap/${nonce}`);
+  assert.throws(() => panelBootstrapUrl(46192, CALLER_KEY), /nonce/i);
+  assert.equal(
+    redactCallerUrl(panelSessionUrl(46192, CALLER_KEY)),
+    "http://127.0.0.1:46192/_codex-router/[REDACTED]/panel-sessions",
+  );
 });
