@@ -716,9 +716,12 @@ test("slow forced 429 clears its deadline immediately after headers and remains 
   const upstream = await directServer((_request, response) => {
     response.writeHead(429, { "content-type": "application/json", "retry-after": "23" });
     response.flushHeaders();
-    setTimeout(() => response.end(JSON.stringify({ error: { message: "slow provider throttle" } })), 80);
+    setTimeout(() => response.end(JSON.stringify({ error: { message: "slow provider throttle" } })), 1_500);
   });
-  const trace = abortTracePreload({ accelerateDeadline: true });
+  // Full-suite Windows load can delay the headers event beyond a tiny test
+  // deadline. Keep the synthetic budget load-tolerant while making the body
+  // delay strictly longer, so only an uncleared deadline still fails.
+  const trace = abortTracePreload({ accelerateDeadline: true, acceleratedDeadlineMs: 1_000 });
   const port = await openPort(); const forwarder = directForwarder(port, `http://127.0.0.1:${upstream.port}/v1`, { importFile: trace.preload });
   try {
     await waitForwarder(port);

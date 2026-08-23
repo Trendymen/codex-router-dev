@@ -311,6 +311,151 @@ test("purge lock wait budget starts after owner identity preparation", () => {
   }
 });
 
+test("purge prepares private JSON before lock acquisition and commits before release", () => {
+  const state = mkdtempSync(path.join(os.tmpdir(), "vision-purge-prepare-order-"));
+  const purgePath = path.join(state, "vision-cache-purge.json");
+  const events = [];
+  try {
+    const fs = {
+      platform: "linux",
+      prepareJson(target) {
+        events.push("prepare");
+        return {
+          committed: false,
+          aborted: false,
+          commit(value) {
+            events.push("commit");
+            writeFileSync(target, `${JSON.stringify(value)}\n`);
+            this.committed = true;
+          },
+          abort() {
+            events.push("abort");
+            this.aborted = true;
+          },
+        };
+      },
+      mkdir(target, options) {
+        if (target.includes(".staging-")) events.push("lock");
+        return mkdirSync(target, options);
+      },
+      removeFile(target) {
+        if (target.includes("owner-")) events.push("release");
+        return unlinkSync(target);
+      },
+      removeDirectory(target) {
+        events.push("release");
+        return rmdirSync(target);
+      },
+    };
+    const result = requestVisionCachePurge(purgePath, {
+      fs,
+      now: () => 100,
+      processIdentity() {
+        events.push("identity");
+        return "order-test-identity";
+      },
+      monotonicNow() {
+        events.push("clock");
+        return 0;
+      },
+    });
+    assert.equal(result.requested, true);
+    assert.deepEqual(events.slice(0, 4), ["identity", "prepare", "clock", "lock"]);
+    assert.ok(events.indexOf("commit") > events.indexOf("lock"));
+    assert.ok(events.findIndex((event) => event === "release") > events.indexOf("commit"));
+    assert.equal(existsSync(`${purgePath}.lock`), false);
+  } finally {
+    rmSync(state, { recursive: true, force: true });
+  }
+});
+
+test("explicit legacy writeJson injection takes priority over prepareJson", () => {
+  const state = mkdtempSync(path.join(os.tmpdir(), "vision-purge-legacy-writer-"));
+  const purgePath = path.join(state, "vision-cache-purge.json");
+  let prepareCalls = 0;
+  let legacyCalls = 0;
+  try {
+    const result = requestVisionCachePurge(purgePath, {
+      fs: {
+        prepareJson() {
+          prepareCalls += 1;
+          throw new Error("prepareJson must not run when legacy writeJson is injected");
+        },
+        writeJson(target, value) {
+          legacyCalls += 1;
+          writeFileSync(target, `${JSON.stringify(value)}\n`);
+        },
+      },
+      now: () => 100,
+      processIdentity: () => "legacy-test-identity",
+      monotonicNow: () => 0,
+    });
+    assert.equal(result.requested, true);
+    assert.equal(prepareCalls, 0);
+    assert.equal(legacyCalls, 1);
+  } finally {
+    rmSync(state, { recursive: true, force: true });
+  }
+});
+
+test("a prepared purge aborts exactly once when lock acquisition times out", () => {
+  const state = mkdtempSync(path.join(os.tmpdir(), "vision-purge-prepare-abort-"));
+  const purgePath = path.join(state, "vision-cache-purge.json");
+  const lockPath = `${purgePath}.lock`;
+  mkdirSync(lockPath);
+  let abortCalls = 0;
+  let clockReads = 0;
+  try {
+    assert.throws(
+      () => requestVisionCachePurge(purgePath, {
+        fs: {
+          prepareJson() {
+            return {
+              commit() { throw new Error("commit must not run"); },
+              abort() { abortCalls += 1; },
+            };
+          },
+        },
+        now: () => 100,
+        processIdentity: () => "timeout-test-identity",
+        monotonicNow: () => (clockReads++ === 0 ? 0 : 20_000),
+        wait: () => {},
+      }),
+      (error) => error?.code === "vision_cache_purge_locked",
+    );
+    assert.equal(abortCalls, 1);
+  } finally {
+    rmSync(state, { recursive: true, force: true });
+  }
+});
+
+test("a prepared purge aborts when its monotonic clock cannot start", () => {
+  const state = mkdtempSync(path.join(os.tmpdir(), "vision-purge-clock-abort-"));
+  const purgePath = path.join(state, "vision-cache-purge.json");
+  const clockError = new Error("clock probe failed");
+  let abortCalls = 0;
+  try {
+    assert.throws(
+      () => requestVisionCachePurge(purgePath, {
+        fs: {
+          prepareJson() {
+            return {
+              commit() { throw new Error("commit must not run"); },
+              abort() { abortCalls += 1; },
+            };
+          },
+        },
+        processIdentity: () => "clock-abort-identity",
+        monotonicNow: () => { throw clockError; },
+      }),
+      (error) => error === clockError,
+    );
+    assert.equal(abortCalls, 1);
+  } finally {
+    rmSync(state, { recursive: true, force: true });
+  }
+});
+
 function transientFsError(code, message = `transient ${code}`) {
   const error = new Error(message);
   error.code = code;

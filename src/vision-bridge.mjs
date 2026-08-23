@@ -14,7 +14,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { writePrivateJson } from "./file-security.mjs";
+import { preparePrivateJson, writePrivateJson } from "./file-security.mjs";
 import { STATE_DIR } from "./paths.mjs";
 import { processStartIdentity } from "./process-identity.mjs";
 import {
@@ -65,6 +65,7 @@ export function createVisionCachePurgeFileSystem({
   removeFileSystemCall = unlinkSync,
   renameSystemCall = renameSync,
   writeFileSystemCall = writeFileSync,
+  prepareJsonSystemCall = preparePrivateJson,
   writeJsonSystemCall = writePrivateJson,
   wait = waitForPurgeLockRetry,
 } = {}) {
@@ -79,6 +80,7 @@ export function createVisionCachePurgeFileSystem({
     removeFile: removeFileSystemCall,
     rename: renameSystemCall,
     writeFile: writeFileSystemCall,
+    prepareJson: prepareJsonSystemCall,
     writeJson: writeJsonSystemCall,
     wait,
   };
@@ -408,88 +410,105 @@ export function requestVisionCachePurge(
   const lockPlatform = platform || fs.platform || process.platform;
   const lockWait = wait || fs.wait || waitForPurgeLockRetry;
   const lockPath = `${purgePath}.lock`;
-  fs.mkdir(path.dirname(purgePath), { recursive: true, mode: 0o700 });
+  const hasExplicitLegacyWriter = Boolean(
+    fsOverrides && Object.prototype.hasOwnProperty.call(fsOverrides, "writeJson"),
+  );
   const ownerRecord = purgeOwnerRecord(now, processIdentity);
-  // Process identity can be a synchronous OS probe on Windows.  Prepare it
-  // before starting the bounded lock-wait budget so normal contention cannot
-  // spend that budget while the owner record is still being built.
-  const startedAt = monotonicNow();
-  const ownerPath = purgeOwnerPath(lockPath, ownerRecord.pathToken);
-  for (;;) {
-    const stagingPath = purgeLockStagingPath(lockPath, ownerRecord.pathToken);
-    const stagingOwnerPath = purgeOwnerPath(stagingPath, ownerRecord.pathToken);
-    let stagingCreated = false;
-    let published = false;
-    let contention = false;
-    let publishError;
-    try {
-      fs.mkdir(stagingPath);
-      stagingCreated = true;
-      fs.writeFile(
-        stagingOwnerPath,
-        ownerRecord.text,
-        { encoding: "utf8", flag: "wx", mode: 0o600 },
-      );
-      try {
-        fs.rename(stagingPath, lockPath);
-        published = true;
-      } catch (error) {
-        if (!lockPublishContention(error, lockPath, fs, lockPlatform)) throw error;
-        contention = true;
-      }
-    } catch (error) {
-      publishError = error;
-    }
-
-    if (stagingCreated && !published) {
-      try {
-        cleanupPurgeLockStaging(stagingPath, stagingOwnerPath, fs, {
-          platform: lockPlatform,
-          wait: lockWait,
-        });
-      } catch (cleanupError) {
-        publishError ||= cleanupError;
-      }
-    }
-    if (publishError) {
-      // A unique staging name can only collide with a crash residue.  It is
-      // never a lock owner, so choose another name and leave it alone.
-      if (!stagingCreated && publishError?.code === "EEXIST") continue;
-      throw publishError;
-    }
-    if (published) break;
-    if (!contention) throw new Error("Could not publish the vision cache purge lock.");
-
-    try {
-      if (stalePurgeLock(lockPath, {
-        fs,
-        now,
-        staleMs,
-        platform: lockPlatform,
-        wait: lockWait,
-        processIdentity,
-      })) {
-        continue;
-      }
-    } catch (lockError) {
-      if (!["ENOENT", "ENOTEMPTY"].includes(lockError?.code)) throw lockError;
-    }
-    if (monotonicNow() - startedAt >= PURGE_LOCK_WAIT_MS) {
-      const timeout = new Error("Timed out waiting to request a vision cache purge.");
-      timeout.code = "vision_cache_purge_locked";
-      throw timeout;
-    }
-    lockWait(PURGE_LOCK_POLL_MS);
+  // Prepare the protected staging file before entering the cross-process
+  // critical section.  The old injected writer remains an explicit
+  // compatibility escape hatch for focused tests and custom callers.
+  let preparedJson;
+  if (hasExplicitLegacyWriter) {
+    fs.mkdir(path.dirname(purgePath), { recursive: true, mode: 0o700 });
+  } else {
+    preparedJson = fs.prepareJson(purgePath, { space: 0, directoryMode: 0o700 });
   }
-
+  const ownerPath = purgeOwnerPath(lockPath, ownerRecord.pathToken);
+  let lockOwned = false;
+  let preparedCommitted = false;
   let result;
   let operationError;
   try {
+    // Process identity can be a synchronous OS probe on Windows. Prepare it
+    // before starting the bounded lock-wait budget so normal contention cannot
+    // spend that budget while the owner record is still being built. Keep the
+    // call inside the transaction so a failed clock probe still aborts the
+    // prepared staging file.
+    const startedAt = monotonicNow();
+    for (;;) {
+      const stagingPath = purgeLockStagingPath(lockPath, ownerRecord.pathToken);
+      const stagingOwnerPath = purgeOwnerPath(stagingPath, ownerRecord.pathToken);
+      let stagingCreated = false;
+      let published = false;
+      let contention = false;
+      let publishError;
+      try {
+        fs.mkdir(stagingPath);
+        stagingCreated = true;
+        fs.writeFile(
+          stagingOwnerPath,
+          ownerRecord.text,
+          { encoding: "utf8", flag: "wx", mode: 0o600 },
+        );
+        try {
+          fs.rename(stagingPath, lockPath);
+          published = true;
+        } catch (error) {
+          if (!lockPublishContention(error, lockPath, fs, lockPlatform)) throw error;
+          contention = true;
+        }
+      } catch (error) {
+        publishError = error;
+      }
+
+      if (stagingCreated && !published) {
+        try {
+          cleanupPurgeLockStaging(stagingPath, stagingOwnerPath, fs, {
+            platform: lockPlatform,
+            wait: lockWait,
+          });
+        } catch (cleanupError) {
+          publishError ||= cleanupError;
+        }
+      }
+      if (publishError) {
+        // A unique staging name can only collide with a crash residue. It is
+        // never a lock owner, so choose another name and leave it alone.
+        if (!stagingCreated && publishError?.code === "EEXIST") continue;
+        throw publishError;
+      }
+      if (published) {
+        lockOwned = true;
+        break;
+      }
+      if (!contention) throw new Error("Could not publish the vision cache purge lock.");
+
+      try {
+        if (stalePurgeLock(lockPath, {
+          fs,
+          now,
+          staleMs,
+          platform: lockPlatform,
+          wait: lockWait,
+          processIdentity,
+        })) {
+          continue;
+        }
+      } catch (lockError) {
+        if (!["ENOENT", "ENOTEMPTY"].includes(lockError?.code)) throw lockError;
+      }
+      if (monotonicNow() - startedAt >= PURGE_LOCK_WAIT_MS) {
+        const timeout = new Error("Timed out waiting to request a vision cache purge.");
+        timeout.code = "vision_cache_purge_locked";
+        throw timeout;
+      }
+      lockWait(PURGE_LOCK_POLL_MS);
+    }
+
     const diskGeneration = purgeRequestGeneration(purgePath, fs);
     const knownGeneration = purgeGenerationByPath.get(purgePath);
-    // Coalesce only after owning the lock.  A pre-lock disk check has a TOCTOU
-    // gap in which another process can begin a fresh purge after this process
-    // already consumed the old generation.
+    // Coalesce only after owning the lock. A prepared file is aborted below
+    // when this process already observed its own generation.
     if (diskGeneration > 0 && diskGeneration === knownGeneration) {
       result = { requested: true, generation: diskGeneration };
     } else {
@@ -500,7 +519,11 @@ export function requestVisionCachePurge(
       if (!Number.isSafeInteger(generation) || generation <= 0) {
         throw new Error("Could not allocate a safe vision cache purge generation.");
       }
-      fs.writeJson(purgePath, { version: 1, generation }, { space: 0, directoryMode: 0o700 });
+      const value = { version: 1, generation };
+      if (preparedJson) {
+        preparedJson.commit(value);
+        preparedCommitted = true;
+      } else fs.writeJson(purgePath, value, { space: 0, directoryMode: 0o700 });
       purgeGeneration = generation;
       purgeGenerationByPath.set(purgePath, generation);
       result = { requested: true, generation };
@@ -509,19 +532,31 @@ export function requestVisionCachePurge(
     operationError = error;
   }
 
+  let abortError;
+  if (preparedJson && !preparedCommitted) {
+    try {
+      preparedJson.abort();
+    } catch (error) {
+      abortError = error;
+    }
+  }
+
   let releaseError;
-  try {
-    releaseVisionCachePurgeLock(lockPath, {
-      fs,
-      platform: lockPlatform,
-      wait: lockWait,
-      ownerPath,
-      ownerToken: ownerRecord.pathToken,
-    });
-  } catch (error) {
-    releaseError = error;
+  if (lockOwned) {
+    try {
+      releaseVisionCachePurgeLock(lockPath, {
+        fs,
+        platform: lockPlatform,
+        wait: lockWait,
+        ownerPath,
+        ownerToken: ownerRecord.pathToken,
+      });
+    } catch (error) {
+      releaseError = error;
+    }
   }
   if (operationError) throw operationError;
+  if (abortError) throw abortError;
   if (releaseError) throw releaseError;
 
   return result;

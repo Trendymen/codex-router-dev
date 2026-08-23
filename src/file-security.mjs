@@ -1,4 +1,5 @@
 import { execFileSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import {
   chmodSync,
   existsSync,
@@ -46,20 +47,110 @@ export function protectPrivateFile(target) {
   return target;
 }
 
-// All private JSON state uses the same temp-file, owner-only, atomic replace.
-// Keeping it here prevents one state writer from drifting away from the rest.
-export function writePrivateFile(target, contents, { directoryMode } = {}) {
+function removePreparedFile(temporary) {
+  try {
+    unlinkSync(temporary);
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+}
+
+function preparedStateError(action, state) {
+  return new Error(`Cannot ${action} private file: it is already ${state}.`);
+}
+
+/**
+ * Stage an owner-only private file before entering a caller's critical
+ * section.  The empty file is created and protected while its descriptor is
+ * closed; commit only writes that already-protected file and atomically
+ * renames it into place.  This is important on Windows where ACL discovery
+ * and icacls are process-wide work that must not be serialized under a lock.
+ */
+export function preparePrivateFile(target, { directoryMode } = {}) {
   const directory = path.dirname(target);
   mkdirSync(directory, { recursive: true, mode: 0o700 });
   if (directoryMode !== undefined) chmodSync(directory, directoryMode);
-  const temporary = `${target}.tmp.${process.pid}`;
+  const temporary = `${target}.tmp.${process.pid}.${randomUUID()}`;
   try {
-    writeFileSync(temporary, contents, { encoding: "utf8", mode: 0o600 });
+    // wx makes the staging name a single-writer claim even when multiple
+    // callers prepare the same target concurrently.
+    writeFileSync(temporary, "", { encoding: "utf8", flag: "wx", mode: 0o600 });
     protectPrivateFile(temporary);
-    renameSync(temporary, target);
-    protectPrivateFile(target);
   } catch (error) {
-    if (existsSync(temporary)) unlinkSync(temporary);
+    try {
+      removePreparedFile(temporary);
+    } catch {
+      // The preparation error is the useful identity.  Cleanup is best effort
+      // here and a caller cannot safely commit a state it never received.
+    }
+    throw error;
+  }
+
+  let state = "prepared";
+  return {
+    target,
+    temporary,
+    get committed() { return state === "committed"; },
+    get aborted() { return state === "aborted"; },
+    commit(contents) {
+      if (state === "committed") throw preparedStateError("commit", "committed");
+      if (state === "aborted") throw preparedStateError("commit", "aborted");
+      try {
+        // Re-open and truncate only after the protected descriptor from the
+        // prepare phase has been closed.  The ACL therefore survives without
+        // another SID lookup or icacls invocation.
+        writeFileSync(temporary, contents, { encoding: "utf8", flag: "w", mode: 0o600 });
+        renameSync(temporary, target);
+        state = "committed";
+        return target;
+      } catch (error) {
+        try {
+          removePreparedFile(temporary);
+          state = "aborted";
+        } catch {
+          // Keep the original write/rename error.  An explicit abort can retry
+          // cleanup while the state remains prepared.
+        }
+        throw error;
+      }
+    },
+    abort() {
+      if (state === "committed" || state === "aborted") return false;
+      removePreparedFile(temporary);
+      state = "aborted";
+      return true;
+    },
+  };
+}
+
+export function preparePrivateJson(target, { space = 2, directoryMode } = {}) {
+  const prepared = preparePrivateFile(target, { directoryMode });
+  return {
+    target: prepared.target,
+    temporary: prepared.temporary,
+    get committed() { return prepared.committed; },
+    get aborted() { return prepared.aborted; },
+    commit(value) {
+      return prepared.commit(`${JSON.stringify(value, null, space)}\n`);
+    },
+    abort() {
+      return prepared.abort();
+    },
+  };
+}
+
+// All private JSON state uses the same temp-file, owner-only, atomic replace.
+// Keeping it here prevents one state writer from drifting away from the rest.
+export function writePrivateFile(target, contents, { directoryMode } = {}) {
+  const prepared = preparePrivateFile(target, { directoryMode });
+  try {
+    prepared.commit(contents);
+  } catch (error) {
+    try {
+      prepared.abort();
+    } catch {
+      // Preserve the original write/rename error identity.
+    }
     throw error;
   }
   return target;

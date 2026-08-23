@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
 import {
+  preparePrivateFile,
+  preparePrivateJson,
   privateFileIsProtected,
   protectPrivateFile,
   writePrivateJson,
@@ -20,6 +22,66 @@ test("private JSON state uses one owner-only atomic writer", () => {
     assert.deepEqual(writePrivateJson(target, value, { directoryMode: 0o700 }), value);
     assert.deepEqual(JSON.parse(readFileSync(target, "utf8")), value);
     if (process.platform !== "win32") assert.equal(statSync(target).mode & 0o777, 0o600);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("prepared private files protect an empty same-directory staging file and commit once", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "codex-router-private-prepare-"));
+  const target = path.join(directory, "state.json");
+  try {
+    const prepared = preparePrivateFile(target, { directoryMode: 0o700 });
+    assert.equal(prepared.target, target);
+    assert.equal(prepared.committed, false);
+    assert.equal(prepared.aborted, false);
+    assert.equal(readFileSync(prepared.temporary, "utf8"), "");
+    if (process.platform !== "win32") assert.equal(statSync(prepared.temporary).mode & 0o777, 0o600);
+    prepared.commit("prepared\n");
+    assert.equal(readFileSync(target, "utf8"), "prepared\n");
+    assert.equal(prepared.committed, true);
+    assert.equal(prepared.aborted, false);
+    assert.throws(() => prepared.commit("second\n"), /already committed/);
+    prepared.abort();
+    assert.equal(prepared.aborted, false, "abort after commit is a no-op");
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("prepared private JSON aborts idempotently and rejects commit after abort", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "codex-router-private-json-prepare-"));
+  const target = path.join(directory, "state.json");
+  try {
+    const prepared = preparePrivateJson(target, { space: 0, directoryMode: 0o700 });
+    assert.equal(prepared.committed, false);
+    assert.equal(prepared.aborted, false);
+    prepared.abort();
+    assert.equal(prepared.aborted, true);
+    prepared.abort();
+    assert.equal(existsSync(prepared.temporary), false);
+    assert.throws(() => prepared.commit({ version: 1 }), /already aborted/);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("prepared private commit preserves the rename error and cleans its staging file", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "codex-router-private-commit-error-"));
+  const target = path.join(directory, "target-directory");
+  try {
+    mkdirSync(target);
+    const prepared = preparePrivateFile(target);
+    let thrown;
+    try {
+      prepared.commit("must not replace a directory\n");
+    } catch (error) {
+      thrown = error;
+    }
+    assert.ok(thrown, "commit should preserve the rename error");
+    assert.equal(existsSync(prepared.temporary), false);
+    prepared.abort();
+    assert.equal(existsSync(target), true);
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
