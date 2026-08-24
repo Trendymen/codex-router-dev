@@ -514,7 +514,16 @@ function fsyncFile(file, fs, flags = "r+", mode) {
 function writeStagedFile(file, bytes, mode, protectedEntry, fs) {
   const descriptor = fs.open(file, "wx", writableStageMode(mode));
   try {
-    fs.writeFd(descriptor, Buffer.from(bytes), 0, bytes.length, 0);
+    const payload = Buffer.from(bytes);
+    let offset = 0;
+    while (offset < payload.length) {
+      const remaining = payload.length - offset;
+      const written = fs.writeFd(descriptor, payload, offset, remaining, offset);
+      if (!Number.isInteger(written) || written <= 0 || written > remaining) {
+        throw new Error(`Staged file write returned an invalid byte count: ${written}`);
+      }
+      offset += written;
+    }
     fs.chmodFd(descriptor, mode);
     fs.fsync(descriptor);
   } finally {
@@ -609,12 +618,9 @@ function replaceFileAtomic(target, bytes, mode, protectedEntry, fs) {
     fs.rename(staging, target);
     installed = true;
     fsyncParent(target, fs);
-    fs.chmod(target, mode);
     if (protectedEntry) {
-      protectWindowsOnly(target, true, fs);
       verifyProtectedPath(target, fs);
     }
-    fsyncParent(target, fs);
     committed = true;
     if (backedUp) {
       removeExact(backup, fs);
@@ -704,7 +710,6 @@ function replaceDirectoryAtomic(target, tree, mode, protectedEntry, fs) {
   let committed = false;
   let oldRestored = false;
   try {
-    fs.chmod(staging, mode);
     if (fs.exists(target)) {
       fs.rename(target, backup);
       backedUp = true;
@@ -713,16 +718,13 @@ function replaceDirectoryAtomic(target, tree, mode, protectedEntry, fs) {
     fs.rename(staging, target);
     installed = true;
     fsyncParent(target, fs);
-    fs.chmod(target, mode);
     if (protectedEntry) {
       for (const entry of tree) {
         if (entry.type !== "file") continue;
         const absolute = entry.relative ? path.join(target, ...entry.relative.split("/")) : target;
-        protectWindowsOnly(absolute, true, fs);
         verifyProtectedPath(absolute, fs);
       }
     }
-    fsyncParent(target, fs);
     committed = true;
     if (backedUp) {
       removeExact(backup, fs);

@@ -206,8 +206,9 @@ test("nonproduction runtime roots cannot escape the resolver-owned isolation roo
 test("a failed backup rollback keeps the backup path and reports rollback failure", () => {
   const { root, target, paths } = fixture();
   try {
-    const snapshot = snapshotOwnedRuntime(paths);
+    const snapshot = snapshotOwnedRuntime({ ...paths, ids: ["caller-secret"] });
     let renames = 0;
+    let flushFailed = false;
     const primaryRestoreFs = {
       rename(from, to) {
         renames += 1;
@@ -215,16 +216,28 @@ test("a failed backup rollback keeps the backup path and reports rollback failur
         if (renames === 3) throw new Error("rollback rename failed");
         renameSync(from, to);
       },
-      chmod(file, mode) {
-        if (renames === 2 && file === target.routerPlistPath) throw new Error("post-commit restore failure");
-        chmodSync(file, mode);
-      },
+      ...(process.platform === "win32"
+        ? {
+            verifyProtected() {
+              if (renames === 2) throw new Error("post-install verification failure");
+              return true;
+            },
+          }
+        : {
+            fsync(fd) {
+              if (!flushFailed && renames === 2) {
+                flushFailed = true;
+                throw new Error("post-install flush failure");
+              }
+              return fsyncSync(fd);
+            },
+          }),
     };
     assert.throws(
       () => restoreOwnedRuntime(snapshot, { fs: primaryRestoreFs }),
       (error) => error instanceof AggregateError && /rollback rename failed/.test(String(error.errors?.[1]?.message || error.message)),
     );
-    const leftovers = readdirSync(path.dirname(target.routerPlistPath));
+    const leftovers = readdirSync(path.dirname(paths.protected["caller-secret"]));
     assert.ok(leftovers.some((name) => name.includes("runtime-backup")), "failed rollback must retain backup evidence");
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -304,6 +317,90 @@ test("staging writes bytes, final metadata, file flush, close, then rename", () 
     assert.ok(order.indexOf("metadata") < order.indexOf("fsync"));
     assert.ok(order.indexOf("fsync") < order.indexOf("close"));
     assert.ok(order.indexOf("close") < order.indexOf("rename"));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("staged file writes retry short writes until every byte is durable", () => {
+  const { root, target, paths } = fixture();
+  try {
+    const snapshot = snapshotOwnedRuntime({ ...paths, ids: ["router-plist"] });
+    const positions = [];
+    let calls = 0;
+    restoreOwnedRuntime(snapshot, {
+      fs: {
+        writeFd(fd, bytes, offset, length, position) {
+          positions.push({ offset, length, position });
+          calls += 1;
+          const partial = calls === 1 ? Math.min(3, length) : length;
+          return writeSync(fd, bytes, offset, partial, position);
+        },
+      },
+    });
+    assert.ok(calls > 1);
+    assert.deepEqual(positions.map(({ offset, position }) => [offset, position]), [[0, 0], [3, 3]]);
+    assert.deepEqual(readFileSync(target.routerPlistPath), Buffer.from("old-router-plist\n"));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("zero or negative staged writes fail before commit and preserve the original", () => {
+  for (const reported of [0, -1]) {
+    const { root, target, paths } = fixture();
+    try {
+      const snapshot = snapshotOwnedRuntime({ ...paths, ids: ["router-plist"] });
+      assert.throws(
+        () => restoreOwnedRuntime(snapshot, {
+          fs: {
+            writeFd() {
+              return reported;
+            },
+          },
+        }),
+        /write|byte/i,
+      );
+      assert.deepEqual(readFileSync(target.routerPlistPath), Buffer.from("old-router-plist\n"));
+      assert.deepEqual(
+        readdirSync(path.dirname(target.routerPlistPath)).filter((name) => name.includes("runtime-")),
+        [],
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("atomic file and tree replacement never mutate target metadata after rename", () => {
+  const { root, target, paths } = fixture();
+  const nested = path.join(target.appPath, "Contents", "Resources", "old.txt");
+  try {
+    mkdirSync(path.dirname(nested), { recursive: true });
+    writeFileSync(nested, "old nested bytes\n", { mode: 0o640 });
+    const snapshot = snapshotOwnedRuntime({ ...paths, ids: ["router-plist", "tray-app"] });
+    const renamedTargets = new Set();
+    const metadataAfterRename = [];
+    restoreOwnedRuntime(snapshot, {
+      fs: {
+        rename(from, to) {
+          const result = renameSync(from, to);
+          if (to === target.routerPlistPath || to === target.appPath) renamedTargets.add(to);
+          return result;
+        },
+        chmod(file, mode) {
+          if (renamedTargets.has(file)) metadataAfterRename.push(file);
+          return chmodSync(file, mode);
+        },
+        protect(file, ...args) {
+          if (renamedTargets.has(file)) metadataAfterRename.push(file);
+          return undefined;
+        },
+      },
+    });
+    assert.deepEqual(metadataAfterRename, []);
+    assert.deepEqual(readFileSync(target.routerPlistPath), Buffer.from("old-router-plist\n"));
+    assert.deepEqual(readFileSync(nested), Buffer.from("old nested bytes\n"));
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
