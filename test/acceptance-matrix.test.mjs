@@ -7,7 +7,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { gzipSync } from "node:zlib";
 
-import { loadAcceptanceMatrix, verifyNodeOnlyBuild } from "../scripts/verify-node-only-build.mjs";
+import { auditRuntimeSource, loadAcceptanceMatrix, verifyNodeOnlyBuild } from "../scripts/verify-node-only-build.mjs";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const routeOracle = JSON.parse(readFileSync(path.join(repoRoot, "test", "fixtures", "node-route-matrix.json"), "utf8"));
@@ -24,6 +24,8 @@ const expectedProfiles = Object.freeze([
   "task1-artifact-audit", "task1-build", "task1-node-check", "task1-node-test", "task1-swift-build",
   "task2-isolated-install", "task3-runtime", "task3-ui", "task3-visual", "task4-live",
 ]);
+const logicalModes = new Map();
+const appExecutableFinding = "app-executable-invalid:Applications/Model Router.app/Contents/MacOS/ModelRouterTray";
 
 function sha256(bytes) {
   return createHash("sha256").update(bytes).digest("hex");
@@ -86,6 +88,7 @@ function write(relative, value, root, mode = 0o644) {
   mkdirSync(path.dirname(target), { recursive: true });
   writeFileSync(target, value, { mode });
   chmodSync(target, mode);
+  logicalModes.set(target, mode);
   return target;
 }
 
@@ -144,7 +147,15 @@ function expectedBuildRoot() {
 }
 
 function findingsFor(root) {
-  return verifyNodeOnlyBuild(root).map(({ kind, path: relative }) => `${kind}:${relative}`);
+  const findings = verifyNodeOnlyBuild(root).map(({ kind, path: relative }) => `${kind}:${relative}`);
+  if (process.platform !== "win32") return findings;
+  const semantic = [];
+  for (const [file, mode] of logicalModes) {
+    if (!file.startsWith(`${root}${path.sep}`) || mode !== 0o755 || !existsSync(file)) continue;
+    const relative = path.relative(root, file).split(path.sep).join("/");
+    semantic.push(...auditRuntimeSource(relative, readFileSync(file, "utf8"), mode).map((kind) => `${kind}:${relative}`));
+  }
+  return [...findings.filter((finding) => finding !== appExecutableFinding), ...semantic];
 }
 
 function releaseEntries(root, relative = "") {
@@ -286,7 +297,8 @@ test("产物审计要求已构建 app 的可执行文件具有 0755 模式", () 
   try {
     const executable = path.join(root, "Applications", "Model Router.app", "Contents", "MacOS", "ModelRouterTray");
     chmodSync(executable, 0o644);
-    assert.ok(findingsFor(root).includes("app-executable-invalid:Applications/Model Router.app/Contents/MacOS/ModelRouterTray"), findingsFor(root).join(", "));
+    const findings = verifyNodeOnlyBuild(root).map(({ kind, path: relative }) => `${kind}:${relative}`);
+    assert.ok(findings.includes(appExecutableFinding), findings.join(", "));
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -539,6 +551,8 @@ test("合法变量命令放行绑定 exact source identity，任意同路径 dri
     const source = path.join(repoRoot, "src", "node-runtime.mjs");
     const target = path.join(root, "src", "node-runtime.mjs");
     cpSync(source, target);
+    assert.equal(findingsFor(root).includes("runtime-command-unresolved:src/node-runtime.mjs"), false, findingsFor(root).join(", "));
+    writeFileSync(target, readFileSync(target, "utf8").replaceAll("\n", "\r\n"));
     assert.equal(findingsFor(root).includes("runtime-command-unresolved:src/node-runtime.mjs"), false, findingsFor(root).join(", "));
     writeFileSync(target, `${readFileSync(target, "utf8")}\n// source identity drift\n`);
     assert.ok(findingsFor(root).includes("runtime-command-unresolved:src/node-runtime.mjs"), findingsFor(root).join(", "));

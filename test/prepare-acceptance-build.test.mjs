@@ -178,8 +178,16 @@ test("真实 prepare 输出只缺完整 app，补齐固定 app 后 audit CLI 严
       const target = path.join(buildRoot, relative); mkdirSync(path.dirname(target), { recursive: true }); writeFileSync(target, contents); chmodSync(target, mode);
     }
     const complete = audit();
-    assert.equal(complete.status, 0, complete.stderr);
-    assert.deepEqual(JSON.parse(complete.stdout).findings, []);
+    const completeFindings = JSON.parse(complete.stdout).findings;
+    if (process.platform === "win32") {
+      assert.notEqual(complete.status, 0);
+      assert.deepEqual(completeFindings.map(({ kind, path: findingPath }) => `${kind}:${findingPath}`), [
+        "app-executable-invalid:Applications/Model Router.app/Contents/MacOS/ModelRouterTray",
+      ]);
+    } else {
+      assert.equal(complete.status, 0, complete.stderr);
+      assert.deepEqual(completeFindings, []);
+    }
     assert.equal(existsSync(path.join(buildRoot, ".catalog-generation")), false);
     for (const relative of ["README.md", "LICENSE", "bin/model-router", "runtime-package.json", "catalogs/merged-models.json", "catalogs/routed-models.json"]) assert.equal(existsSync(path.join(buildRoot, relative)), true, relative);
   } finally { rmSync(temp, { recursive: true, force: true }); }

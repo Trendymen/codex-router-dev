@@ -79,6 +79,7 @@ const VARIABLE_SHELL_COMMAND_SOURCE_DIGESTS = Object.freeze({
 
 function finding(kind, value, detail) { return { kind, path: value, detail }; }
 function hash(bytes) { return createHash("sha256").update(bytes).digest("hex"); }
+function sourceIdentityHash(source) { return hash(Buffer.from(String(source).replace(/\r\n/g, "\n"), "utf8")); }
 function safePath(value) { return typeof value === "string" && value && !value.startsWith("/") && !value.includes("\\") && path.posix.normalize(value) === value && value.split("/").every((part) => part && part !== "." && part !== ".." && !/[\u0000-\u001f\u007f]/.test(part)); }
 function parseJson(entry) { try { return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(entry.data)); } catch { return null; } }
 function available(entries, value) { return entries.has(value) || [...entries.keys()].some((entry) => entry.startsWith(value + "/")); }
@@ -381,7 +382,7 @@ function permittedVariableCommand(relative, operation, callee, argument, source,
   const normalizedArgument = normalized(argument);
   return VARIABLE_CHILD_PROCESS_PROVENANCE.some((entry) => {
     if (entry.path !== relative || entry.operation !== operation || entry.callee !== callee || entry.argument !== normalizedArgument) return false;
-    return hash(Buffer.from(source, "utf8")) === entry.sourceDigest;
+    return sourceIdentityHash(source) === entry.sourceDigest;
   });
 }
 function childProcessCommands(relative, source) {
@@ -406,7 +407,7 @@ function childProcessCommands(relative, source) {
 function scriptCommands(relative, entry, source) {
   const lines = source.split(/\r?\n/);
   const shebang = lines.find((line) => line.startsWith("#!")) || "";
-  const sourceTrusted = VARIABLE_SHELL_COMMAND_SOURCE_DIGESTS[relative] === hash(Buffer.from(source, "utf8"));
+  const sourceTrusted = VARIABLE_SHELL_COMMAND_SOURCE_DIGESTS[relative] === sourceIdentityHash(source);
   const interpreterKinds = (entry.mode & 0o111) !== 0 && shebang ? commandKinds(shebang.slice(2)) : [];
   const shellShebang = /\b(?:sh|bash|zsh|pwsh|powershell)(?:\s|$)/i.test(shebang);
   if (!shellShebang && interpreterKinds?.length) return admittedShellFindings(interpreterKinds, sourceTrusted);
@@ -467,6 +468,14 @@ function semanticRuntimeReferences(relative, entry) {
     }
   }
   return findings;
+}
+export function auditRuntimeSource(relative, source, mode = 0o644) {
+  return semanticRuntimeReferences(relative, {
+    type: "file",
+    mode,
+    bytes: Buffer.byteLength(source, "utf8"),
+    data: Buffer.from(source, "utf8"),
+  });
 }
 function removedRuntime(entries) {
   const findings = [];
