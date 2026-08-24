@@ -9,6 +9,7 @@
   },
   "scripts": {
     "check": "node scripts-check.mjs",
+    "audit:node-only-build": "node scripts/verify-node-only-build.mjs generated/build-root",
     "test": "node --test test/*.test.mjs"
   },
   "dependencies": {
