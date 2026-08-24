@@ -6,6 +6,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { resolveServiceTarget } from "../src/service-target.mjs";
+import { commandOnPath, spawnableCommand } from "../src/spawnable-command.mjs";
 import { readTrayFixtureContext, writeTrayFixtureContext } from "../src/tray-build-plan.mjs";
 import { recordAcceptanceEvidence } from "./verify-acceptance.mjs";
 
@@ -157,7 +158,7 @@ function materialize(commit, destination) {
 }
 
 function toolIdentity(tool) {
-  const resolved = tool === "/usr/libexec/PlistBuddy"
+  const resolved = path.isAbsolute(tool)
     ? tool
     : execFileSync("/bin/sh", ["-lc", `command -v ${tool}`], { encoding: "utf8" }).trim();
   const target = realpathSync(resolved), info = statSync(target);
@@ -229,11 +230,15 @@ function copyRouteRegistry(sourceRoot, buildRoot, slugs) {
 function prepareCatalogTooling(sourceRoot, root) {
   const tooling = within(root, path.join(root, "catalog-tooling"), "catalogTooling");
   for (const name of ["package.json", "package-lock.json"]) cpSync(path.join(sourceRoot, name), path.join(tooling, name));
-  const cache = execFileSync("npm", ["config", "get", "cache"], { encoding: "utf8" }).trim();
+  const npm = commandOnPath("npm");
+  if (!npm) throw new Error("npm is required to prepare hash-verified catalog tooling");
+  const npmConfig = spawnableCommand(npm, ["config", "get", "cache"]);
+  const cache = execFileSync(npmConfig.command, npmConfig.args, { ...npmConfig.options, encoding: "utf8", windowsHide: true }).trim();
   const command = ["ci", "--ignore-scripts", "--omit=dev", "--offline", "--audit=false", "--fund=false", "--cache", cache];
   // npm's offline lockfile install is the SRI verifier. A cache miss is an
   // explicit failure; there is no network or current-node_modules fallback.
-  execFileSync("npm", command, { cwd: tooling, encoding: "utf8", env: { ...process.env, npm_config_ignore_scripts: "true", npm_config_audit: "false", npm_config_fund: "false" }, maxBuffer: 64 * 1024 * 1024 });
+  const npmCi = spawnableCommand(npm, command);
+  execFileSync(npmCi.command, npmCi.args, { ...npmCi.options, cwd: tooling, encoding: "utf8", windowsHide: true, env: { ...process.env, npm_config_ignore_scripts: "true", npm_config_audit: "false", npm_config_fund: "false" }, maxBuffer: 64 * 1024 * 1024 });
   return { path: tooling, digest: digestTree(tooling), lockDigest: sha256(readFileSync(path.join(sourceRoot, "package-lock.json"))), command: `npm ${command.join(" ")}` };
 }
 
@@ -298,7 +303,7 @@ export function prepareAcceptanceBuild({ isolationRoot, sourceCommit: requestedC
   mkdirSync(toolsRoot);
   const wrappers = Object.fromEntries(["uname", "swift", "codesign", "plistBuddy"].map((name) => {
     const destination = path.join(toolsRoot, name);
-    return [name, writeWrapper(destination, toolIdentity(name === "plistBuddy" ? "/usr/libexec/PlistBuddy" : name))];
+    return [name, writeWrapper(destination, toolIdentity(dryRun ? process.execPath : name === "plistBuddy" ? "/usr/libexec/PlistBuddy" : name))];
   }));
   const tools = Object.fromEntries(Object.entries(wrappers).map(([name, wrapper]) => [name, wrapper.path]));
   const swiftScratchPath = within(root, path.join(buildRoot, ".swift-scratch"), "swiftScratchPath");

@@ -37,6 +37,11 @@ test("prepare 从指定提交创建隔离、可复现的 build-only manifest", (
     assert.equal(fixture.buildOnly, true);
     assert.notEqual(fixture.target.routerLabel, "io.github.codex-router");
     assert.notEqual(fixture.target.ports.router, 4202);
+    for (const wrapper of Object.values(manifest.wrappers)) {
+      assert.equal(path.isAbsolute(wrapper.tool.path), true);
+      assert.equal(existsSync(wrapper.tool.path), true);
+      assert.equal(wrapper.tool.path, realpathSync(process.execPath));
+    }
   } finally { rmSync(temp, { recursive: true, force: true }); }
 });
 
