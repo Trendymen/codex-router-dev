@@ -11,12 +11,15 @@ cd "$repo_dir"
 target=${MODEL_ROUTER_TARGET:-codex}
 case "$target" in
   codex|dsh|gemini) ;;
-  *) echo "MODEL_ROUTER_TARGET must be codex, dsh, or gemini." >&2; exit 2 ;;
+  *) echo "MODEL_ROUTER_TARGET must be codex, dsh, or gemini for an uninstall-only legacy migration." >&2; exit 2 ;;
 esac
 # Snapshot happens before the client config, skills, shim, service, or runtime
 # is touched. The Node boundary owns the entire callback and restores the
 # resolver-bound snapshot before restarting the old service on any failure.
 # Its callback runs `src/service.mjs uninstall` before `src/skills-install.mjs uninstall`
 # when this is the last client, preserving the old stop-before-skills ordering.
-node src/local-uninstall.mjs --router-runtime --client-target "$target"
+# The public runtime is Codex-only. Legacy client removal is an explicit,
+# fail-closed compatibility operation; keep the implementation's target plane
+# on Codex while passing the client document to remove as data.
+MODEL_ROUTER_TARGET=codex node src/local-uninstall.mjs --router-runtime --client-target "$target"
 echo "The repository, cached native catalog, logs, and provider credentials were retained."

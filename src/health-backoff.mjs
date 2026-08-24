@@ -1,5 +1,5 @@
 // Startup health polling ran at a flat interval, which is cheap when a service
-// comes up in a second and wasteful when it does not. The LiteLLM gateway is
+// comes up in a second and wasteful when it does not. A provider forwarder is
 // allowed 300 seconds to cold start, so a flat 200 ms produced up to 1500
 // probes for a single boot -- and every gateway probe is an access-log line.
 // A crash-looping service under KeepAlive repeats that burst on every restart

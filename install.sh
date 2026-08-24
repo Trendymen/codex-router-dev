@@ -22,12 +22,11 @@ usage() {
   cat <<'EOF'
 Usage: install.sh [options]
 
-Install external model routes for Codex or DeepSeek Harness.
+Install the Node router and external model routes for Codex CLI/Desktop.
 
 Options:
   --install-dir PATH  Stable checkout used by the background service
-  --target APP        Install for "codex" (default), "dsh" (DeepSeek Harness),
-                      or "gemini" (Gemini CLI)
+  --target codex      Codex CLI/Desktop target (the only shipped target)
   --prepare-only      Install dependencies without changing either app
   --api-key           Alias for --kimi-api-key
   --kimi-api-key      Prompt securely for a Kimi Platform API key
@@ -100,7 +99,7 @@ local_modifications_message() {
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --target)
-      [ "$#" -ge 2 ] || die "--target requires codex, dsh, or gemini"
+      [ "$#" -ge 2 ] || die "--target requires codex"
       target=$2
       shift 2
       ;;
@@ -195,15 +194,10 @@ if [ "$platform_name" != "Darwin" ]; then
 fi
 
 case "$target" in
-  codex|dsh|gemini) ;;
-  *) die "--target must be codex, dsh, or gemini" ;;
+  codex) ;;
+  *) die "--target must be codex" ;;
 esac
-# Legacy migration replaces an older router's managed Codex config block, and
-# the native catalog is the ChatGPT-plan model list Codex adopts. Neither has a
-# counterpart in the harness, whose integration is one settings section.
-if [ "$target" != codex ] && [ "$migrate_known" = true ]; then
-  die "--migrate-known applies only to the Codex target"
-fi
+# Legacy migration replaces an older router's managed Codex config block.
 # An idle install is exactly "no providers", so naming providers or pasting
 # keys alongside it is a contradiction; and --no-discovery alone would select
 # providers that can never authenticate.

@@ -65,24 +65,17 @@ async function finishWorker(child) {
   return { code, signal, stderr: child._modelOverlayStderr || "" };
 }
 
-test("shared publication writes gateway routes before every installed target", async () => {
+test("shared publication refreshes the shipped Codex catalog through the Node route snapshot", async () => {
   const events = [];
   const result = await rebuildModelOverlayPublication({
-    writeGateway: () => {
-      events.push("gateway");
-      return "/private/router/litellm.yaml";
-    },
     refreshTargets: () => {
-      for (const target of ["codex", "dsh", "gemini"]) events.push(target);
+      events.push("codex");
       return true;
     },
   });
 
-  assert.deepEqual(events, ["gateway", "codex", "dsh", "gemini"]);
-  assert.deepEqual(result, {
-    gatewayPath: "/private/router/litellm.yaml",
-    targetsRefreshed: true,
-  });
+  assert.deepEqual(events, ["codex"]);
+  assert.deepEqual(result, { targetsRefreshed: true });
 });
 
 test("overlay rollback reapplies private-file protection to recreated files", () => {

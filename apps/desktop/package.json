@@ -4,14 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "tauri dev",
-    "build": "tauri build",
-    "build:binary": "tauri build --no-bundle",
-    "test:ui": "node --test ../../test/desktop-ui.test.mjs",
-    "check:js": "node --check ui/app.js && node --check ui/model.mjs",
-    "check": "npm run check:js && npm run test:ui && cargo fmt --manifest-path src-tauri/Cargo.toml -- --check && cargo check --manifest-path src-tauri/Cargo.toml && cargo test --manifest-path src-tauri/Cargo.toml"
-  },
-  "devDependencies": {
-    "@tauri-apps/cli": "2.11.4"
+    "check:ui": "node --check ui/app.js && node --check ui/model.mjs && node --test ../../test/desktop-ui.test.mjs",
+    "check": "npm run check:ui"
   }
 }

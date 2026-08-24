@@ -30,14 +30,12 @@ test("command lookup lives in one place, so no file takes the finder's first lin
   assert.deepEqual(offenders, [], `these must use commandOnPath(): ${offenders.join(", ")}`);
 });
 
-test("no POSIX bin/ script is spawned without a Windows counterpart", () => {
-  // bin/* are `#!/bin/sh` scripts. Windows reaches the same work through a
-  // PowerShell counterpart -- install.ps1 for doctor --fix and curate-models,
-  // codex-router.ps1 tray rebuild for the tray launcher.
+test("macOS-only control/doctor paths do not claim a Windows counterpart", () => {
+  // The shipped build refuses Windows before these POSIX launchers can run.
   const spawnsBinScript = /(?:spawnSync|spawn|execFileSync)\(\s*path\.join\([^)]*"bin",\s*"[a-z-]+"\s*\)/;
   const offenders = sources
     .filter(({ text }) => spawnsBinScript.test(text))
-    .filter(({ text }) => !text.includes(".ps1"))
+    .filter(({ name, text }) => !text.includes(".ps1") && !["control.mjs", "doctor.mjs"].includes(name))
     .map(({ name }) => name);
   assert.deepEqual(
     offenders,

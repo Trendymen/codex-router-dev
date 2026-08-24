@@ -107,7 +107,10 @@ async function uninstallRouterRuntimeFromCli() {
     installReplacement: async () => {
       const installed = spawnSync(
         process.execPath,
-        [path.join(SOURCE_ROOT, "src", "target-integration.mjs"), "installed-targets"],
+        [
+          path.join(SOURCE_ROOT, "src", "target-integration.mjs"),
+          "legacy-installed-targets",
+        ],
         { cwd: SOURCE_ROOT, env: process.env, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], windowsHide: true },
       );
       if (installed.error) throw installed.error;

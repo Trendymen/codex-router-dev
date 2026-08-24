@@ -95,12 +95,6 @@ test("rotation runs while the service is stopped, never from inside it", () => {
     "macOS must rotate before starting the service again",
   );
 
-  const linux = readFileSync(path.join(root, "src", "service-linux.mjs"), "utf8");
-  assert.match(linux, /rotateLog\(LOG_PATH\)/);
-  assert.ok(
-    linux.indexOf('systemctl(["stop", unitName]') < linux.indexOf("rotateLog(LOG_PATH)"),
-    "Linux must stop the unit before rotating",
-  );
 });
 
 test("rotating twice does not lose the log to a failed replace", () => {

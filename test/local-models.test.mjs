@@ -96,51 +96,6 @@ test("the snapshot joins installed, checked, loaded, and vision state", () => {
   assert.deepEqual(snapshot.runtime, { installed: true, running: true, version: "0.1.0" });
 });
 
-test("Control Center LocalModel mirrors the Vision snapshot without legacy chat fields", () => {
-  const types = readFileSync(new URL("../apps/control-center/src/types.ts", import.meta.url), "utf8");
-  const localModel = types.match(/export interface LocalModel \{([\s\S]*?)\n\}/)?.[1];
-  assert.ok(localModel, "LocalModel interface must remain discoverable");
-  assert.match(localModel, /\bvision\?: boolean;/);
-  assert.match(localModel, /\brunning\?: boolean;/);
-
-  const legacyFields = [
-    "tools",
-    "context",
-    "speed",
-    "observedTokensPerSecond",
-    "codex",
-    "fit",
-    "diskFit",
-    "recommended",
-    "researchStatus",
-    "researchCapabilities",
-    "researchNote",
-    "capabilities",
-    "tokensPerSecond",
-    "speedStatus",
-    "agent",
-    "agentCapable",
-  ];
-  for (const field of legacyFields) {
-    assert.doesNotMatch(localModel, new RegExp(`\\b${field}\\??\\s*:`), `${field} must stay out of LocalModel`);
-  }
-
-  const snapshot = localModelsSnapshot({
-    inventory: parseOllamaList("NAME  ID  SIZE  MODIFIED\nqwen2.5vl:3b  aaa  3.2 GB  now\n"),
-    running: ["qwen2.5vl:3b"],
-    selection: { version: 1, enabled: [] },
-    benchmarks: { "qwen2.5vl:3b": { tier: "accurate", tokensPerSecond: 42 } },
-    capabilities: { "qwen2.5vl:3b": ["completion", "vision"] },
-    agentChecks: { "qwen2.5vl:3b": { verdict: "verified", agentCapable: true } },
-    runtime: { installed: true, running: true },
-  });
-  const model = snapshot.models.find((entry) => entry.tag === "qwen2.5vl:3b");
-  assert.ok(model, "the Vision snapshot must retain the installed reader");
-  assert.equal(model?.vision, true);
-  assert.equal(model?.running, true);
-  for (const field of legacyFields) assert.equal(field in model, false, `${field} must stay out of the Vision snapshot`);
-});
-
 test("withdrawing a model never deletes its local weights", () => {
   setLocalModelEnabled("doomed:latest", true, NO_OLLAMA);
   let called;

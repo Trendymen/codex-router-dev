@@ -969,9 +969,8 @@ api_key = "ROLLBACK_QUERY_SECRET"
   }
 });
 
-// The state directory is pinned per case on purpose: this assertion used to
-// read the developer's own installation, so publishing to DeepSeek Harness on
-// the machine running the tests changed the expected target list.
+// The state directory is pinned per case on purpose: this assertion must never
+// read a legacy external document from the developer's own installation.
 function overviewTargets(stateDir) {
   const output = execFileSync(process.execPath, [path.join(root, "src", "control.mjs"), "--json"], {
     cwd: root,
@@ -1007,7 +1006,7 @@ test("aggregate overview publishes the versioned capability manifest", () => {
   }
 });
 
-test("the harness target appears only once its route has been published", () => {
+test("legacy external snapshots never become public control targets", () => {
   const stateDir = mkdtempSync(path.join(os.tmpdir(), "control-targets-dsh-"));
   try {
     writeFileSync(
@@ -1015,7 +1014,7 @@ test("the harness target appears only once its route has been published", () => 
       `${JSON.stringify({ version: 1, route: "codex-router", models: [] })}\n`,
       { mode: 0o600 },
     );
-    assert.deepEqual(overviewTargets(stateDir), ["codex", "dsh"]);
+    assert.deepEqual(overviewTargets(stateDir), ["codex"]);
   } finally {
     rmSync(stateDir, { recursive: true, force: true });
   }

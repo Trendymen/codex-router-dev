@@ -16,6 +16,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { callerBaseUrl } from "../src/caller-auth.mjs";
+import { PROVIDERS } from "../src/model-registry.mjs";
 import { openPort } from "./port-pool.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -33,19 +34,27 @@ async function mockServer(handler) {
 
 function run(env) {
   const stateDir = mkdtempSync(path.join(os.tmpdir(), "router-resilience-state-"));
+  const nodeBaseUrl = env?.CODEX_ROUTER_NODE_PROVIDER_BASE_URL || env?.CODEX_ROUTER_GATEWAY_BASE_URL;
+  const childEnv = {
+    ...process.env,
+    MODEL_ROUTER_STATE_DIR: stateDir,
+    CODEX_ROUTER_CALLER_KEY: CALLER_KEY,
+    CODEX_ROUTER_INTERNAL_KEY: INTERNAL_KEY,
+    KIMI_INTERNAL_KEY: INTERNAL_KEY,
+    CODEX_ROUTER_SHOW_ALL_MODELS: "1",
+    CODEX_ROUTER_TEST_NODE_ROUTE_FIXTURE: "1",
+    ...(nodeBaseUrl ? { CODEX_ROUTER_NODE_PROVIDER_BASE_URL: nodeBaseUrl } : {}),
+    ...env,
+  };
+  if (nodeBaseUrl) {
+    for (const provider of PROVIDERS.values()) {
+      if (provider.baseUrlEnv) childEnv[provider.baseUrlEnv] ||= nodeBaseUrl;
+      for (const name of provider.credential?.environment || []) childEnv[name] ||= INTERNAL_KEY;
+    }
+  }
   const child = spawn(process.execPath, [path.join(root, "src", "router.mjs")], {
     cwd: root,
-    env: {
-      ...process.env,
-      MODEL_ROUTER_STATE_DIR: stateDir,
-      CODEX_ROUTER_CALLER_KEY: CALLER_KEY,
-      CODEX_ROUTER_INTERNAL_KEY: INTERNAL_KEY,
-      KIMI_INTERNAL_KEY: INTERNAL_KEY,
-      CODEX_ROUTER_SHOW_ALL_MODELS: "1",
-      CODEX_ROUTER_QUIET: "1",
-      CODEX_ROUTER_DIRECT_DISPATCH: "0",
-      ...env,
-    },
+    env: { ...childEnv, CODEX_ROUTER_QUIET: "1" },
     stdio: ["ignore", "ignore", "pipe"],
   });
   child.stderr.setEncoding("utf8");
@@ -146,7 +155,7 @@ function readRouted(port, body) {
 // bare socket reset: `.pipe()` never forwarded the error, so the response stayed
 // half-written until the top-level handler destroyed it, and the log said only
 // "[codex-router] request failed".
-test("a gateway that dies mid-stream ends the routed body and logs the cause", async () => {
+test("a Node provider that dies mid-stream ends the routed body and logs the cause", async () => {
   const gateway = await mockServer((request, response) => {
     if (request.method === "GET" && request.url === "/health") {
       const payload = Buffer.from(JSON.stringify({ ok: true }), "utf8");
@@ -196,21 +205,16 @@ test("a gateway that dies mid-stream ends the routed body and logs the cause", a
     // What the upstream managed to send survives, and the failure is stated
     // rather than passed off as a short successful turn.
     assert.match(result.body, /event: response\.created/);
-    assert.match(result.body, /event: error/);
-    assert.match(result.body, /local_router_stream_failed/);
+    assert.match(result.body, /response\.failed/);
+    assert.match(result.body, /reasoning_protocol_error/);
 
-    // The log has to name the cause; the bare string it used to write is why
-    // this was undiagnosable in production.
-    // A wait, not a bound: nothing here is asserting how *fast* the router
-    // logs, only that it does, and 2s was short enough that a loaded machine
-    // could still be scheduling the write. Wait as long as the rest of this
-    // file waits for anything else. A router that never logs the cause still
-    // fails on the assertion below, which is the property under test.
+    // The direct Node path records the committed failure in its timing log; the
+    // public Responses failure event carries the protocol code above.
     const deadline = Date.now() + 10_000;
-    while (!/request failed: /.test(router.testErrors()) && Date.now() < deadline) {
+    while (!/timing .*status=502/.test(router.testErrors()) && Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, 25));
     }
-    assert.match(router.testErrors(), /\[codex-router\] request failed: \w+: .+/);
+    assert.match(router.testErrors(), /\[codex-router\] timing .*status=502/);
 
     // The turn is truncated, not successful: the meter must record a failure
     // carrying the abort marker instead of the committed 200 the client

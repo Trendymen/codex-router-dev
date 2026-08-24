@@ -213,7 +213,7 @@ function restoreGlmReasoningContent(messages) {
     for (const part of message.content) {
       if (part?.type === "thinking") {
         // A malformed or signature-only thinking block must never fall through
-        // as ordinary assistant content. LiteLLM normally supplies `text`,
+        // as ordinary assistant content. The upstream adapter normally supplies `text`,
         // while a few adapters use `thinking`; accept either spelling only
         // when it is a non-empty string, and drop the block otherwise.
         sawThinking = true;
@@ -244,7 +244,7 @@ function restoreGlmReasoningContent(messages) {
 
 // Strict chat-completions providers (Console Go / MiniMax / similar) reject any
 // assistant tool_calls message whose matching tool results are incomplete or
-// separated by non-tool traffic. LiteLLM's Responses->chat translation and
+// separated by non-tool traffic. The Responses-to-chat adapter and
 // Codex remote compact can emit orphan tool_calls after interrupted tool runs
 // or partial history. Insert synthetic tool results for missing call ids so
 // the request stays well-formed. Prefer a short machine-readable stub over
@@ -305,7 +305,7 @@ function ensureToolResultsForCalls(messages) {
   return repaired;
 }
 
-// LiteLLM and the Gemini OpenAI-compatible endpoint accept this sentinel in
+// The Gemini OpenAI-compatible endpoint accepts this sentinel in
 // place of a real reasoning signature to skip thought-signature validation.
 const GEMINI_THOUGHT_SIGNATURE_SENTINEL = "skip_thought_signature_validator";
 
@@ -544,7 +544,7 @@ function normalizeBody(buffer, contentType, route) {
   // provider consumes; strict providers reject the unknown field outright.
   delete payload.client_metadata;
   const requestedModel = String(payload.model || "");
-  // LiteLLM's Responses bridge prefixes the gateway id with `responses/` on
+  // Some Responses adapters prefix the provider id with `responses/` on
   // the upstream wire format; the forwarder still owns the id translation.
   const model =
     MODEL_BY_GATEWAY_ID.get(requestedModel.replace(/^responses\//, "")) ||
@@ -908,7 +908,7 @@ function recordUpstreamLimits(normalized, upstream) {
   // headers land under the family's canonical provider id.
   if (rateLimit) recordRateLimitSnapshot(canonicalProviderId(normalized.provider.id), rateLimit);
   // This hop is the only place the provider's own status and headers are seen
-  // before LiteLLM restates them, so it is the only place a reset time the
+  // before the adapter restates them, so it is the only place a reset time the
   // gateway does not relay can still be read. A failure that names when the
   // caller may return is worth recording: the router reads it to skip a
   // provider it already knows is empty instead of buying the same rejection

@@ -9,23 +9,14 @@ import { withServiceOperationLock } from "./service-operation-lock.mjs";
 import { environmentProxyOptedIn } from "./proxy-environment.mjs";
 
 const platform = process.platform;
-const script = {
-  darwin: "service-macos.mjs",
-  linux: "service-linux.mjs",
-  win32: "service-windows.mjs",
-}[platform];
-
-if (!script) {
-  throw new Error(`Unsupported background-service platform: ${platform}`);
-}
+const script = platform === "darwin" ? "service-macos.mjs" : undefined;
 
 const command = process.argv[2] || "status";
 if (refuseUnsupportedPlatform(`service:${command}`)) process.exit(2);
 const mutatingCommands = new Set(["install", "uninstall", "start", "stop", "restart"]);
 const readinessCommands = new Set(["install", "start", "restart"]);
 const shutdownCommands = new Set(["stop", "uninstall"]);
-// The Node runtime has no third-party gateway cold start. Keep service
-// readiness bounded by the local Router health window.
+// Keep service readiness bounded by the local Router health window.
 const READINESS_TIMEOUT_MS = 30_000;
 
 async function runServiceCommand() {

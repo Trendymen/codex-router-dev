@@ -23,14 +23,13 @@ import { callerBaseUrl } from "../src/caller-auth.mjs";
 import {
   CALLER_SECRET_PATH,
   INTERNAL_SECRET_PATH,
-  PORTS,
   STATE_DIR,
 } from "../src/paths.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const args = process.argv.slice(2);
 const modelIndex = args.indexOf("--model");
-const model = modelIndex === -1 ? "grok-oauth/grok-4.6" : args[modelIndex + 1];
+const model = modelIndex === -1 ? "deepseek/deepseek-v4-pro" : args[modelIndex + 1];
 
 if (!args.includes("--yes")) {
   console.error(
@@ -139,7 +138,6 @@ if (!args.includes("--yes")) {
         CODEX_ROUTER_PORT: String(port),
         CODEX_ROUTER_INTERNAL_KEY: internalSecret,
         CODEX_ROUTER_CALLER_KEY: callerSecret,
-        CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${PORTS.gateway}/v1`,
         CODEX_ROUTER_TOOL_RESULT_AGING: enabled ? "1" : "0",
         CODEX_ROUTER_QUIET: "1",
         CODEX_ROUTER_SHOW_ALL_MODELS: "1",

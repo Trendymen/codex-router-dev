@@ -129,7 +129,9 @@ function declarationEntries(tools) {
   const entries = [];
   for (const tool of tools) {
     if (!tool || typeof tool !== "object") fail();
-    if (tool.type === "namespace") {
+    if (tool.type === "tool_search") {
+      entries.push({ kind: "native", namespace: undefined, tool, name: typeof tool.name === "string" && tool.name ? tool.name : "tool_search", nested: tool });
+    } else if (tool.type === "namespace") {
       if (typeof tool.name !== "string" || !Array.isArray(tool.tools)) fail();
       for (const { namespace, tool: child } of namespaceToolEntries([tool])) entries.push({ kind: "namespace", namespace, tool: child, ...functionParts(child) });
     } else if (tool.type === "custom") {
@@ -141,6 +143,7 @@ function declarationEntries(tools) {
 }
 
 function outputTool(entry, encodedName, preserveStrict = false) {
+  if (entry.kind === "native") return entry.tool;
   if (entry.kind === "custom") {
     return {
       type: "function", name: encodedName,
@@ -274,6 +277,19 @@ export function encodeToolDialect(options = {}) {
   const request = safeSnapshot(options);
   if (typeof request.input === "string") request.input = [{ role: "user", content: request.input }];
   const usesFunctions = profileUsesFunctions(request.profile);
+  // A Responses continuation may legitimately carry prior function calls
+  // without declaring tools again (for example after the client has already
+  // completed the tool turn).  There is no mapping to apply in that shape;
+  // preserving the history is safer than treating every prior call as an
+  // undeclared function and failing the whole request with tool_mapping_error.
+  // Once declarations are present, unknown/foreign calls remain fail-closed
+  // below so this does not weaken the dialect boundary.
+  if (request.tools === undefined) {
+    const mapping = Object.freeze({ entries: Object.freeze([]) });
+    const build = Object.freeze({ tools: undefined, toolChoice: ownData(options, "toolChoice"), input: ownData(options, "input"), mapping, forcedRequirement: undefined, strictValidators: Object.freeze([]) });
+    MAPPING_STATE.set(mapping, { native: true }); BUILD_STATE.set(build, { native: true });
+    return build;
+  }
   if (!usesFunctions) {
     const mapping = Object.freeze({ entries: Object.freeze([]) });
     const build = Object.freeze({ tools: ownData(options, "tools"), toolChoice: ownData(options, "toolChoice"), input: ownData(options, "input"), mapping, forcedRequirement: undefined, strictValidators: Object.freeze([]) });
@@ -283,7 +299,11 @@ export function encodeToolDialect(options = {}) {
   const state = { byEncodedName: new Map(), byOriginal: new Map(), callIds: new Map(), returnedCallIds: new Map(), itemCalls: new Map(), strictValidators: new Map() };
   const names = new Set();
   const builtTools = declarationEntries(request.tools).map((entry) => {
-    const encodedName = entry.kind === "function" && UPSTREAM_NAME.test(entry.name) ? entry.name : encodedToolName(entry.kind, originalName(entry));
+    const encodedName = entry.kind === "native"
+      ? entry.name
+      : entry.kind === "function" && UPSTREAM_NAME.test(entry.name)
+        ? entry.name
+        : encodedToolName(entry.kind, originalName(entry));
     if (names.has(encodedName) || state.byEncodedName.has(encodedName)) fail();
     names.add(encodedName);
     const record = Object.freeze({ ...entry, encodedName });
@@ -293,7 +313,7 @@ export function encodeToolDialect(options = {}) {
   const loweredInput = request.input === undefined ? undefined : Array.isArray(request.input) ? request.input.map((item) => lowerInputItem(item, state)) : fail();
   const selected = choiceFor(request.toolChoice, state, true);
   for (const entry of state.byEncodedName.values()) {
-    if (entry.kind === "custom" || entry.nested.strict !== true) continue;
+    if (entry.kind === "custom" || entry.kind === "native" || entry.nested.strict !== true) continue;
     const schema = providerToolSchema(entry.parameters); // normalize nullable root first
     // A nullable object root is the one documented provider normalization.
     // Every other unsupported source form must be rejected, not erased by the

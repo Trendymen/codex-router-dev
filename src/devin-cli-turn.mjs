@@ -1,4 +1,4 @@
-// Translation between the OpenAI Chat Completions request LiteLLM sends this
+// Translation between the OpenAI Chat Completions request the router sends this
 // provider and the Cascade `GetChatMessage` call the Devin backend answers.
 // Kept free of I/O so the mapping can be tested without an account.
 

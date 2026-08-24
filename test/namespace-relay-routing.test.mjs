@@ -9,6 +9,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { callerBaseUrl } from "../src/caller-auth.mjs";
+import { PROVIDERS } from "../src/model-registry.mjs";
 
 // End-to-end proof of the namespace relay through the REAL router: a routed
 // request carrying the client's namespace toolset must reach the (mock)
@@ -71,17 +72,24 @@ function run(script, env) {
     env?.MODEL_ROUTER_STATE_DIR || env?.CODEX_ROUTER_STATE_DIR
       ? {}
       : { MODEL_ROUTER_STATE_DIR: mkdtempSync(path.join(os.tmpdir(), "relay-routing-state-")) };
+  const childEnv = {
+    ...process.env,
+    ...stateIsolation,
+    CODEX_ROUTER_CALLER_KEY: CALLER_KEY,
+    CODEX_ROUTER_INTERNAL_KEY: INTERNAL_KEY,
+    CODEX_ROUTER_SHOW_ALL_MODELS: "1",
+    ...env,
+  };
+  if (script === "router.mjs" && childEnv.CODEX_ROUTER_GATEWAY_BASE_URL) {
+    childEnv.CODEX_ROUTER_TEST_NODE_ROUTE_FIXTURE = "1";
+    for (const provider of PROVIDERS.values()) {
+      if (provider.baseUrlEnv) childEnv[provider.baseUrlEnv] ||= childEnv.CODEX_ROUTER_GATEWAY_BASE_URL;
+      for (const name of provider.credential?.environment || []) childEnv[name] ||= INTERNAL_KEY;
+    }
+  }
   const child = spawn(process.execPath, [path.join(root, "src", script)], {
     cwd: root,
-    env: {
-      ...process.env,
-      ...stateIsolation,
-      CODEX_ROUTER_CALLER_KEY: CALLER_KEY,
-      CODEX_ROUTER_INTERNAL_KEY: INTERNAL_KEY,
-      CODEX_ROUTER_SHOW_ALL_MODELS: "1",
-      ...(script === "router.mjs" ? { CODEX_ROUTER_DIRECT_DISPATCH: "0" } : {}),
-      ...env,
-    },
+    env: childEnv,
     stdio: ["ignore", "ignore", "pipe"],
   });
   child.stderr.setEncoding("utf8");
@@ -171,6 +179,8 @@ function routedRequestPayload(stream = true, model = "opencode-go/deepseek-v4-fl
           { type: "function", name: "load_workspace_dependencies" },
           { type: "function", name: "navigate_to_codex_page" },
           { type: "function", name: "read_thread_terminal" },
+          { type: "function", name: "create_thread" },
+          { type: "function", name: "send_message_to_thread" },
         ],
       },
       {
@@ -371,13 +381,13 @@ function gatewaySseBody() {
     sseEvent({
       type: "response.output_item.done",
       item: {
-        type: "function_call",
-        name: "tool_search",
-        call_id: "call_search",
-        arguments: JSON.stringify({ query: "calendar", limit: 2 }),
+         type: "tool_search_call",
+         execution: "client",
+         call_id: "call_search",
+         arguments: { query: "calendar", limit: 2 },
       },
     }),
-    sseEvent({ type: "response.completed" }),
+    sseEvent({ type: "response.completed", response: { output: [] } }),
     "data: [DONE]\n\n",
   ].join("");
 }
@@ -426,10 +436,10 @@ function gatewayJsonBody() {
         arguments: "{}",
       },
       {
-        type: "function_call",
-        name: "tool_search",
+        type: "tool_search_call",
+        execution: "client",
         call_id: "call_search",
-        arguments: JSON.stringify({ query: "calendar", limit: 2 }),
+        arguments: { query: "calendar", limit: 2 },
       },
     ],
   };
@@ -447,7 +457,7 @@ function responsesProviderSseBody() {
         arguments: JSON.stringify({ prompt: "hi", target: { type: "projectless" } }),
       },
     }),
-    sseEvent({ type: "response.completed" }),
+    sseEvent({ type: "response.completed", response: { output: [] } }),
     "data: [DONE]\n\n",
   ].join("");
 }
@@ -495,7 +505,7 @@ function functionCallsFromSse(body) {
 async function scenario(
   stream = true,
   {
-    model = "opencode-go/deepseek-v4-flash",
+    model = "zai-api/glm-5.2",
     sseBody = gatewaySseBody,
     jsonBody = gatewayJsonBody,
     requestPayload = routedRequestPayload,
@@ -545,7 +555,7 @@ async function scenario(
   }
 }
 
-test("routed request flattens every namespace to the gateway and restores calls to the client", async () => {
+test("routed Node request preserves namespace relay and restores calls to the client", async () => {
   const first = await scenario();
   const second = await scenario();
   // Determinism: two identical runs produce byte-identical outgoing and
@@ -555,41 +565,24 @@ test("routed request flattens every namespace to the gateway and restores calls 
   assert.equal(second.clientBody, first.clientBody);
 
   const outgoing = first.gatewayBodies[0];
-  assert.equal(outgoing.model, "opencode-go-deepseek-v4-flash");
-  const names = outgoing.tools.map((tool) => tool.name);
+  assert.equal(outgoing.model, "glm-5.2");
+  const names = outgoing.tools.filter((tool) => tool?.type === "function").map((tool) => tool.name);
 
-  // The full native toolset reaches the provider in the flattened form,
-  // including the MCP namespaces the bridge drops when left as namespace
-  // entries.
-  assert.ok(names.includes("collaboration__spawn_agent"), "collaboration flattened");
-  assert.ok(names.includes("codex_app__create_thread"), "merged codex_app tool flattened");
-  assert.ok(names.includes("mcp__node_repl__js"), "node_repl js flattened");
-  assert.ok(names.includes("mcp__node_repl__js_reset"), "node_repl js_reset flattened");
-  assert.ok(names.includes("tool_search"), "native tool_search exposed as a function");
-  assert.ok(
-    names.includes("mcp__codex_apps__github__fetch_issue"),
-    "nested-namespace MCP tool flattened",
-  );
+  // The direct Responses route keeps the native namespace and deferred-search
+  // declarations intact; it does not use the removed gateway flattening layer.
+  assert.ok(outgoing.tools.some((tool) => tool?.type === "namespace" && tool.name === "collaboration"));
+  assert.ok(outgoing.tools.some((tool) => tool?.type === "namespace" && tool.name === "mcp__node_repl"));
+  assert.ok(outgoing.tools.some((tool) => tool?.type === "namespace" && tool.name === "mcp__codex_apps__github"));
   assert.ok(names.includes("exec_command"), "plain tools untouched");
-  assert.ok(
-    outgoing.tools.every((tool) => tool?.type !== "namespace"),
-    "no namespace entries reach the gateway",
-  );
-  assert.ok(
-    outgoing.tools.every((tool) => tool?.type !== "tool_search"),
-    "native deferred-search controls do not reach a function-only provider",
-  );
-  const toolSearch = outgoing.tools.find((tool) => tool.name === "tool_search");
-  assert.equal(toolSearch.type, "function");
+  const toolSearch = outgoing.tools.find((tool) => tool?.type === "tool_search");
+  assert.ok(toolSearch, "native tool_search stays native");
   assert.deepEqual(toolSearch.parameters.required, ["query"]);
-  // The merged codex_app tool definitions keep their schema.
-  const createThread = outgoing.tools.find((tool) => tool.name === "codex_app__create_thread");
-  assert.ok(createThread?.inputSchema, "create_thread schema survives the relay");
-  assert.equal(createThread.inputSchema.type, "object");
-  const fetchIssue = outgoing.tools.find(
-    (tool) => tool.name === "mcp__codex_apps__github__fetch_issue",
-  );
-  assert.deepEqual(fetchIssue?.parameters, {
+  const codexApp = outgoing.tools.find((tool) => tool?.type === "namespace" && tool.name === "codex_app");
+  const createThread = codexApp?.tools.find((tool) => tool.name === "create_thread");
+  assert.ok(createThread, "create_thread survives the direct relay");
+  const fetchNamespace = outgoing.tools.find((tool) => tool?.type === "namespace" && tool.name === "mcp__codex_apps__github");
+  const fetchIssue = fetchNamespace?.tools.find((tool) => tool.name === "fetch_issue");
+  assert.deepEqual(fetchIssue?.inputSchema, {
     type: "object",
     properties: {
       owner: { type: "string" },
@@ -600,11 +593,10 @@ test("routed request flattens every namespace to the gateway and restores calls 
     additionalProperties: false,
   });
 
-  // Stored namespaced calls in the input history are renamed to match the
-  // flattened tool list the model sees.
+  // Stored namespaced calls stay in the native direct Responses shape.
   const historyCall = outgoing.input.find((item) => item?.type === "function_call");
-  assert.equal(historyCall.name, "codex_app__create_thread");
-  assert.equal(historyCall.namespace, undefined);
+  assert.equal(historyCall.name, "create_thread");
+  assert.equal(historyCall.namespace, "codex_app");
   // Historical calls are evidence, not fresh outbound actions. Rewriting
   // their model would change the transcript the provider is meant to see.
   assert.deepEqual(JSON.parse(historyCall.arguments), {});
@@ -621,7 +613,7 @@ test("routed request flattens every namespace to the gateway and restores calls 
     { name: "create_thread", namespace: "codex_app" },
   );
   assert.deepEqual(JSON.parse(calls.get("call_thread").arguments), {
-    model: "opencode-go/deepseek-v4-flash",
+    model: "zai-api/glm-5.2",
   });
   assert.deepEqual(JSON.parse(calls.get("call_explicit_thread").arguments), {
     model: "gpt-5.6-terra",
@@ -655,7 +647,7 @@ test("routed request flattens every namespace to the gateway and restores calls 
   assert.equal(first.gatewayBodies.length, 1);
 });
 
-test("non-streaming routed responses restore namespace calls before client dispatch", async () => {
+test("non-streaming routed Node responses restore namespace calls before client dispatch", async () => {
   const result = await scenario(false);
   assert.equal(result.gatewayBodies.length, 1);
   assert.equal(result.gatewayBodies[0].stream, false);
@@ -670,7 +662,7 @@ test("non-streaming routed responses restore namespace calls before client dispa
     { name: "create_thread", namespace: "codex_app" },
   );
   assert.deepEqual(JSON.parse(client.output[1].arguments), {
-    model: "opencode-go/deepseek-v4-flash",
+    model: "zai-api/glm-5.2",
   });
   assert.deepEqual(JSON.parse(client.output[2].arguments), {
     model: "gpt-5.6-terra",
@@ -705,10 +697,11 @@ test("non-streaming routed responses restore namespace calls before client dispa
   });
 });
 
-test("routed tool_search history declares discovered tools and restores their calls", async () => {
+test("routed Node tool_search history declares discovered tools and restores their calls", async () => {
   const searchedCall = {
     type: "function_call",
-    name: "mcp__calendar__delete_event",
+    name: "delete_event",
+    namespace: "mcp__calendar",
     call_id: "delete-1",
     arguments: JSON.stringify({ id: "evt-1" }),
   };
@@ -730,58 +723,55 @@ test("routed tool_search history declares discovered tools and restores their ca
     const result = await scenario(stream, options);
     const outgoing = result.gatewayBodies[0];
     const historyCall = outgoing.input.find(
-      (item) => item.call_id === "search-history-1" && item.type === "function_call",
+      (item) => item.call_id === "search-history-1" && item.type === "tool_search_call",
     );
     assert.deepEqual(historyCall, {
-      type: "function_call",
-      name: "tool_search",
+      type: "tool_search_call",
       call_id: "search-history-1",
-      arguments: '{"query":"calendar","limit":2}',
+      execution: "client",
+      arguments: { query: "calendar", limit: 2 },
     });
     assert.deepEqual(
       outgoing.input.find(
-        (item) => item.call_id === "search-history-2" && item.type === "function_call",
+        (item) => item.call_id === "search-history-2" && item.type === "tool_search_call",
       ),
       {
-        type: "function_call",
-        name: "tool_search",
+        type: "tool_search_call",
         call_id: "search-history-2",
-        arguments: '{"query":"mail","limit":1}',
+        execution: "client",
+        arguments: { query: "mail", limit: 1 },
       },
     );
     const historyOutput = outgoing.input.find(
       (item) =>
-        item.call_id === "search-history-1" && item.type === "function_call_output",
+        item.call_id === "search-history-1" && item.type === "tool_search_output",
     );
     assert.deepEqual(
-      JSON.parse(historyOutput.output).tools.map((tool) => tool.name),
-      ["mcp__calendar__delete_event"],
+      historyOutput.tools[0].tools.map((tool) => tool.name),
+      ["create_event", "delete_event"],
     );
     const secondHistoryOutput = outgoing.input.find(
       (item) =>
-        item.call_id === "search-history-2" && item.type === "function_call_output",
+        item.call_id === "search-history-2" && item.type === "tool_search_output",
     );
     assert.deepEqual(
-      JSON.parse(secondHistoryOutput.output).tools.map((tool) => tool.name),
+      secondHistoryOutput.tools.map((tool) => tool.name),
       ["list_messages"],
     );
     assert.equal(
       outgoing.input.some(
         (item) => item.type === "tool_search_call" || item.type === "tool_search_output",
       ),
-      false,
-      "batched native search history never leaks to a chat-completions provider",
+      true,
+      "native search history stays on the direct Responses route",
     );
     assert.equal(
       outgoing.tools.filter((tool) => tool.name === "mcp__calendar__create_event").length,
       1,
-      "live top-level schemas take precedence over searched history",
+      "live top-level schemas remain visible",
     );
-    assert.ok(
-      outgoing.tools.some((tool) => tool.name === "mcp__calendar__delete_event"),
-      "the searched tool is declared to the chat-completions provider",
-    );
-    assert.ok(outgoing.tools.some((tool) => tool.name === "list_messages"));
+    assert.equal(outgoing.tools.some((tool) => tool.name === "mcp__calendar__delete_event"), false);
+    assert.equal(outgoing.tools.some((tool) => tool.name === "list_messages"), false);
 
     const clientCall = stream
       ? responseItemsFromSse(result.clientBody).find((item) => item.call_id === "delete-1")
@@ -796,15 +786,15 @@ test("routed tool_search history declares discovered tools and restores their ca
   }
 });
 
-test("Responses-native routed providers inherit the model on fresh local thread calls", async () => {
+test("Node Responses providers inherit the model on fresh local thread calls", async () => {
   const options = {
-    model: "opencode-go-responses/gpt-5.6-luna",
+    model: "zai-api/glm-5.2",
     sseBody: responsesProviderSseBody,
     jsonBody: responsesProviderJsonBody,
     requestPayload: routedToolSearchHistoryPayload,
   };
   const streamed = await scenario(true, options);
-  assert.equal(streamed.gatewayBodies[0].model, "opencode-go-responses-gpt-5-6-luna");
+  assert.equal(streamed.gatewayBodies[0].model, "glm-5.2");
   assert.ok(
     streamed.gatewayBodies[0].tools.some((tool) => tool?.type === "namespace"),
     "Responses-native tools stay namespaced",
@@ -826,7 +816,7 @@ test("Responses-native routed providers inherit the model on fresh local thread 
   assert.deepEqual(JSON.parse(streamedCall.arguments), {
     prompt: "hi",
     target: { type: "projectless" },
-    model: "opencode-go-responses/gpt-5.6-luna",
+    model: "zai-api/glm-5.2",
   });
 
   const nonStreaming = await scenario(false, options);
@@ -834,6 +824,6 @@ test("Responses-native routed providers inherit the model on fresh local thread 
   assert.deepEqual(JSON.parse(nonStreamingCall.arguments), {
     prompt: "hi",
     target: { type: "projectless" },
-    model: "opencode-go-responses/gpt-5.6-luna",
+    model: "zai-api/glm-5.2",
   });
 });

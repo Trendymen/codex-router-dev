@@ -28,13 +28,9 @@ import {
   CODEX_AGENTS_DIR,
   CODEX_HOME,
   CONFIG_PATH,
-  DSH_CATALOG_PATH,
-  DSH_SETTINGS_PATH,
-  GEMINI_CATALOG_PATH,
-  GEMINI_ENV_PATH,
   INTERNAL_SECRET_PATH,
-  LITELLM_CONFIG_PATH,
   MERGED_CATALOG_PATH,
+  NODE_ROUTES_PATH,
   PORTS,
   ROUTED_CATALOG_PATH,
   SOURCE_ROOT,
@@ -70,10 +66,7 @@ import {
 } from "./model-failover.mjs";
 import { contextWindowDrift, describeContextWindowDrift } from "./context-window-drift.mjs";
 import { observedInputCeilings } from "./usage-events.mjs";
-import { venvRuntimeProblem } from "./venv-runtime.mjs";
 import {
-  dependencyRepairHint,
-  isHomebrewManaged,
   requireMacOSRepair,
 } from "./dependency-repair.mjs";
 import {
@@ -92,32 +85,6 @@ if (process.argv.includes("--fix") && refuseUnsupportedPlatform("doctor:fix")) p
 const checks = [];
 const add = (status, name, detail, fix) => checks.push({ status, name, detail, fix });
 const jsonOutput = process.argv.includes("--json");
-const homebrewManaged = isHomebrewManaged();
-const usesBundledVenv = !process.env.MODEL_ROUTER_LITELLM_BIN &&
-  !(TARGET === "codex" &&
-    (process.env.CODEX_ROUTER_LITELLM_BIN || process.env.KIMI_LITELLM_BIN));
-const bundledVenvBin = path.join(
-  SOURCE_ROOT,
-  ".venv",
-  process.platform === "win32" ? "Scripts" : "bin",
-);
-const bundledVenvPython = path.join(
-  bundledVenvBin,
-  process.platform === "win32" ? "python.exe" : "python",
-);
-const bundledLiteLlm = path.join(
-  bundledVenvBin,
-  process.platform === "win32" ? "litellm.exe" : "litellm",
-);
-const dependencyFix = dependencyRepairHint();
-
-function bundledVenvProblem() {
-  if (!existsSync(bundledLiteLlm)) return `${bundledLiteLlm} is missing`;
-  const pythonProblem = venvRuntimeProblem(bundledVenvPython);
-  return pythonProblem
-    ? `${bundledVenvPython} cannot run (${pythonProblem})`
-    : undefined;
-}
 
 // Asks Codex to load its own configuration and returns its complaint, if any.
 // `login status` exits non-zero merely for being signed out, so the exit code
@@ -223,17 +190,9 @@ async function repair() {
     process.exit(result.status ?? 1);
   }
 
-  // Homebrew owns every file under the formula prefix. Re-running npm or pip
-  // from here would mutate that prefix and fails for resources intentionally
-  // installed without pip RECORD metadata. A healthy package can still use
-  // doctor --fix to regenerate config and services, but damaged package files
-  // must be rebuilt by Homebrew itself before the service transaction starts.
-  if (homebrewManaged && usesBundledVenv) {
-    const problem = bundledVenvProblem();
-    if (problem) {
-      throw new Error(`Homebrew-managed LiteLLM is damaged (${problem}). ${dependencyFix}.`);
-    }
-  }
+  // Homebrew owns every file under the formula prefix. A Node-only repair can
+  // regenerate configuration and services in place; no foreign runtime tree
+  // is inspected or rebuilt here.
 
   const legacy = detectLegacyInstallations();
   if (legacy.unknownConflict) {
@@ -251,32 +210,16 @@ async function repair() {
   // an ordinary install trusts cannot see a corrupted node_modules or virtual
   // environment. Homebrew has already validated its package-owned tree above,
   // so its repair only regenerates configuration and services.
-  const posixArguments = homebrewManaged ? [] : ["--force-deps"];
   await repairRuntimeTransaction({
     installReplacement: async () => {
       if (legacy.installations.length) {
         childJson("legacy-migration.mjs", ["apply", "--yes"]);
       }
-      const result = process.platform === "win32"
-        ? spawnSync(
-            "powershell.exe",
-            [
-              "-NoLogo",
-              "-NoProfile",
-              "-ExecutionPolicy",
-              "Bypass",
-              "-File",
-              path.join(SOURCE_ROOT, "install.ps1"),
-              "-CheckoutInstall",
-              "-ForceDeps",
-            ],
-            { cwd: SOURCE_ROOT, env: process.env, stdio: repairStdio },
-          )
-        : spawnSync(path.join(SOURCE_ROOT, "bin", "install"), posixArguments, {
-            cwd: SOURCE_ROOT,
-            env: process.env,
-            stdio: repairStdio,
-          });
+      const result = spawnSync(path.join(SOURCE_ROOT, "bin", "install"), [], {
+        cwd: SOURCE_ROOT,
+        env: process.env,
+        stdio: repairStdio,
+      });
       if (result.error) throw result.error;
       if (result.status !== 0) throw new Error(`Repair installer exited with ${result.status}.`);
     },
@@ -311,10 +254,10 @@ add(
   "Install Node.js 24 LTS, then run ./bin/doctor --fix.",
 );
 add(
-  ["darwin", "linux", "win32"].includes(process.platform) ? "ok" : "fail",
+  process.platform === "darwin" ? "ok" : "fail",
   "Platform",
   process.platform,
-  "Use macOS, Windows, or Linux with the Codex CLI.",
+  "Use the macOS build of the model router.",
 );
 
 // Everything from here to the routing-config check describes the *client* this
@@ -365,24 +308,15 @@ if (codexTarget) {
       : undefined,
   );
 }
-// Both clients hold the managed base URL, which is a local caller capability,
-// so both documents are held to the same privacy bound.
-const privacyTarget = codexTarget
-  ? CONFIG_PATH
-  : TARGET === "gemini"
-    ? GEMINI_ENV_PATH
-    : DSH_SETTINGS_PATH;
+// Codex holds the managed base URL, which is a local caller capability.
+const privacyTarget = CONFIG_PATH;
 const configMode = existsSync(privacyTarget)
   ? statSync(privacyTarget).mode & 0o777
   : undefined;
 const configProtected = privateFileIsProtected(privacyTarget);
 add(
   configProtected ? "ok" : "fail",
-  codexTarget
-    ? "Codex config privacy"
-    : TARGET === "gemini"
-      ? "Gemini environment privacy"
-      : "Harness settings privacy",
+  "Codex config privacy",
   configMode === undefined
     ? "missing"
     : process.platform === "win32"
@@ -395,15 +329,11 @@ let selection = { providers: [], explicit: false };
 let requiredRoutedModels = [];
 let catalogRoutedModels = [];
 let requiredModels = new Set();
-// "Is routed traffic actually reaching the gateway?" has a different witness
-// per client: Codex's managed config block, and the harness's published route
-// snapshot. Reading Codex's config for a harness install reported every routed
-// model as unoffered on a machine that has no Codex at all.
-const routedTransportActive = codexTarget
-  ? routedCatalogConfigured(existsSync(CONFIG_PATH) ? readFileSync(CONFIG_PATH, "utf8") : "")
-  : TARGET === "gemini"
-    ? existsSync(GEMINI_CATALOG_PATH)
-    : existsSync(DSH_CATALOG_PATH);
+// Routed traffic is active only when the managed Codex config points at the
+// router plane.
+const routedTransportActive = routedCatalogConfigured(
+  existsSync(CONFIG_PATH) ? readFileSync(CONFIG_PATH, "utf8") : "",
+);
 // An install made with --no-provider --no-discovery is idle on purpose: the
 // selection is an explicit empty list and the discovery marker is set. That
 // state is what the operator asked for, so the empty selection and the empty
@@ -481,10 +411,10 @@ if (codexTarget) add(
     : MERGED_CATALOG_PATH,
   "Run ./bin/refresh-catalog, or ./bin/doctor --fix if files are missing.",
 );
-// The catalog tells Codex which models to offer; the gateway config decides
-// which it can actually route. When a second checkout writes one of them the
-// two drift apart, and Codex forwards the unroutable model upstream, where it
-// fails with a confusing account-level error instead of a routing error.
+// The catalog tells Codex which models to offer; the protected Node route
+// snapshot decides which it can actually route. When a second checkout writes
+// one of them the two drift apart, and the request must fail closed rather than
+// fall through to a native account-level error.
 const ownership = stateOwnershipStatus();
 add(
   ownership.foreign ? "fail" : "ok",
@@ -496,18 +426,23 @@ add(
 );
 let unroutable = [];
 try {
-  const rendered = readFileSync(LITELLM_CONFIG_PATH, "utf8");
+  const document = JSON.parse(readFileSync(NODE_ROUTES_PATH, "utf8"));
+  const published = new Set(
+    (Array.isArray(document?.routes) ? document.routes : [])
+      .filter((route) => route?.routable === true)
+      .map((route) => String(route.slug)),
+  );
   unroutable = catalogRoutedModels
-    .filter((model) => !rendered.includes(`model_name: "${model.gatewayModel}"`))
+    .filter((model) => !published.has(String(model.slug)))
     .map((model) => model.slug);
 } catch {
-  // The missing-config case is already reported by the gateway config check.
+  // The missing snapshot is reported by the Node route check below.
 }
 add(
   unroutable.length ? "fail" : "ok",
-  "Catalog matches gateway routes",
+  "Catalog matches Node routes",
   unroutable.length
-    ? `${unroutable.length} offered model(s) have no gateway route: ${unroutable.join(", ")}`
+    ? `${unroutable.length} offered model(s) have no Node route: ${unroutable.join(", ")}`
     : `${catalogRoutedModels.length} routed models`,
   "Run ./bin/doctor --fix from the owning checkout, then fully quit and reopen Codex.",
 );
@@ -645,9 +580,7 @@ if (!failoverSettings.enabled) {
 }
 // The same list the catalog writes definitions from, so a model switched off
 // as a subagent is expected to have no definition rather than a missing one.
-// Codex-only: these are files in Codex's own agents directory, and the harness
-// spawns children through `dsh-tool-subagent` instead
-// (`./bin/model-router dsh subagent-preset`).
+// These are files in Codex's own agents directory.
 const multiAgentSettings = readMultiAgentSettings();
 const hiddenModels = readHiddenModels();
 const effectiveSubagentModels = applyMultiAgentCapabilities(
@@ -687,42 +620,10 @@ add(
   "Change per-model visibility in the desktop Models settings.",
 );
 add(
-  existsSync(LITELLM_CONFIG_PATH) ? "ok" : "fail",
-  "Generated gateway config",
-  LITELLM_CONFIG_PATH,
-  "Run ./bin/doctor --fix.",
-);
-
-// The venv that runs LiteLLM can be broken while every file it needs still
-// exists: an interpreter home pointing at a cleared temporary directory
-// (macOS wipes /private/tmp, and an installer that recorded a temporary
-// Python as the venv home leaves `.venv/bin/python` dangling) keeps the
-// launcher on disk but makes every spawn fail with a bare ENOENT. Probing
-// the interpreter turns that silent restart loop into an actionable check.
-// The probe applies only to the bundled venv: a custom launcher
-// (MODEL_ROUTER_LITELLM_BIN or a codex-target alias) may deliberately ship
-// without the bundled `.venv`, and a fresh checkout has no venv until the
-// installer runs.
-let venvCheck;
-if (usesBundledVenv) {
-  const venvProblem = bundledVenvProblem();
-  venvCheck = venvProblem
-    ? {
-        status: "fail",
-        detail: venvProblem,
-      }
-    : { status: "ok", detail: `${bundledVenvPython} runs and ${bundledLiteLlm} exists` };
-} else {
-  venvCheck = {
-    status: "ok",
-    detail: "custom LiteLLM launcher configured; bundled venv not required",
-  };
-}
-add(
-  venvCheck.status,
-  "LiteLLM venv runtime",
-  venvCheck.detail,
-  `${dependencyFix}.`,
+  existsSync(NODE_ROUTES_PATH) || !routedTransportActive ? "ok" : "fail",
+  "Node route snapshot",
+  existsSync(NODE_ROUTES_PATH) ? NODE_ROUTES_PATH : "missing",
+  "Run ./bin/doctor --fix from the owning checkout.",
 );
 
 const secretMode = existsSync(INTERNAL_SECRET_PATH)
@@ -957,95 +858,7 @@ for (const provider of PROVIDERS.values()) {
   }
 }
 
-if (TARGET === "gemini") {
-  try {
-    const gemini = childJson("gemini-config-manager.mjs", ["status"]);
-    add(
-      gemini.installed && gemini.baseUrlManaged ? "ok" : "fail",
-      "Gemini routing config",
-      gemini.installed
-        ? gemini.baseUrlManaged
-          ? `${gemini.managedKeys.join(", ")} in ${gemini.envPath}`
-          : `${gemini.envPath} names a base URL this router does not serve (${gemini.baseUrl})`
-        : `no managed block in ${gemini.envPath}`,
-      "Run ./bin/model-router gemini enable.",
-    );
-    // A managed key assigned outside the block is the failure mode this
-    // integration has that the others do not: dotenv lets the last assignment
-    // of a key win, so a duplicate silently decides the endpoint or the
-    // credential and nothing about the file says which one is in force.
-    add(
-      gemini.documentReadable && !gemini.conflicts.length ? "ok" : "fail",
-      "Gemini environment conflicts",
-      !gemini.documentReadable
-        ? `${gemini.envPath} could not be read plainly; its managed block markers are damaged`
-        : gemini.conflicts.length
-          ? gemini.conflicts.map(({ key, line }) => `${key} (line ${line})`).join(", ")
-          : "no competing assignments",
-      `Remove or comment out the competing assignments in ${gemini.envPath}, then run ./bin/model-router gemini enable.`,
-    );
-    // The model list is served live off the router's own catalog, so it cannot
-    // drift. The published default model can: it is one slug, written once, and
-    // a default naming a model the routable set has lost puts every fresh
-    // session on a 404 before the user has typed anything.
-    const drift = childJson("gemini-config-manager.mjs", ["drift"]);
-    add(
-      drift.defaultMissing ? "warn" : "ok",
-      "Gemini default model",
-      gemini.defaultModel
-        ? drift.defaultMissing
-          ? `${gemini.defaultModel} is no longer routable`
-          : gemini.defaultModel
-        : "not set; Gemini CLI will use its own default unless --model is passed",
-      "Run ./bin/model-router gemini enable to republish.",
-    );
-  } catch (error) {
-    add(
-      "fail",
-      "Gemini routing config",
-      error instanceof Error ? error.message : String(error),
-      `Inspect ${GEMINI_ENV_PATH}, then run ./bin/model-router gemini enable.`,
-    );
-  }
-} else if (TARGET === "dsh") {
-  try {
-    const dsh = childJson("dsh-config-manager.mjs", ["status"]);
-    add(
-      dsh.routeInstalled ? "ok" : "fail",
-      "Harness routing config",
-      dsh.routeInstalled
-        ? `llm-pi-ai.providers.${dsh.route} in ${dsh.settings}`
-        : dsh.structureError || `no ${dsh.route} route in ${dsh.settings}`,
-      "Run ./bin/model-router dsh enable.",
-    );
-    add(
-      dsh.credentialInstalled ? "ok" : "fail",
-      "Harness caller credential",
-      dsh.credentialInstalled
-        ? `stored in ${dsh.credentials}`
-        : `missing from ${dsh.credentials}`,
-      "Run ./bin/model-router dsh enable; the route resolves its key by reference, so an absent value fails every request.",
-    );
-    // Drift is the failure mode this integration has that Codex's does not:
-    // the harness hot-reloads its settings document, so anything else that
-    // writes it -- the Models page, a hand edit -- takes effect at once and can
-    // leave the published route naming models the gateway no longer routes.
-    add(
-      dsh.publishedModels === dsh.routableModels ? "ok" : "warn",
-      "Harness catalog freshness",
-      `published ${dsh.publishedModels}, routable ${dsh.routableModels}`,
-      "Run ./bin/model-router dsh enable to republish.",
-    );
-  } catch (error) {
-    add(
-      "fail",
-      "Harness routing config",
-      error instanceof Error ? error.message : String(error),
-      "Inspect $DSH_HOME/settings.yaml, then run ./bin/model-router dsh enable.",
-    );
-  }
-} else {
-  try {
+try {
     const config = readCodexConfigStatus(existsSync(CONFIG_PATH) ? readFileSync(CONFIG_PATH, "utf8") : "");
     add(
       config.mode === "router" ? "ok" : "fail",
@@ -1091,7 +904,6 @@ if (TARGET === "gemini") {
       "Inspect ~/.codex/config.toml, then run ./bin/doctor --fix.",
     );
   }
-}
 
 const legacy = detectLegacyInstallations();
 add(
@@ -1122,7 +934,7 @@ try {
     const hours = session.expiresInHours;
     add(
       session.usable ? "ok" : "warn",
-      "Codex session for harness models",
+      "Codex session for native models",
       session.usable
         ? `valid${hours === undefined ? "" : ` for ${hours}h`}`
         : "expired; open Codex once to renew it (native models are withheld until then)",
@@ -1160,8 +972,8 @@ try {
 const health = await waitForRouterHealth({ timeoutMs: serviceLoaded ? 30_000 : 2_000 });
 // A router that answers while a dependency is down is not the same outcome as
 // a router that never answered, and saying "not ready" for both sent operators
-// looking for a dead service when the gateway was the thing that died. The
-// gateway is restarted in place, so this state is usually transient.
+// looking for a dead service when one of the local Node forwarders is the
+// thing that died.
 const degradedDependencies = Array.isArray(health.degradedPayload?.degraded)
   ? health.degradedPayload.degraded
   : [];
@@ -1174,9 +986,7 @@ add(
       ? "not serving; the background service is following Codex"
       : degradedDependencies.length
         ? `serving on 127.0.0.1:${PORTS.router} but ${health.error}` +
-          (degradedDependencies.includes("gateway")
-            ? "; the service restarts a crashed gateway in place, so check the log for its restart lines"
-            : "")
+          ""
         : `not ready on 127.0.0.1:${PORTS.router} after ${serviceLoaded ? 30 : 2} seconds; ${health.error}`,
   "Run ./bin/doctor --fix. If it still fails, create a support bundle.",
 );

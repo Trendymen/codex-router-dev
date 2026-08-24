@@ -124,49 +124,6 @@ test("writing the catalog from a foreign checkout fails with guidance, not a sta
   });
 });
 
-test("writing the gateway config from a foreign checkout is refused", () => {
-  withState({ owner: FOREIGN_OWNER }, (stateDir) => {
-    const result = spawnSync(
-      process.execPath,
-      [
-        "--input-type=module",
-        "-e",
-        'import { writeLiteLlmConfig } from "./src/litellm-config.mjs";' +
-          "try { writeLiteLlmConfig(); process.stdout.write('wrote'); }" +
-          "catch (error) { process.stdout.write(error.code || 'other'); }",
-      ],
-      {
-        cwd: root,
-        encoding: "utf8",
-        env: isolatedEnv(stateDir),
-      },
-    );
-    assert.equal(result.stdout, "foreign_state_owner");
-  });
-});
-
-test("rendering the gateway config to an explicit path stays unguarded", () => {
-  withState({ owner: FOREIGN_OWNER }, (stateDir) => {
-    const target = path.join(stateDir, "scratch-litellm.yaml");
-    const result = spawnSync(
-      process.execPath,
-      [
-        "--input-type=module",
-        "-e",
-        'import { writeLiteLlmConfig } from "./src/litellm-config.mjs";' +
-          `writeLiteLlmConfig(${JSON.stringify(target)});` +
-          "process.stdout.write('wrote');",
-      ],
-      {
-        cwd: root,
-        encoding: "utf8",
-        env: isolatedEnv(stateDir),
-      },
-    );
-    assert.equal(result.stdout, "wrote", result.stderr);
-  });
-});
-
 test("the installer is allowed to take ownership", () => {
   withState({ owner: FOREIGN_OWNER }, (stateDir) => {
     // bin/install exports the override for its whole run because it rebuilds

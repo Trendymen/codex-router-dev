@@ -31,11 +31,7 @@ export function targetCli(command) {
   return `./bin/${command}`;
 }
 
-const PICKER_NAMES = Object.freeze({
-  dsh: "DeepSeek Harness",
-  gemini: "Gemini CLI",
-  codex: "Codex",
-});
+const PICKER_NAMES = Object.freeze({ codex: "Codex" });
 
 export function targetPickerName() {
   return PICKER_NAMES[TARGET] || PICKER_NAMES.codex;
@@ -50,15 +46,6 @@ export function targetPickerName() {
  * reopen" there would be busywork the product does not need.
  */
 export function targetRestartHint() {
-  if (TARGET === "dsh") {
-    return "DeepSeek Harness reloads its settings document on the next request.";
-  }
-  // Gemini CLI reads its `.env` once, at process start. A session already open
-  // keeps the old values; the next `gemini` invocation picks the new ones up.
-  // Telling somebody to quit a CLI they may not have running would be busywork.
-  if (TARGET === "gemini") {
-    return "Gemini CLI reads its environment at startup; the next `gemini` run picks this up.";
-  }
   return `Fully quit and reopen ${targetPickerName()} to refresh the model picker.`;
 }
 
@@ -73,7 +60,7 @@ export function targetRestartHint() {
 /**
  * Which client integrations are currently published.
  *
- * The service, gateway, ports, and credentials are one shared plane -- see the
+ * The service, ports, and credentials are one shared plane -- see the
  * note on `ROUTER_PLANE_TARGET` in paths.mjs. Turning one client off is not a
  * reason to tear that plane down while another client is still pointed at it,
  * which is how disabling the harness used to stop Codex working too.
@@ -86,9 +73,19 @@ export function installedTargets() {
   // pointed at the plane -- keying on it left the service and its LaunchAgent
   // behind after the last integration was removed.
   if (codexIntegrationInstalled()) installed.push("codex");
-  if (existsSync(DSH_CATALOG_PATH)) installed.push("dsh");
-  if (existsSync(GEMINI_CATALOG_PATH)) installed.push("gemini");
   return installed;
+}
+
+// Legacy client documents are never republished. They remain visible only to
+// the uninstall transaction, so removing Codex cannot tear down a shared plane
+// while an old external document still points at it. No public target picker or
+// install path consumes this list.
+export function legacyInstalledTargets() {
+  return [
+    ...(codexIntegrationInstalled() ? ["codex"] : []),
+    ...(existsSync(DSH_CATALOG_PATH) ? ["dsh"] : []),
+    ...(existsSync(GEMINI_CATALOG_PATH) ? ["gemini"] : []),
+  ];
 }
 
 function codexIntegrationInstalled() {
@@ -111,27 +108,14 @@ export function refreshTargetPickerIfInstalled({ rebuildCodex = true } = {}) {
     run("catalog.mjs");
     refreshed = true;
   }
-  // The snapshot in the router's own state directory is the marker, not the
-  // user's settings document: it records that this router published there, and
-  // it survives a user who edits or moves the document by hand.
-  if (existsSync(DSH_CATALOG_PATH)) {
-    run("dsh-config-manager.mjs", ["install"]);
-    refreshed = true;
-  }
-  // Gemini CLI is served its model list live off the router's own catalog, so
-  // there is no list here to keep in step -- but the published default model is
-  // a slug like any other, and a republish is what moves it off one the routable
-  // set just lost.
-  if (existsSync(GEMINI_CATALOG_PATH)) {
-    run("gemini-config-manager.mjs", ["install"]);
-    refreshed = true;
-  }
   return refreshed;
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  if (process.argv[2] === "installed-targets") {
-    process.stdout.write(`${installedTargets().join(",")}\n`);
+    if (process.argv[2] === "installed-targets") {
+      process.stdout.write(`${installedTargets().join(",")}\n`);
+    } else if (process.argv[2] === "legacy-installed-targets") {
+      process.stdout.write(`${legacyInstalledTargets().join(",")}\n`);
   } else {
     console.error("Usage: target-integration installed-targets");
     process.exit(2);

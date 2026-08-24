@@ -77,7 +77,9 @@ export function restoreModelOverlayFiles(
 }
 
 /**
- * Rebuild the shared routing plane, then every installed client's model list.
+ * Rebuild the shared Node routing publication, then every installed client's
+ * model list. The provider registry is read directly by the Router; there is
+ * no generated gateway document to keep in sync.
  *
  * This is exported for dependency-injected tests and for the fresh child below.
  * Callers that have already loaded model-registry.mjs must use
@@ -85,23 +87,20 @@ export function restoreModelOverlayFiles(
  * rebuilding in their process can silently publish the pre-mutation model set.
  */
 export async function rebuildModelOverlayPublication({
-  writeGateway,
   refreshTargets,
 } = {}) {
-  const write = writeGateway ||
-    (await import("./litellm-config.mjs")).writeLiteLlmConfig;
   const refresh = refreshTargets ||
     (await import("./target-integration.mjs")).refreshTargetPickerIfInstalled;
 
-  const gatewayPath = write();
   const targetsRefreshed = refresh();
-  return { gatewayPath, targetsRefreshed };
+  return { targetsRefreshed };
 }
 
 /**
  * Publish from a new Node process so the registry observes the overlay that was
  * just committed to disk. The child also provides one fail-closed ordering
- * point: the gateway is written before any Codex, DSH, or Gemini publication.
+ * point: the Node route publication is refreshed before the Codex catalog
+ * becomes visible.
  */
 export function publishModelOverlayFresh({
   spawn = spawnSync,
@@ -146,7 +145,7 @@ export async function applyModelOverlayPublication({
     if (!warningOnly) throw error;
     warnings.catalogError = errorMessage(error);
     // A restart is the commit point for the running service. Do not load an
-    // overlay whose gateway/client publication did not finish; the completed
+    // overlay whose client publication did not finish; the completed
     // physical operation remains truthful and its warning tells the operator
     // that publication (and therefore restart) is still needed.
     return warnings;

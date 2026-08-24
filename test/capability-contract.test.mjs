@@ -53,7 +53,14 @@ const PROVIDER_CREDENTIAL_ENV = Object.freeze([...new Set([
 ])].sort());
 
 function repositorySnapshot() {
-  const git = (...args) => execFileSync("git", args, { cwd: repoRoot, encoding: "utf8", windowsHide: true });
+  const git = (...args) => execFileSync("git", args, {
+    cwd: repoRoot,
+    encoding: "utf8",
+    windowsHide: true,
+    // Phase 4 intentionally removes the obsolete desktop trees; keep the
+    // snapshot oracle bounded by the test rather than Node's 1 MiB default.
+    maxBuffer: 32 * 1024 * 1024,
+  });
   return {
     head: git("rev-parse", "HEAD"),
     status: git("status", "--porcelain=v1", "--untracked-files=all"),

@@ -428,17 +428,8 @@ export async function handlePanelRequest(request, response, route, {
   // Browsers ask for this unprompted; answering keeps a console clean enough
   // that a real error still stands out in it.
   if (route === "/panel/favicon.ico") {
-    const icon = path.resolve(UI_DIR, "..", "src-tauri", "icons", "32x32.png");
-    try {
-      const body = await readFile(icon);
-      applyHeaders(response, { staticAsset: true });
-      response.setHeader("content-type", "image/png");
-      response.writeHead(200);
-      response.end(body);
-    } catch {
-      applyHeaders(response, { staticAsset: true });
-      response.writeHead(204).end();
-    }
+    applyHeaders(response, { staticAsset: true });
+    response.writeHead(204).end();
     return true;
   }
 

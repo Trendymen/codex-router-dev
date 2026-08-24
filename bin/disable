@@ -9,10 +9,7 @@ fi
 repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$repo_dir"
 
-# The service, gateway, ports, and credentials are one plane shared by every
-# client integration. Tearing it down because *one* client was turned off is how
-# disabling the harness used to stop Codex working as well. Uninstall it only
-# once nothing is pointed at it any more.
+# The service, ports, and credentials are one plane owned by the Codex target.
 retire_service_if_unused() {
   remaining=$(node src/target-integration.mjs installed-targets)
   if [ -z "$remaining" ]; then
@@ -23,24 +20,11 @@ retire_service_if_unused() {
   fi
 }
 
-case "${MODEL_ROUTER_TARGET:-codex}" in
-  codex)
-    node src/config-manager.mjs disable
-    retire_service_if_unused
-    echo "External model routes disabled. Your model, provider, and profile settings were preserved."
-    echo "Fully quit and reopen Codex."
-    ;;
-  dsh)
-    node src/dsh-config-manager.mjs uninstall >/dev/null
-    retire_service_if_unused
-    echo "The codex-router provider route was removed from DeepSeek Harness."
-    echo "Every other settings section, provider route, and stored credential was preserved."
-    ;;
-  gemini)
-    node src/gemini-config-manager.mjs uninstall >/dev/null
-    retire_service_if_unused
-    echo "The router's managed block was removed from Gemini CLI's environment file."
-    echo "Every other line in that file, and its settings.json, were left untouched."
-    ;;
-  *) echo "MODEL_ROUTER_TARGET must be codex, dsh, or gemini." >&2; exit 2 ;;
-esac
+if [ "${MODEL_ROUTER_TARGET:-codex}" != codex ]; then
+  echo "Only the Codex target has a public disable operation. Use bin/uninstall with an explicit legacy client target to remove an old external document safely." >&2
+  exit 2
+fi
+node src/config-manager.mjs disable
+retire_service_if_unused
+echo "External model routes disabled. Your model, provider, and profile settings were preserved."
+echo "Fully quit and reopen Codex."

@@ -5,7 +5,9 @@ import { fileURLToPath } from "node:url";
 import { trayBundleDir } from "./tray-install.mjs";
 import { PRODUCTION_SERVICE_TARGET, resolveServiceTarget } from "./service-target.mjs";
 
-const supportedTargets = new Set(["codex", "dsh", "gemini"]);
+export const PUBLIC_TARGETS = Object.freeze(["codex"]);
+export const LEGACY_EXTERNAL_TARGETS = Object.freeze(["dsh", "gemini"]);
+const supportedTargets = new Set(PUBLIC_TARGETS);
 
 export const TARGET = process.env.MODEL_ROUTER_TARGET || "codex";
 if (!supportedTargets.has(TARGET)) {
@@ -14,23 +16,19 @@ if (!supportedTargets.has(TARGET)) {
   );
 }
 
-// The router *plane* -- service, ports, gateway, secrets, credentials, provider
+// The router *plane* -- service, ports, secrets, credentials, provider
 // selection -- is one installation shared by every client integration, so the
 // two targets are not two routers. `TARGET` selects which client's
 // configuration this command writes; it must never fork the state directory or
 // the service, or a user who installs both would be asked for every API key
-// twice and would run two gateways against one set of provider quotas.
+// twice and would run two routers against one set of provider quotas.
 //
 // A handful of environment aliases (`CODEX_ROUTER_*`, `KIMI_*`) are keyed on
 // the plane rather than on the client, because they name the service's own
 // process. They stay on `codex` whichever integration is being installed.
 export const ROUTER_PLANE_TARGET = "codex";
 
-const TARGET_DISPLAY_NAMES = Object.freeze({
-  dsh: "DeepSeek Harness Router",
-  gemini: "Gemini CLI Router",
-  codex: "Codex Router",
-});
+const TARGET_DISPLAY_NAMES = Object.freeze({ codex: "Codex Router" });
 export const TARGET_DISPLAY_NAME = TARGET_DISPLAY_NAMES[TARGET] || TARGET_DISPLAY_NAMES.codex;
 const configuredSourceRoot = process.env.CODEX_ROUTER_SOURCE_ROOT;
 if (configuredSourceRoot && !path.isAbsolute(configuredSourceRoot)) {
@@ -120,7 +118,6 @@ export const DSH_CATALOG_PATH = path.join(STATE_DIR, "dsh-models.json");
 export const GEMINI_CATALOG_PATH = path.join(STATE_DIR, "gemini-models.json");
 export const NATIVE_ALIAS_PATH = path.join(STATE_DIR, "native-aliases.json");
 export const ANNOUNCED_MODELS_PATH = path.join(STATE_DIR, "announced-models.json");
-export const LITELLM_CONFIG_PATH = path.join(STATE_DIR, "litellm.yaml");
 export const INTERNAL_SECRET_PATH = path.join(STATE_DIR, "internal-secret");
 export const CALLER_SECRET_PATH = path.join(STATE_DIR, "caller-secret");
 export const CODEX_PROVIDER_MODE_PATH = path.join(STATE_DIR, "codex-provider-mode.json");
@@ -180,11 +177,9 @@ function port(name, fallback) {
 
 // Keep the defaults in an unassigned IANA range. 4101-4104 are the registered
 // BrlAPI ports on Linux; binding an HTTP service there makes xbrlapi wait for a
-// protocol response during GNOME login. gateway/oauth/router/api are the
-// original four; grokOauth is a fifth forwarder port for the Grok OAuth
-// provider.
+// protocol response during GNOME login. oauth/router/api are the forwarder
+// ports; grokOauth and devinCli are optional provider forwarders.
 export const DEFAULT_PORTS = Object.freeze({
-  gateway: 4200,
   oauth: 4201,
   router: 4202,
   api: 4203,
@@ -196,7 +191,6 @@ export const DEFAULT_PORTS = Object.freeze({
 // by config migration, but are never selected unless an operator explicitly
 // sets one of the environment variables below.
 export const LEGACY_PORTS = Object.freeze({
-  gateway: 4100,
   oauth: 4101,
   router: 4102,
   api: 4103,
@@ -204,10 +198,6 @@ export const LEGACY_PORTS = Object.freeze({
 });
 
 export const PORTS = {
-  gateway: port(
-    "MODEL_ROUTER_GATEWAY_PORT",
-    process.env.CODEX_ROUTER_GATEWAY_PORT || process.env.KIMI_GATEWAY_PORT || DEFAULT_PORTS.gateway,
-  ),
   oauth: port(
     "MODEL_ROUTER_OAUTH_PORT",
     process.env.CODEX_ROUTER_OAUTH_PORT || process.env.KIMI_OAUTH_FORWARD_PORT || DEFAULT_PORTS.oauth,

@@ -8,6 +8,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { callerBaseUrl } from "../src/caller-auth.mjs";
+import { PROVIDERS } from "../src/model-registry.mjs";
 import { openPort } from "./port-pool.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -25,21 +26,27 @@ async function mockServer(handler) {
 
 function run(env) {
   const stateDir = mkdtempSync(path.join(os.tmpdir(), "router-timing-state-"));
+  const nodeBaseUrl = env?.CODEX_ROUTER_NODE_PROVIDER_BASE_URL || env?.CODEX_ROUTER_GATEWAY_BASE_URL;
+  const childEnv = {
+    ...process.env,
+    MODEL_ROUTER_STATE_DIR: stateDir,
+    CODEX_ROUTER_CALLER_KEY: CALLER_KEY,
+    CODEX_ROUTER_INTERNAL_KEY: INTERNAL_KEY,
+    KIMI_INTERNAL_KEY: INTERNAL_KEY,
+    CODEX_ROUTER_SHOW_ALL_MODELS: "1",
+    CODEX_ROUTER_TEST_NODE_ROUTE_FIXTURE: "1",
+    ...(nodeBaseUrl ? { CODEX_ROUTER_NODE_PROVIDER_BASE_URL: nodeBaseUrl } : {}),
+    ...env,
+  };
+  if (nodeBaseUrl) {
+    for (const provider of PROVIDERS.values()) {
+      if (provider.baseUrlEnv) childEnv[provider.baseUrlEnv] ||= nodeBaseUrl;
+      for (const name of provider.credential?.environment || []) childEnv[name] ||= INTERNAL_KEY;
+    }
+  }
   const child = spawn(process.execPath, [path.join(root, "src", "router.mjs")], {
     cwd: root,
-    env: {
-      ...process.env,
-      MODEL_ROUTER_STATE_DIR: stateDir,
-      CODEX_ROUTER_CALLER_KEY: CALLER_KEY,
-      CODEX_ROUTER_INTERNAL_KEY: INTERNAL_KEY,
-      KIMI_INTERNAL_KEY: INTERNAL_KEY,
-      CODEX_ROUTER_SHOW_ALL_MODELS: "1",
-      // The production LaunchAgent hard-sets CODEX_ROUTER_QUIET=1; the timing
-      // line must fire anyway, so the test runs in that exact mode.
-      CODEX_ROUTER_QUIET: "1",
-      CODEX_ROUTER_DIRECT_DISPATCH: "0",
-      ...env,
-    },
+    env: { ...childEnv, CODEX_ROUTER_QUIET: "1" },
     stdio: ["ignore", "ignore", "pipe"],
   });
   child.stderr.setEncoding("utf8");
@@ -143,6 +150,7 @@ test("every routed turn writes a timestamped timing line with cache tokens", asy
       type: "response.completed",
       response: {
         id: "resp_timing",
+        output: [],
         usage: {
           input_tokens: 100,
           output_tokens: 5,

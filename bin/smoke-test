@@ -6,7 +6,8 @@ sh "$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/platform-gate"
 repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 # The smoke test spends provider quota against the shared router plane, so it
 # proves the same routes whichever client asked for it.
-case "${MODEL_ROUTER_TARGET:-codex}" in
-  codex|dsh|gemini) exec node "$repo_dir/src/smoke-test.mjs" "$@" ;;
-  *) echo "MODEL_ROUTER_TARGET must be codex, dsh, or gemini." >&2; exit 2 ;;
-esac
+if [ "${MODEL_ROUTER_TARGET:-codex}" != codex ]; then
+  echo "Only the Codex target has a public smoke-test operation." >&2
+  exit 2
+fi
+exec node "$repo_dir/src/smoke-test.mjs" "$@"

@@ -8,7 +8,7 @@ const testRoot = mkdtempSync(path.join(os.tmpdir(), "codex-router-targets-"));
 process.env.CODEX_HOME = path.join(testRoot, "codex");
 process.env.CODEX_ROUTER_STATE_DIR = path.join(testRoot, "state");
 
-const { installedTargets } = await import("../src/target-integration.mjs");
+const { installedTargets, legacyInstalledTargets } = await import("../src/target-integration.mjs");
 const { CONFIG_PATH, DSH_CATALOG_PATH, NATIVE_CATALOG_PATH } = await import("../src/paths.mjs");
 
 function stageFile(filePath, contents) {
@@ -69,15 +69,17 @@ test("legacy managed markers still count as an installed codex integration", () 
   }
 });
 
-test("the harness catalog snapshot still marks the dsh integration", () => {
+test("legacy harness snapshots stay uninstall-visible but never become public targets", () => {
   try {
     // dsh-config-manager.mjs removes this snapshot on uninstall, so unlike the
     // codex catalog it is a faithful installed-state marker.
     stageFile(DSH_CATALOG_PATH, "{}");
-    assert.deepEqual(installedTargets(), ["dsh"]);
+    assert.deepEqual(installedTargets(), []);
+    assert.deepEqual(legacyInstalledTargets(), ["dsh"]);
 
     stageFile(CONFIG_PATH, "# BEGIN codex-router-managed\n# END codex-router-managed\n");
-    assert.deepEqual(installedTargets(), ["codex", "dsh"]);
+    assert.deepEqual(installedTargets(), ["codex"]);
+    assert.deepEqual(legacyInstalledTargets(), ["codex", "dsh"]);
   } finally {
     clearStagedFiles();
   }

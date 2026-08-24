@@ -1,5 +1,5 @@
-// One command table for every surface that drives apps/desktop/ui: the Tauri
-// tray, the Electron shell, and the router's own browser panel. Each call is a
+// One command table for every surface that drives apps/desktop/ui: the Swift
+// tray and the router's own browser panel. Each call is a
 // single shell-out to the control CLI, so a shell is only a window and an IPC
 // hop -- not a second implementation of what the companion does. Duplicating
 // this table is how the surfaces would drift apart, so they all import it.
@@ -30,17 +30,11 @@ export function sourceRoot(env = process.env, here = SELF_ROOT) {
   return undefined;
 }
 
-// process.execPath is the Electron binary inside the main process, not Node,
-// so using it launches a second Electron to run a Node script -- which fails
-// with a sandbox error rather than anything that names the real cause. Prefer
-// the system Node the router is tested against; fall back to Electron's own
-// bundled Node, which is what ELECTRON_RUN_AS_NODE selects.
+// Prefer the Node executable found on PATH. A caller may inject another
+// executable for an isolated test, but no desktop shell is part of this path.
 export function nodeRuntime({ env = process.env, execPath = process.execPath } = {}) {
   const onPath = which("node", env);
   if (onPath) return { command: onPath, env };
-  if (process.versions.electron) {
-    return { command: execPath, env: { ...env, ELECTRON_RUN_AS_NODE: "1" } };
-  }
   return { command: execPath, env };
 }
 

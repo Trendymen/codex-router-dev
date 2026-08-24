@@ -148,8 +148,8 @@ wire_api = "responses"
         detail: "native-only; routed transport is inactive",
         fix: "Run ./bin/refresh-catalog, or ./bin/doctor --fix if files are missing.",
       });
-      assert.equal(byName.get("Catalog matches gateway routes").status, "ok");
-      assert.equal(byName.get("Catalog matches gateway routes").detail, "0 routed models");
+      assert.equal(byName.get("Catalog matches Node routes").status, "ok");
+      assert.equal(byName.get("Catalog matches Node routes").detail, "0 routed models");
       assert.equal(byName.get("Routed model agents").status, "ok");
       assert.match(byName.get("Routed model agents").detail, /^0 current definitions/);
       assert.equal(byName.get("Signed router coexistence").status, "ok");
@@ -212,8 +212,6 @@ test(
         path.join(codexHome, "agents", "router-model-deepseek-deepseek-v4-pro.toml"),
       );
 
-      const routes = child("litellm-config.mjs", [], env);
-      assert.equal(routes.status, 0, routes.stderr);
       const enabled = child("config-manager.mjs", ["enable"], env);
       assert.equal(enabled.status, 0, enabled.stderr);
 

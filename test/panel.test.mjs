@@ -67,7 +67,7 @@ test("redaction covers every leaf the capability guards", () => {
   }
 });
 
-test("both entry points expose the command", () => {
+test("the POSIX panel entry point is shipped and PowerShell is an explicit refusal shim", () => {
   const posix = readFileSync(path.join(root, "bin", "panel"), "utf8");
   assert.match(posix, /src\/panel\.mjs/);
   // Asserted against .gitattributes rather than the bytes on disk: a Windows
@@ -84,8 +84,8 @@ test("both entry points expose the command", () => {
   assert.match(dispatcher, /\|panel\|/, "model-router must dispatch panel");
 
   const windows = readFileSync(path.join(root, "codex-router.ps1"), "utf8");
-  assert.match(windows, /"panel"/, "codex-router.ps1 must list panel");
-  assert.match(windows, /src\\panel\.mjs/);
+  assert.match(windows, /unsupported_platform/);
+  assert.doesNotMatch(windows, /src\\panel\.mjs/);
 });
 
 test("browser launcher mints a caller-authenticated nonce and opens only the clean bootstrap URL", () => {

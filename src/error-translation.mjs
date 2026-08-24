@@ -1,22 +1,21 @@
-// Rewrites gateway error bodies before they reach Codex. LiteLLM reports
-// failures as a chain of internal exception names plus routing metadata
-// ("litellm.ServiceUnavailableError: ... Received Model Group=..."), which
-// reads like a router bug. These helpers name the provider that actually
-// failed and keep only the innermost upstream message as detail.
+// Rewrites provider error bodies before they reach Codex. Upstream adapters
+// report failures as a chain of internal exception names plus routing
+// metadata, which reads like a router bug. These helpers name the provider
+// that actually failed and keep only the innermost upstream message as detail.
 
 const DETAIL_LIMIT = 300;
 
-// LiteLLM appends its routing state after the upstream message; neither line
-// helps the caller and both leak internal gateway naming.
+// Some upstream adapters append routing state after the provider message;
+// neither line helps the caller and both leak internal routing details.
 const ROUTING_NOISE = [
   /\.?\s*Received Model Group=[\s\S]*$/,
   /\s*Available Model Group Fallbacks=[\s\S]*$/,
 ];
 
-// Wrapper prefixes stack recursively (litellm.XError: XError: OpenAIException - ...),
-// so stripping repeats until the message stops changing.
+// Wrapper prefixes stack recursively (Provider.XError: XError: OpenAIException
+// - ...), so stripping repeats until the message stops changing.
 const WRAPPER_PREFIXES = [
-  /^litellm\.[A-Za-z]+:\s*/,
+  /^[A-Za-z][A-Za-z0-9_-]*\.[A-Za-z]+Error:\s*/,
   /^[A-Za-z]+Error:\s*/,
   /^[A-Za-z]+Exception\s*-\s*/,
 ];
@@ -40,7 +39,7 @@ function parseUpstreamError(bodyText) {
     const type = [error?.type, error?.status].find((value) => typeof value === "string");
     return { message, type };
   } catch {
-    // Non-JSON bodies (HTML gateway pages, plain text) pass through as-is.
+    // Non-JSON bodies (HTML upstream pages, plain text) pass through as-is.
     return { message: bodyText, type: undefined };
   }
 }

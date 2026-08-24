@@ -31,15 +31,16 @@ test("the signed provider precedence probe requires both live intent and consent
   assert.match(help.stdout, /--live --yes/);
 });
 
-test("the precedence probe uses shared cross-platform Codex and venv paths", () => {
+test("the precedence probe uses shared Codex spawning and the Node router", () => {
   const source = readFileSync(
     path.join(root, "scripts", "provider-precedence-probe.mjs"),
     "utf8",
   );
   assert.match(source, /findCodexBinary\(\)/);
-  assert.match(source, /spawnableCommand\(CODEX_BIN, args\)/);
-  assert.match(source, /process\.platform === "win32" \? "Scripts" : "bin"/);
-  assert.match(source, /process\.platform === "win32" \? "litellm\.exe" : "litellm"/);
+  assert.match(source, /spawnableCommand\(CODEX_BIN, codexArgs\)/);
+  assert.match(source, /src.*router\.mjs/);
+  assert.match(source, /MODEL_ROUTER_STATE_DIR/);
+  assert.doesNotMatch(source, /(?:litellm|venv|GATEWAY_BASE_URL|python)/i);
 });
 
 test("setup forwards its already-confirmed smoke choice as --yes", () => {

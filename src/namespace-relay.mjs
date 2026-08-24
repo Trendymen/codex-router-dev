@@ -15,7 +15,7 @@ import {
 // the collaboration runtime, the app toolset (threads, automations,
 // navigation), and every MCP server (node_repl, peekaboo, github, ...).
 //
-// LiteLLM's Responses -> Chat Completions bridge drops namespace tools, which
+// A Responses -> Chat Completions bridge may drop namespace tools, which
 // is how the app sends all of those to the model. A routed chat-completions
 // provider would therefore see none of them: no collaboration tools, no
 // threads, and no `mcp__node_repl__js` -- the runtime the in-app browser and
@@ -236,7 +236,7 @@ export function flattenNamespaceTools(tools, { bridgeToolSearch = true } = {}) {
       const names = new Set();
       for (const fn of tool.tools) {
         if (!fn?.name) continue;
-        // Codex names function schemas `inputSchema`, while LiteLLM's
+        // Codex names function schemas `inputSchema`, while a provider's
         // Responses -> Chat Completions adapter reads only `parameters`.
         // Without this alias every flattened namespace child reaches the
         // provider as an empty object schema, so MCP calls cannot receive the
@@ -324,7 +324,7 @@ function addDiscoveredNamespace(namespaces, native) {
 
 // A native tool_search output changes what the model may call on the next
 // turn. The Responses API understands that special history item directly;
-// LiteLLM's chat-completions bridge does not. Translate matched call/output
+// A chat-completions bridge does not. Translate matched call/output
 // pairs into ordinary function history and add the returned definitions to
 // this request's provider-facing tool list. Live top-level schemas win on a
 // name collision. Native items that do not form one unique, ordered,
@@ -472,7 +472,7 @@ export function flattenToolSearchHistory(input, tools, namespaces) {
 
 // Flattening only the tool list leaves the model reading two names for one
 // tool: `collaboration__spawn_agent` in its tools, but a bare `spawn_agent`
-// in its own call history, because LiteLLM's bridge drops the `namespace`
+// in its own call history, because a bridge can drop the `namespace`
 // field when it converts stored function calls to Chat Completions tool calls.
 // The model imitates the history, emits the bare name, nothing rewrites it,
 // and Codex answers `unsupported call` -- permanently, since every failure
@@ -728,7 +728,7 @@ function appendInterruptCallsToOutput(output, pending, interrupted) {
   return { output: base, injected: still.length, remaining: still };
 }
 
-// Rewrites LiteLLM's flattened `<namespace>__<tool>` function calls back to
+// Rewrites flattened `<namespace>__<tool>` function calls back to
 // the namespace + name shape Codex dispatches through its app runtime.
 export class NamespaceToolCallTransform extends Transform {
   #eventStream;

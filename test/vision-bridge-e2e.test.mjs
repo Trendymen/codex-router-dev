@@ -8,6 +8,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { callerBaseUrl } from "../src/caller-auth.mjs";
+import { PROVIDERS } from "../src/model-registry.mjs";
 import { openPort } from "./port-pool.mjs";
 
 // `test/vision-bridge.test.mjs` proves the bridge's parts in isolation. This
@@ -25,7 +26,7 @@ const INTERNAL_KEY = "test-internal-service-key-with-sufficient-length";
 const CALLER_KEY = "test-router-caller-capability-with-sufficient-length";
 
 const TEXT_MODEL = "deepseek/deepseek-v4-pro";
-const IMAGE_MODEL = "kimi-oauth/k3";
+const IMAGE_MODEL = "meta/muse-spark-1.2";
 const LOCAL_ENGINE_MODEL = "mock-vision-1b";
 
 // A 1x1 PNG. What matters is that the bytes are identical on every turn, which
@@ -168,18 +169,26 @@ function stateDirectory(settings) {
 }
 
 function run(env) {
+  const nodeBaseUrl = env?.CODEX_ROUTER_NODE_PROVIDER_BASE_URL || env?.CODEX_ROUTER_GATEWAY_BASE_URL;
+  const childEnv = {
+    ...process.env,
+    CODEX_ROUTER_CALLER_KEY: CALLER_KEY,
+    CODEX_ROUTER_INTERNAL_KEY: INTERNAL_KEY,
+    KIMI_INTERNAL_KEY: INTERNAL_KEY,
+    CODEX_ROUTER_SHOW_ALL_MODELS: "1",
+    CODEX_ROUTER_TEST_NODE_ROUTE_FIXTURE: "1",
+    ...(nodeBaseUrl ? { CODEX_ROUTER_NODE_PROVIDER_BASE_URL: nodeBaseUrl } : {}),
+    ...env,
+  };
+  if (nodeBaseUrl) {
+    for (const provider of PROVIDERS.values()) {
+      if (provider.baseUrlEnv) childEnv[provider.baseUrlEnv] ||= nodeBaseUrl;
+      for (const name of provider.credential?.environment || []) childEnv[name] ||= INTERNAL_KEY;
+    }
+  }
   const child = spawn(process.execPath, [path.join(root, "src", "router.mjs")], {
     cwd: root,
-    env: {
-      ...process.env,
-      CODEX_ROUTER_CALLER_KEY: CALLER_KEY,
-      CODEX_ROUTER_INTERNAL_KEY: INTERNAL_KEY,
-      KIMI_INTERNAL_KEY: INTERNAL_KEY,
-      CODEX_ROUTER_SHOW_ALL_MODELS: "1",
-      CODEX_ROUTER_QUIET: "1",
-      CODEX_ROUTER_DIRECT_DISPATCH: "0",
-      ...env,
-    },
+    env: { ...childEnv, CODEX_ROUTER_QUIET: "1" },
     stdio: ["ignore", "ignore", "pipe"],
   });
   child.stderr.setEncoding("utf8");
@@ -496,7 +505,7 @@ test("a model that declares image input is never sent through the bridge", async
     const sent = upstreams.state.gatewayRequests.at(-1);
     const images = imageParts(sent.input);
     assert.equal(images.length, 1);
-    assert.equal(sent.model, "kimi-oauth-k3");
+    assert.equal(sent.model, "muse-spark-1.2");
     // Byte-identical: the part is forwarded, not rebuilt.
     assert.deepEqual(images[0], { type: "input_image", image_url: IMAGE_A });
   } finally {

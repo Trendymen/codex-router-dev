@@ -5,7 +5,7 @@ import { isDeepStrictEqual } from "node:util";
 import { secretEqual } from "./caller-auth.mjs";
 import { TARGET } from "./paths.mjs";
 
-// Some Responses -> Chat Completions bridges (LiteLLM's, notably) emit one
+// Some Responses -> Chat Completions bridges emit one
 // assistant message per Responses item, so a stored turn of
 // `function_call`, assistant commentary `message`, `function_call_output`
 // arrives here as `assistant(tool_calls)`, `assistant(text)`, `tool`.
@@ -548,7 +548,7 @@ export async function pipeResponse(
   response,
   denylist,
   transform,
-  { leaveOpen = false } = {},
+  { leaveOpen = false, signal } = {},
 ) {
   const transforms = transform === undefined
     ? []
@@ -562,6 +562,11 @@ export async function pipeResponse(
     return;
   }
   const source = Readable.fromWeb(upstream.body);
+  const abortPipeline = () => {
+    source.destroy();
+    for (const stage of transforms) stage?.destroy?.();
+  };
+  signal?.addEventListener("abort", abortPipeline, { once: true });
   try {
     // `pipeline` forwards errors and destroys every stream in the chain, which
     // `.pipe()` does not: a mid-stream upstream failure used to leave the
@@ -576,6 +581,8 @@ export async function pipeResponse(
     // counter releases without inventing an error.
     if (response.destroyed && !response.writableFinished) return;
     throw error;
+  } finally {
+    signal?.removeEventListener("abort", abortPipeline);
   }
   // `leaveOpen` lets the caller keep the response writable after the upstream
   // stream ends so an empty completion can be retried against the same

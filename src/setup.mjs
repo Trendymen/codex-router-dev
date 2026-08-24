@@ -307,54 +307,27 @@ function configureProvider(provider) {
 // build failure warns and continues instead of failing the whole setup.
 function installTray() {
   try {
-    if (process.platform === "darwin") {
-      const serviceTarget = currentServiceTarget();
-      try {
-        execFileSync("xcrun", ["--find", "swift"], { stdio: "ignore" });
-      } catch {
-        process.stdout.write(
-          "The Swift toolchain is missing; run `xcode-select --install`, then `./bin/model-router-tray` to add the companion later.\n",
-        );
-        return;
-      }
-      const bundleDir = serviceTarget.appPath;
-      run(path.join(SOURCE_ROOT, "scripts", "build-macos-tray-app.sh"), [bundleDir]);
-      run("open", [bundleDir]);
-      process.stdout.write(`Menu-bar companion installed at ${bundleDir} and opened.\n`);
-    } else if (process.platform === "win32") {
-      // Windows had no path through here at all: the tray was built by hand or
-      // not at all, and nothing brought it back after a reboot. `tray install`
-      // builds when the sources moved, stamps the build, and registers the
-      // logon task that starts it now and at every logon -- the same entry
-      // point a user runs by hand, so the sequence exists once instead of
-      // drifting between the installer and the CLI.
-      run("powershell.exe", [
-        "-NoLogo",
-        "-NoProfile",
-        "-ExecutionPolicy",
-        "Bypass",
-        "-File",
-        path.join(SOURCE_ROOT, "codex-router.ps1"),
-        "tray",
-        "install",
-      ]);
-    } else {
-      run(path.join(SOURCE_ROOT, "bin", "model-router-tray"), []);
-      process.stdout.write("Desktop companion built and launched.\n");
+    const serviceTarget = currentServiceTarget();
+    try {
+      execFileSync("xcrun", ["--find", "swift"], { stdio: "ignore" });
+    } catch {
+      process.stdout.write(
+        "The Swift toolchain is missing; run `xcode-select --install`, then `./bin/model-router-tray` to add the companion later.\n",
+      );
+      return;
     }
+    const bundleDir = serviceTarget.appPath;
+    run(path.join(SOURCE_ROOT, "scripts", "build-macos-tray-app.sh"), [bundleDir]);
+    run("open", [bundleDir]);
+    process.stdout.write(`Menu-bar companion installed at ${bundleDir} and opened.\n`);
   } catch (error) {
     process.stdout.write(
       `Desktop companion install did not finish: ${error instanceof Error ? error.message : String(error)}\n` +
         (process.platform === "darwin"
           ? "Recent macOS SDKs need the full Xcode app (not only the Command Line Tools) to build the menu-bar companion's SwiftUI macros.\n"
           : "") +
-        (process.platform === "win32"
-          ? "The router itself is installed; retry later with .\\codex-router.ps1 tray,\n" +
-            "or .\\codex-router.ps1 companion for the Electron build, which needs no Rust.\n"
-          : "The router itself is installed; retry later with ./bin/model-router-tray.\n") +
-        // Nothing to build and nothing to download, so it is the one suggestion
-        // that cannot fail for the same reason this just did.
-        "The companion also runs in a browser: .\\codex-router.ps1 panel (./bin/panel on macOS and Linux).\n",
+        "The router itself is installed; retry later with ./bin/model-router-tray.\n" +
+        "The companion also runs in the browser panel served by the Router.\n",
     );
   }
 }
@@ -468,21 +441,13 @@ async function main() {
   }
 
   nextStep("Review and install");
-  const dshTarget = TARGET === "dsh";
-  // Like the harness, Gemini CLI has no native catalog to adopt: that list is
-  // the ChatGPT-plan model set Codex publishes for itself.
-  const geminiTarget = TARGET === "gemini";
   if (guided) {
     process.stdout.write(
       `\nReady to install:\n` +
         `  Providers: ${providers.length ? providers.join(", ") : "none (idle install)"}\n` +
         `  Migration: ${migration ? "recognized older router (rollback snapshot kept)" : "none needed"}\n` +
-        (dshTarget
-          ? `  Changes: per-user background service and one provider route in the harness settings document\n`
-          : geminiTarget
-            ? `  Changes: per-user background service and one managed block in Gemini CLI's environment file\n`
-            : `  Native catalog: ${adoptNativeCatalog ? "adopt existing user catalog" : "capture from Codex"}\n` +
-              `  Changes: per-user background service and the managed Codex config block\n`),
+        `  Native catalog: ${adoptNativeCatalog ? "adopt existing user catalog" : "capture from Codex"}\n` +
+          `  Changes: per-user background service and the managed Codex config block\n`,
     );
     if (!confirm("Proceed?")) {
       throw incomplete("Setup was cancelled before installing the service.");
@@ -527,14 +492,7 @@ async function main() {
     ? providers.join(", ")
     : "no providers (idle install; traffic gets a local error until one is enabled)";
   process.stdout.write(
-    dshTarget
-      ? `\nDeepSeek Harness is ready with: ${providerSummary}\n` +
-        `It reloads its settings document on the next request, so there is nothing to restart.\n`
-      : geminiTarget
-        ? `\nGemini CLI is ready with: ${providerSummary}\n` +
-          `It reads its environment at startup, so the next \`gemini\` run picks this up.\n` +
-          `If it asks how to authenticate, choose "Use Gemini API key" once -- the key is this router's local caller capability.\n`
-        : `\nCodex Router is ready with: ${providerSummary}\nFully quit Codex, reopen it, and start a new task.\n`,
+    `\nCodex Router is ready with: ${providerSummary}\nFully quit Codex, reopen it, and start a new task.\n`,
   );
   if (visionBridge?.enabled && visionBridge.engine) {
     process.stdout.write(

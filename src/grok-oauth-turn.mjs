@@ -340,7 +340,7 @@ export function applyResponsesEvent(state, event) {
     }
     // xAI streams grok-4.6 summaries as reasoning_summary_text, and also
     // documents reasoning_text. Both belong on the chat `reasoning_content`
-    // field so LiteLLM can put them back on the Responses reasoning channel
+    // field so the adapter can put them back on the Responses reasoning channel
     // Codex uses to show-then-collapse thinking.
     case "response.reasoning_summary_text.delta":
     case "response.reasoning_text.delta": {

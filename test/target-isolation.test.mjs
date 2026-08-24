@@ -28,7 +28,6 @@ function pathsForTarget(target) {
       env: {
         ...process.env,
         MODEL_ROUTER_TARGET: target,
-        MODEL_ROUTER_GATEWAY_PORT: "",
         MODEL_ROUTER_OAUTH_PORT: "",
         MODEL_ROUTER_PORT: "",
         MODEL_ROUTER_API_PORT: "",
@@ -40,7 +39,6 @@ function pathsForTarget(target) {
 
 test("codex owns the default port block", () => {
   assert.deepEqual(JSON.parse(pathsForTarget("codex")), {
-    gateway: 4200,
     oauth: 4201,
     router: 4202,
     api: 4203,
@@ -49,7 +47,7 @@ test("codex owns the default port block", () => {
   });
 });
 
-test("operators can keep an explicitly configured legacy block during migration", () => {
+test("operators can keep an explicitly configured forwarder port block during migration", () => {
   const ports = JSON.parse(
     execFileSync(
       process.execPath,
@@ -60,7 +58,6 @@ test("operators can keep an explicitly configured legacy block during migration"
         env: {
           ...process.env,
           MODEL_ROUTER_TARGET: "codex",
-          MODEL_ROUTER_GATEWAY_PORT: "4100",
           MODEL_ROUTER_OAUTH_PORT: "4101",
           MODEL_ROUTER_PORT: "4102",
           MODEL_ROUTER_API_PORT: "4103",
@@ -72,7 +69,6 @@ test("operators can keep an explicitly configured legacy block during migration"
   // The Devin CLI forwarder postdates the legacy block, so an operator
   // migrating from it never pinned that port and keeps the current default.
   assert.deepEqual(ports, {
-    gateway: 4100,
     oauth: 4101,
     router: 4102,
     api: 4103,
@@ -82,7 +78,7 @@ test("operators can keep an explicitly configured legacy block during migration"
 });
 
 test("removed targets are rejected rather than silently mapped to codex", () => {
-  for (const target of ["cursor", "opencode"]) {
+  for (const target of ["cursor", "opencode", "dsh", "gemini"]) {
     assert.throws(
       () => pathsForTarget(target),
       /MODEL_ROUTER_TARGET must be one of/,

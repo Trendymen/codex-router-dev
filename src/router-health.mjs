@@ -29,13 +29,10 @@ function currentNodeHealth(payload) {
 const SERVICE_BY_TARGET = {
   [ROUTER_PLANE_TARGET]: "codex-router",
 };
-// Every client this router publishes to. The set only guards against a typo in
-// a caller's `target` argument -- the health check itself is keyed on the plane
-// above, because one process serves all of them. It has to be extended
-// alongside `supportedTargets` in paths.mjs; a target missing here fails
-// `doctor` and `wait-health` with "Unknown router target" long before anything
-// about the integration itself is exercised.
-const SUPPORTED_TARGETS = new Set(["codex", "dsh", "gemini"]);
+// The health endpoint is shipped for the Codex service target only. Legacy
+// external documents are removed through the explicit uninstall transaction and
+// never create a second health namespace.
+const SUPPORTED_TARGETS = new Set(["codex"]);
 
 export async function waitForRouterHealth({
   target = TARGET,

@@ -12,6 +12,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { callerBaseUrl } from "../src/caller-auth.mjs";
+import { PROVIDERS } from "../src/model-registry.mjs";
 import { openPort } from "./port-pool.mjs";
 
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
@@ -39,17 +40,24 @@ async function mockServer(handler) {
 }
 
 function run(script, env) {
+  const childEnv = {
+    ...process.env,
+    CODEX_ROUTER_CALLER_KEY: CALLER_KEY,
+    CODEX_ROUTER_INTERNAL_KEY: INTERNAL_KEY,
+    KIMI_INTERNAL_KEY: INTERNAL_KEY,
+    CODEX_ROUTER_SHOW_ALL_MODELS: "1",
+    ...env,
+  };
+  if (script === "router.mjs" && childEnv.CODEX_ROUTER_GATEWAY_BASE_URL) {
+    childEnv.CODEX_ROUTER_TEST_NODE_ROUTE_FIXTURE = "1";
+    for (const provider of PROVIDERS.values()) {
+      if (provider.baseUrlEnv) childEnv[provider.baseUrlEnv] ||= childEnv.CODEX_ROUTER_GATEWAY_BASE_URL;
+      for (const name of provider.credential?.environment || []) childEnv[name] ||= INTERNAL_KEY;
+    }
+  }
   const child = spawn(process.execPath, [path.join(ROOT, "src", script)], {
     cwd: ROOT,
-    env: {
-      ...process.env,
-      CODEX_ROUTER_CALLER_KEY: CALLER_KEY,
-      CODEX_ROUTER_INTERNAL_KEY: INTERNAL_KEY,
-      KIMI_INTERNAL_KEY: INTERNAL_KEY,
-      CODEX_ROUTER_SHOW_ALL_MODELS: "1",
-      ...(script === "router.mjs" ? { CODEX_ROUTER_DIRECT_DISPATCH: "0" } : {}),
-      ...env,
-    },
+    env: childEnv,
     stdio: ["ignore", "ignore", "pipe"],
   });
   child.stderr.setEncoding("utf8");
@@ -224,7 +232,7 @@ test("API forwarder trims only official and explicitly opted-in trailing model t
   }
 });
 
-test("router trims only official and explicitly opted-in trailing Responses model turns", async () => {
+test("router trims only official and explicitly opted-in trailing Node Responses model turns", async () => {
   const gatewayRequests = [];
   const gateway = await mockServer(async (request, response) => {
     gatewayRequests.push(await bodyJson(request));

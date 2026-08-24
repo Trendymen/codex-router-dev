@@ -2,7 +2,8 @@
 set -eu
 
 repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-case "${MODEL_ROUTER_TARGET:-codex}" in
-  codex|dsh|gemini) exec node "$repo_dir/src/setup.mjs" "$@" ;;
-  *) echo "MODEL_ROUTER_TARGET must be codex, dsh, or gemini." >&2; exit 2 ;;
-esac
+if [ "${MODEL_ROUTER_TARGET:-codex}" != codex ]; then
+  echo "Only the Codex target has a public setup operation." >&2
+  exit 2
+fi
+exec node "$repo_dir/src/setup.mjs" "$@"

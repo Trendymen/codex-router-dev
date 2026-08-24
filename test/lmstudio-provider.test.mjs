@@ -32,15 +32,15 @@ writeFileSync(
 );
 
 const { MODELS, PROVIDERS } = await import("../src/model-registry.mjs");
-const { renderLiteLlmConfig } = await import("../src/litellm-config.mjs");
+const { nodeRoutableModels } = await import("../src/model-contract.mjs");
 
-test("stale LM Studio models are excluded from chat registry and gateway config", () => {
+test("stale LM Studio models are excluded from the chat and Node registries", () => {
   const model = MODELS.find((entry) => entry.slug === "lmstudio/qwen2.5-coder");
   assert.equal(model, undefined);
   assert.equal(PROVIDERS.get("lmstudio").protocol, "openai");
-
-  const rendered = renderLiteLlmConfig();
-  assert.doesNotMatch(rendered, /lmstudio-qwen2-5-coder/);
-  assert.doesNotMatch(rendered, /ollama_chat\/qwen2\.5-coder/);
-  assert.match(rendered, /os\.environ\/CODEX_ROUTER_API_FORWARD_BASE_URL/);
+  assert.deepEqual(
+    nodeRoutableModels({ enabledProviders: new Set(["lmstudio"]), hiddenModels: new Set() })
+      .filter((entry) => entry.provider === "lmstudio"),
+    [],
+  );
 });

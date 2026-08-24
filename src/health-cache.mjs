@@ -1,6 +1,6 @@
 // The companion polls the router's /health continuously, and every one of
 // those fanned out to three downstream probes -- including the gateway's
-// /health/liveliness, which LiteLLM's uvicorn logs a line for. On an idle
+// /health, which the local forwarder logs a line for. On an idle
 // machine that measured 2.5 probes a second, roughly 16.6 MB of log a day,
 // none of it carrying information: the answer cannot meaningfully change
 // between two probes a fraction of a second apart.

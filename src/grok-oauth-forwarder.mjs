@@ -46,7 +46,7 @@ import { installStableFetchTransport } from "./fetch-transport.mjs";
 
 installStableFetchTransport();
 
-// LiteLLM speaks OpenAI Chat Completions to this forwarder. It reuses the
+// The router speaks OpenAI Chat Completions to this forwarder. It reuses the
 // official Grok CLI OAuth session and translates to xAI's Responses proxy.
 
 const LISTEN_HOST = process.env.MODEL_ROUTER_GROK_OAUTH_HOST || "127.0.0.1";
@@ -100,7 +100,7 @@ const HOSTED_SEARCH_FUNCTION_NAMES = new Set(["web_search", "x_search"]);
 // The registry entry is the single capability source: hosted search attaches
 // only when the slug that resolves to this upstream model declares it, so a
 // curated model without the flag keeps plain function calling. The forwarder
-// receives the upstream model id (LiteLLM translates OAuth slugs before the
+    // receives the upstream model id (the router translates OAuth slugs before the
 // request arrives), so the lookup goes provider + upstreamModel, not slug.
 export function hostedSearchEnabledFor(upstreamModel, models = MODELS) {
   return models.some(

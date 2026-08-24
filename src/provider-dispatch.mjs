@@ -284,6 +284,15 @@ function candidateList(options, current, payload) {
   const supplied = typeof options.failoverCandidates === "function"
     ? options.failoverCandidates(current, payload)
     : options.failoverCandidates;
+  if (options.preserveFailoverOrder) {
+    const usedModels = options.usedModels || new Set();
+    const usedProviderFamilies = options.usedProviderFamilies || new Set();
+    return (Array.isArray(supplied) ? supplied : [])
+      .filter((candidate) => canFailoverTo(candidate, current, payload, options))
+      .filter((candidate) => !usedModels.has(candidate.slug))
+      .filter((candidate) => !usedProviderFamilies.has(canonicalProviderId(candidate.provider)))
+      .slice(0, options.limit ?? MAX_FAILOVER_HOPS);
+  }
   return rankRoutedCandidates(supplied, current, payload, options);
 }
 
@@ -345,6 +354,7 @@ export async function dispatchRoutedRequest(built, options = {}) {
   const usedProviderFamilies = new Set([canonicalProviderId(currentModel.provider)]);
   let originalFailure;
   let failoverStartedAt;
+  let failoverReason;
   try {
    for (;;) {
     const attempted = await fetchWithRetry(currentBuilt.url, {
@@ -374,12 +384,12 @@ export async function dispatchRoutedRequest(built, options = {}) {
         retries,
         hops,
         failures,
+        ...(hops ? { failoverFrom: built.model.slug } : {}),
+        ...(failoverReason ? { failoverReason } : {}),
         elapsedMs: (options.now ? options.now() : Date.now()) - startedAt,
       });
     }
     const bodyText = await upstream.text().catch(() => "");
-    originalFailure ??= { status: upstream.status, bodyText, headers: upstream.headers };
-    failures.push({ model: currentModel, providerFamily: canonicalProviderId(currentModel.provider), kind: "response", status: upstream.status });
     const failureNow = options.now ? options.now() : Date.now();
     const verdict = classifyRoutedFailure({
       status: upstream.status,
@@ -387,8 +397,11 @@ export async function dispatchRoutedRequest(built, options = {}) {
       retryAfterSeconds: parseRetryAfter(upstream.headers?.get?.("retry-after")),
       now: failureNow,
     });
+    originalFailure ??= { status: upstream.status, bodyText, headers: upstream.headers };
+    failures.push({ model: currentModel, providerFamily: canonicalProviderId(currentModel.provider), kind: "response", status: upstream.status, ...(verdict.reason ? { reason: verdict.reason } : {}) });
     if (verdict.swap) {
       failoverStartedAt ??= failureNow;
+      failoverReason ??= verdict.reason;
       recordProviderCooldown(currentModel.provider, { ...verdict, now: failureNow });
     }
     if (!verdict.swap || hops >= MAX_FAILOVER_HOPS) {
@@ -400,6 +413,8 @@ export async function dispatchRoutedRequest(built, options = {}) {
         retries,
         hops,
         failures,
+        ...(hops ? { failoverFrom: built.model.slug } : {}),
+        ...(failoverReason ? { failoverReason } : {}),
         elapsedMs: (options.now ? options.now() : Date.now()) - startedAt,
       });
     }
@@ -408,20 +423,19 @@ export async function dispatchRoutedRequest(built, options = {}) {
     const failoverElapsed = currentNow - (failoverStartedAt ?? currentNow);
     const failoverBudgetMs = options.failoverBudgetMs ?? FAILOVER_BUDGET_MS;
     if (failoverElapsed >= failoverBudgetMs) {
-      return Object.freeze({ response: new Response(originalFailure.bodyText, { status: originalFailure.status, headers: originalFailure.headers }), model: built.model, built, retries, hops, failures, elapsedMs: elapsed });
+      return Object.freeze({ response: new Response(originalFailure.bodyText, { status: originalFailure.status, headers: originalFailure.headers }), model: built.model, built, retries, hops, failures, ...(hops ? { failoverFrom: built.model.slug } : {}), ...(failoverReason ? { failoverReason } : {}), elapsedMs: elapsed });
     }
-    const candidate = rankRoutedCandidates(
-      typeof options.failoverCandidates === "function" ? options.failoverCandidates(currentModel, built.pristinePayload) : options.failoverCandidates,
+    const candidate = candidateList(
+      { ...options, usedModels, usedProviderFamilies },
       currentModel,
       built.pristinePayload,
-      { ...options, usedModels, usedProviderFamilies },
     )
-      .filter((entry) => !usedModels.has(entry.slug))
       .map((entry) => ({ model: entry, credential: candidateCredential(options, entry) }))
       .find((entry) => entry.credential !== undefined);
     if (!candidate) {
-      return Object.freeze({ response: new Response(originalFailure.bodyText, { status: originalFailure.status, headers: originalFailure.headers }), model: built.model, built, retries, hops, failures, elapsedMs: elapsed });
+      return Object.freeze({ response: new Response(originalFailure.bodyText, { status: originalFailure.status, headers: originalFailure.headers }), model: built.model, built, retries, hops, failures, ...(hops ? { failoverFrom: built.model.slug } : {}), ...(failoverReason ? { failoverReason } : {}), elapsedMs: elapsed });
     }
+    options.beforeFailover?.(currentModel, candidate.model);
     if (!deadlineController) {
       deadlineController = new AbortController();
       deadlineTimer = setTimeout(() => deadlineController.abort(new Error("routed failover budget exceeded")), failoverBudgetMs - failoverElapsed);
@@ -434,13 +448,25 @@ export async function dispatchRoutedRequest(built, options = {}) {
     usedModels.add(candidate.model.slug);
     usedProviderFamilies.add(canonicalProviderId(candidate.model.provider));
     currentModel = candidate.model;
-    currentBuilt = buildRoutedRequest(built.pristinePayload, candidate.model, {
-      ...built.context,
-      ...options,
+    const { forcedBuffer: _sourceForcedBuffer, onForcedValidated: _sourceOnForcedValidated, ...candidateContext } = built.context || {};
+    const { forcedBuffer: _dispatchForcedBuffer, onForcedValidated: _dispatchOnForcedValidated, beforeFailover: _beforeFailover, routeContextFor: _routeContextFor, ...dispatchOptions } = options;
+    const candidateBuilt = buildRoutedRequest(built.pristinePayload, candidate.model, {
+      ...candidateContext,
+      ...dispatchOptions,
       signal,
       credential: candidate.credential,
       baseUrl: options.baseUrlFor?.(candidate.model) ?? candidate.model.baseUrl,
     });
+    const routeContext = options.routeContextFor?.(candidate.model, candidateBuilt);
+    currentBuilt = routeContext && typeof routeContext === "object"
+      ? buildRoutedRequest(built.pristinePayload, candidate.model, {
+          ...candidateBuilt.context,
+          ...routeContext,
+          signal,
+          credential: candidate.credential,
+          baseUrl: options.baseUrlFor?.(candidate.model) ?? candidate.model.baseUrl,
+        })
+      : candidateBuilt;
    }
   } catch (error) {
     if (deadlineController?.signal.aborted && !callerSignal?.aborted && originalFailure) {
@@ -451,6 +477,8 @@ export async function dispatchRoutedRequest(built, options = {}) {
         retries,
         hops,
         failures,
+        ...(hops ? { failoverFrom: built.model.slug } : {}),
+        ...(failoverReason ? { failoverReason } : {}),
         elapsedMs: (options.now ? options.now() : Date.now()) - startedAt,
         aborted: true,
       });
@@ -469,6 +497,8 @@ export async function dispatchRoutedRequest(built, options = {}) {
         retries,
         hops,
         failures,
+        ...(hops ? { failoverFrom: built.model.slug } : {}),
+        ...(failoverReason ? { failoverReason } : {}),
         elapsedMs: (options.now ? options.now() : Date.now()) - startedAt,
       });
     }

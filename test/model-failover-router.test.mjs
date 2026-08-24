@@ -8,9 +8,10 @@ import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { callerBaseUrl } from "../src/caller-auth.mjs";
-import { MODEL_BY_SLUG } from "../src/model-registry.mjs";
+import { MODEL_BY_SLUG, PROVIDERS } from "../src/model-registry.mjs";
 import { registryFingerprint } from "../src/protocol-proof.mjs";
 import { PROTOCOL_PROOF_VERIFIER_VERSION } from "../src/protocol-proof-verifier.mjs";
+import { encodedToolName } from "../src/tool-dialect.mjs";
 import { openPort } from "./port-pool.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -22,7 +23,7 @@ const CALLER_KEY = "test-router-caller-capability-with-sufficient-length";
 // assertion does not depend on which providers the developer's own machine has
 // credentials for.
 const PRIMARY = { slug: "deepseek/deepseek-v4-pro", gatewayModel: "deepseek-v4-pro" };
-const FALLBACK = { slug: "zai-api/glm-5.2", gatewayModel: "zai-api-glm-5-2" };
+const FALLBACK = { slug: "zai-api/glm-5.2", gatewayModel: "glm-5.2" };
 
 const TURN_BODY = { model: PRIMARY.slug, input: "hello", stream: true };
 
@@ -49,7 +50,20 @@ function contentSse(marker) {
     "",
     "data: [DONE]",
     "",
-  ].join("\n");
+  ].join("\n") + "\n";
+}
+
+function requiredToolSse(name = "run") {
+  const argumentsText = "{}";
+  const events = [
+    { type: "response.created", response: { id: "r-forced" } },
+    { type: "response.output_item.added", item: { type: "function_call", id: "fc-forced", call_id: "call-forced", name, arguments: "" } },
+    { type: "response.function_call_arguments.delta", item_id: "fc-forced", delta: argumentsText },
+    { type: "response.function_call_arguments.done", item_id: "fc-forced", arguments: argumentsText },
+    { type: "response.output_item.done", item: { type: "function_call", id: "fc-forced", call_id: "call-forced", name, arguments: argumentsText } },
+    { type: "response.completed", response: { id: "r-forced", output: [{ type: "function_call", id: "fc-forced", call_id: "call-forced", name, arguments: argumentsText }], usage: { input_tokens: 10, output_tokens: 2, total_tokens: 12 } } },
+  ];
+  return `${events.map((entry) => `event: ${entry.type}\ndata: ${JSON.stringify(entry)}\n\n`).join("")}data: [DONE]\n\n`;
 }
 
 const QUOTA_BODY = JSON.stringify({
@@ -65,6 +79,13 @@ const FREE_USAGE_BODY = JSON.stringify({
   error: {
     type: "FreeUsageLimitError",
     message: "Rate limit exceeded",
+  },
+});
+
+const RATE_LIMIT_BODY = JSON.stringify({
+  error: {
+    type: "rate_limit_error",
+    message: "Too many requests; retry later.",
   },
 });
 
@@ -137,6 +158,10 @@ function run(env, { chain = [FALLBACK.slug], enabled = true, cooldowns, nodeRout
   // environment variable deliberately does not qualify. Write the file the
   // provider's registry entry names, so the fallback is credentialed here and
   // nowhere else on the machine.
+  writeFileSync(path.join(stateDir, "deepseek-api-key.secret"), "test-deepseek-key\n", {
+    encoding: "utf8",
+    mode: 0o600,
+  });
   writeFileSync(path.join(stateDir, "zai-api-key.secret"), "test-zai-platform-key\n", {
     encoding: "utf8",
     mode: 0o600,
@@ -147,22 +172,26 @@ function run(env, { chain = [FALLBACK.slug], enabled = true, cooldowns, nodeRout
     encoding: "utf8",
     mode: 0o600,
   });
+  const childEnv = {
+    ...process.env,
+    MODEL_ROUTER_STATE_DIR: stateDir,
+    CODEX_ROUTER_CALLER_KEY: CALLER_KEY,
+    CODEX_ROUTER_INTERNAL_KEY: INTERNAL_KEY,
+    KIMI_INTERNAL_KEY: INTERNAL_KEY,
+    CODEX_ROUTER_SHOW_ALL_MODELS: "1",
+    CODEX_ROUTER_QUIET: "1",
+    ZAI_PLATFORM_API_KEY: "test-zai-platform-key",
+    ...env,
+  };
+  if (childEnv.CODEX_ROUTER_TEST_NODE_ROUTE_FIXTURE && !nodeRoutes) {
+    for (const provider of PROVIDERS.values()) {
+      if (provider.baseUrlEnv) childEnv[provider.baseUrlEnv] ||= childEnv.CODEX_ROUTER_NODE_PROVIDER_BASE_URL;
+      for (const name of provider.credential?.environment || []) childEnv[name] ||= INTERNAL_KEY;
+    }
+  }
   const child = spawn(process.execPath, [...(importFile ? ["--import", pathToFileURL(importFile).href] : []), path.join(root, "src", "router.mjs")], {
     cwd: root,
-    env: {
-      ...process.env,
-      MODEL_ROUTER_STATE_DIR: stateDir,
-      CODEX_ROUTER_CALLER_KEY: CALLER_KEY,
-      CODEX_ROUTER_INTERNAL_KEY: INTERNAL_KEY,
-      KIMI_INTERNAL_KEY: INTERNAL_KEY,
-      CODEX_ROUTER_SHOW_ALL_MODELS: "1",
-      // The failover log line must survive the flag a production LaunchAgent
-      // hard-sets, so every test here runs with it on.
-      CODEX_ROUTER_QUIET: "1",
-      // Makes the fallback provider credentialed without touching a keychain.
-      ZAI_PLATFORM_API_KEY: "test-zai-platform-key",
-      ...env,
-    },
+    env: childEnv,
     stdio: ["ignore", "ignore", "pipe"],
   });
   child.stderr.setEncoding("utf8");
@@ -175,13 +204,14 @@ function run(env, { chain = [FALLBACK.slug], enabled = true, cooldowns, nodeRout
   return child;
 }
 
-function routerEnv(gatewayPort, routerPort, { legacyKillSwitch = true } = {}) {
+function routerEnv(providerPort, routerPort, { legacyKillSwitch = false } = {}) {
   return {
     CODEX_ROUTER_PORT: String(routerPort),
-    CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${gatewayPort}/v1`,
-    CODEX_ROUTER_OAUTH_HEALTH_URL: `http://127.0.0.1:${gatewayPort}/health`,
-    CODEX_ROUTER_API_HEALTH_URL: `http://127.0.0.1:${gatewayPort}/health`,
-    CODEX_ROUTER_GATEWAY_HEALTH_URL: `http://127.0.0.1:${gatewayPort}/health`,
+    CODEX_ROUTER_TEST_NODE_ROUTE_FIXTURE: "1",
+    CODEX_ROUTER_NODE_PROVIDER_BASE_URL: `http://127.0.0.1:${providerPort}/v1`,
+    CODEX_ROUTER_OAUTH_HEALTH_URL: `http://127.0.0.1:${providerPort}/health`,
+    CODEX_ROUTER_API_HEALTH_URL: `http://127.0.0.1:${providerPort}/health`,
+    CODEX_ROUTER_GATEWAY_HEALTH_URL: `http://127.0.0.1:${providerPort}/health`,
     ...(legacyKillSwitch ? { CODEX_ROUTER_DIRECT_DISPATCH: "0" } : {}),
   };
 }
@@ -210,6 +240,15 @@ async function waitForUsageEvents(stateDir, count, child) {
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
   throw new Error(`Timed out waiting for ${count} usage events: ${child.testErrors()}`);
+}
+
+async function waitForLog(child, pattern) {
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    if (pattern.test(child.testErrors())) return child.testErrors();
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error(`Timed out waiting for ${pattern}: ${child.testErrors()}`);
 }
 
 async function waitFor(url, child) {
@@ -369,6 +408,143 @@ test("the router fails over OpenCode FreeUsageLimitError without leaking the ori
     const events = await waitForUsageEvents(child.stateDir, 2, child);
     assert.equal(events.find((event) => event.model === PRIMARY.slug).status, 429);
     assert.equal(events.find((event) => event.model === FALLBACK.slug).status, 200);
+  } finally {
+    await stopChild(child);
+    await closeServer(gw.server);
+  }
+});
+
+test("a long rate limit failover records the real reason and served route identity", async () => {
+  const seen = [];
+  const gw = await gateway(async (request, response) => {
+    const body = await bodyJson(request);
+    seen.push(body);
+    if (body.model === PRIMARY.gatewayModel) {
+      const payload = Buffer.from(RATE_LIMIT_BODY, "utf8");
+      response.writeHead(429, {
+        "Content-Type": "application/json",
+        "Retry-After": "61",
+        "Content-Length": String(payload.length),
+      });
+      response.end(payload);
+      return;
+    }
+    response.writeHead(200, { "Content-Type": "text/event-stream" });
+    response.end(contentSse("rate-limit-fallback"));
+  });
+  const routerPort = await openPort();
+  const child = run(routerEnv(gw.port, routerPort));
+  try {
+    await waitFor(`http://127.0.0.1:${routerPort}/health`, child);
+    const result = await readRouted(routerPort, TURN_BODY);
+    assert.equal(result.status, 200);
+    assert.deepEqual(seen.map((body) => body.model), [PRIMARY.gatewayModel, FALLBACK.gatewayModel]);
+    assert.match(child.testErrors(), /failover model=deepseek\/deepseek-v4-pro status=429 reason=rate_limited -> zai-api\/glm-5\.2 outcome=200/);
+    await waitForLog(child, /timing .*model=zai-api\/glm-5\.2 provider=zai-api status=200 .*failover_from=deepseek\/deepseek-v4-pro/);
+    const events = await waitForUsageEvents(child.stateDir, 2, child);
+    const served = events.find((event) => event.model === FALLBACK.slug);
+    assert.equal(served.provider, "zai-api");
+    assert.equal(served.failoverFrom, PRIMARY.slug);
+  } finally {
+    await stopChild(child);
+    await closeServer(gw.server);
+  }
+});
+
+test("cooldown selects a fallback before creating an unsupported forced coordinator", async () => {
+  const seen = [];
+  const gw = await gateway(async (request, response) => {
+    const body = await bodyJson(request);
+    seen.push(body);
+    response.writeHead(200, { "Content-Type": "text/event-stream" });
+    response.end(contentSse("cooldown-unsupported"));
+  });
+  const routerPort = await openPort();
+  const child = run(routerEnv(gw.port, routerPort), {
+    chain: [FALLBACK.slug],
+    cooldowns: { deepseek: { until: new Date(Date.now() + 60_000).toISOString(), reason: "out_of_usage" } },
+  });
+  try {
+    await waitFor(`http://127.0.0.1:${routerPort}/health`, child);
+    const result = await readRouted(routerPort, {
+      ...TURN_BODY,
+      tools: [{ type: "function", name: "run", parameters: { type: "object", properties: {}, additionalProperties: false } }],
+      tool_choice: "required",
+    });
+    assert.equal(result.status, 200);
+    assert.deepEqual(seen.map((body) => body.model), [FALLBACK.gatewayModel]);
+    assert.match(result.body, /cooldown-unsupported/);
+    assert.doesNotMatch(result.body, /forced_tool_buffer_timeout|forced_tool_not_called/);
+  } finally {
+    await stopChild(child);
+    await closeServer(gw.server);
+  }
+});
+
+test("cooldown selects a forced-capable Node fallback with its own tool lifecycle", async () => {
+  const fallback = "opencode-go/deepseek-v4-flash";
+  const seen = [];
+  const gw = await gateway(async (request, response) => {
+    const body = await bodyJson(request);
+    seen.push(body);
+    response.writeHead(200, { "Content-Type": "text/event-stream" });
+    response.end(requiredToolSse("run"));
+  });
+  const routerPort = await openPort();
+  const child = run(routerEnv(gw.port, routerPort), {
+    chain: [fallback],
+    cooldowns: { deepseek: { until: new Date(Date.now() + 60_000).toISOString(), reason: "out_of_usage" } },
+  });
+  try {
+    await waitFor(`http://127.0.0.1:${routerPort}/health`, child);
+    const result = await readRouted(routerPort, {
+      ...TURN_BODY,
+      tools: [{ type: "function", name: "run", parameters: { type: "object", properties: {}, additionalProperties: false } }],
+      tool_choice: "required",
+    });
+    assert.equal(result.status, 200, `${result.body}\n${child.testErrors()}`);
+    assert.deepEqual(seen.map((body) => body.model), ["deepseek-v4-flash"]);
+    assert.match(result.body, /function_call/);
+    assert.doesNotMatch(result.body, /forced_tool_buffer_timeout|forced_tool_not_called/);
+  } finally {
+    await stopChild(child);
+    await closeServer(gw.server);
+  }
+});
+
+test("a normal forced failover cleans the source deadline before delayed candidate validation", async () => {
+  const fallback = "opencode-go/deepseek-v4-flash";
+  const seen = [];
+  const gw = await gateway(async (request, response) => {
+    const body = await bodyJson(request);
+    seen.push(body);
+    if (seen.length === 1) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      response.writeHead(402, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ error: { type: "billing_error", message: "primary exhausted" } }));
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    response.writeHead(200, { "Content-Type": "text/event-stream" });
+    response.end(requiredToolSse("run"));
+  });
+  const routerPort = await openPort();
+  const preload = acceleratedForcedDeadlinePreload(200);
+  const child = run(routerEnv(gw.port, routerPort), {
+    chain: [fallback],
+    importFile: preload,
+  });
+  try {
+    await waitFor(`http://127.0.0.1:${routerPort}/health`, child);
+    const result = await readRouted(routerPort, {
+      ...TURN_BODY,
+      tools: [{ type: "function", name: "run", parameters: { type: "object", properties: {}, additionalProperties: false } }],
+      tool_choice: "required",
+    });
+    assert.equal(result.status, 200, `${result.body}\n${child.testErrors()}`);
+    assert.deepEqual(seen.map((body) => body.model), [PRIMARY.gatewayModel, "deepseek-v4-flash"]);
+    assert.match(result.body, /function_call/);
+    assert.doesNotMatch(result.body, /forced_tool_buffer_timeout|forced_tool_not_called/);
   } finally {
     await stopChild(child);
     await closeServer(gw.server);
@@ -603,6 +779,7 @@ test("default direct router covers summary/raw/compaction, exact Retry-After, tr
   const forcedDeadlinePreload = acceleratedForcedDeadlinePreload();
   const child = run({
     ...routerEnv(gw.port, routerPort, { legacyKillSwitch: false }),
+    CODEX_ROUTER_TEST_NODE_ROUTE_STRICT: "1",
     DEEPSEEK_API_BASE_URL: `http://127.0.0.1:${gw.port}/direct`,
     DEEPSEEK_API_KEY: "direct-deepseek-key",
     QWEN_PLAN_BASE_URL: `http://127.0.0.1:${gw.port}/qwen`,
@@ -826,13 +1003,13 @@ test("experimental authorization is proof-gated before the direct-dispatch trans
       expectedPath: "/qwen/responses",
     });
     await exercise({
-      name: "unlisted hidden compatibility alias remains legal through the legacy kill-switch path",
+       name: "unlisted hidden compatibility alias remains direct when legacy kill-switch is requested",
       legacyKillSwitch: true,
       model: alias,
       nodeRoutes: [aliasRoute],
       protocolProofs: { [alias.slug]: aliasProof },
       expectedStatus: 200,
-      expectedPath: "/v1/responses",
+       expectedPath: "/qwen/responses",
     });
     for (const legacyKillSwitch of [false, true]) {
       await exercise({
@@ -886,12 +1063,12 @@ test("experimental authorization is proof-gated before the direct-dispatch trans
       }
     }
     await exercise({
-      name: "kill switch with an authorized route",
+       name: "legacy kill-switch request still uses the authorized Node route",
       legacyKillSwitch: true,
       nodeRoutes: [resolved],
       protocolProofs: { [canary.slug]: validProof },
       expectedStatus: 200,
-      expectedPath: "/v1/responses",
+       expectedPath: "/qwen/responses",
     });
   } finally {
     await closeServer(gw.server);
@@ -1055,7 +1232,7 @@ test("a provider that answers again clears the cooldown this router recorded", a
   }
 });
 
-test("a fallback rebuild carries the full request, not a model swap", async () => {
+test("a fallback rebuild carries the full request and rebuilds the Node tool dialect", async () => {
   // The routed body is rebuilt for the fallback from the pristine payload.
   // The regression this guards is a second build over already-flattened tools,
   // which yields a plausible tool list with an empty namespace map.
@@ -1098,10 +1275,13 @@ test("a fallback rebuild carries the full request, not a model swap", async () =
     });
     assert.equal(seen.length, 2);
     const [first, second] = seen;
-    // Both attempts flattened the namespace the same way, from the same source.
+    // Each Node route rebuilds from the same pristine source, but applies its own
+    // transport/profile contract. DeepSeek's Responses profile encodes the
+    // namespace; the Z.ai route keeps the direct Responses namespace shape.
     const names = (body) => (body.tools || []).map((tool) => tool.name).sort();
-    assert.deepEqual(names(second), names(first));
-    assert.ok(names(second).includes("collaboration__spawn_agent"));
+    assert.ok(names(first)[0].startsWith("cr_collaboration__spawn_agent_"));
+    assert.deepEqual(names(second), ["collaboration"]);
+    assert.equal(second.tools[0].tools[0].name, "spawn_agent");
     // A bare string is as legal an `input` as an array, and the rebuild must
     // hand the fallback the same prompt -- not the same prompt spread into its
     // own letters, which reaches the provider and still reads as a 200.
@@ -1125,6 +1305,7 @@ test("a fallback rebuild carries the full request, not a model swap", async () =
 const RESPONSES_MODEL = {
   slug: "opencode-go-responses/gpt-5.6-luna",
   gatewayModel: "opencode-go-responses-gpt-5-6-luna",
+  upstreamModel: "gpt-5.6-luna",
 };
 
 const NAMESPACE_TOOLS = [
@@ -1151,7 +1332,9 @@ function toolNames(body) {
   return (body.tools || []).map((tool) => `${tool.type}:${tool.name}`).sort();
 }
 
-test("a chat-completions turn failing over to a responses provider keeps the namespace", async () => {
+const ENCODED_NAMESPACE_TOOL = encodedToolName("namespace", "collaboration__spawn_agent");
+
+test("a direct Responses turn failing over rebuilds the destination namespace", async () => {
   const seen = [];
   const gw = await gateway(async (request, response) => {
     const body = await bodyJson(request);
@@ -1169,7 +1352,7 @@ test("a chat-completions turn failing over to a responses provider keeps the nam
     response.end(contentSse("responses-fallback"));
   });
   const routerPort = await openPort();
-  const child = run(routerEnv(gw.port, routerPort), { chain: [RESPONSES_MODEL.slug] });
+  const child = run(routerEnv(gw.port, routerPort), { chain: [FALLBACK.slug] });
   try {
     await waitFor(`http://127.0.0.1:${routerPort}/health`, child);
     const result = await readRouted(routerPort, { ...TURN_BODY, tools: NAMESPACE_TOOLS });
@@ -1177,16 +1360,14 @@ test("a chat-completions turn failing over to a responses provider keeps the nam
     assert.equal(seen.length, 2);
     const [first, second] = seen;
     assert.equal(first.model, PRIMARY.gatewayModel);
-    assert.equal(second.model, RESPONSES_MODEL.gatewayModel);
+    assert.equal(second.model, FALLBACK.gatewayModel);
 
-    // The chat-completions attempt flattened the namespace into plain functions
-    // (alongside the merged codex_app toolset, which only that branch adds).
-    assert.ok(toolNames(first).includes("function:collaboration__spawn_agent"));
+    // DeepSeek's direct profile encodes the namespace for its provider-facing
+    // declaration (alongside the merged codex_app toolset).
+    assert.ok(toolNames(first).includes(`function:${ENCODED_NAMESPACE_TOOL}`));
     assert.ok(!toolNames(first).some((name) => name.startsWith("namespace:")));
-    // The responses-native attempt must have been rebuilt from the pristine
-    // payload and kept the namespace intact. A flattened name here is the exact
-    // regression this guards: the second build reusing the first's rewritten
-    // tool list, which also yields an empty namespace map.
+    // Z.ai's direct Responses profile must be rebuilt from the pristine payload
+    // and keep its namespace intact rather than reusing the first build.
     assert.deepEqual(toolNames(second), ["namespace:collaboration"]);
     assert.equal(second.tools[0].tools[0].name, "spawn_agent");
   } finally {
@@ -1195,12 +1376,12 @@ test("a chat-completions turn failing over to a responses provider keeps the nam
   }
 });
 
-test("a responses turn failing over to a chat-completions provider flattens it", async () => {
+test("a direct Responses turn failing over to Z.ai rebuilds its own tool dialect", async () => {
   const seen = [];
   const gw = await gateway(async (request, response) => {
     const body = await bodyJson(request);
     seen.push(body);
-    if (body.model === RESPONSES_MODEL.gatewayModel) {
+    if (body.model === RESPONSES_MODEL.upstreamModel) {
       const payload = Buffer.from(QUOTA_BODY, "utf8");
       response.writeHead(429, {
         "Content-Type": "application/json",
@@ -1225,11 +1406,12 @@ test("a responses turn failing over to a chat-completions provider flattens it",
     assert.equal(result.status, 200);
     assert.equal(seen.length, 2);
     const [first, second] = seen;
-    assert.deepEqual(toolNames(first), ["namespace:collaboration"]);
-    // Rebuilt for a chat-completions destination: the namespace is gone and the
-    // call is an ordinary function the provider can actually invoke.
-    assert.ok(toolNames(second).includes("function:collaboration__spawn_agent"));
-    assert.ok(!toolNames(second).some((name) => name.startsWith("namespace:")));
+    // opencode's direct profile encodes the namespace on the first attempt.
+    assert.deepEqual(toolNames(first), [`function:${ENCODED_NAMESPACE_TOOL}`]);
+    // Z.ai is rebuilt from the pristine payload and retains the native namespace
+    // shape required by its Responses profile.
+    assert.deepEqual(toolNames(second), ["namespace:collaboration"]);
+    assert.equal(second.tools[0].tools[0].name, "spawn_agent");
   } finally {
     await stopChild(child);
     await closeServer(gw.server);
@@ -1309,7 +1491,7 @@ test("failover walks past a candidate that is also out of usage", async () => {
   const gw = await gateway(async (request, response) => {
     const body = await bodyJson(request);
     seen.push(body.model);
-    if (body.model === RESPONSES_MODEL.gatewayModel) {
+    if (body.model === RESPONSES_MODEL.upstreamModel) {
       response.writeHead(200, { "Content-Type": "text/event-stream" });
       response.end(contentSse("second-candidate"));
       return;
@@ -1336,7 +1518,7 @@ test("failover walks past a candidate that is also out of usage", async () => {
     assert.deepEqual(seen, [
       PRIMARY.gatewayModel,
       FALLBACK.gatewayModel,
-      RESPONSES_MODEL.gatewayModel,
+      RESPONSES_MODEL.upstreamModel,
     ]);
     // The candidate that also reported empty is cooled down on its own account.
     const events = await waitForUsageEvents(child.stateDir, 2, child);

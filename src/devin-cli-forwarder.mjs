@@ -30,7 +30,7 @@ import { installStableFetchTransport } from "./fetch-transport.mjs";
 
 installStableFetchTransport();
 
-// LiteLLM speaks OpenAI Chat Completions to this forwarder. It reuses the
+// The router speaks OpenAI Chat Completions to this forwarder. It reuses the
 // official Devin CLI session and translates to Cascade's Connect RPC, which is
 // the only interface Cognition's models answer on.
 

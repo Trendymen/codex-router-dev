@@ -159,6 +159,7 @@ function mappedGlmChoice(choice, sourceTools, encodedTools) {
 }
 
 function glmMappedTools(sourceTools, encodedTools) {
+  if (!Array.isArray(encodedTools)) return encodedTools;
   const flattened = [];
   for (const tool of sourceTools || []) {
     if (tool?.type === "namespace" && Array.isArray(tool.tools)) flattened.push(...tool.tools);

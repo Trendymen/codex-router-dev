@@ -16,7 +16,8 @@ import { fileURLToPath } from "node:url";
 import { zstdCompressSync, zstdDecompressSync } from "node:zlib";
 
 import { callerBaseUrl } from "../src/caller-auth.mjs";
-import { MODEL_BY_SLUG } from "../src/model-registry.mjs";
+import { MODEL_BY_SLUG, PROVIDERS } from "../src/model-registry.mjs";
+import { isNodeModel, resolveNodeModel } from "../src/model-contract.mjs";
 import { registryFingerprint } from "../src/protocol-proof.mjs";
 import { PROTOCOL_PROOF_VERIFIER_VERSION } from "../src/protocol-proof-verifier.mjs";
 import { openPort } from "./port-pool.mjs";
@@ -59,6 +60,27 @@ async function mockServer(handler) {
   return { server, port: address.port };
 }
 
+function responsesTextStream({ id = "resp_routed", model = "deepseek-v4-flash", text = "ok", inputTokens = 0, outputTokens = 1 } = {}) {
+  const message = {
+    id: "msg_1",
+    type: "message",
+    role: "assistant",
+    status: "completed",
+    content: [{ type: "output_text", text }],
+  };
+  const events = [
+    { type: "response.created", response: { id, model } },
+    { type: "response.output_item.added", output_index: 0, item: { ...message, status: "in_progress", content: [] } },
+    { type: "response.content_part.added", output_index: 0, content_index: 0, item_id: message.id, part: { type: "output_text", text: "" } },
+    { type: "response.output_text.delta", output_index: 0, content_index: 0, item_id: message.id, delta: text },
+    { type: "response.output_text.done", output_index: 0, content_index: 0, item_id: message.id, text },
+    { type: "response.content_part.done", output_index: 0, content_index: 0, item_id: message.id, part: { type: "output_text", text } },
+    { type: "response.output_item.done", output_index: 0, item: message },
+    { type: "response.completed", response: { id, model, output: [message], usage: { input_tokens: inputTokens, output_tokens: outputTokens, total_tokens: inputTokens + outputTokens } } },
+  ];
+  return `${events.map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join("")}data: [DONE]\n\n`;
+}
+
 function run(script, env) {
   // Isolate from the user's real router state (e.g. native-aliases.json)
   // unless the test provides its own state directory.
@@ -66,21 +88,45 @@ function run(script, env) {
     env?.MODEL_ROUTER_STATE_DIR || env?.CODEX_ROUTER_STATE_DIR
       ? {}
       : { MODEL_ROUTER_STATE_DIR: mkdtempSync(path.join(os.tmpdir(), "routing-state-")) };
+  const childEnv = {
+    ...process.env,
+    ...stateIsolation,
+    CODEX_ROUTER_CALLER_KEY: CALLER_KEY,
+    CODEX_ROUTER_INTERNAL_KEY: INTERNAL_KEY,
+    KIMI_INTERNAL_KEY: INTERNAL_KEY,
+    CODEX_ROUTER_SHOW_ALL_MODELS: "1",
+    ...env,
+  };
+  // Route the retained end-to-end cases through the protected Node snapshot.
+  // The former suite pointed every external turn at the removed local gateway;
+  // the fixture now uses its mock as each provider's test endpoint.
+  if (script === "router.mjs" && childEnv.CODEX_ROUTER_GATEWAY_BASE_URL) {
+    childEnv.CODEX_ROUTER_TEST_NODE_ROUTE_FIXTURE = "1";
+    const stateDir = childEnv.MODEL_ROUTER_STATE_DIR || childEnv.CODEX_ROUTER_STATE_DIR;
+    const routes = [];
+    for (const model of MODEL_BY_SLUG.values()) {
+      if (!isNodeModel(model) || model.effectiveTransport === "native-openai" || model.rolloutState === "experimental") continue;
+      const resolved = resolveNodeModel(model, { enabled: true });
+      if (!resolved.routable) continue;
+      const fields = [
+        "slug", "provider", "upstreamModel", "effectiveTransport", "toolDialect",
+        "requestProfile", "reasoningDisplayMode", "declaredFinalReasoningShape",
+        "effectiveFinalReasoningShape", "rolloutState", "purpose", "routable", "listed", "visible",
+      ];
+      routes.push(Object.fromEntries(fields.map((field) => [field, resolved[field]])));
+    }
+    if (stateDir && !existsSync(path.join(stateDir, "node-routes.json"))) {
+      mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+      writeFileSync(path.join(stateDir, "node-routes.json"), `${JSON.stringify({ version: 1, routes })}\n`, { mode: 0o600 });
+    }
+    for (const provider of PROVIDERS.values()) {
+      if (provider.baseUrlEnv) childEnv[provider.baseUrlEnv] ||= childEnv.CODEX_ROUTER_GATEWAY_BASE_URL;
+      for (const name of provider.credential?.environment || []) childEnv[name] ||= INTERNAL_KEY;
+    }
+  }
   const child = spawn(process.execPath, [path.join(root, "src", script)], {
     cwd: root,
-    env: {
-      ...process.env,
-      ...stateIsolation,
-      CODEX_ROUTER_CALLER_KEY: CALLER_KEY,
-      CODEX_ROUTER_INTERNAL_KEY: INTERNAL_KEY,
-      KIMI_INTERNAL_KEY: INTERNAL_KEY,
-      CODEX_ROUTER_SHOW_ALL_MODELS: "1",
-      // This suite is the legacy gateway contract. Direct-default behavior,
-      // including the no-snapshot fail-closed gate, has its own whole-router
-      // fixture in model-failover-router.test.mjs.
-      ...(script === "router.mjs" ? { CODEX_ROUTER_DIRECT_DISPATCH: "0" } : {}),
-      ...env,
-    },
+    env: childEnv,
     stdio: ["ignore", "ignore", "pipe"],
   });
   child.stderr.setEncoding("utf8");
@@ -381,7 +427,7 @@ test("provider vision reads use Node dispatch and never the retired gateway", as
         ] }],
       }),
     });
-    assert.equal(response.status, 200, await response.text());
+    assert.equal(response.status, 200);
     assert.equal(gatewayRequests, 0);
     assert.ok(providerRequests.some((body) => body.model === qwen.upstreamModel), JSON.stringify(providerRequests));
     const answer = providerRequests.find((body) => body.model === deepseek.upstreamModel);
@@ -421,7 +467,12 @@ test("router requires the configured path capability before any model route", as
     if (body.input === "hold") {
       await new Promise((resolve) => setTimeout(resolve, 120));
     }
-    json(response, 200, { route: "external" });
+    json(response, 200, {
+      id: "resp-alias",
+      object: "response",
+      output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "ok" }] }],
+      usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+    });
   });
   const routerPort = await openPort();
   const router = run("router.mjs", {
@@ -722,7 +773,12 @@ test("router dispatches aliased native slugs to the mapped external model", asyn
   const gatewayRequests = [];
   const gateway = await mockServer(async (request, response) => {
     gatewayRequests.push(await bodyJson(request));
-    json(response, 200, { route: "external" });
+    json(response, 200, {
+      id: "resp-alias",
+      object: "response",
+      output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "ok" }] }],
+      usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+    });
   });
   const routerPort = await openPort();
   const testRoot = mkdtempSync(path.join(os.tmpdir(), "codex-router-alias-route-"));
@@ -730,7 +786,7 @@ test("router dispatches aliased native slugs to the mapped external model", asyn
   mkdirSync(stateDir, { recursive: true });
   writeFileSync(
     path.join(stateDir, "native-aliases.json"),
-    `${JSON.stringify({ version: 1, aliases: { "gpt-5.5": "kimi-oauth/k3" } })}\n`,
+    `${JSON.stringify({ version: 1, aliases: { "gpt-5.5": "deepseek/deepseek-v4-pro" } })}\n`,
   );
   const router = run("router.mjs", {
     CODEX_ROUTER_PORT: String(routerPort),
@@ -749,8 +805,9 @@ test("router dispatches aliased native slugs to the mapped external model", asyn
       },
       body: JSON.stringify({ model: "gpt-5.5", input: "alias test" }),
     });
-    assert.equal(response.status, 200);
-    assert.equal(gatewayRequests.at(-1).model, "kimi-oauth-k3");
+    const responseBody = await response.text();
+    assert.equal(response.status, 200, `${responseBody}\n${router.testErrors()}`);
+    assert.equal(gatewayRequests.at(-1).model, "deepseek-v4-pro");
   } finally {
     await stopChild(router);
     await closeServer(gateway.server);
@@ -870,12 +927,19 @@ test("router preserves native auth and isolates every external route", async () 
         output: [
           {
             type: "message",
+            role: "assistant",
             content: [{ type: "output_text", text: "compact summary" }],
           },
         ],
+        usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
       });
     } else {
-      json(response, 200, { route: "external" });
+      json(response, 200, {
+        id: "resp-external",
+        object: "response",
+        output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "ok" }] }],
+        usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+      });
     }
   });
   const routerPort = await openPort();
@@ -918,12 +982,10 @@ test("router preserves native auth and isolates every external route", async () 
     assert.equal(nativeResponse.status, 200);
 
     for (const [model, gatewayModel] of [
-      ["kimi-oauth/k3", "kimi-oauth-k3"],
-      ["kimi-api/kimi-k3", "kimi-api-k3"],
       ["deepseek/deepseek-v4-flash", "deepseek-v4-flash"],
       ["deepseek/deepseek-v4-pro", "deepseek-v4-pro"],
-      ["grok-api/grok-4.5", "grok-api-grok-4-5"],
-      ["anthropic-api/claude-opus-4.8", "anthropic-api-claude-opus-4-8"],
+      ["qwen-plan/deepseek-v4-flash-0731", "deepseek-v4-flash-0731"],
+      ["opencode-go/deepseek-v4-flash", "deepseek-v4-flash"],
     ]) {
       const response = await fetch(`${routerBase(routerPort)}/responses`, {
         method: "POST",
@@ -934,7 +996,7 @@ test("router preserves native auth and isolates every external route", async () 
           client_metadata: { workspace: "caller-owned" },
         }),
       });
-      assert.equal(response.status, 200);
+      assert.equal(response.status, 200, `${model}\n${await response.text()}\n${router.testErrors()}`);
       assert.equal(routedRequests.at(-1).body.model, gatewayModel);
     }
 
@@ -996,7 +1058,7 @@ test("router permits a compressed context larger than the encoded request limit"
       body: compressed,
     });
 
-    assert.equal(response.status, 200, await response.text());
+    assert.equal(response.status, 200);
     assert.equal(receivedInputLength, input.length);
   } finally {
     await stopChild(router);
@@ -1041,7 +1103,8 @@ test("router hands the native backend a compressed body instead of inflated JSON
       headers: { Authorization: `Bearer ${CALLER_KEY}`, "Content-Type": "application/json" },
       body: big,
     });
-    assert.equal(response.status, 200, await response.text());
+    const responseBody = await response.text();
+    assert.equal(response.status, 200, `${responseBody}\n${router.testErrors()}`);
 
     const [call] = seen;
     assert.equal(call.encoding, "zstd");
@@ -1076,7 +1139,8 @@ test("a small native turn is sent unencoded, exactly as it always was", async ()
       headers: { Authorization: `Bearer ${CALLER_KEY}`, "Content-Type": "application/json" },
       body: JSON.stringify({ model: "gpt-5.6-sol", input: "hello" }),
     });
-    assert.equal(response.status, 200, await response.text());
+    const responseBody = await response.text();
+    assert.equal(response.status, 200, `${responseBody}\n${router.testErrors()}`);
     assert.equal(seen[0].encoding, undefined);
     assert.equal(seen[0].body.input, "hello");
   } finally {
@@ -1127,7 +1191,12 @@ test("router relays encrypted Codex subagent payloads before external routing", 
   const gatewayRequests = [];
   const gateway = await mockServer(async (request, response) => {
     gatewayRequests.push({ headers: request.headers, body: await bodyJson(request) });
-    json(response, 200, { route: "external" });
+    json(response, 200, {
+      id: "resp-relay",
+      object: "response",
+      output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "ok" }] }],
+      usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+    });
   });
   const routerPort = await openPort();
   const router = run("router.mjs", {
@@ -1147,7 +1216,7 @@ test("router relays encrypted Codex subagent payloads before external routing", 
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        model: "kimi-oauth/k3",
+        model: "deepseek/deepseek-v4-pro",
         stream: false,
         input: [
           {
@@ -1186,7 +1255,7 @@ test("router relays encrypted Codex subagent payloads before external routing", 
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        model: "kimi-oauth/k3",
+        model: "deepseek/deepseek-v4-pro",
         stream: false,
         input: [
           {
@@ -1213,7 +1282,7 @@ test("router relays encrypted Codex subagent payloads before external routing", 
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        model: "kimi-oauth/k3",
+        model: "deepseek/deepseek-v4-pro",
         stream: false,
         input: [
           {
@@ -1460,9 +1529,11 @@ test("router synthesizes routed compaction and safely replays it to native model
       output: [
         {
           type: "message",
+          role: "assistant",
           content: [{ type: "output_text", text: "compact summary" }],
         },
       ],
+      usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
     });
   });
   const nativeRequests = [];
@@ -4132,7 +4203,12 @@ test("router strips empty text parts and drops the messages left with nothing", 
   const gatewayRequests = [];
   const gateway = await mockServer(async (request, response) => {
     gatewayRequests.push(await bodyJson(request));
-    json(response, 200, { route: "external" });
+    json(response, 200, {
+      id: "resp-clean",
+      object: "response",
+      output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "ok" }] }],
+      usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+    });
   });
   const native = await mockServer(async (_request, response) => {
     json(response, 200, { id: "unused", output: [] });
@@ -4154,7 +4230,7 @@ test("router strips empty text parts and drops the messages left with nothing", 
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        model: "kimi-oauth/k3",
+        model: "deepseek/deepseek-v4-pro",
         stream: false,
         input: [
           // Codex emits these filler assistant turns around tool calls.
@@ -4229,7 +4305,7 @@ function curatedFireworksModel() {
     }),
     "utf8",
   );
-  return { dir, file, gatewayModel: "fireworks-test-model" };
+  return { dir, file, gatewayModel: "fireworks-test-model", upstreamModel: "accounts/fireworks/models/test-model" };
 }
 
 test("API forwarder strips web_search_options for Fireworks", async () => {
@@ -4463,7 +4539,7 @@ test("router strips Fireworks web_search_options on routed and compaction reques
       }),
     });
     assert.equal(routed.status, 200, router.testErrors());
-    assert.equal(gatewayRequests[0].model, curated.gatewayModel);
+    assert.equal(gatewayRequests[0].model, curated.upstreamModel);
     assert.equal(gatewayRequests[0].web_search_options, undefined);
     assert.equal(gatewayRequests[0].client_metadata, undefined);
 
@@ -4484,7 +4560,7 @@ test("router strips Fireworks web_search_options on routed and compaction reques
       }),
     });
     assert.equal(compact.status, 200, router.testErrors());
-    assert.equal(gatewayRequests[1].model, curated.gatewayModel);
+    assert.equal(gatewayRequests[1].model, curated.upstreamModel);
     assert.equal(gatewayRequests[1].web_search_options, undefined);
     assert.equal(gatewayRequests[1].client_metadata, undefined);
   } finally {
@@ -4527,7 +4603,7 @@ test("router normalizes forced tool choices before LiteLLM for auto-tool-choice 
     // LiteLLM does its Responses -> Chat Completions translation after the
     // router, so this must already be auto when it reaches the gateway.
     const required = await route("ollama-cloud/minimax-m3", "required");
-    assert.equal(required.model, "ollama-cloud-minimax-m3");
+    assert.equal(required.model, "minimax-m3");
     assert.equal(required.tool_choice, "auto");
 
     // The collaboration relay uses an object form; it has the same upstream
@@ -4560,7 +4636,12 @@ test("router redirects native background turns to the configured routed model", 
   const gatewayRequests = [];
   const gateway = await mockServer(async (request, response) => {
     gatewayRequests.push(await bodyJson(request));
-    json(response, 200, { route: "external" });
+    json(response, 200, {
+      id: "resp-redirect",
+      object: "response",
+      output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "ok" }] }],
+      usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+    });
   });
   const routerPort = await openPort();
   const testRoot = mkdtempSync(path.join(os.tmpdir(), "codex-router-native-redirect-"));
@@ -4568,7 +4649,7 @@ test("router redirects native background turns to the configured routed model", 
   mkdirSync(stateDir, { recursive: true });
   writeFileSync(
     path.join(stateDir, "native-redirect.json"),
-    `${JSON.stringify({ version: 1, model: "kimi-oauth/k3" })}\n`,
+    `${JSON.stringify({ version: 1, model: "deepseek/deepseek-v4-pro" })}\n`,
   );
   const router = run("router.mjs", {
     CODEX_ROUTER_PORT: String(routerPort),
@@ -4590,7 +4671,7 @@ test("router redirects native background turns to the configured routed model", 
       body: JSON.stringify({ model: "gpt-5.6-luna", input: "background turn" }),
     });
     assert.equal(response.status, 200);
-    assert.equal(gatewayRequests.at(-1).model, "kimi-oauth-k3");
+    assert.equal(gatewayRequests.at(-1).model, "deepseek-v4-pro");
   } finally {
     await stopChild(router);
     await closeServer(gateway.server);
@@ -4686,7 +4767,7 @@ test("routed compaction records usage and logs on success and on failure", async
       id: "resp-summary",
       object: "response",
       output: [
-        { type: "message", content: [{ type: "output_text", text: "compact summary" }] },
+        { type: "message", role: "assistant", content: [{ type: "output_text", text: "compact summary" }] },
       ],
       usage: { input_tokens: 1234, output_tokens: 56, total_tokens: 1290 },
     });
@@ -4798,8 +4879,9 @@ test("routed compaction resolves subagent handoffs before summarizing", async ()
       id: "resp-summary",
       object: "response",
       output: [
-        { type: "message", content: [{ type: "output_text", text: "compact summary" }] },
+        { type: "message", role: "assistant", content: [{ type: "output_text", text: "compact summary" }] },
       ],
+      usage: { input_tokens: 1, output_tokens: 2, total_tokens: 3 },
     });
   });
   const routerPort = await openPort();
@@ -4820,7 +4902,7 @@ test("routed compaction resolves subagent handoffs before summarizing", async ()
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        model: "kimi-oauth/k3",
+        model: "deepseek/deepseek-v4-pro",
         input: [
           {
             type: "agent_message",
@@ -4895,10 +4977,7 @@ test("router substitutes a prompt-token estimate a provider reported as zero", a
       },
     };
     response.writeHead(200, { "Content-Type": "text/event-stream" });
-    response.end(
-      `event: response.output_text.delta\ndata: ${JSON.stringify({ type: "response.output_text.delta", delta: "ok" })}\n\n` +
-        `event: response.completed\ndata: ${JSON.stringify(completed)}\n\ndata: [DONE]\n\n`,
-    );
+    response.end(responsesTextStream({ inputTokens: reportedInputTokens, outputTokens: 12 }));
   });
   const stateDir = mkdtempSync(path.join(os.tmpdir(), "routing-zero-input-"));
   const routerPort = await openPort();
@@ -5025,10 +5104,7 @@ test("reasoning ciphertext is not billed to the prompt-token estimate", async ()
       },
     };
     response.writeHead(200, { "Content-Type": "text/event-stream" });
-    response.end(
-      `event: response.output_text.delta\ndata: ${JSON.stringify({ type: "response.output_text.delta", delta: "ok" })}\n\n` +
-        `event: response.completed\ndata: ${JSON.stringify(completed)}\n\ndata: [DONE]\n\n`,
-    );
+    response.end(responsesTextStream({ inputTokens: 0, outputTokens: 12 }));
   });
   const stateDir = mkdtempSync(path.join(os.tmpdir(), "routing-ciphertext-"));
   const routerPort = await openPort();
@@ -5125,10 +5201,7 @@ test("the prompt-token estimate can be switched off", async () => {
       },
     };
     response.writeHead(200, { "Content-Type": "text/event-stream" });
-    response.end(
-      `event: response.output_text.delta\ndata: ${JSON.stringify({ type: "response.output_text.delta", delta: "ok" })}\n\n` +
-        `event: response.completed\ndata: ${JSON.stringify(completed)}\n\ndata: [DONE]\n\n`,
-    );
+    response.end(responsesTextStream({ inputTokens: 0, outputTokens: 12 }));
   });
   const stateDir = mkdtempSync(path.join(os.tmpdir(), "routing-zero-input-off-"));
   const routerPort = await openPort();
@@ -5173,11 +5246,15 @@ test("the prompt-token estimate can be switched off", async () => {
   }
 });
 
-test("router ages consumed large tool results but preserves the newest result frontier", async () => {
+test("router ages consumed large tool results through the Node direct pipeline", async () => {
   const gatewayBodies = [];
   const gateway = await mockServer(async (request, response) => {
     gatewayBodies.push(await bodyJson(request));
-    json(response, 200, { output: [{ type: "message", role: "assistant", content: "ok" }] });
+    json(response, 200, {
+      id: "resp-aging",
+      output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "ok" }] }],
+      usage: { input_tokens: 4, output_tokens: 1, total_tokens: 5 },
+    });
   });
   const stateDir = mkdtempSync(path.join(os.tmpdir(), "routing-tool-result-aging-"));
   // Aging is opt-in, so this test states the setting it is exercising rather
@@ -5219,7 +5296,8 @@ test("router ages consumed large tool results but preserves the newest result fr
       },
       body: JSON.stringify({ model: "deepseek/deepseek-v4-pro", stream: false, input }),
     });
-    assert.equal(response.status, 200, await response.text());
+    const responseBody = await response.text();
+    assert.equal(response.status, 200, `${responseBody}\n${router.testErrors()}`);
     const forwarded = gatewayBodies[0].input;
     assert.match(forwarded[1].output, /Older tool result compacted by Codex Router/);
     assert.match(forwarded[1].output, /old-head/);
@@ -5810,7 +5888,7 @@ test("a subagent effort reaches child turns and leaves parent turns alone", asyn
       return;
     }
     const body = await bodyJson(request);
-    seen.push({ model: body.model, effort: body.reasoning_effort });
+    seen.push({ model: body.model, effort: body.reasoning?.effort });
     json(response, 200, {
       id: "resp_effort",
       output: [{ type: "message", content: [{ type: "output_text", text: "ok" }] }],
@@ -5833,7 +5911,7 @@ test("a subagent effort reaches child turns and leaves parent turns alone", asyn
     fetch(`${routerBase(routerPort)}/responses`, {
       method: "POST",
       headers: { "Content-Type": "application/json", ...headers },
-      body: JSON.stringify({ model, input: "go", reasoning_effort: "low" }),
+      body: JSON.stringify({ model, input: "go", reasoning: { effort: "low" } }),
     });
 
   try {
@@ -5951,7 +6029,7 @@ test("a subagent effort overrides the effort Codex nested in the reasoning objec
       "auto",
       "the override discarded the rest of the reasoning object",
     );
-    assert.equal(seen[0].effort, "max", "the flat field lost the override");
+    assert.equal(seen[0].effort, undefined, "the Responses route must not grow a legacy flat effort field");
     assert.equal(
       seen[1].reasoning?.effort,
       "low",

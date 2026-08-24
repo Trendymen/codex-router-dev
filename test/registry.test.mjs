@@ -13,7 +13,6 @@ process.env.MODEL_ROUTER_USER_MODELS = path.join(
   "user-models.json",
 );
 
-const { renderLiteLlmConfig } = await import("../src/litellm-config.mjs");
 const {
   API_MODELS,
   anonymousModelAllowed,
@@ -26,6 +25,7 @@ const {
   readRegistryDocument,
   resolveProviderBaseUrl,
 } = await import("../src/model-registry.mjs");
+const { nodeRoutableModels } = await import("../src/model-contract.mjs");
 
 test("provider registry exposes configured API and OAuth model families", () => {
   // Order follows the deterministic sorted walk of the config/ vendor tree;
@@ -640,41 +640,18 @@ test("Ollama Cloud models advertise only levels the forwarder maps to Ollama", (
   }
 });
 
-// Every model_name has exactly one deployment, so a cooldown can only hide a
-// failure -- it turns a 401 into LiteLLM's own 429. See #179.
-test("the gateway config disables deployment cooldowns", () => {
-  const rendered = renderLiteLlmConfig();
-  assert.match(rendered, /router_settings:\n\s+disable_cooldowns: true/);
-  const names = [...rendered.matchAll(/^  - model_name: (.+)$/gm)].map((m) => m[1]);
-  assert.equal(new Set(names).size, names.length, "one deployment per model_name");
-});
-
-test("LiteLLM configuration is generated from every registry route", () => {
-  const rendered = renderLiteLlmConfig();
-  for (const model of MODELS) {
-    assert.match(rendered, new RegExp(`model_name: "${model.gatewayModel}"`));
+test("Node route publication is derived from the registered transport contract", () => {
+  const routed = nodeRoutableModels({ enabledProviders: new Set(PROVIDERS.keys()), hiddenModels: new Set() });
+  assert.ok(routed.length > 0);
+  for (const model of routed) {
+    assert.ok(["native-openai", "openai-responses", "anthropic-messages"].includes(model.effectiveTransport));
+    assert.equal(model.routable, true);
   }
-  assert.match(rendered, /os\.environ\/CODEX_ROUTER_API_FORWARD_BASE_URL/);
-  assert.match(rendered, /os\.environ\/CODEX_ROUTER_ANTHROPIC_FORWARD_BASE_URL/);
-  assert.match(rendered, /os\.environ\/GROK_OAUTH_FORWARD_BASE_URL/);
-  assert.match(rendered, /os\.environ\/CODEX_ROUTER_INTERNAL_KEY/);
-  assert.match(rendered, /model: "anthropic\/anthropic-api-claude-opus-4-8"/);
-  assert.match(
-    rendered,
-    /model: "openai\/responses\/opencode-go-responses-gpt-5-6-luna"/,
-  );
   assert.equal(
     MODELS.some((model) => model.provider === "github-copilot"),
     false,
     "Copilot stays catalog-only until account-visible models are curated",
   );
-  assert.match(rendered, /model: "anthropic\/opencode-go-messages-minimax-m3"/);
-  const lunaBlock = rendered.slice(
-    rendered.indexOf('model_name: "opencode-go-responses-gpt-5-6-luna"'),
-    rendered.indexOf('model_name:', rendered.indexOf('model_name: "opencode-go-responses-gpt-5-6-luna"') + 1),
-  );
-  assert.doesNotMatch(lunaBlock, /use_chat_completions_api/);
-  assert.doesNotMatch(rendered, /ANTHROPIC_API_KEY|CLINE_API_KEY|DEEPSEEK_API_KEY|KIMI_API_KEY/);
 });
 
 test("curated upgrade prompts point at listed generational successors", () => {
@@ -1085,12 +1062,9 @@ test("the Copilot auth profile cannot be attached to an OAuth provider", async (
 // routed through it gets Ollama's maximum context -- a ~15 GB KV cache for ~2 GB
 // of weights, which overflows a 16 GB machine and drops inference onto the CPU.
 // Local models therefore route with Ollama's own protocol, which honours it.
-test("local models route with Ollama's native protocol and a bounded context", () => {
-  const rendered = renderLiteLlmConfig();
-  const openAiRoutes = rendered.match(/model: "openai\/local-[^"]+"/g);
-  assert.equal(openAiRoutes, null, "a local model must not use the OpenAI-compatible surface");
-  // Every non-local model keeps the forwarder path untouched.
-  assert.match(rendered, /model: "openai\/deepseek-v4-pro"/);
+test("local models remain outside the shipped Node chat route", () => {
+  const routed = nodeRoutableModels({ enabledProviders: new Set(["local"]), hiddenModels: new Set() });
+  assert.equal(routed.some((model) => model.provider === "local"), false);
 });
 
 test("a keyless provider's baseUrl override must stay on loopback", () => {

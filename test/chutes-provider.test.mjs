@@ -132,7 +132,7 @@ test("doctor recognizes a persistent Chutes key and warns when no models are cur
   }
 });
 
-test("Chutes public-catalog fixtures drive discovery, deterministic curation, and a LiteLLM route", () => {
+test("Chutes public-catalog fixtures remain discoverable but are not shipped Node routes", () => {
   const testRoot = mkdtempSync(path.join(os.tmpdir(), "chutes-curation-test-"));
   try {
     const fixture = path.join(testRoot, "models.json");
@@ -188,26 +188,14 @@ test("Chutes public-catalog fixtures drive discovery, deterministic curation, an
     );
 
     const route = runNode([
+      "--input-type=module",
       "-e",
-      "const { MODELS } = await import('./src/model-registry.mjs');" +
-        "const { renderLiteLlmConfig } = await import('./src/litellm-config.mjs');" +
-        "const model = MODELS.find((entry) => entry.provider === 'chutes');" +
-        "process.stdout.write(JSON.stringify({ model, config: renderLiteLlmConfig() }));",
+      "const { nodeRoutableModels } = await import('./src/model-contract.mjs');" +
+        "const models = nodeRoutableModels({ enabledProviders: new Set(['chutes']), hiddenModels: new Set() });" +
+        "process.stdout.write(JSON.stringify(models.map(({ provider, slug }) => ({ provider, slug }))));",
     ], env);
     assert.equal(route.status, 0, route.stderr);
-    const rendered = JSON.parse(route.stdout);
-    assert.equal(rendered.model.gatewayModel, "chutes-moonshotai-kimi-k3-tee");
-    assert.equal(rendered.model.requestProfile, undefined);
-    const blockStart = rendered.config.indexOf(
-      'model_name: "chutes-moonshotai-kimi-k3-tee"',
-    );
-    assert.ok(blockStart >= 0);
-    const nextBlock = rendered.config.indexOf("model_name:", blockStart + 1);
-    const block = rendered.config.slice(blockStart, nextBlock === -1 ? undefined : nextBlock);
-    assert.match(block, /model: "openai\/chutes-moonshotai-kimi-k3-tee"/);
-    assert.match(block, /api_base: "os\.environ\/CODEX_ROUTER_API_FORWARD_BASE_URL"/);
-    assert.match(block, /use_chat_completions_api: true/);
-    assert.doesNotMatch(block, /CHUTES_API_KEY/);
+    assert.deepEqual(JSON.parse(route.stdout), []);
   } finally {
     rmSync(testRoot, { recursive: true, force: true });
   }

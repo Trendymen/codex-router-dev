@@ -14,6 +14,9 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { callerBaseUrl } from "../src/caller-auth.mjs";
+import { MODEL_BY_SLUG } from "../src/model-registry.mjs";
+import { resolveNodeModel } from "../src/model-contract.mjs";
+import { encodedToolName } from "../src/tool-dialect.mjs";
 import { openPort } from "./port-pool.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -33,7 +36,9 @@ const EMPTY_SSE = [
   'data: {"type":"response.completed","sequence_number":2,"response":{"id":"r-empty","output":[]}}',
   "",
   'event: response.done',
-  'data: {"type":"response.done","sequence_number":3,"response":{"id":"r-empty"}}',
+   'data: {"type":"response.done","sequence_number":3,"response":{"id":"r-empty"}}',
+   "",
+   "data: [DONE]",
   "",
 ].join("\n");
 
@@ -44,14 +49,22 @@ const REASONING_EMPTY_SSE = [
   'event: response.created',
   'data: {"type":"response.created","sequence_number":0,"response":{"id":"r-empty"}}',
   "",
+  'event: response.output_item.added',
+  'data: {"type":"response.output_item.added","sequence_number":1,"output_index":0,"item":{"id":"rs-empty","type":"reasoning","status":"in_progress","summary":[],"content":[]}}',
+  "",
   'event: response.reasoning_text.delta',
-  'data: {"type":"response.reasoning_text.delta","sequence_number":1,"delta":"thinking..."}',
+  'data: {"type":"response.reasoning_text.delta","sequence_number":2,"output_index":0,"item_id":"rs-empty","content_index":0,"delta":"thinking..."}',
+  "",
+  'event: response.output_item.done',
+  'data: {"type":"response.output_item.done","sequence_number":3,"output_index":0,"item":{"id":"rs-empty","type":"reasoning","status":"completed","summary":[],"content":[{"type":"reasoning_text","text":"thinking..."}]}}',
   "",
   'event: response.completed',
-  'data: {"type":"response.completed","sequence_number":2,"response":{"id":"r-empty","output":[]}}',
+  'data: {"type":"response.completed","sequence_number":4,"response":{"id":"r-empty","output":[{"id":"rs-empty","type":"reasoning","status":"completed","summary":[],"content":[{"type":"reasoning_text","text":"thinking..."}]}]}}',
   "",
   'event: response.done',
-  'data: {"type":"response.done","sequence_number":3,"response":{"id":"r-empty"}}',
+   'data: {"type":"response.done","sequence_number":5,"response":{"id":"r-empty"}}',
+   "",
+   "data: [DONE]",
   "",
 ].join("\n");
 
@@ -69,7 +82,9 @@ const CONTENT_SSE = [
   'data: {"type":"response.completed","sequence_number":3,"response":{"id":"r-content","output":[]}}',
   "",
   'event: response.done',
-  'data: {"type":"response.done","sequence_number":4,"response":{"id":"r-content"}}',
+   'data: {"type":"response.done","sequence_number":4,"response":{"id":"r-content"}}',
+   "",
+   "data: [DONE]",
   "",
 ].join("\n");
 
@@ -95,7 +110,9 @@ const BUDGET_RELEASE_EMPTY_SSE = [
   'data: {"type":"response.completed","response":{"id":"r-budget","output":[]}}',
   "",
   "event: response.done",
-  'data: {"type":"response.done","response":{"id":"r-budget"}}',
+   'data: {"type":"response.done","response":{"id":"r-budget"}}',
+   "",
+   "data: [DONE]",
   "",
 ].join("\n");
 
@@ -128,7 +145,9 @@ const CUSTOM_TOOL_CALL_SSE = [
   })}`,
   "",
   "event: response.done",
-  'data: {"type":"response.done","sequence_number":4,"response":{"id":"r-custom-tool"}}',
+   'data: {"type":"response.done","sequence_number":4,"response":{"id":"r-custom-tool"}}',
+   "",
+   "data: [DONE]",
   "",
 ].join("\n");
 
@@ -146,7 +165,9 @@ const REFUSAL_EVENT_SSE = [
   'data: {"type":"response.completed","sequence_number":3,"response":{"id":"r-refusal-event","output":[]}}',
   "",
   "event: response.done",
-  'data: {"type":"response.done","sequence_number":4,"response":{"id":"r-refusal-event"}}',
+   'data: {"type":"response.done","sequence_number":4,"response":{"id":"r-refusal-event"}}',
+   "",
+   "data: [DONE]",
   "",
 ].join("\n");
 
@@ -170,33 +191,35 @@ const REFUSAL_OUTPUT_SSE = [
   })}`,
   "",
   "event: response.done",
-  'data: {"type":"response.done","sequence_number":2,"response":{"id":"r-refusal-output"}}',
+   'data: {"type":"response.done","sequence_number":2,"response":{"id":"r-refusal-output"}}',
+   "",
+   "data: [DONE]",
   "",
 ].join("\n");
 
-const CHAT_REFUSAL_SSE = [
-  `data: ${JSON.stringify({
-    id: "chat-refusal",
-    choices: [{ index: 0, delta: { refusal: "I cannot help with that." } }],
-  })}`,
-  "",
-  "data: [DONE]",
-  "",
-].join("\n");
+// Responses-native Node routes do not expose the retired chat-completions
+// transport; retain the refusal coverage with the equivalent Responses event.
+const CHAT_REFUSAL_SSE = REFUSAL_EVENT_SSE;
 
+const encodedPrefixSpawnAgent = encodedToolName("namespace", "collaboration__spawn_agent");
 const HEADERLESS_PREFIX_TOOL_SSE = Buffer.from(
   [
     "\uFEFF: keepalive\r\n\r\n",
     "\n",
     "event: response.created\n",
     'data: {"type":"response.created","sequence_number":0,"response":{"id":"r-prefix-tool"}}\n\n',
+    "event: response.output_item.added\n",
+    `data: ${JSON.stringify({ type: "response.output_item.added", sequence_number: 1, item: { id: "fc_prefix_tool", type: "function_call", name: encodedPrefixSpawnAgent, call_id: "call_prefix_tool", arguments: "" } })}\n\n`,
+    "event: response.function_call_arguments.done\n",
+    'data: {"type":"response.function_call_arguments.done","sequence_number":2,"item_id":"fc_prefix_tool","arguments":"{}"}\n\n',
     "event: response.output_item.done\n",
     `data: ${JSON.stringify({
       type: "response.output_item.done",
-      sequence_number: 1,
+      sequence_number: 3,
       item: {
+        id: "fc_prefix_tool",
         type: "function_call",
-        name: "collaboration__spawn_agent",
+        name: encodedPrefixSpawnAgent,
         call_id: "call_prefix_tool",
         arguments: "{}",
       },
@@ -204,10 +227,10 @@ const HEADERLESS_PREFIX_TOOL_SSE = Buffer.from(
     "event: response.completed\n",
     `data: ${JSON.stringify({
       type: "response.completed",
-      sequence_number: 2,
+      sequence_number: 4,
       response: {
         id: "r-prefix-tool",
-        output: [],
+        output: [{ id: "fc_prefix_tool", type: "function_call", name: encodedPrefixSpawnAgent, call_id: "call_prefix_tool", arguments: "{}" }],
         usage: {
           input_tokens: 19,
           output_tokens: 2,
@@ -283,6 +306,17 @@ async function mockServer(handler) {
 
 function run(env) {
   const stateDir = mkdtempSync(path.join(os.tmpdir(), "empty-completion-router-state-"));
+  const route = resolveNodeModel(MODEL_BY_SLUG.get("deepseek/deepseek-v4-pro"), { enabled: true });
+  const routeFields = [
+    "slug", "provider", "upstreamModel", "effectiveTransport", "toolDialect",
+    "requestProfile", "reasoningDisplayMode", "declaredFinalReasoningShape",
+    "effectiveFinalReasoningShape", "rolloutState", "purpose", "routable", "listed", "visible",
+  ];
+  writeFileSync(
+    path.join(stateDir, "node-routes.json"),
+    `${JSON.stringify({ version: 1, routes: [Object.fromEntries(routeFields.map((field) => [field, route[field]]))] })}\n`,
+    { mode: 0o600 },
+  );
   const child = spawn(process.execPath, [path.join(root, "src", "router.mjs")], {
     cwd: root,
     env: {
@@ -293,10 +327,6 @@ function run(env) {
       KIMI_INTERNAL_KEY: INTERNAL_KEY,
       CODEX_ROUTER_SHOW_ALL_MODELS: "1",
       CODEX_ROUTER_QUIET: "1",
-      // Empty-completion repair belongs to the retained gateway path. Direct
-      // default/no-snapshot behavior is covered by the Task 6 whole-router
-      // fixture, so select the explicit rollback path for this legacy suite.
-      CODEX_ROUTER_DIRECT_DISPATCH: "0",
       ...env,
     },
     stdio: ["ignore", "ignore", "pipe"],
@@ -414,17 +444,32 @@ function gateway(handler) {
       response.end(payload);
       return;
     }
+    const originalWrite = response.write.bind(response);
+    const originalEnd = response.end.bind(response);
+    const chunks = [];
+    response.write = (chunk) => {
+      if (chunk) chunks.push(Buffer.from(chunk));
+      return true;
+    };
+    response.end = (chunk) => {
+      if (chunk) chunks.push(Buffer.from(chunk));
+      let body = Buffer.concat(chunks);
+      if (body.toString("utf8").includes("data: [DONE]") && !body.toString("utf8").endsWith("\n\n")) {
+        body = Buffer.concat([body, Buffer.from("\n")]);
+      }
+      if (body.length) originalWrite(body);
+      originalEnd();
+    };
     handler(request, response);
   });
 }
 
-function routerEnv(gatewayPort, routerPort) {
+function routerEnv(providerPort, routerPort) {
   return {
     CODEX_ROUTER_PORT: String(routerPort),
-    CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${gatewayPort}/v1`,
-    CODEX_ROUTER_OAUTH_HEALTH_URL: `http://127.0.0.1:${gatewayPort}/health`,
-    CODEX_ROUTER_API_HEALTH_URL: `http://127.0.0.1:${gatewayPort}/health`,
-    CODEX_ROUTER_GATEWAY_HEALTH_URL: `http://127.0.0.1:${gatewayPort}/health`,
+    CODEX_ROUTER_TEST_NODE_ROUTE_FIXTURE: "1",
+    DEEPSEEK_API_BASE_URL: `http://127.0.0.1:${providerPort}/v1`,
+    DEEPSEEK_API_KEY: INTERNAL_KEY,
   };
 }
 
@@ -456,7 +501,7 @@ test("an empty completion is retried once and the retry's content reaches the cl
 
     const result = await readRouted(routerPort, TURN_BODY);
 
-    assert.equal(result.status, 200);
+    assert.equal(result.status, 200, `${result.body}\n${router.testErrors()}`);
     assert.equal(result.complete, true);
     // The retry's content reached the client...
     assert.match(result.body, /Recovered/);
@@ -465,15 +510,15 @@ test("an empty completion is retried once and the retry's content reaches the cl
     assert.equal(result.headers["x-upstream-attempt"], "retry");
     // ...and exactly one completed event did: the first attempt's terminal
     // events were suppressed.
-    assert.equal((result.body.match(/event: response\.completed/g) || []).length, 1);
-    assert.equal((result.body.match(/event: response\.done/g) || []).length, 1);
+    assert.equal((result.body.match(/data: \{"type":"response\.completed"/g) || []).length, 1);
+    assert.equal((result.body.match(/data: \[DONE\]/g) || []).length, 1);
     // ...and so did exactly one prologue: the retry's duplicate
     // `response.created`, with its new id and restarted sequence numbers, must
     // not appear inside the response the client already opened.
     assert.equal((result.body.match(/event: response\.created/g) || []).length, 1);
     assert.deepEqual(
       [...result.body.matchAll(/"sequence_number":(\d+)/g)].map((match) => Number(match[1])),
-      [0, 1, 2, 3, 4],
+      [0, 1, 2, 3],
     );
     assert.equal(posts, 2, "the empty first attempt must be retried");
 
@@ -511,9 +556,9 @@ test("a reasoning turn that ends empty is relayed and stated, never retried", as
 
     const result = await readRouted(routerPort, TURN_BODY);
 
-    assert.equal(result.status, 200);
+    assert.equal(result.status, 200, `${result.body}\n${router.testErrors()}`);
     // The reasoning the user watched arrive is still theirs...
-    assert.match(result.body, /thinking/);
+    assert.match(result.body, /rs-empty/);
     assert.match(result.body, /r-empty/);
     // ...followed by a stated failure rather than a silent stop.
     assert.match(result.body, /event: error/);
@@ -627,7 +672,7 @@ test("a retried turn meters the tokens of both attempts", async () => {
     await waitFor(`${callerBaseUrl(routerPort, CALLER_KEY)}/models`, router);
 
     const result = await readRouted(routerPort, TURN_BODY);
-    assert.equal(result.status, 200);
+    assert.equal(result.status, 200, `${result.body}\n${router.testErrors()}`);
     assert.match(result.body, /Recovered/);
 
     const [event] = await waitForUsageEvents(router.stateDir, 1, router);
@@ -673,21 +718,25 @@ test("a retry that crosses the guard byte budget records the release", async () 
 
 test("a retry tool call uses the normal namespace response transform", async () => {
   let posts = 0;
+  const encodedSpawnAgent = encodedToolName("namespace", "collaboration__spawn_agent");
   const toolCall = [
     "event: response.created",
     'data: {"type":"response.created","sequence_number":0,"response":{"id":"r-tool"}}',
     "",
     "event: response.output_item.added",
-    'data: {"type":"response.output_item.added","sequence_number":1,"item":{"type":"function_call","name":"collaboration__spawn_agent","call_id":"call_1"}}',
+    `data: ${JSON.stringify({ type: "response.output_item.added", sequence_number: 1, item: { id: "fc_1", type: "function_call", name: encodedSpawnAgent, call_id: "call_1", arguments: "" } })}`,
+    "",
+    "event: response.function_call_arguments.done",
+    `data: ${JSON.stringify({ type: "response.function_call_arguments.done", sequence_number: 2, item_id: "fc_1", arguments: "{}" })}`,
     "",
     "event: response.output_item.done",
-    'data: {"type":"response.output_item.done","sequence_number":2,"item":{"type":"function_call","name":"collaboration__spawn_agent","call_id":"call_1","arguments":"{}"}}',
+    `data: ${JSON.stringify({ type: "response.output_item.done", sequence_number: 3, item: { id: "fc_1", type: "function_call", name: encodedSpawnAgent, call_id: "call_1", arguments: "{}" } })}`,
     "",
     "event: response.completed",
-    'data: {"type":"response.completed","sequence_number":3,"response":{"id":"r-tool","output":[]}}',
+    `data: ${JSON.stringify({ type: "response.completed", sequence_number: 4, response: { id: "r-tool", output: [{ id: "fc_1", type: "function_call", name: encodedSpawnAgent, call_id: "call_1", arguments: "{}" }] } })}`,
     "",
     "event: response.done",
-    'data: {"type":"response.done","sequence_number":4,"response":{"id":"r-tool"}}',
+    'data: {"type":"response.done","sequence_number":5,"response":{"id":"r-tool"}}',
     "",
   ].join("\n");
   const gw = await gateway((_request, response) => {
@@ -711,7 +760,7 @@ test("a retry tool call uses the normal namespace response transform", async () 
       ],
     });
 
-    assert.equal(result.status, 200);
+    assert.equal(result.status, 200, `${result.body}\n${router.testErrors()}`);
     assert.match(result.body, /"name":"spawn_agent"/);
     assert.match(result.body, /"namespace":"collaboration"/);
     assert.doesNotMatch(result.body, /collaboration__spawn_agent|r-empty|thinking/);
@@ -954,7 +1003,7 @@ test("a headerless first attempt preserves guard, usage, and namespace transform
         },
       ],
     });
-    assert.equal(result.status, 200);
+    assert.equal(result.status, 200, `${result.body}\n${router.testErrors()}`);
     assert.match(result.body, /"name":"spawn_agent"/);
     assert.match(result.body, /"namespace":"collaboration"/);
     assert.doesNotMatch(result.body, /collaboration__spawn_agent/);
@@ -974,6 +1023,8 @@ test("a headerless first attempt preserves guard, usage, and namespace transform
 
 test("a client cancel during the retry meters and logs status zero", async () => {
   let posts = 0;
+  let retryStartedResolve;
+  const retryStarted = new Promise((resolve) => { retryStartedResolve = resolve; });
   const gw = await gateway((_request, response) => {
     posts += 1;
     response.writeHead(200, { "Content-Type": "text/event-stream" });
@@ -989,38 +1040,37 @@ test("a client cancel during the retry meters and logs status zero", async () =>
         "event: response.output_text.delta",
         'data: {"type":"response.output_text.delta","sequence_number":1,"delta":"started"}',
         "",
+        "event: response.output_text.done",
+        'data: {"type":"response.output_text.done","sequence_number":2,"text":"started"}',
         "",
-      ].join("\n"),
+        "",
+      ].join("\n") + "\n",
     );
+    retryStartedResolve();
   });
   const routerPort = await openPort();
   const router = run(routerEnv(gw.port, routerPort));
 
   try {
     await waitFor(`${callerBaseUrl(routerPort, CALLER_KEY)}/models`, router);
-    await new Promise((resolve) => {
-      const base = new URL(`${callerBaseUrl(routerPort, CALLER_KEY)}/responses`);
-      const request = http.request(
-        {
-          host: "127.0.0.1",
-          port: routerPort,
-          path: base.pathname,
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: "Bearer codex-caller-auth",
-          },
+    const base = new URL(`${callerBaseUrl(routerPort, CALLER_KEY)}/responses`);
+    const request = http.request(
+      {
+        host: "127.0.0.1",
+        port: routerPort,
+        path: base.pathname,
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: "Bearer codex-caller-auth",
         },
-        (response) => {
-          response.once("data", () => {
-            request.destroy();
-            resolve();
-          });
-        },
-      );
-      request.once("error", resolve);
-      request.end(JSON.stringify(TURN_BODY));
-    });
+      },
+      () => {},
+    );
+    request.once("error", () => {});
+    request.end(JSON.stringify(TURN_BODY));
+    await retryStarted;
+    request.destroy();
 
     const [event] = await waitForUsageEvents(router.stateDir, 1, router);
     assert.equal(posts, 2);
@@ -1176,9 +1226,9 @@ test("the guard can be turned off and the turn relays exactly as before", async 
     const result = await readRouted(routerPort, TURN_BODY);
 
     assert.equal(result.status, 200);
-    assert.match(result.body, /event: response\.completed/);
-    assert.match(result.body, /event: response\.done/);
-    assert.doesNotMatch(result.body, /event: error/);
+    assert.match(result.body, /data: \{"type":"response\.completed"/);
+    assert.match(result.body, /data: \[DONE\]/);
+    assert.doesNotMatch(result.body, /event: error|data: \{"type":"error"/);
     assert.equal(posts, 1, "the guard is off, so nothing is retried");
 
     const [event] = await waitForUsageEvents(router.stateDir, 1, router);

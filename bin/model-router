@@ -14,27 +14,20 @@ Usage: model-router TARGET COMMAND [arguments]
 
 Targets:
   codex   the Codex CLI and desktop app
-  dsh     DeepSeek Harness (its settings document, hot-reloaded)
-  gemini  Gemini CLI (its ~/.gemini/.env, read at startup)
 
-Every target shares one router: one service, one set of provider credentials,
-one provider selection. The target chooses which client's configuration a
-command writes, not which router it talks to.
+The shipped target is Codex CLI/Desktop on macOS. One installation owns one
+router service, one provider selection, and one credential plane.
 
 Commands:
   setup, install, doctor, status, provider-key, providers, enable, disable,
   multi-agent, media, panel, protocol-proof, uninstall, smoke-test, start, stop, update,
-  rollback, shim, subagent-preset (dsh only)
+  rollback, shim
 
 Examples:
   ./bin/model-router codex doctor
   ./bin/model-router codex status
   ./bin/model-router codex panel
   ./bin/model-router codex shim install
-  ./bin/model-router dsh enable
-  ./bin/model-router dsh status
-  ./bin/model-router gemini enable
-  ./bin/model-router gemini status
 EOF
 }
 
@@ -47,7 +40,7 @@ if [ "$#" -eq 1 ] && [ "$1" = "--version" ]; then
   exit 0
 fi
 
-if [ "$#" -eq 2 ] && { [ "$1" = "codex" ] || [ "$1" = "dsh" ] || [ "$1" = "gemini" ]; } && [ "$2" = "--version" ]; then
+if [ "$#" -eq 2 ] && [ "$1" = "codex" ] && [ "$2" = "--version" ]; then
   version
   exit 0
 fi
@@ -62,12 +55,12 @@ command=$2
 shift 2
 
 case "$target" in
-  codex|dsh|gemini) ;;
+  codex) ;;
   *) echo "Unknown target: $target" >&2; usage >&2; exit 2 ;;
 esac
 
 case "$command" in
-  setup|install|doctor|status|provider-key|providers|enable|disable|multi-agent|media|panel|protocol-proof|uninstall|smoke-test|start|stop|update|rollback|subagent-preset|shim) ;;
+  setup|install|doctor|status|provider-key|providers|enable|disable|multi-agent|media|panel|protocol-proof|uninstall|smoke-test|start|stop|update|rollback|shim) ;;
   *) echo "Unknown command: $command" >&2; usage >&2; exit 2 ;;
 esac
 

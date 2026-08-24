@@ -20,8 +20,8 @@ MODEL_ROUTER_ALLOW_FOREIGN_STATE=1
 export MODEL_ROUTER_ALLOW_FOREIGN_STATE
 
 case "$target" in
-  codex|dsh|gemini) ;;
-  *) echo "MODEL_ROUTER_TARGET must be codex, dsh, or gemini." >&2; exit 2 ;;
+  codex) ;;
+  *) echo "MODEL_ROUTER_TARGET must be codex." >&2; exit 2 ;;
 esac
 
 for argument in "$@"; do
@@ -49,10 +49,6 @@ fi
 # The native catalog is the ChatGPT-plan model list Codex ships and adopts.
 # The harness has no equivalent and no ChatGPT session, so there is nothing for
 # either flag to act on there.
-if [ "$target" = dsh ] && [ "$adopt_native_catalog" = true ]; then
-  echo "--adopt-native-catalog applies to the Codex integration only." >&2
-  exit 2
-fi
 if [ "${CODEX_ROUTER_PACKAGE_MANAGER:-}" = homebrew ] && [ "$force_deps" = true ]; then
   echo "--force-deps cannot rebuild Homebrew-managed dependencies; run brew reinstall codex-router instead." >&2
   exit 2
@@ -104,7 +100,7 @@ install_step() {
   # A package-manager checkout already contains the dependency tree assembled
   # by that package manager. Re-running npm/pip here would mutate its managed
   # prefix and can fail when packages intentionally have no pip RECORD (as
-  # Homebrew-installed Python resources do). The explicit --force-deps case is
+  # Homebrew-managed resources do). The explicit --force-deps case is
   # rejected above with its package-manager repair command.
   if [ "${CODEX_ROUTER_PACKAGE_MANAGER:-}" = homebrew ]; then
     echo managed
@@ -124,66 +120,12 @@ case "$(install_step node-deps)" in
     ;;
 esac
 
-case "$(install_step python-deps)" in
-  managed) echo "Homebrew manages LiteLLM; skipping Python dependency installation." ;;
-  skip) echo "LiteLLM already matches the pinned versions; skipping the Python install." ;;
-  *)
-    if command -v uv >/dev/null 2>&1; then
-      if [ ! -x .venv/bin/python ]; then
-        uv venv --python 3.12 .venv
-      elif ! node src/install-plan.mjs venv-home-ok >/dev/null 2>&1; then
-        # A venv whose interpreter home was cleared (macOS wipes /private/tmp,
-        # and installers that recorded a temporary Python as the venv home end
-        # up with a dangling interpreter) must be recreated, not pip-installed
-        # into: the launcher may still exist while pyvenv.cfg points at a
-        # vanished home.
-        echo "The virtual environment's interpreter home is missing; recreating the venv."
-        uv venv --clear --python 3.12 .venv
-      fi
-      # requirements/python.txt is the hash-verified transitive closure of the
-      # pins in src/install-plan.mjs. Hash checking makes every wheel and sdist
-      # in that tree verify against the lock before it is executed; without it
-      # only the two top-level packages were pinned and the rest was whatever
-      # PyPI resolved that day. Regenerate the lock with bin/lock-python, never
-      # by hand.
-      uv pip install --python .venv/bin/python --require-hashes -r requirements/python.txt
-      node src/install-plan.mjs record python-deps
-    else
-      if ! command -v python3 >/dev/null 2>&1; then
-        echo "Python 3.10+ or uv is required to install LiteLLM." >&2
-        exit 1
-      fi
-      python3 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else "Python 3.10 or newer is required.")'
-      # Same clearing logic as the uv branch: a venv with a vanished interpreter
-      # home must be recreated from scratch instead of installed over.
-      if node src/install-plan.mjs venv-home-ok >/dev/null 2>&1; then
-        python3 -m venv .venv
-      else
-        echo "The virtual environment's interpreter home is missing; recreating the venv."
-        python3 -m venv --clear .venv
-      fi
-      .venv/bin/python -m pip install --upgrade pip
-      # Same hash-verified lock as the uv branch above; both branches stay checked.
-      .venv/bin/python -m pip install --require-hashes -r requirements/python.txt
-      node src/install-plan.mjs record python-deps
-    fi
-    ;;
-esac
-
 node src/secret.mjs ensure
 config_enabled=false
 service_installed=false
-# Each target enables its own client configuration; everything above and below
-# that one step is the shared router plane.
-if [ "$target" = dsh ]; then
-  config_manager=src/dsh-config-manager.mjs
-  config_enable_command=install
-  config_disable_command=uninstall
-else
-  config_manager=src/config-manager.mjs
-  config_enable_command=enable
-  config_disable_command=disable
-fi
+config_manager=src/config-manager.mjs
+config_enable_command=enable
+config_disable_command=disable
 rollback() {
   if [ "$service_installed" = true ]; then
     node src/service.mjs uninstall >/dev/null 2>&1 || true
@@ -204,21 +146,10 @@ fi
 # Codex to ask, so the catalog is built only when Codex is the target or an
 # earlier Codex install already left one behind.
 state_dir=${MODEL_ROUTER_STATE_DIR:-${CODEX_ROUTER_STATE_DIR:-${KIMI_CODEX_STATE_DIR:-${CODEX_HOME:-$HOME/.codex}/codex-router}}}
-if [ "$target" = codex ]; then
-  if [ -s "$state_dir/native-models.json" ]; then
-    node src/catalog.mjs
-  else
-    node src/catalog.mjs --refresh-native --bundled-native
-  fi
-elif [ -s "$state_dir/native-models.json" ]; then
+if [ -s "$state_dir/native-models.json" ]; then
   node src/catalog.mjs
-fi
-node src/litellm-config.mjs
-# The router plane is shared, so an install for one client changes the routable
-# set for the other. Republish whichever integration is already installed here
-# rather than leaving it advertising a stale model list.
-if [ "$target" != dsh ] && [ -s "$state_dir/dsh-models.json" ]; then
-  node src/dsh-config-manager.mjs install >/dev/null
+else
+  node src/catalog.mjs --refresh-native --bundled-native
 fi
 
 if [ "$prepare_only" = true ]; then
@@ -276,13 +207,8 @@ if [ "$target" = codex ]; then
   node src/skills-install.mjs install
 fi
 
-if [ "$target" = dsh ]; then
-  echo "Published the selected external model routes to DeepSeek Harness."
-  echo "The harness reloads its settings document on the next request; no restart is needed."
-else
-  echo "Installed the selected external model routes for Codex."
-  echo "Fully quit and reopen Codex, then start a new task."
-fi
+echo "Installed the selected external model routes for Codex."
+echo "Fully quit and reopen Codex, then start a new task."
 echo "Kimi API key: $repo_dir/bin/provider-key kimi-api set"
 echo "DeepSeek API key: $repo_dir/bin/provider-key deepseek set"
 echo "xAI API key: $repo_dir/bin/provider-key grok-api set"

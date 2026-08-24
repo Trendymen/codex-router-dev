@@ -721,6 +721,32 @@ test("all failed failover hops return the originally selected provider error", a
   assert.equal(await result.response.text(), "primary");
 });
 
+test("a failover candidate never inherits the source forced coordinator context", async () => {
+  const fallback = { ...model, slug: "z-forced-fallback/openai", provider: "z-forced-fallback", baseUrl: "http://127.0.0.1:9998/v1" };
+  const sourceForcedBuffer = { source: true };
+  const sourceForcedCallback = () => {};
+  let calls = 0;
+  const built = buildRoutedRequest({ input: "forced source" }, model, {
+    credential: "A",
+    forcedBuffer: sourceForcedBuffer,
+    onForcedValidated: sourceForcedCallback,
+  });
+  const result = await dispatchRoutedRequest(built, {
+    fetchImpl: async () => {
+      calls += 1;
+      return new Response(calls === 1 ? "quota" : "fallback", { status: calls === 1 ? 402 : 200 });
+    },
+    retries: 0,
+    failoverCandidates: [fallback],
+    credentialFor: () => "B",
+    baseUrlFor: (candidate) => candidate.baseUrl,
+  });
+  assert.equal(calls, 2);
+  assert.equal(result.model.slug, fallback.slug);
+  assert.equal(result.built.context.forcedBuffer, undefined);
+  assert.equal(result.built.context.onForcedValidated, undefined);
+});
+
 test("candidate transport retry exhaustion returns the original failure while caller abort stays distinct", async () => {
   const fallback = { ...model, slug: "z-transport-fallback/openai", provider: "z-transport-fallback", baseUrl: "http://127.0.0.1:9998/v1" };
   const built = buildRoutedRequest({ input: "same" }, model, { credential: "A" });

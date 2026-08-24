@@ -167,7 +167,7 @@ export function providerCooldown(providerId, { now } = {}) {
 //
 // The one exception is naming, not timing. Two hops see the same failure and
 // know different amounts about it: `api-forwarder` sees the provider's real
-// headers -- including the `Retry-After` LiteLLM does not relay, which is the
+// headers -- including the `Retry-After` an adapter may not relay, which is the
 // only reason a window is ever known at all -- but it has already piped the
 // body away and can classify by status alone. The router sees the body and can
 // tell an exhausted plan from a burst rate limit. So a later caller with no

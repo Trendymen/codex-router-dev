@@ -14,38 +14,20 @@ import { withNativeContextVariants } from "./native-context-variants.mjs";
 // The publish marker lives under the shared state directory, which does not
 // vary by target, so reading it here does not disturb the per-target probes
 // below that re-import paths with their own MODEL_ROUTER_TARGET.
-import {
-  DSH_CATALOG_PATH,
-  GEMINI_CATALOG_PATH,
-  PORTS,
-  PROVIDER_SELECTION_PATH,
-} from "./paths.mjs";
+import { PORTS, PROVIDER_SELECTION_PATH } from "./paths.mjs";
 // Same reasoning: presence is a property of the shared plane, not of a target,
 // so the overview can resolve it statically without perturbing those probes.
 import { presenceSnapshot } from "./presence-state.mjs";
-import { harnessSnapshotWithWeb } from "./dsh-install.mjs";
 import { USER_MODELS_PATH } from "./user-models.mjs";
 import { buildCapabilityManifest, SUPPORTED_PROVIDER_IDS } from "./capability-manifest.mjs";
 
-// Cross-target control plane for a tray/UI (e.g. the planned pane fork). It
-// reads which registry models are enabled per target and toggles them. Toggling
-// only rewrites each target's provider selection; making it live is a separate
-// explicit `apply`, so a toggle never silently restarts a running target.
+// Codex control plane for the tray/UI. Provider selection and publication are
+// owned by the shared Node router plane; no external client publication target
+// is exposed here.
 
 const SELF = fileURLToPath(import.meta.url);
 const REPO_ROOT = path.resolve(path.dirname(SELF), "..");
-// The harness integration appears here only once it is installed. The tray
-// renders one section per target, so listing `dsh` unconditionally would put an
-// empty section in front of every Codex-only install for a client they do not
-// run. `dsh-models.json` is written by the publish and removed by the
-// uninstall, so its presence is exactly the question being asked.
-const DSH_PUBLISHED = DSH_CATALOG_PATH;
-const GEMINI_PUBLISHED = GEMINI_CATALOG_PATH;
-const TARGETS = [
-  "codex",
-  ...(existsSync(DSH_PUBLISHED) ? ["dsh"] : []),
-  ...(existsSync(GEMINI_PUBLISHED) ? ["gemini"] : []),
-];
+const TARGETS = ["codex"];
 const args = process.argv.slice(2);
 
 function assertSupportedProviderEnable(provider) {
@@ -55,13 +37,6 @@ function assertSupportedProviderEnable(provider) {
 }
 
 function targetIsActive(target) {
-  // One service serves every client, so "is this target active" cannot be the
-  // service's own status for more than one of them. For the harness it is
-  // whether the route has been published into its settings document.
-  if (target === "dsh") return existsSync(DSH_PUBLISHED);
-  // Same question for Gemini CLI: whether this router published its `.env`
-  // block. The CLI itself is not a resident process there is anything to poll.
-  if (target === "gemini") return existsSync(GEMINI_PUBLISHED);
   const result = spawnSync(process.execPath, [path.join(REPO_ROOT, "src", "service.mjs"), "status"], {
     env: { ...process.env, MODEL_ROUTER_TARGET: target },
     encoding: "utf8",
@@ -243,8 +218,8 @@ async function emitProbe() {
     : [];
   // The same machine-local capability proofs the catalog honors: the tray's
   // "Subagent models" section filters on v2, so a probe built from the raw
-  // registry hid every model this machine had just verified — the third
-  // consumer to need this overlay, after the catalog and the DSH preset.
+  // registry hid every model this machine had just verified — the same
+  // capability overlay used by the catalog.
   //
   // Deliberately unlike the catalog, `disabled` is not passed: the catalog
   // demotes a switched-off model so Codex stops offering it, but this probe
@@ -447,9 +422,6 @@ async function printOverview(asJson) {
     // The tray polls this. Presence rides along so the rule that decides
     // whether the router may be stopped is computed once, here, rather than
     // re-derived from target flags on the Swift side where it would drift.
-    // The harness snapshot joins it for the same reason -- and it has to be
-    // the variant that probes the web port, or the tray reads every running
-    // harness as stopped and offers to start one that is already up.
     process.stdout.write(
       `${JSON.stringify(
         {
@@ -457,7 +429,6 @@ async function printOverview(asJson) {
           service,
           presence: presenceSnapshot(),
           activity,
-          harness: await harnessSnapshotWithWeb(),
           capabilities: buildCapabilityManifest({ targets, presence: presenceSnapshot() }),
         },
         null,
@@ -546,19 +517,9 @@ async function runSet(provider, desired) {
   await printOverview(args.includes("--json"));
 }
 
-function refreshActiveTarget(target) {
-  const command =
-    target === "dsh"
-        ? [process.execPath, [path.join(REPO_ROOT, "src", "dsh-config-manager.mjs"), "install"]]
-        : target === "gemini"
-          ? [process.execPath, [path.join(REPO_ROOT, "src", "gemini-config-manager.mjs"), "install"]]
-          : undefined;
-  if (!command) return;
-  const result = spawnSync(command[0], command[1], {
-    env: { ...process.env, MODEL_ROUTER_TARGET: target },
-    stdio: "inherit",
-  });
-  if (result.status !== 0) throw new Error(`${target}: refresh failed`);
+function refreshActiveTarget() {
+  // Codex reads provider selection on the next request; its catalog is rebuilt
+  // by the shared Node publication transaction before this function returns.
 }
 
 // Active routers read provider selection on each request, so only their picker
@@ -2144,29 +2105,11 @@ function handleTray(action) {
     // checkout even when its source fingerprint says the installed copy is
     // current, so this bypasses the update flow's staleness check and runs
     // the launcher directly. The launcher quits the running tray only after
-    // the staged replacement passes verification. `bin/model-router-tray` is
-    // a POSIX shell script; Windows reaches the same sequence through
-    // `codex-router.ps1 tray rebuild`, which owns the cargo-or-Electron
-    // choice so it exists once instead of drifting between here and there.
-    const result = process.platform === "win32"
-      ? spawnSync(
-          "powershell.exe",
-          [
-            "-NoLogo",
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-            path.join(REPO_ROOT, "codex-router.ps1"),
-            "tray",
-            "rebuild",
-          ],
-          { stdio: "inherit", env: process.env },
-        )
-      : spawnSync(path.join(REPO_ROOT, "bin", "model-router-tray"), [], {
-          stdio: "inherit",
-          env: process.env,
-        });
+    // the staged replacement passes verification.
+    const result = spawnSync(path.join(REPO_ROOT, "bin", "model-router-tray"), [], {
+      stdio: "inherit",
+      env: process.env,
+    });
     if (result.error) throw result.error;
     if (result.status !== 0) {
       throw new Error(`Tray rebuild failed with exit code ${result.status}.`);
@@ -2213,29 +2156,12 @@ async function handleNativeRedirect(action, value) {
   process.stdout.write(`${JSON.stringify(setNativeRedirect(value))}\n`);
 }
 
-// One action for "give me a working harness": install the CLI if it is absent,
-// then publish the routed models into its own documents. Kept behind an
-// explicit subcommand rather than folded into `apply`, because it installs a
-// third-party package and that must never be a side effect of something else.
+// Legacy harness documents may still be inspected or disconnected explicitly,
+// but the shipped control plane no longer installs or publishes them.
 async function handleHarness(action) {
-  const { harnessSnapshotWithWeb, setupHarness } = await import("./dsh-install.mjs");
   if (!action || action === "status") {
+    const { harnessSnapshotWithWeb } = await import("./dsh-install.mjs");
     process.stdout.write(`${JSON.stringify(await harnessSnapshotWithWeb())}\n`);
-    return;
-  }
-  if (action === "web") {
-    const { dshWebState } = await import("./dsh-web.mjs");
-    process.stdout.write(`${JSON.stringify(await dshWebState())}\n`);
-    return;
-  }
-  if (action === "start") {
-    const { startDshWeb } = await import("./dsh-web.mjs");
-    process.stdout.write(`${JSON.stringify(await startDshWeb())}\n`);
-    return;
-  }
-  if (action === "stop") {
-    const { stopDshWeb } = await import("./dsh-web.mjs");
-    process.stdout.write(`${JSON.stringify(await stopDshWeb())}\n`);
     return;
   }
   if (action === "disconnect" || action === "off") {
@@ -2243,11 +2169,7 @@ async function handleHarness(action) {
     process.stdout.write(`${JSON.stringify(await disconnectHarness())}\n`);
     return;
   }
-  if (action !== "setup" && action !== "install") {
-    throw new Error("Usage: control harness status|setup|start|stop|web|disconnect");
-  }
-  const result = await setupHarness();
-  process.stdout.write(`${JSON.stringify(result)}\n`);
+  throw new Error("External harness publication was removed; use harness status or harness disconnect for an existing document.");
 }
 
 async function handlePresence(action, value) {

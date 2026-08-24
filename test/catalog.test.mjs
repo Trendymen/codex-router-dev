@@ -1163,17 +1163,6 @@ test("local model weight paths remain outside router deletion targets", async ()
   assert.doesNotMatch(source, /removeLocalModelFromDisk/);
 });
 
-test("Control Center local surface is Vision-only and cannot publish chat models", async () => {
-  const { readFileSync } = await import("node:fs");
-  const page = readFileSync(
-    new URL("../apps/control-center/src/pages/LocalPage.tsx", import.meta.url),
-    "utf8",
-  );
-  const ipc = readFileSync(new URL("../apps/control-center/electron/ipc.mjs", import.meta.url), "utf8");
-  assert.doesNotMatch(page, /availableExplore|For coding|Enable .*Codex|Remove local model|uninstallLocalModel/);
-  assert.doesNotMatch(ipc, /handleAction\("uninstallLocalModel"|handleAction\("benchmarkLocalModel"/);
-});
-
 test("catalog Vision candidates distinguish selection from credential state", async () => {
   const { readFileSync } = await import("node:fs");
   const source = readFileSync(new URL("../src/catalog.mjs", import.meta.url), "utf8");

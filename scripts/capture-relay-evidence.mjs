@@ -1,6 +1,7 @@
 // Capture the real router's outgoing relay body (relay-out.json) and the
 // final streamed response (relay-in.json) for plan verification #2. Boots the
-// router with a mock gateway exactly like test/namespace-relay-routing.test.mjs
+// Node provider-dispatch path with a mock provider exactly like the retained
+// namespace relay tests.
 // and dumps both bodies.
 import { spawn } from "node:child_process";
 import http from "node:http";
@@ -38,7 +39,7 @@ async function openPort() {
 }
 
 const payload = {
-  model: "opencode-go/deepseek-v4-flash",
+  model: "deepseek/deepseek-v4-pro",
   stream: true,
   input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] }],
   tools: [
@@ -66,7 +67,7 @@ const payload = {
 };
 
 const sse = (event) => `data: ${JSON.stringify(event)}\n\n`;
-const gatewaySse = [
+const providerSse = [
   sse({ type: "response.created" }),
   sse({
     type: "response.output_item.done",
@@ -85,12 +86,12 @@ const gatewaySse = [
 ].join("");
 
 let outgoing;
-const gateway = http.createServer(async (request, response) => {
+const providerServer = http.createServer(async (request, response) => {
   if (request.url === "/v1/responses") {
     const chunks = [];
     for await (const chunk of request) chunks.push(chunk);
     outgoing = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-    const body = Buffer.from(gatewaySse, "utf8");
+    const body = Buffer.from(providerSse, "utf8");
     response.writeHead(200, {
       "Content-Type": "text/event-stream",
       "Content-Length": String(body.length),
@@ -100,8 +101,8 @@ const gateway = http.createServer(async (request, response) => {
   }
   response.writeHead(404).end();
 });
-await new Promise((resolve) => gateway.listen(0, "127.0.0.1", resolve));
-const gatewayPort = gateway.address().port;
+await new Promise((resolve) => providerServer.listen(0, "127.0.0.1", resolve));
+const providerPort = providerServer.address().port;
 
 const routerPort = await openPort();
 const stateDir = mkdtempSync(path.join(os.tmpdir(), "relay-evidence-"));
@@ -114,7 +115,9 @@ const child = spawn(process.execPath, [path.join(root, "src", "router.mjs")], {
     CODEX_ROUTER_INTERNAL_KEY: INTERNAL_KEY,
     CODEX_ROUTER_SHOW_ALL_MODELS: "1",
     CODEX_ROUTER_PORT: String(routerPort),
-    CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${gatewayPort}/v1`,
+    CODEX_ROUTER_TEST_NODE_ROUTE_FIXTURE: "1",
+    DEEPSEEK_API_BASE_URL: `http://127.0.0.1:${providerPort}/v1`,
+    DEEPSEEK_API_KEY: INTERNAL_KEY,
     CODEX_ROUTER_QUIET: "1",
   },
   stdio: ["ignore", "ignore", "pipe"],
@@ -155,4 +158,4 @@ writeFileSync(path.join(OUT_DIR, "relay-in.json"), `${clientBody}\n`);
 console.log(`wrote ${OUT_DIR}/relay-out.json (${JSON.stringify(outgoing).length} bytes) and relay-in.json (${clientBody.length} bytes)`);
 child.kill("SIGTERM");
 await new Promise((resolve) => child.once("exit", resolve));
-gateway.close();
+providerServer.close();

@@ -97,8 +97,6 @@ test(
         false,
         "the catalog capture spawned the account-aware `codex debug models`",
       );
-      const gateway = child("litellm-config.mjs", [], env);
-      assert.equal(gateway.status, 0, gateway.stderr);
       const enabled = child("config-manager.mjs", ["enable"], env);
       assert.equal(enabled.status, 0, enabled.stderr);
 
@@ -138,13 +136,13 @@ test(
 
       // The idle state fails nothing that touches providers; anything failed
       // must be environmental -- no running service, no installed skill pack,
-      // and on CI no LiteLLM virtual environment either.
+      // and on CI no external provider runtime is installed either.
       const failed = report.checks.filter((check) => check.status === "fail");
       const allowed = new Set([
+        "Platform",
         "Background service",
         "Router health",
         "Codex skill pack",
-        "LiteLLM venv runtime",
         // The staged secrets get POSIX modes, not the Windows ACL the real
         // writers apply, so these two rows are staging noise on win32 only.
         ...(process.platform === "win32"
