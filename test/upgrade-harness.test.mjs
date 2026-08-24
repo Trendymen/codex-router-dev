@@ -6,7 +6,7 @@ import path from "node:path";
 import test from "node:test";
 
 import { createIsolatedEnvironment, planIsolatedEnvironment } from "../scripts/verify-isolated-install.mjs";
-import { preflightProductionCases, releasePlans, runUpgradeCases, settleUpgradeRun, verifyUpgradeAndRollback } from "../scripts/verify-upgrade-preservation.mjs";
+import { installReplacementPreservingProtected, preflightProductionCases, releasePlans, runUpgradeCases, settleUpgradeRun, setupReleasedRuntime, verifyUpgradeAndRollback } from "../scripts/verify-upgrade-preservation.mjs";
 
 function fixture() {
   const root = mkdtempSync(path.join(os.tmpdir(), "codex-router-upgrade-harness-"));
@@ -104,6 +104,68 @@ test("public upgrade verifier accepts exactly environment and released fixture, 
     const result = await verifyUpgradeAndRollback(env, released);
     assert.equal(result.status, "rolled_back");
     assert.ok(calls.includes("rollback-asserted"));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("released runtime installs shared secrets before start and the replacement preserves the same caller identity", async () => {
+  const { root, sourceRoot } = fixture();
+  try {
+    const env = createIsolatedEnvironment({ root, sourceRoot, nonce: "released-install", sourceCommit: "released" });
+    seed(env);
+    const events = [];
+    const oldRuntime = {
+      callbacks: {
+        install: async (oldEnv) => {
+          events.push("old:install");
+          oldEnv.write(path.relative(oldEnv.root, path.join(oldEnv.stateRoot, "caller-secret")), "shared-caller\n", 0o600);
+          oldEnv.write(path.relative(oldEnv.root, path.join(oldEnv.stateRoot, "internal-secret")), "shared-internal\n", 0o600);
+        },
+        health: async () => {
+          events.push("old:health");
+          return { ok: true };
+        },
+      },
+      start: async () => {
+        events.push("old:start");
+        return { pid: 4242 };
+      },
+    };
+    const oldIdentity = await setupReleasedRuntime({ oldRuntime, oldEnv: env, oldCommit: "released" });
+    assert.deepEqual(events, ["old:install", "old:start", "old:health"]);
+    assert.equal(oldIdentity.sourceCommit, "released");
+    assert.deepEqual(readFileSync(path.join(env.stateRoot, "caller-secret")), Buffer.from("shared-caller\n"));
+
+    const replacement = {
+      callbacks: {
+        install: async (currentEnv) => {
+          events.push("new:install");
+          assert.deepEqual(readFileSync(path.join(currentEnv.stateRoot, "caller-secret")), Buffer.from("shared-caller\n"));
+        },
+      },
+    };
+    const proof = await installReplacementPreservingProtected(env, replacement);
+    assert.deepEqual(proof, { protected: true, callerPreserved: true });
+    assert.deepEqual(readFileSync(path.join(env.stateRoot, "caller-secret")), Buffer.from("shared-caller\n"));
+    await assert.rejects(
+      () => installReplacementPreservingProtected(env, { callbacks: { install: async (currentEnv) => currentEnv.write(path.relative(currentEnv.root, path.join(currentEnv.stateRoot, "caller-secret")), "rotated-caller\n", 0o600) } }),
+      /protected bytes|caller identity/,
+    );
+
+    await assert.rejects(
+      () => setupReleasedRuntime({ oldRuntime: { callbacks: {} }, oldEnv: env, oldCommit: "released" }),
+      /install callback/,
+    );
+    const noSecrets = {
+      callbacks: {
+        install: async () => {},
+        health: async () => ({ ok: true }),
+      },
+      start: async () => ({ pid: 1 }),
+    };
+    const noSecretEnv = createIsolatedEnvironment({ root: path.join(root, "missing-secrets"), sourceRoot, nonce: "missing-secrets", sourceCommit: "released" });
+    await assert.rejects(() => setupReleasedRuntime({ oldRuntime: noSecrets, oldEnv: noSecretEnv, oldCommit: "released" }), /shared secret/);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { acquireIsolationLease, assertCliPreflight, assertPortsAvailable, assertPushedHarness, createIsolatedEnvironment, isolationLeasePath, ownedProcessAlive, planIsolatedEnvironment, verifyCleanInstall } from "../scripts/verify-isolated-install.mjs";
+import { callerBaseUrl } from "../src/caller-auth.mjs";
+import { redactSensitive } from "../src/sensitive-redactor.mjs";
+import { acquireIsolationLease, assertCliPreflight, assertPortsAvailable, assertPushedHarness, completeIsolatedInstaller, createIsolatedEnvironment, guardIsolatedRuntimeCallback, isolationLeasePath, ownedProcessAlive, planIsolatedEnvironment, readInstalledCallerSecret, verifyCleanInstall } from "../scripts/verify-isolated-install.mjs";
 
 function fixture() {
   const root = mkdtempSync(path.join(os.tmpdir(), "codex-router-isolated-install-"));
@@ -91,6 +93,55 @@ test("owned process state treats either exit status as dead", () => {
   child.exitCode = 1;
   assert.equal(ownedProcessAlive(state, child), false);
   assert.equal(ownedProcessAlive(state, { exitCode: null, signalCode: null }), false);
+});
+
+test("installed caller capability is atomically read from the private installer file and stays redacted", () => {
+  const { root, sourceRoot } = fixture();
+  const installerSecret = "installed_caller_capability_0123456789abcdef";
+  try {
+    const env = createIsolatedEnvironment({ root, sourceRoot, nonce: "installer-secret" });
+    mkdirSync(env.stateRoot, { recursive: true, mode: 0o700 });
+    writeFileSync(path.join(env.stateRoot, "caller-secret"), `${installerSecret}\n`, { mode: 0o600 });
+    assert.equal(readInstalledCallerSecret(env), installerSecret);
+    const base = callerBaseUrl(env.target.ports.router, readInstalledCallerSecret(env));
+    assert.match(base, new RegExp(installerSecret));
+    assert.doesNotMatch(redactSensitive(`caller URL ${base}`, { profile: "log" }), new RegExp(installerSecret));
+
+    chmodSync(path.join(env.stateRoot, "caller-secret"), 0o644);
+    assert.throws(() => readInstalledCallerSecret(env), /private mode/);
+    chmodSync(path.join(env.stateRoot, "caller-secret"), 0o600);
+    writeFileSync(path.join(env.stateRoot, "caller-secret"), "x".repeat(4_097), { mode: 0o600 });
+    assert.throws(() => readInstalledCallerSecret(env), /invalid size/);
+    rmSync(path.join(env.stateRoot, "caller-secret"));
+    symlinkSync(path.join(env.stateRoot, "missing-target"), path.join(env.stateRoot, "caller-secret"));
+    assert.throws(() => readInstalledCallerSecret(env), /did not create|regular file/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("a completed installer that omits caller-secret fails before harness preparation and never synthesizes one", () => {
+  const { root, sourceRoot } = fixture();
+  const sentinel = "missing_installer_secret_0123456789abcdef";
+  try {
+    const env = createIsolatedEnvironment({ root, sourceRoot, nonce: "missing-installer-secret" });
+    mkdirSync(env.stateRoot, { recursive: true, mode: 0o700 });
+    let error;
+    try { completeIsolatedInstaller(env, { runInstaller: () => "installer completed" }); } catch (caught) { error = caught; }
+    assert.ok(error instanceof Error);
+    assert.match(error.message, /did not create/);
+    assert.doesNotMatch(error.message, new RegExp(sentinel));
+    assert.equal(existsSync(path.join(env.stateRoot, "caller-secret")), false);
+    assert.equal(existsSync(path.join(env.evidenceRoot, "clean-install.json")), false);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("disposed runtimes reject callbacks before they can reuse cleared capability state", async () => {
+  let disposed = false;
+  let calls = 0;
+  const callback = guardIsolatedRuntimeCallback(() => disposed, async () => { calls += 1; });
+  await callback();
+  disposed = true;
+  await assert.rejects(callback(), /runtime is disposed/);
+  assert.equal(calls, 1);
 });
 
 test("clean install harness proves the full isolated service and command contract through injected callbacks", async () => {

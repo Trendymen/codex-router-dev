@@ -305,6 +305,47 @@ function removeReplacementResidue(env) {
   rmSync(env.target.appPath, { recursive: true, force: true });
 }
 
+function sharedSecretFiles(env) {
+  return [path.join(env.stateRoot, "caller-secret"), path.join(env.stateRoot, "internal-secret")];
+}
+
+function captureSharedSecrets(env) {
+  return sharedSecretFiles(env).map((file) => {
+    if (!existsSync(file)) throw new Error(`runtime installer did not provision shared secret: ${file}`);
+    return { file, bytes: readFileSync(file), mode: statSync(file).mode & 0o777 };
+  });
+}
+
+function sameSnapshots(left, right) {
+  return left.length === right.length && left.every((item, index) => item.file === right[index]?.file
+    && item.mode === right[index]?.mode && item.bytes.equals(right[index]?.bytes));
+}
+
+/** Prepare the released runtime through its installer before it may start. */
+export async function setupReleasedRuntime({ oldRuntime, oldEnv, oldCommit } = {}) {
+  if (typeof oldRuntime?.callbacks?.install !== "function") throw new Error("released runtime requires an install callback");
+  if (typeof oldRuntime?.callbacks?.health !== "function") throw new Error("released runtime requires a health callback");
+  if (typeof oldRuntime?.start !== "function") throw new Error("released runtime requires a start callback");
+  await oldRuntime.callbacks.install(oldEnv);
+  captureSharedSecrets(oldEnv);
+  const started = await oldRuntime.start();
+  const health = await oldRuntime.callbacks.health(oldEnv);
+  if (health?.ok !== true || !Number.isInteger(started?.pid) || oldEnv.sourceCommit !== oldCommit) throw new Error("released runtime did not start with the expected identity and health");
+  return { sourceRoot: oldEnv.sourceRoot, sourceCommit: oldCommit, pid: started.pid };
+}
+
+/** The new installer shares the released state root and may not rotate secrets. */
+export async function installReplacementPreservingProtected(environment, runtime) {
+  if (typeof runtime?.callbacks?.install !== "function") throw new Error("replacement runtime requires an install callback");
+  const protectedBefore = snapshot(environment);
+  const sharedBefore = captureSharedSecrets(environment);
+  await runtime.callbacks.install(environment);
+  if (!equalProtected(protectedBefore, environment)) throw new Error("replacement installer changed protected bytes or modes");
+  const sharedAfter = captureSharedSecrets(environment);
+  if (!sameSnapshots(sharedBefore, sharedAfter)) throw new Error("replacement installer changed the shared caller identity");
+  return { protected: true, callerPreserved: true };
+}
+
 async function productionCase(state, { sourceCommit, oldCommit, plan }) {
   const root = state.root;
   if (!plan || plan.name !== state.name || plan.root !== root || typeof plan.release !== "function") throw new Error(`missing preflight lease for upgrade ${state.name}`);
@@ -316,13 +357,12 @@ async function productionCase(state, { sourceCommit, oldCommit, plan }) {
   state.env = createIsolatedEnvironment({ root, sourceName: "current-checkout", nonce, sourceCommit });
   if (JSON.stringify(state.env.target.ports) !== JSON.stringify(plan.target.ports)) throw new Error("upgrade case target drifted after preflight");
   state.oldEnv = createIsolatedEnvironment({ root, sourceName: "released-checkout", nonce, sourceCommit: oldCommit });
-  state.runtime = await createLocalRuntime(state.env, { sourceCommit });
-  state.oldRuntime = await createLocalRuntime(state.oldEnv, { sourceCommit: oldCommit, allowReleased: true, requireSwift: false });
-  state.oldRuntime.prepare();
-  const oldStarted = await state.oldRuntime.start();
-  state.oldIdentity = { sourceRoot: state.oldEnv.sourceRoot, sourceCommit: oldCommit, pid: oldStarted.pid };
+  mkdirSync(path.dirname(state.env.credentialsPath), { recursive: true, mode: 0o700 });
   writeFileSync(state.env.credentialsPath, "protected-caller\n", { mode: 0o600 });
   chmodSync(state.env.credentialsPath, 0o600);
+  state.runtime = await createLocalRuntime(state.env, { sourceCommit });
+  state.oldRuntime = await createLocalRuntime(state.oldEnv, { sourceCommit: oldCommit, allowReleased: true, requireSwift: false });
+  state.oldIdentity = await setupReleasedRuntime({ oldRuntime: state.oldRuntime, oldEnv: state.oldEnv, oldCommit });
   const replace = async () => {
     // Remove the deliberately partial bundle before invoking the real installer.
     // The final public app path is installed through rename, leaving no partial
@@ -330,7 +370,7 @@ async function productionCase(state, { sourceCommit, oldCommit, plan }) {
     const residue = `${state.env.target.appPath}.partial-${process.pid}`;
     if (existsSync(state.env.target.appPath)) renameSync(state.env.target.appPath, residue);
     try {
-      await state.runtime.callbacks.install(state.env);
+      await installReplacementPreservingProtected(state.env, state.runtime);
       const installed = `${state.env.target.appPath}.installed-${process.pid}`;
       renameSync(state.env.target.appPath, installed);
       renameSync(installed, state.env.target.appPath);
