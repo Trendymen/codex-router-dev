@@ -3,11 +3,12 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 import { loadAcceptanceOracle } from "../scripts/verify-node-only-build.mjs";
 import { beginFinalEvidence, loadMatrix, verifyAcceptance } from "../scripts/verify-acceptance.mjs";
 
-const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const expectedRows = Object.freeze({
   "reasoning.json": ["identity-state", "stream-final", "abort-nonstream", "errors"],
   "tool-glm.json": ["tool-names-conversion", "forced-tool-boundaries", "glm-messages-continuation"],

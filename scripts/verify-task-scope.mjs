@@ -1,6 +1,7 @@
 import { execFileSync, spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 const RETIRED_PATHS = new Set(["test/acceptance/normative-requirements.json"]);
 
@@ -60,6 +61,6 @@ function cli() {
   if (findings.length) process.exitCode = 1;
 }
 
-if (process.argv[1] === new URL(import.meta.url).pathname) {
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
   try { cli(); } catch (error) { process.stderr.write(`${error.message}\n`); process.exitCode = 2; }
 }

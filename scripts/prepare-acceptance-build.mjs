@@ -172,12 +172,12 @@ function writeWrapper(file, identity) {
   return { path: file, mode: lstatSync(file).mode & 0o777, digest: digestFile(file), tool: identity };
 }
 
-function verifyWrappers(wrappers) {
+function verifyWrappers(wrappers, platform = process.platform) {
   if (!wrappers || typeof wrappers !== "object" || Array.isArray(wrappers)) throw new Error("manifest wrappers are invalid");
   for (const name of ["uname", "swift", "codesign", "plistBuddy"]) {
     const wrapper = wrappers[name];
-    if (!wrapper || typeof wrapper !== "object" || wrapper.mode !== 0o700 || !/^[0-9a-f]{64}$/.test(wrapper.digest) || !wrapper.tool || !/^[0-9a-f]{64}$/.test(wrapper.tool.digest)) throw new Error("manifest wrapper integrity is invalid");
-    if (!existsSync(wrapper.path) || lstatSync(wrapper.path).isSymbolicLink() || (lstatSync(wrapper.path).mode & 0o777) !== wrapper.mode || digestFile(wrapper.path) !== wrapper.digest) throw new Error("manifest wrapper digest mismatch");
+    if (!wrapper || typeof wrapper !== "object" || (platform !== "win32" && wrapper.mode !== 0o700) || !Number.isInteger(wrapper.mode) || !/^[0-9a-f]{64}$/.test(wrapper.digest) || !wrapper.tool || !/^[0-9a-f]{64}$/.test(wrapper.tool.digest)) throw new Error("manifest wrapper integrity is invalid");
+    if (!existsSync(wrapper.path) || !lstatSync(wrapper.path).isFile() || lstatSync(wrapper.path).isSymbolicLink() || (lstatSync(wrapper.path).mode & 0o777) !== wrapper.mode || digestFile(wrapper.path) !== wrapper.digest) throw new Error("manifest wrapper digest mismatch");
     const identity = toolIdentity(wrapper.tool.path);
     if (identity.path !== wrapper.tool.path || identity.mode !== wrapper.tool.mode || identity.digest !== wrapper.tool.digest) throw new Error("manifest tool identity mismatch");
   }

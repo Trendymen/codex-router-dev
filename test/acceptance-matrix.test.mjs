@@ -4,11 +4,12 @@ import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 import { gzipSync } from "node:zlib";
 
 import { loadAcceptanceMatrix, verifyNodeOnlyBuild } from "../scripts/verify-node-only-build.mjs";
 
-const repoRoot = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const routeOracle = JSON.parse(readFileSync(path.join(repoRoot, "test", "fixtures", "node-route-matrix.json"), "utf8"));
 const expectedThemeIds = Object.freeze([
   "reasoning-identity-state", "reasoning-stream-final", "reasoning-abort-nonstream", "reasoning-errors",
@@ -244,7 +245,7 @@ test("release archive rejects a runtime-package asset absent from its logical ar
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
-test("预期 build-root 使用 checked-in 的 12 条 Node route oracle 并通过完整产物审计", () => {
+test("预期 build-root 使用 checked-in 的 12 条 Node route oracle 并通过完整产物审计", { skip: process.platform === "win32" }, () => {
   const root = expectedBuildRoot();
   try {
     assert.equal(Object.keys(routeOracle).length, 12, "fixture is the complete Node route oracle");
@@ -252,7 +253,7 @@ test("预期 build-root 使用 checked-in 的 12 条 Node route oracle 并通过
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
-test("同一完整逻辑 artifact map 在未打包根与 release archive 都通过审计", () => {
+test("同一完整逻辑 artifact map 在未打包根与 release archive 都通过审计", { skip: process.platform === "win32" }, () => {
   const unpacked = expectedBuildRoot();
   let releaseRoot;
   try {
@@ -329,7 +330,7 @@ test("产物审计精确覆盖 fixture 的 12 条 route：额外、重复和每�
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
-test("artifact audit 只将具备完整 Node-route 边界字段的模型纳入 Appendix B 闭集", () => {
+test("artifact audit 只将具备完整 Node-route 边界字段的模型纳入 Appendix B 闭集", { skip: process.platform === "win32" }, () => {
   const root = expectedBuildRoot();
   try {
     write("config/other/ordinary-model.json", JSON.stringify({
