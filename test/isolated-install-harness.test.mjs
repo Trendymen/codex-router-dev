@@ -7,7 +7,7 @@ import test from "node:test";
 
 import { callerBaseUrl } from "../src/caller-auth.mjs";
 import { redactSensitive } from "../src/sensitive-redactor.mjs";
-import { acquireIsolationLease, assertCliPreflight, assertPortsAvailable, assertPushedHarness, completeIsolatedInstaller, createIsolatedEnvironment, guardIsolatedRuntimeCallback, isolationLeasePath, ownedProcessAlive, planIsolatedEnvironment, readInstalledCallerSecret, verifyCleanInstall } from "../scripts/verify-isolated-install.mjs";
+import { acquireIsolationLease, assertCliPreflight, assertPortsAvailable, assertPushedHarness, completeIsolatedInstaller, createIsolatedEnvironment, createLocalProviderFixture, guardIsolatedRuntimeCallback, isolationLeasePath, ownedProcessAlive, planIsolatedEnvironment, readInstalledCallerSecret, validDownstreamResponsesLifecycle, verifyCleanInstall } from "../scripts/verify-isolated-install.mjs";
 
 function fixture() {
   const root = mkdtempSync(path.join(os.tmpdir(), "codex-router-isolated-install-"));
@@ -142,6 +142,51 @@ test("disposed runtimes reject callbacks before they can reuse cleared capabilit
   disposed = true;
   await assert.rejects(callback(), /runtime is disposed/);
   assert.equal(calls, 1);
+});
+
+test("local provider fixture accepts only the exact Responses and Messages dialects", async () => {
+  const fixture = await createLocalProviderFixture();
+  const post = (suffix, body) => fetch(`${fixture.baseUrl}${suffix}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+  try {
+    const responsesString = await post("/responses", { model: "deepseek-v4-flash", stream: true, input: "plain Responses input" });
+    assert.equal(responsesString.status, 200);
+    assert.match(await responsesString.text(), /event: response\.created/);
+    assert.equal((await post("/responses", { model: "deepseek-v4-flash", stream: true, input: [{ role: "user", content: "array Responses input" }] })).status, 200);
+    const messages = await post("/messages", { model: "glm-5.2", stream: true, max_tokens: 8, messages: [{ role: "user", content: "Messages input" }] });
+    assert.equal(messages.status, 200);
+    const messagesSse = await messages.text();
+    for (const event of ["message_start", "content_block_start", "content_block_delta", "content_block_stop", "message_delta", "message_stop"]) assert.match(messagesSse, new RegExp(`event: ${event}`));
+    assert.equal(fixture.requests.length, 3);
+
+    assert.equal((await post("/responses", { model: "glm-5.2", stream: true, input: "wrong model" })).status, 422);
+    assert.equal((await post("/responses", { model: "deepseek-v4-flash", stream: false, input: "missing stream" })).status, 422);
+    assert.equal((await post("/responses", { model: "deepseek-v4-flash", stream: true, input: [], messages: [] })).status, 422);
+    assert.equal((await post("/messages", { model: "glm-5.2", stream: true, messages: [{ role: "user", content: "missing max" }] })).status, 422);
+    assert.equal((await post("/messages", { model: "glm-5.2", stream: true, max_tokens: 8, messages: [], input: "mixed" })).status, 422);
+    assert.equal((await post("/wrong-path", { model: "deepseek-v4-flash", input: "wrong path" })).status, 404);
+    assert.equal(fixture.requests.length, 3);
+    assert.equal(fixture.attempts.length, 9);
+    assert.deepEqual(fixture.attempts.slice(0, 3).map(({ path, method, model, accepted, transport }) => ({ path, method, model, accepted, transport })), [
+      { path: "/v1/responses", method: "POST", model: "deepseek-v4-flash", accepted: true, transport: "responses" },
+      { path: "/v1/responses", method: "POST", model: "deepseek-v4-flash", accepted: true, transport: "responses" },
+      { path: "/v1/messages", method: "POST", model: "glm-5.2", accepted: true, transport: "messages" },
+    ]);
+    for (const attempt of fixture.attempts) {
+      assert.equal(Object.hasOwn(attempt, "payload"), false);
+      assert.equal(Object.hasOwn(attempt, "content"), false);
+    }
+    assert.equal(fixture.attempts.filter((attempt) => !attempt.accepted).length, 6);
+  } finally { await new Promise((resolve) => fixture.server.close(resolve)); }
+});
+
+test("downstream client lifecycle requires Responses created and completed events", () => {
+  const valid = "event: response.created\r\ndata: {\"type\":\"response.created\"}\r\n\r\ndata: {\"type\":\"response.completed\"}\n\ndata: [DONE]\n\n";
+  assert.equal(validDownstreamResponsesLifecycle(valid), true);
+  assert.equal(validDownstreamResponsesLifecycle("data: {\"type\":\"response.completed\"}\n\nevent: response.created\ndata: {\"type\":\"response.created\"}\n\n"), false);
+  assert.equal(validDownstreamResponsesLifecycle("event: response.created\ndata: {\"type\":\"response.created\"}\n\nevent: response.created\ndata: {\"type\":\"response.created\"}\n\ndata: {\"type\":\"response.completed\"}\n\n"), false);
+  assert.equal(validDownstreamResponsesLifecycle("event: response.created\ndata: {\"type\":\"response.created\"}\n\n"), false);
+  assert.equal(validDownstreamResponsesLifecycle("event: message_start\ndata: {\"type\":\"message_start\"}\n\nevent: response.created\ndata: {\"type\":\"response.created\"}\n\ndata: {\"type\":\"response.completed\"}\n\n"), false);
+  assert.equal(validDownstreamResponsesLifecycle("event: response.created\ndata: not-json\n\ndata: {\"type\":\"response.completed\"}\n\n"), false);
 });
 
 test("clean install harness proves the full isolated service and command contract through injected callbacks", async () => {
