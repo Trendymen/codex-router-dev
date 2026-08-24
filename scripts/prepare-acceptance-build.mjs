@@ -20,6 +20,29 @@ function absolute(value, name) {
   return path.resolve(value);
 }
 
+export function classifyCliIsolationRoot(value, pathApi = path) {
+  if (!value || value.startsWith("-")) throw new Error("invalid --isolation-root");
+  const windows = pathApi.sep === "\\";
+  if (windows) {
+    if (/^(?:[\\/]|[A-Za-z]:$|[A-Za-z]:[^\\/])/.test(value)) throw new Error("relative isolationRoot is ambiguous");
+    if (/^[A-Za-z]:[\\/]/.test(value) && pathApi.isAbsolute(value)) return { absolute: true, value };
+    if (value.split(/[\\/]/).some((part) => part === ".." || !part)) throw new Error("relative isolationRoot is ambiguous");
+    return { absolute: false, value, components: value.split(/[\\/]/) };
+  }
+  if (value.includes("\\") || /^[A-Za-z]:/.test(value) || /^\/\//.test(value)) throw new Error("relative isolationRoot is ambiguous");
+  if (pathApi.isAbsolute(value)) return { absolute: true, value };
+  if (value.split("/").some((part) => part === ".." || !part)) throw new Error("relative isolationRoot is ambiguous");
+  return { absolute: false, value, components: value.split("/") };
+}
+
+function cliIsolationRoot(value) {
+  const classified = classifyCliIsolationRoot(value);
+  if (classified.absolute) return classified.value;
+  const cwd = realpathSync(process.cwd()); let cursor = cwd;
+  for (const part of classified.components) { cursor = path.join(cursor, part); if (existsSync(cursor) && lstatSync(cursor).isSymbolicLink()) throw new Error("relative isolationRoot must not cross a symbolic link"); }
+  return within(cwd, path.resolve(cwd, classified.value), "relative isolationRoot");
+}
+
 function canonicalPath(value, name) {
   const resolved = absolute(value, name);
   const missing = [];
@@ -330,10 +353,12 @@ function cli() {
   const value = (name, optional = false) => {
     const index = args.indexOf(name);
     if (index === -1) { if (optional) return undefined; throw new Error(`missing ${name}`); }
-    return args[index + 1];
+    const result = args[index + 1];
+    if (!result || result.startsWith("-")) throw new Error(`missing value for ${name}`);
+    return result;
   };
   if (command === "prepare") {
-    const manifest = prepareAcceptanceBuild({ isolationRoot: value("--isolation-root"), sourceCommit: value("--source-commit"), dryRun: args.includes("--dry-run") });
+    const manifest = prepareAcceptanceBuild({ isolationRoot: cliIsolationRoot(value("--isolation-root")), sourceCommit: value("--source-commit"), dryRun: args.includes("--dry-run") });
     process.stdout.write(`${path.join(manifest.isolationRoot, MANIFEST)}\n`);
     return;
   }

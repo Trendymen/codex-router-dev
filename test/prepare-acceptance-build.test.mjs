@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { classifyCliIsolationRoot } from "../scripts/prepare-acceptance-build.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const tool = path.join(root, "scripts", "prepare-acceptance-build.mjs");
@@ -37,6 +38,52 @@ test("prepare 从指定提交创建隔离、可复现的 build-only manifest", (
     assert.notEqual(fixture.target.routerLabel, "io.github.codex-router");
     assert.notEqual(fixture.target.ports.router, 4202);
   } finally { rmSync(temp, { recursive: true, force: true }); }
+});
+
+test("prepare CLI 从仓库 cwd 接受相对 isolation root，但 manifest 与后续命令保持 absolute", () => {
+  const relative = path.join("generated", "acceptance", `relative-contract-${process.pid}-${Date.now()}`);
+  const absoluteRoot = path.join(root, relative);
+  try {
+    const commit = spawnSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" }).stdout.trim();
+    const prepared = run(["prepare", "--isolation-root", relative, "--source-commit", commit, "--dry-run"], root);
+    assert.equal(prepared.status, 0, prepared.stderr);
+    const manifest = JSON.parse(readFileSync(path.join(absoluteRoot, "acceptance-build.json"), "utf8"));
+    for (const value of [manifest.isolationRoot, manifest.sourceRoot, manifest.fixtureContext, manifest.buildRoot, manifest.bundlePath, manifest.catalogTooling.path]) {
+      assert.equal(path.isAbsolute(value), true);
+      assert.equal(path.relative(realpathSync(absoluteRoot), value).startsWith(".."), false);
+    }
+    const outside = mkdtempSync(path.join(os.tmpdir(), "acceptance-relative-cwd-"));
+    try { for (const action of ["test-swift", "build-swift", "finalize"]) assert.equal(run([action, "--manifest", path.join(absoluteRoot, "acceptance-build.json")], outside).status, 0); }
+    finally { rmSync(outside, { recursive: true, force: true }); }
+  } finally { rmSync(absoluteRoot, { recursive: true, force: true }); }
+});
+
+test("prepare 在写入前拒绝缺失 value flag 与 fully-existing symlink relative root", () => {
+  const temp = mkdtempSync(path.join(os.tmpdir(), "acceptance-build-cli-"));
+  try {
+    const commit = spawnSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" }).stdout.trim();
+    const decoy = path.join(temp, "decoy"); mkdirSync(decoy);
+    const missing = run(["prepare", "--isolation-root", "--source-commit", commit, "--dry-run"], temp);
+    assert.equal(missing.status, 2); assert.equal(existsSync(path.join(temp, "--source-commit")), false);
+    const outside = path.join(temp, "outside"); mkdirSync(path.join(outside, "child"), { recursive: true }); symlinkSync(outside, path.join(temp, "link"));
+    const linked = run(["prepare", "--isolation-root", "link/child", "--source-commit", commit, "--dry-run"], temp);
+    assert.equal(linked.status, 2); assert.equal(existsSync(path.join(outside, "child", ".acceptance-build-owner.json")), false);
+  } finally { rmSync(temp, { recursive: true, force: true }); }
+});
+
+test("POSIX CLI relative root 在写入前拒绝反斜杠歧义", { skip: path.sep !== "/" }, () => {
+  const temp = mkdtempSync(path.join(os.tmpdir(), "acceptance-build-backslash-"));
+  try {
+    const commit = spawnSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" }).stdout.trim();
+    const result = run(["prepare", "--isolation-root", "a\\b", "--source-commit", commit, "--dry-run"], temp);
+    assert.equal(result.status, 2); assert.equal(existsSync(path.join(temp, "a\\b")), false);
+  } finally { rmSync(temp, { recursive: true, force: true }); }
+});
+
+test("pure CLI path classifier uses Windows lexical semantics before filesystem access", () => {
+  assert.deepEqual(classifyCliIsolationRoot("safe\\nested", path.win32), { absolute: false, value: "safe\\nested", components: ["safe", "nested"] });
+  assert.deepEqual(classifyCliIsolationRoot("C:\\isolated", path.win32), { absolute: true, value: "C:\\isolated" });
+  for (const value of ["C:", "C:relative", "\\rooted", "/rooted", "\\\\server\\share", "//server/share", "\\\\?\\C:\\x", "\\\\.\\pipe"]) assert.throws(() => classifyCliIsolationRoot(value, path.win32));
 });
 
 test("Swift 子命令只消费 manifest 的绝对路径，并拒绝非受管或生产构建", () => {
