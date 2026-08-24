@@ -552,7 +552,7 @@ test("合法变量命令放行绑定 exact source identity，任意同路径 dri
     const target = path.join(root, "src", "node-runtime.mjs");
     cpSync(source, target);
     assert.equal(findingsFor(root).includes("runtime-command-unresolved:src/node-runtime.mjs"), false, findingsFor(root).join(", "));
-    writeFileSync(target, readFileSync(target, "utf8").replaceAll("\n", "\r\n"));
+    writeFileSync(target, readFileSync(target, "utf8").replace(/\r\n/g, "\n").replaceAll("\n", "\r\n"));
     assert.equal(findingsFor(root).includes("runtime-command-unresolved:src/node-runtime.mjs"), false, findingsFor(root).join(", "));
     writeFileSync(target, `${readFileSync(target, "utf8")}\n// source identity drift\n`);
     assert.ok(findingsFor(root).includes("runtime-command-unresolved:src/node-runtime.mjs"), findingsFor(root).join(", "));

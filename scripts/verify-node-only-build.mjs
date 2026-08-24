@@ -470,12 +470,14 @@ function semanticRuntimeReferences(relative, entry) {
   return findings;
 }
 export function auditRuntimeSource(relative, source, mode = 0o644) {
-  return semanticRuntimeReferences(relative, {
+  const entry = {
     type: "file",
     mode,
     bytes: Buffer.byteLength(source, "utf8"),
     data: Buffer.from(source, "utf8"),
-  });
+  };
+  const executable = (mode & 0o111) !== 0 ? removedKind(path.posix.basename(relative).toLowerCase()) : null;
+  return [...(executable ? [executable] : []), ...semanticRuntimeReferences(relative, entry)];
 }
 function removedRuntime(entries) {
   const findings = [];
