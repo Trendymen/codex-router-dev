@@ -27,6 +27,30 @@ const OLD_RUNTIME_ARTIFACTS = Object.freeze([
   "legacy-gateway-config",
 ]);
 
+export const NON_PRODUCTION_RUNTIME_CALLBACKS = Object.freeze([
+  "preflight",
+  "installReplacement",
+  "verifyReplacement",
+  "publishReplacement",
+  "cleanupOld",
+  "restoreSnapshot",
+  "restartOldService",
+  "refreshTray",
+]);
+
+const MIGRATION_RUNTIME_CALLBACKS = Object.freeze(
+  NON_PRODUCTION_RUNTIME_CALLBACKS.filter((name) => name !== "refreshTray"),
+);
+
+function requireNonProductionRuntimeCallbacks(target, runtime, operation, callbacks = NON_PRODUCTION_RUNTIME_CALLBACKS) {
+  if (target.mode === "production") return;
+  for (const name of callbacks) {
+    if (typeof runtime[name] !== "function") {
+      throw new Error(`Non-production ${operation} requires isolated ${name} callback.`);
+    }
+  }
+}
+
 function errorMessage(error) {
   return error instanceof Error ? error.message : String(error);
 }
@@ -35,10 +59,20 @@ function errorMessage(error) {
 // non-macOS update must reject before even loading registry-backed state, let
 // alone fetching or replacing a checkout. The full manifest writer remains in
 // install-manifest.mjs for the install path.
-function readInstallManifestSnapshot() {
-  if (!existsSync(INSTALL_MANIFEST_PATH)) return undefined;
+export function installManifestPathForTarget(target = currentServiceTarget()) {
+  // The production manifest path remains the exact compatibility constant. An
+  // isolated target must derive its marker from its validated state root; it
+  // must never inherit the process-wide path selected for a real installation.
+  if (target.mode === "production") return INSTALL_MANIFEST_PATH;
+  if (!target.stateRoot) throw new Error("Non-production update target requires a stateRoot.");
+  return path.join(target.stateRoot, "install-manifest.json");
+}
+
+function readInstallManifestSnapshot(target = currentServiceTarget()) {
+  const manifestPath = installManifestPathForTarget(target);
+  if (!existsSync(manifestPath)) return undefined;
   try {
-    const parsed = JSON.parse(readFileSync(INSTALL_MANIFEST_PATH, "utf8"));
+    const parsed = JSON.parse(readFileSync(manifestPath, "utf8"));
     return parsed?.version === 1 ? parsed : undefined;
   } catch {
     return undefined;
@@ -46,20 +80,25 @@ function readInstallManifestSnapshot() {
 }
 
 function git(args, options = {}) {
-  const output = execFileSync("git", ["-C", SOURCE_ROOT, ...args], {
+  const output = execFileSync("git", ["-C", options.sourceRoot || SOURCE_ROOT, ...args], {
     encoding: "utf8",
     stdio: options.inherit ? "inherit" : ["ignore", "pipe", "pipe"],
   });
   return typeof output === "string" ? output.trim() : "";
 }
 
-function requireManagedCheckout(gitImpl = git) {
+function targetGit(target, gitImpl) {
+  const invoke = gitImpl || git;
+  return (args, options = {}) => invoke(args, { ...options, sourceRoot: target.sourceRoot });
+}
+
+function requireManagedCheckout(target, gitImpl) {
   if (process.env.CODEX_ROUTER_PACKAGE_MANAGER === "homebrew") {
     throw new Error(
       "This installation is managed by Homebrew. Upgrade it with `brew upgrade codex-router`.",
     );
   }
-  if (!existsSync(path.join(SOURCE_ROOT, ".git"))) {
+  if (!existsSync(path.join(target.sourceRoot, ".git"))) {
     throw new Error(
       "This release is not a Git checkout. Re-run the installation command to upgrade it.",
     );
@@ -114,10 +153,10 @@ export function localModificationsMessage(changes, sourceRoot = SOURCE_ROOT) {
 // Called only where the checkout is actually about to be rewritten, so a
 // checkout with edits still answers "is an update available?" and still
 // reinstalls at the same commit.
-function requireReplaceableCheckout(force, gitImpl = git) {
+function requireReplaceableCheckout(force, target, gitImpl) {
   const changes = localModifications(gitImpl);
   if (changes.length === 0) return;
-  if (!force) throw new Error(localModificationsMessage(changes));
+  if (!force) throw new Error(localModificationsMessage(changes, target.sourceRoot));
   gitImpl(["reset", "--hard", "HEAD"], { inherit: true });
 }
 
@@ -129,7 +168,7 @@ function requireReplaceableCheckout(force, gitImpl = git) {
 export function currentCheckoutInstaller(
   platform = process.platform,
   target = TARGET,
-  { posixScript = "install" } = {},
+  { posixScript = "install", sourceRoot = SOURCE_ROOT } = {},
 ) {
   return platform === "win32"
     ? {
@@ -140,19 +179,19 @@ export function currentCheckoutInstaller(
           "-ExecutionPolicy",
           "Bypass",
           "-File",
-          path.join(SOURCE_ROOT, "install.ps1"),
+          path.join(sourceRoot, "install.ps1"),
           "-CheckoutInstall",
           "-Target",
           target,
         ],
       }
-    : { command: path.join(SOURCE_ROOT, "bin", posixScript), args: [] };
+    : { command: path.join(sourceRoot, "bin", posixScript), args: [] };
 }
 
-function installCurrentCheckout() {
-  const installer = currentCheckoutInstaller();
+function installCurrentCheckout(target = currentServiceTarget()) {
+  const installer = currentCheckoutInstaller(target.platform, TARGET, { sourceRoot: target.sourceRoot });
   const result = spawnSync(installer.command, installer.args, {
-    cwd: SOURCE_ROOT,
+    cwd: target.sourceRoot,
     stdio: "inherit",
     env: { ...process.env, MODEL_ROUTER_TARGET: TARGET },
   });
@@ -282,8 +321,8 @@ function restartOldRuntime(target) {
   if (target.platform !== "darwin") return true;
   const result = spawnSync(
     process.execPath,
-    [path.join(SOURCE_ROOT, "src", "service.mjs"), "restart"],
-    { cwd: SOURCE_ROOT, env: process.env, stdio: "inherit" },
+    [path.join(target.sourceRoot, "src", "service.mjs"), "restart"],
+    { cwd: target.sourceRoot, env: process.env, stdio: "inherit" },
   );
   if (result.error) throw result.error;
   if (result.status !== 0) throw new Error(`Old Router service restart exited with ${result.status}.`);
@@ -295,18 +334,20 @@ function restartOldRuntime(target) {
  * the replacement installer runs, and cleanup is reachable only after the
  * Router, browser, and Swift contracts have all passed.
  */
-export async function runRuntimeMigration({
-  target = currentServiceTarget(),
-  runtimeRoots,
-  snapshot,
-  preflight,
-  installReplacement = installCurrentCheckout,
-  verifyReplacement = () => verifyInstalledRuntime(target),
-  publishReplacement = rebuildNodeSnapshotsAfterUpdate,
-  cleanupOld,
-  restoreSnapshot = (value) => restoreOwnedRuntime(value),
-  restartOldService = () => restartOldRuntime(target),
-} = {}) {
+export async function runRuntimeMigration(options = {}) {
+  const target = options.target || currentServiceTarget();
+  const {
+    runtimeRoots,
+    snapshot,
+    preflight,
+    cleanupOld,
+  } = options;
+  requireNonProductionRuntimeCallbacks(target, options, "runtime migration", MIGRATION_RUNTIME_CALLBACKS);
+  const installReplacement = options.installReplacement || (() => installCurrentCheckout(target));
+  const verifyReplacement = options.verifyReplacement || (() => verifyInstalledRuntime(target));
+  const publishReplacement = options.publishReplacement || (() => rebuildNodeSnapshotsAfterUpdate({ target }));
+  const restoreSnapshot = options.restoreSnapshot || ((value) => restoreOwnedRuntime(value));
+  const restartOldService = options.restartOldService || (() => restartOldRuntime(target));
   const paths = ownedRuntimePaths(target, runtimeRoots || snapshot?.options || {});
   const runtimeSnapshot = snapshot || snapshotOwnedRuntime(paths);
   if (snapshot && (snapshot.target !== target || JSON.stringify(snapshot.options) !== JSON.stringify(paths.options))) {
@@ -356,7 +397,7 @@ export function trayRefreshRequired({
   const registered = registeredPath ?? registeredTrayBundlePath(resolvedTarget?.trayLabel);
   const candidates = [
     resolvedTarget?.appPath || path.join(home, "Applications", "Model Router.app"),
-    path.join(sourceRoot, "dist", "Model Router.app"),
+    path.join(resolvedTarget?.sourceRoot || sourceRoot, "dist", "Model Router.app"),
   ];
   return (
     candidates.some((candidate) => existsSync(candidate)) ||
@@ -367,16 +408,20 @@ export function trayRefreshRequired({
 // The tray is rebuilt from the same checkout that owns the router, so an
 // update never leaves a stale companion binary behind. Best-effort: the router
 // update itself succeeded, and a failed tray refresh must not roll it back.
-function refreshTrayCompanion() {
-  const target = currentServiceTarget();
+function refreshTrayCompanion(target) {
   if (!trayRefreshRequired({ target })) return;
   const launcher = path.join(target.sourceRoot, "bin", "model-router-tray");
-  const result = spawnSync(launcher, [], { cwd: SOURCE_ROOT, stdio: "inherit" });
+  const result = spawnSync(launcher, [], { cwd: target.sourceRoot, stdio: "inherit" });
   if (result.error) {
     process.stderr.write(`Menu-bar companion refresh did not finish: ${result.error.message}\n`);
   } else if (result.status !== 0) {
     process.stderr.write(`Menu-bar companion refresh exited with status ${result.status}.\n`);
   }
+}
+
+async function refreshTrayAfterRuntime(target, runtime) {
+  if (target.mode === "production") return refreshTrayCompanion(target);
+  return runtime.refreshTray(target);
 }
 
 function revisionExists(revision, gitImpl = git) {
@@ -395,9 +440,9 @@ function switchRevision(revision, gitImpl = git) {
   gitImpl(["reset", "--hard", revision], { inherit: true });
 }
 
-function restoreRevision(revision, { gitImpl = git, reinstall = false } = {}) {
+function restoreRevision(revision, { gitImpl = git, reinstall = false, target = currentServiceTarget() } = {}) {
   switchRevision(revision, gitImpl);
-  if (reinstall) installCurrentCheckout();
+  if (reinstall) installCurrentCheckout(target);
 }
 
 export async function restoreRuntimeAndRevision(
@@ -440,11 +485,12 @@ async function captureRuntimeSnapshot(target, runtime = {}) {
   return snapshotOwnedRuntime(paths);
 }
 
-export function checkForUpdate({ gitImpl = git } = {}) {
-  requireManagedCheckout(gitImpl);
-  gitImpl(["fetch", "--quiet", "origin", "main"]);
-  const current = gitImpl(["rev-parse", "HEAD"]);
-  const available = gitImpl(["rev-parse", "origin/main"]);
+export function checkForUpdate({ gitImpl, target = currentServiceTarget() } = {}) {
+  const scopedGit = targetGit(target, gitImpl);
+  requireManagedCheckout(target, scopedGit);
+  scopedGit(["fetch", "--quiet", "origin", "main"]);
+  const current = scopedGit(["rev-parse", "HEAD"]);
+  const available = scopedGit(["rev-parse", "origin/main"]);
   return { current, available, updateAvailable: current !== available };
 }
 
@@ -453,12 +499,12 @@ export function installationNeedsRefresh(manifest, revision) {
 }
 
 /** Complete update publication after the installer has rebuilt the base catalog. */
-export function rebuildNodeSnapshotsAfterUpdate({ run = spawnSync } = {}) {
+export function rebuildNodeSnapshotsAfterUpdate({ run = spawnSync, target = currentServiceTarget() } = {}) {
   const result = run(
     process.execPath,
-    [path.join(SOURCE_ROOT, "src", "node-snapshot-triggers.mjs"), "registry-update"],
+    [path.join(target.sourceRoot, "src", "node-snapshot-triggers.mjs"), "registry-update"],
     {
-      cwd: SOURCE_ROOT,
+      cwd: target.sourceRoot,
       env: process.env,
       encoding: "utf8",
       stdio: "inherit",
@@ -478,9 +524,11 @@ export async function updateCheckout({
   gitImpl = git,
   target = currentServiceTarget(),
 } = {}) {
-  const status = checkForUpdate({ gitImpl });
+  requireNonProductionRuntimeCallbacks(target, runtime, "updateCheckout");
+  const scopedGit = targetGit(target, gitImpl);
+  const status = checkForUpdate({ gitImpl, target });
   if (!status.updateAvailable) {
-    if (!installationNeedsRefresh(readInstallManifestSnapshot(), status.current)) {
+    if (!installationNeedsRefresh(readInstallManifestSnapshot(target), status.current)) {
       return { ...status, updated: false, reinstalled: false };
     }
     const runtimeSnapshot = await captureRuntimeSnapshot(target, runtime);
@@ -489,9 +537,11 @@ export async function updateCheckout({
       target,
       snapshot: runtimeSnapshot,
       preflight: runtime.preflight,
-      installReplacement: runtime.installReplacement || installCurrentCheckout,
+      installReplacement: runtime.installReplacement || (() => installCurrentCheckout(target)),
+      restartOldService: runtime.restartOldService,
+      restoreSnapshot: runtime.restoreSnapshot,
     });
-    refreshTrayCompanion();
+    await refreshTrayAfterRuntime(target, runtime);
     return { ...status, updated: false, reinstalled: true };
   }
   // Capture all owned runtime bytes before any checkout mutation. In
@@ -500,8 +550,8 @@ export async function updateCheckout({
   let branch;
   const preflight = async (snapshotValue) => {
     await runtime.preflight?.(snapshotValue);
-    requireReplaceableCheckout(force, gitImpl);
-    branch = gitImpl(["branch", "--show-current"]);
+    requireReplaceableCheckout(force, target, scopedGit);
+    branch = scopedGit(["branch", "--show-current"]);
     if (!branch) {
       throw new Error("Updates require the managed checkout to be on its main branch.");
     }
@@ -510,9 +560,9 @@ export async function updateCheckout({
     // Revision mutation is part of the replacement step, after snapshot and
     // preflight have both succeeded. The old revision remains recoverable until
     // this step is reached.
-    gitImpl(["update-ref", "refs/codex-router/rollback", status.current]);
-    gitImpl(["merge", "--ff-only", status.available], { inherit: true });
-    installCurrentCheckout();
+    scopedGit(["update-ref", "refs/codex-router/rollback", status.current]);
+    scopedGit(["merge", "--ff-only", status.available], { inherit: true });
+    installCurrentCheckout(target);
   });
   await runRuntimeMigration({
     ...runtime,
@@ -523,60 +573,65 @@ export async function updateCheckout({
     restoreSnapshot: runtime.restoreSnapshot || ((snapshotValue) => restoreRuntimeAndRevision(
       snapshotValue,
       status.current,
-      { restoreRevision: (revision) => switchRevision(revision, gitImpl) },
+      { restoreRevision: (revision) => switchRevision(revision, scopedGit) },
     )),
+    restartOldService: runtime.restartOldService,
   });
-  refreshTrayCompanion();
+  await refreshTrayAfterRuntime(target, runtime);
   return { ...status, updated: true, reinstalled: true };
 }
 
-export async function rollbackCheckout({ force = false, runtime = {}, gitImpl = git } = {}) {
-  requireManagedCheckout(gitImpl);
+export async function rollbackCheckout({ force = false, runtime = {}, gitImpl, target = currentServiceTarget() } = {}) {
+  requireNonProductionRuntimeCallbacks(target, runtime, "rollbackCheckout");
+  const scopedGit = targetGit(target, gitImpl);
+  requireManagedCheckout(target, scopedGit);
   // A rollback checks out a different revision, so it overwrites tracked edits
   // exactly the way an update does.
-  const current = gitImpl(["rev-parse", "HEAD"]);
-  let target;
+  const current = scopedGit(["rev-parse", "HEAD"]);
+  let rollbackTarget;
   try {
-    target = gitImpl(["rev-parse", "refs/codex-router/rollback"]);
+    rollbackTarget = scopedGit(["rev-parse", "refs/codex-router/rollback"]);
   } catch {
-    target = readInstallManifestSnapshot()?.history?.find((entry) => entry.commit)?.commit;
+    rollbackTarget = readInstallManifestSnapshot(target)?.history?.find((entry) => entry.commit)?.commit;
   }
-  if (!target || !revisionExists(target, gitImpl)) {
+  if (!rollbackTarget || !revisionExists(rollbackTarget, scopedGit)) {
     throw new Error("No locally cached working revision is available to roll back to.");
   }
-  if (target === current) throw new Error("The rollback revision is already installed.");
+  if (rollbackTarget === current) throw new Error("The rollback revision is already installed.");
   const runtimeSnapshot = Object.keys(runtime).length
-    ? await captureRuntimeSnapshot(currentServiceTarget(), runtime)
+    ? await captureRuntimeSnapshot(target, runtime)
     : undefined;
   const preflight = async (snapshotValue) => {
     await runtime.preflight?.(snapshotValue);
-    requireReplaceableCheckout(force, gitImpl);
+    requireReplaceableCheckout(force, target, scopedGit);
   };
   // A bare checkout without an install manifest is not a managed runtime
   // installation yet (for example, a deterministic control-child fixture),
   // so preserve the old checkout-only rollback path. Real managed installs
   // and injected acceptance transactions always take the snapshot gate.
-  if (Object.keys(runtime).length || existsSync(INSTALL_MANIFEST_PATH)) {
+  if (Object.keys(runtime).length || existsSync(installManifestPathForTarget(target))) {
     await runRuntimeMigration({
       ...runtime,
+      target,
       ...(runtimeSnapshot ? { snapshot: runtimeSnapshot } : {}),
       preflight,
       installReplacement: runtime.installReplacement || (() => {
-        gitImpl(["update-ref", "refs/codex-router/rollback", current]);
-        restoreRevision(target, { gitImpl, reinstall: true });
+        scopedGit(["update-ref", "refs/codex-router/rollback", current]);
+        restoreRevision(rollbackTarget, { gitImpl: scopedGit, reinstall: true, target });
       }),
       restoreSnapshot: runtime.restoreSnapshot || ((snapshotValue) => restoreRuntimeAndRevision(
         snapshotValue,
         current,
-        { restoreRevision: (revision) => switchRevision(revision, gitImpl) },
+        { restoreRevision: (revision) => switchRevision(revision, scopedGit) },
       )),
     });
+    if (target.mode !== "production") await refreshTrayAfterRuntime(target, runtime);
   } else {
-    requireReplaceableCheckout(force, gitImpl);
-    gitImpl(["update-ref", "refs/codex-router/rollback", current]);
-    restoreRevision(target, { gitImpl, reinstall: true });
+    requireReplaceableCheckout(force, target, scopedGit);
+    scopedGit(["update-ref", "refs/codex-router/rollback", current]);
+    restoreRevision(rollbackTarget, { gitImpl: scopedGit, reinstall: true, target });
   }
-  return { rolledBack: true, from: current, to: target };
+  return { rolledBack: true, from: current, to: rollbackTarget };
 }
 
 const COMMANDS = {

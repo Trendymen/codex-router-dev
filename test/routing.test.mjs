@@ -88,6 +88,7 @@ function run(script, env) {
     env?.MODEL_ROUTER_STATE_DIR || env?.CODEX_ROUTER_STATE_DIR
       ? {}
       : { MODEL_ROUTER_STATE_DIR: mkdtempSync(path.join(os.tmpdir(), "routing-state-")) };
+  const explicitEnv = { ...(env || {}) };
   const childEnv = {
     ...process.env,
     ...stateIsolation,
@@ -95,8 +96,12 @@ function run(script, env) {
     CODEX_ROUTER_INTERNAL_KEY: INTERNAL_KEY,
     KIMI_INTERNAL_KEY: INTERNAL_KEY,
     CODEX_ROUTER_SHOW_ALL_MODELS: "1",
-    ...env,
   };
+  for (const provider of PROVIDERS.values()) {
+    if (provider.baseUrlEnv) delete childEnv[provider.baseUrlEnv];
+    for (const name of provider.credential?.environment || []) delete childEnv[name];
+  }
+  Object.assign(childEnv, explicitEnv);
   // Route the retained end-to-end cases through the protected Node snapshot.
   // The former suite pointed every external turn at the removed local gateway;
   // the fixture now uses its mock as each provider's test endpoint.
@@ -120,8 +125,8 @@ function run(script, env) {
       writeFileSync(path.join(stateDir, "node-routes.json"), `${JSON.stringify({ version: 1, routes })}\n`, { mode: 0o600 });
     }
     for (const provider of PROVIDERS.values()) {
-      if (provider.baseUrlEnv) childEnv[provider.baseUrlEnv] ||= childEnv.CODEX_ROUTER_GATEWAY_BASE_URL;
-      for (const name of provider.credential?.environment || []) childEnv[name] ||= INTERNAL_KEY;
+      if (provider.baseUrlEnv) childEnv[provider.baseUrlEnv] ??= childEnv.CODEX_ROUTER_GATEWAY_BASE_URL;
+      for (const name of provider.credential?.environment || []) childEnv[name] ??= INTERNAL_KEY;
     }
   }
   const child = spawn(process.execPath, [path.join(root, "src", script)], {
@@ -1027,6 +1032,36 @@ test("router preserves native auth and isolates every external route", async () 
   } finally {
     await stopChild(router);
     await Promise.all([closeServer(native.server), closeServer(gateway.server)]);
+  }
+});
+
+test("route fixture preserves an explicit provider endpoint after stripping inherited provider state", async () => {
+  const generic = await mockServer((request, response) => json(response, 418, { route: "generic" }));
+  const explicitRequests = [];
+  const explicit = await mockServer(async (request, response) => {
+    explicitRequests.push(await bodyJson(request));
+    json(response, 200, { id: "resp-explicit", object: "response", output: [], usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 } });
+  });
+  const routerPort = await openPort();
+  const router = run("router.mjs", {
+    CODEX_ROUTER_PORT: String(routerPort),
+    CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${generic.port}/v1`,
+    QWEN_PLAN_BASE_URL: `http://127.0.0.1:${explicit.port}/v1`,
+    QWEN_PLAN_API_KEY: "explicit-test-key",
+    CODEX_ROUTER_QUIET: "1",
+  });
+  try {
+    await waitFor(`${routerBase(routerPort)}/models`, router);
+    const response = await fetch(`${routerBase(routerPort)}/responses`, {
+      method: "POST",
+      headers: { Authorization: "Bearer CODEX_CALLER_SECRET", "Content-Type": "application/json" },
+      body: JSON.stringify({ model: "qwen-plan/deepseek-v4-flash-0731", input: "fixture endpoint" }),
+    });
+    assert.equal(response.status, 200, `${await response.text()}\n${router.testErrors()}`);
+    assert.equal(explicitRequests.length, 1);
+  } finally {
+    await stopChild(router);
+    await Promise.all([closeServer(generic.server), closeServer(explicit.server)]);
   }
 });
 

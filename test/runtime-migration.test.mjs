@@ -209,6 +209,7 @@ test("public runtime migration binds explicit runtime roots to its snapshot", as
       target,
       runtimeRoots,
       snapshot,
+      preflight: async () => events.push("preflight"),
       installReplacement: async () => events.push("install"),
       verifyReplacement: async () => events.push("verify"),
       publishReplacement: async () => events.push("publish"),
@@ -216,13 +217,19 @@ test("public runtime migration binds explicit runtime roots to its snapshot", as
       restoreSnapshot: async () => events.push("restore"),
       restartOldService: async () => events.push("restart"),
     });
-    assert.deepEqual(events, ["install", "verify", "publish", "cleanup"]);
+    assert.deepEqual(events, ["preflight", "install", "verify", "publish", "cleanup"]);
     await assert.rejects(
       runRuntimeMigration({
         target,
         runtimeRoots: { ...runtimeRoots, dshHome: path.join(root, "other-dsh") },
         snapshot,
+        preflight: async () => {},
         installReplacement: async () => {},
+        verifyReplacement: async () => {},
+        publishReplacement: async () => {},
+        cleanupOld: async () => {},
+        restoreSnapshot: async () => {},
+        restartOldService: async () => {},
       }),
       /different ServiceTarget|runtime roots|snapshot/i,
     );

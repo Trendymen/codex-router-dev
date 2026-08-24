@@ -51,13 +51,14 @@ function guardEvents(stderr) {
     .flatMap((line) => JSON.parse(line.slice(guardMarker.length)));
 }
 
-function writeCodexStub(directory) {
-  const target = path.join(directory, process.platform === "win32" ? "codex-test.cmd" : "codex-test");
+function writeCodexStub(directory, name = process.platform === "win32" ? "codex-test.cmd" : "codex-test") {
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const target = path.join(directory, name);
   writeFileSync(
     target,
     process.platform === "win32"
-      ? "@echo off\r\nif \"%1\"==\"--version\" (echo codex-cli 99.0.0& exit /b 0)\r\nif \"%1\"==\"login\" exit /b 0\r\nif \"%1\"==\"debug\" (echo {\"models\":[]}& exit /b 0)\r\nexit /b 1\r\n"
-      : "#!/bin/sh\ncase \"$1\" in\n  --version) echo 'codex-cli 99.0.0' ;;\n  login) exit 0 ;;\n  debug) printf '%s\\n' '{\"models\":[]}' ;;\n  *) exit 1 ;;\nesac\n",
+      ? "@echo off\r\nif not \"%CODEX_STUB_LOG%\"==\"\" echo %~nx0>>\"%CODEX_STUB_LOG%\"\r\nif \"%1\"==\"--version\" (echo codex-cli 99.0.0& exit /b 0)\r\nif \"%1\"==\"login\" exit /b 0\r\nif \"%1\"==\"debug\" (echo {\"models\":[]}& exit /b 0)\r\nexit /b 1\r\n"
+      : "#!/bin/sh\nif [ -n \"$CODEX_STUB_LOG\" ]; then basename \"$0\" >> \"$CODEX_STUB_LOG\"; fi\ncase \"$1\" in\n  --version) echo 'codex-cli 99.0.0' ;;\n  login) exit 0 ;;\n  debug) printf '%s\\n' '{\"models\":[]}' ;;\n  *) exit 1 ;;\nesac\n",
     { mode: 0o755 },
   );
   return target;
@@ -190,6 +191,7 @@ test("read-only snippet, status, and doctor calls leave the fully isolated home 
   const isolated = mkdtempSync(path.join(os.tmpdir(), "codex-router-runtime-guard-"));
   const home = path.join(isolated, "home");
   const codexHome = path.join(isolated, "codex");
+  const stubLog = `${isolated}.codex-stubs.log`;
   const stateDir = path.join(codexHome, "router-state");
   const secret = "runtime-guard-caller-capability-decoy-with-sufficient-length";
   const ccSwitchDatabase = path.join(home, ".cc-switch", "cc-switch.db");
@@ -218,11 +220,14 @@ standalone_web_search = true
     CODEX_ROUTER_STATE_DIR: stateDir,
     MODEL_ROUTER_STATE_DIR: stateDir,
     CODEX_ROUTER_PORT: "46192",
-    CODEX_BIN: writeCodexStub(isolated),
+    CODEX_BIN: writeCodexStub(path.join(isolated, "bin"), process.platform === "win32" ? "codex-desktop.cmd" : "codex-desktop"),
+    PATH: `${path.join(isolated, "bin")}${path.delimiter}${process.env.PATH || ""}`,
+    CODEX_STUB_LOG: stubLog,
     CODEX_ROUTER_SERVICE_PLATFORM: "darwin",
     TASK5_RUNTIME_GUARD_ROOT: isolated,
     NODE_OPTIONS: `${process.env.NODE_OPTIONS || ""} --require=${runtimeGuard}`.trim(),
   };
+  writeCodexStub(path.join(isolated, "bin"), process.platform === "win32" ? "codex.cmd" : "codex");
 
   try {
     const before = snapshotTree(isolated);
@@ -240,6 +245,11 @@ standalone_web_search = true
       }
       assert.deepEqual(guardEvents(result.stderr), []);
       assert.deepEqual(snapshotTree(isolated), before, args.join(" "));
+      if (args[1] === "doctor") {
+        const invoked = readFileSync(stubLog, "utf8").trim().split(/\r?\n/).filter(Boolean);
+        assert.ok(invoked.includes(process.platform === "win32" ? "codex-desktop.cmd" : "codex-desktop"), invoked.join(", "));
+        assert.ok(invoked.includes(process.platform === "win32" ? "codex.cmd" : "codex"), invoked.join(", "));
+      }
     }
 
     const ccSwitchOperations = [
@@ -265,6 +275,7 @@ standalone_web_search = true
     }
   } finally {
     rmSync(isolated, { recursive: true, force: true });
+    rmSync(stubLog, { force: true });
   }
 });
 

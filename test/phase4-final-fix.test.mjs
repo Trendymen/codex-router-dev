@@ -9,8 +9,12 @@ import { fileURLToPath } from "node:url";
 
 import { migrateRuntime } from "../src/runtime-migration.mjs";
 import { buildReleasePackage } from "../scripts/package-release.mjs";
-import { updateCheckout } from "../src/update.mjs";
-import { currentServiceTarget } from "../src/paths.mjs";
+import {
+  NON_PRODUCTION_RUNTIME_CALLBACKS,
+  rollbackCheckout,
+  runRuntimeMigration,
+  updateCheckout,
+} from "../src/update.mjs";
 import { ownedRuntimePaths } from "../src/owned-runtime-paths.mjs";
 import { createTrayFixtureContext, readTrayFixtureContext, writeTrayFixtureContext } from "../src/tray-build-plan.mjs";
 import { PRODUCTION_SERVICE_TARGET, resolveServiceTarget } from "../src/service-target.mjs";
@@ -107,11 +111,24 @@ test("vision Responses reads the dispatcher's transformed body", () => {
 });
 
 test("update-level injection keeps snapshot and preflight before the merge", async () => {
-  const target = currentServiceTarget();
+  const isolationRoot = mkdtempSync(path.join(os.tmpdir(), "codex-router-update-injection-"));
+  const target = resolveServiceTarget({
+    mode: "test",
+    isolationRoot,
+    sourceRoot: path.join(isolationRoot, "checkout"),
+    routerLabel: "io.github.codex-router.update-test",
+    trayLabel: "io.github.codex-router.update-test.tray",
+    ports: { oauth: 7311, router: 7312, api: 7313, grokOauth: 7318, devinCli: 7320 },
+  });
+  const roots = {
+    userHome: path.join(isolationRoot, "home"), codexHome: path.join(isolationRoot, "codex"),
+    dshHome: path.join(isolationRoot, "dsh"), geminiHome: path.join(isolationRoot, "gemini"),
+  };
+  mkdirSync(path.join(target.sourceRoot, ".git"), { recursive: true });
   const snapshot = {
     version: 1,
     target,
-    options: ownedRuntimePaths(target).options,
+    options: ownedRuntimePaths(target, roots).options,
     entries: {},
   };
   const events = [];
@@ -124,23 +141,227 @@ test("update-level injection keeps snapshot and preflight before the merge", asy
     if (args[0] === "rev-parse" && args[1] === "origin/main") return "new-revision";
     return "";
   };
-  await updateCheckout({
-    gitImpl,
-    target,
-    runtime: {
-      snapshot,
-      preflight: async () => events.push("preflight"),
-      installReplacement: async () => {
-        events.push("merge");
-        gitImpl(["merge", "--ff-only", "new-revision"]);
+  try {
+    await updateCheckout({
+      gitImpl,
+      target,
+      runtime: {
+        snapshot,
+        runtimeRoots: roots,
+        preflight: async () => events.push("preflight"),
+        installReplacement: async () => {
+          events.push("merge");
+          gitImpl(["merge", "--ff-only", "new-revision"]);
+        },
+        verifyReplacement: async () => events.push("verify"),
+        publishReplacement: async () => events.push("publish"),
+        cleanupOld: async () => events.push("cleanup"),
+        restoreSnapshot: async () => events.push("restore"),
+        restartOldService: async () => events.push("restart"),
+        refreshTray: async (refreshedTarget) => {
+          assert.equal(refreshedTarget, target);
+          events.push("refresh");
+        },
       },
-      verifyReplacement: async () => events.push("verify"),
+    });
+    assert.deepEqual(events, ["preflight", "merge", "verify", "publish", "cleanup", "refresh"]);
+    assert.ok(gitCalls.findIndex((args) => args[0] === "merge") > gitCalls.findIndex((args) => args[0] === "branch"));
+  } finally {
+    rmSync(isolationRoot, { recursive: true, force: true });
+  }
+});
+
+test("non-production update migrations reject missing lifecycle callbacks before touching their target", async () => {
+  const isolationRoot = mkdtempSync(path.join(os.tmpdir(), "codex-router-update-guard-"));
+  try {
+    const target = resolveServiceTarget({
+      mode: "test", isolationRoot, sourceRoot: path.join(isolationRoot, "checkout"),
+      routerLabel: "io.github.codex-router.update-guard", trayLabel: "io.github.codex-router.update-guard.tray",
+      ports: { oauth: 7411, router: 7412, api: 7413, grokOauth: 7418, devinCli: 7420 },
+    });
+    await assert.rejects(() => runRuntimeMigration({ target }), /Non-production runtime migration requires isolated preflight callback/);
+  } finally {
+    rmSync(isolationRoot, { recursive: true, force: true });
+  }
+});
+
+test("non-production updateCheckout rejects every missing caller lifecycle callback before defaults", async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "codex-router-update-callbacks-"));
+  try {
+    const target = resolveServiceTarget({ mode: "test", isolationRoot: root, sourceRoot: path.join(root, "checkout"), routerLabel: "io.github.codex-router.callback-test", trayLabel: "io.github.codex-router.callback-test.tray", ports: { oauth: 7511, router: 7512, api: 7513, grokOauth: 7518, devinCli: 7520 } });
+    const callbacks = Object.fromEntries(NON_PRODUCTION_RUNTIME_CALLBACKS.map((name) => [name, async () => {}]));
+    for (const missing of NON_PRODUCTION_RUNTIME_CALLBACKS) {
+      const runtime = { ...callbacks }; delete runtime[missing];
+      await assert.rejects(() => updateCheckout({ target, runtime, gitImpl: () => { throw new Error("must not reach git"); } }), new RegExp(`isolated ${missing} callback`));
+    }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("non-production updates never read, execute, or inspect production checkout, manifest, or tray paths", () => {
+  const isolationRoot = mkdtempSync(path.join(os.tmpdir(), "codex-router-update-decoy-"));
+  const productionDecoy = path.join(isolationRoot, "production-decoy");
+  const guard = path.join(isolationRoot, "reject-production-update-access.cjs");
+  const scenario = path.join(isolationRoot, "scenario.mjs");
+  mkdirSync(productionDecoy, { recursive: true });
+  writeFileSync(guard, String.raw`
+    const childProcess = require("node:child_process");
+    const fs = require("node:fs");
+    const path = require("node:path");
+    const { syncBuiltinESMExports } = require("node:module");
+    const decoy = path.resolve(process.env.UPDATE_PRODUCTION_DECOY);
+    const blocked = (value) => {
+      if (typeof value !== "string") return;
+      const candidate = path.resolve(value);
+      if (candidate === decoy || candidate.startsWith(decoy + path.sep)) {
+        throw new Error("production update path was accessed: " + candidate);
+      }
+    };
+    for (const name of ["existsSync", "readFileSync", "statSync"]) {
+      const original = fs[name];
+      fs[name] = (...args) => { blocked(args[0]); return original(...args); };
+    }
+    const originalExecFileSync = childProcess.execFileSync;
+    childProcess.execFileSync = (command, args, ...rest) => {
+      if (Array.isArray(args)) {
+        const index = args.indexOf("-C");
+        if (index >= 0) blocked(args[index + 1]);
+      }
+      return originalExecFileSync(command, args, ...rest);
+    };
+    syncBuiltinESMExports();
+  `);
+  writeFileSync(scenario, String.raw`
+    import assert from "node:assert/strict";
+    import { mkdirSync, writeFileSync } from "node:fs";
+    import path from "node:path";
+    import { pathToFileURL } from "node:url";
+
+    const root = process.env.UPDATE_ACTUAL_ROOT;
+    const { resolveServiceTarget } = await import(pathToFileURL(path.join(root, "src", "service-target.mjs")));
+    const { ownedRuntimePaths } = await import(pathToFileURL(path.join(root, "src", "owned-runtime-paths.mjs")));
+    const { rollbackCheckout, trayRefreshRequired, updateCheckout } = await import(pathToFileURL(path.join(root, "src", "update.mjs")));
+    const rootDir = process.env.UPDATE_ISOLATION_ROOT;
+    const target = resolveServiceTarget({
+      mode: "test", isolationRoot: rootDir, sourceRoot: path.join(rootDir, "checkout"),
+      routerLabel: "io.github.codex-router.decoy", trayLabel: "io.github.codex-router.decoy.tray",
+      ports: { oauth: 7611, router: 7612, api: 7613, grokOauth: 7618, devinCli: 7620 },
+    });
+    mkdirSync(path.join(target.sourceRoot, ".git"), { recursive: true });
+    mkdirSync(target.stateRoot, { recursive: true });
+    writeFileSync(path.join(target.stateRoot, "install-manifest.json"), JSON.stringify({ version: 1, current: { commit: "same" } }));
+    const runtimeRoots = {
+      userHome: path.join(rootDir, "home"), codexHome: path.join(rootDir, "codex"),
+      dshHome: path.join(rootDir, "dsh"), geminiHome: path.join(rootDir, "gemini"),
+    };
+    const callbacks = (events, verifyReplacement = async () => events.push("verify")) => ({
+      runtimeRoots,
+      snapshot: { version: 1, target, options: ownedRuntimePaths(target, runtimeRoots).options, entries: {} },
+      preflight: async () => events.push("preflight"),
+      installReplacement: async () => events.push("merge"),
+      verifyReplacement,
       publishReplacement: async () => events.push("publish"),
       cleanupOld: async () => events.push("cleanup"),
-    },
-  });
-  assert.deepEqual(events, ["preflight", "merge", "verify", "publish", "cleanup"]);
-  assert.ok(gitCalls.findIndex((args) => args[0] === "merge") > gitCalls.findIndex((args) => args[0] === "branch"));
+      restoreSnapshot: async () => events.push("restore"),
+      restartOldService: async () => events.push("restart"),
+      refreshTray: async (refreshedTarget) => {
+        assert.equal(refreshedTarget, target);
+        for (const value of [refreshedTarget.sourceRoot, refreshedTarget.stateRoot, refreshedTarget.appPath]) {
+          assert.ok(value.startsWith(rootDir + path.sep), value);
+        }
+        assert.match(refreshedTarget.routerLabel, /\.decoy$/);
+        assert.match(refreshedTarget.trayLabel, /\.decoy\.tray$/);
+        events.push("refresh");
+      },
+    });
+    const sameCalls = [];
+    const same = await updateCheckout({
+      target,
+      runtime: callbacks([]),
+      gitImpl: (args, options) => {
+        assert.equal(options.sourceRoot, target.sourceRoot, args.join(" "));
+        sameCalls.push(args);
+        if (args[0] === "remote") return "https://github.com/duolahypercho/codex-router.git";
+        if (args[1] === "HEAD") return "same";
+        return "same";
+      },
+    });
+    assert.deepEqual(same, { current: "same", available: "same", updateAvailable: false, updated: false, reinstalled: false });
+    assert.deepEqual(sameCalls.map((args) => args[0]), ["remote", "fetch", "rev-parse", "rev-parse"]);
+    mkdirSync(path.join(target.sourceRoot, "dist", "Model Router.app"), { recursive: true });
+    assert.equal(trayRefreshRequired({ target, platform: "darwin", registeredPath: "" }), true);
+    const updateEvents = [];
+    await updateCheckout({
+      target,
+      runtime: callbacks(updateEvents),
+      gitImpl: (args, options) => {
+        assert.equal(options.sourceRoot, target.sourceRoot, args.join(" "));
+        if (args[0] === "remote") return "https://github.com/duolahypercho/codex-router.git";
+        if (args[0] === "status") return "";
+        if (args[0] === "branch") return "main";
+        if (args[1] === "HEAD") return "old";
+        if (args[1] === "origin/main") return "new";
+        return "";
+      },
+    });
+    assert.deepEqual(updateEvents, ["preflight", "merge", "verify", "publish", "cleanup", "refresh"]);
+    const events = [];
+    await assert.rejects(
+      updateCheckout({
+        target,
+        runtime: callbacks(events, async () => { events.push("verify"); throw new Error("replacement failed"); }),
+        gitImpl: (args, options) => {
+          assert.equal(options.sourceRoot, target.sourceRoot, args.join(" "));
+          if (args[0] === "remote") return "https://github.com/duolahypercho/codex-router.git";
+          if (args[0] === "status") return "";
+          if (args[0] === "branch") return "main";
+          if (args[1] === "HEAD") return "old";
+          if (args[1] === "origin/main") return "new";
+          return "";
+        },
+      }),
+      /replacement failed/,
+    );
+    assert.deepEqual(events, ["preflight", "merge", "verify", "restore", "restart"]);
+    const rollbackGit = (args, options) => {
+      assert.equal(options.sourceRoot, target.sourceRoot, args.join(" "));
+      if (args[0] === "remote") return "https://github.com/duolahypercho/codex-router.git";
+      if (args[0] === "status") return "";
+      if (args[0] === "cat-file") return "";
+      if (args[1] === "HEAD") return "new";
+      if (args[1] === "refs/codex-router/rollback") return "old";
+      return "";
+    };
+    const rollbackEvents = [];
+    await rollbackCheckout({ target, runtime: callbacks(rollbackEvents), gitImpl: rollbackGit });
+    assert.deepEqual(rollbackEvents, ["preflight", "merge", "verify", "publish", "cleanup", "refresh"]);
+    const rollbackFailureEvents = [];
+    await assert.rejects(
+      rollbackCheckout({
+        target,
+        runtime: callbacks(rollbackFailureEvents, async () => { rollbackFailureEvents.push("verify"); throw new Error("rollback replacement failed"); }),
+        gitImpl: rollbackGit,
+      }),
+      /rollback replacement failed/,
+    );
+    assert.deepEqual(rollbackFailureEvents, ["preflight", "merge", "verify", "restore", "restart"]);
+  `);
+  try {
+    const result = spawnSync(process.execPath, ["--require", guard, scenario], {
+      cwd: root,
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        UPDATE_ACTUAL_ROOT: root,
+        UPDATE_ISOLATION_ROOT: path.join(isolationRoot, "target"),
+        UPDATE_PRODUCTION_DECOY: productionDecoy,
+        CODEX_ROUTER_SOURCE_ROOT: productionDecoy,
+        CODEX_ROUTER_STATE_DIR: path.join(productionDecoy, "state"),
+      },
+    });
+    assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+  } finally {
+    rmSync(isolationRoot, { recursive: true, force: true });
+  }
 });
 
 test("update restore attempts runtime and revision independently and keeps primary first", async () => {
