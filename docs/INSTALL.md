@@ -1,478 +1,129 @@
-# Installation, migration, and upgrades
+# 安装、升级与回滚
 
-This page covers the Codex target:
+本文描述当前 macOS Node Router 交付。安装、更新和卸载只管理 Router 自己的 state、catalog、服务和 companion；不会写入 Codex 的 config.toml，也不会接管 Codex 身份验证。
 
-```sh
-./bin/model-router codex doctor
-```
-
-## Supported hosts
-
-| Host | Codex surface |
-| --- | --- |
-| macOS | Codex App or CLI |
-| Windows | Codex App or CLI |
-| Linux | Codex CLI |
-
-Required software:
-
-- Node.js 22.19+ (Node.js 24 LTS recommended)
-- `uv`, or Python 3.10+ with `venv`
-- Git for managed one-command installation and rollback
-- At least one Kimi OAuth, Kimi API, or DeepSeek API credential
-
-The installer does not silently install a system package manager or runtime.
-When a prerequisite is missing, install it from its official source and rerun
-the same command.
-
-## Ask Codex to install it
-
-```text
-Install Codex Router from:
-https://github.com/duolahypercho/codex-router
-
-Follow AGENTS.md. Preserve all of my existing Codex settings and ChatGPT login.
-Use only the provider authentication I choose, safely migrate recognized older
-versions with a rollback snapshot, run the doctor, and do not quit Codex for me.
-Never ask me to paste a token or API key into chat.
-```
-
-Codex should use a stable checkout, not a temporary directory. The service
-definition stores the checkout's absolute path.
-
-## Guided terminal install
-
-macOS or Linux:
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/duolahypercho/codex-router/main/install.sh | sh -s -- --guided
-```
-
-Windows PowerShell:
-
-```powershell
-$installer = Join-Path $env:TEMP "codex-router-install.ps1"
-Invoke-WebRequest https://raw.githubusercontent.com/duolahypercho/codex-router/main/install.ps1 -OutFile $installer
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File $installer -Guided
-```
-
-Clone-and-review installation is also supported:
-
-```sh
-git clone https://github.com/duolahypercho/codex-router.git
-cd codex-router
-./install.sh --guided
-```
-
-```powershell
-git clone https://github.com/duolahypercho/codex-router.git
-Set-Location codex-router
-./install.ps1 -Guided
-```
-
-Guided setup also offers to build and launch the desktop companion (the macOS
-menu bar app, or the Windows/Linux tray). `--with-tray` installs it without
-asking, `--no-tray` never offers it, and automatic mode skips it. On Windows
-the same choice is `-WithTray` / `-NoTray`.
-
-On macOS the app bundle is placed in `~/Applications` and needs the Swift
-toolchain; a missing toolchain skips the step with guidance instead of failing
-setup. On Windows the Tauri companion is built with Rust and registered as a
-`Codex Router Tray` logon task so it returns after a reboot; a missing Rust
-toolchain skips the step the same way. You can still build it by hand with
-`scripts/build-desktop-tray.ps1`.
-Guided setup walks through numbered steps: a provider list you toggle by
-number (`a` selects all, `n` clears, Enter continues) with a live
-ready/needs-key/needs-sign-in status per provider, credential onboarding for
-anything you selected that is not connected yet, and a review summary before
-any change is made.
-
-## Authentication choices
-
-Kimi Code OAuth reuses the official CLI session. Guided setup offers to run the
-login command when the CLI exists:
-
-```sh
-kimi login
-```
-
-API-key providers use hidden prompts:
-
-```sh
-./bin/provider-key kimi-api set
-./bin/provider-key deepseek set
-./bin/provider-key grok-api set
-./bin/provider-key anthropic-api set
-./bin/provider-key ollama-cloud set
-./bin/provider-key qwen-plan set
-./bin/provider-key zai-coding set
-./bin/provider-key zai-api set
-./bin/provider-key github-copilot set
-```
-
-Replace a stored key by running `set` again. Delete one with `remove`, which
-also hides the provider from the model picker:
-
-```sh
-./bin/provider-key deepseek remove
-```
-
-The desktop app and macOS tray expose the same two actions per API provider:
-**Replace key** and **Remove**. Removal only deletes the key files the router
-manages — a key that also lives in the macOS Keychain or in an environment
-variable is reported as still active so you can clear it at the source.
-
-Grok OAuth uses the official Grok CLI session:
-
-```sh
-npm install -g @xai-official/grok
-grok login --oauth
-./bin/model-router codex providers enable grok-oauth
-```
-
-The OAuth token remains in `~/.grok/auth.json` and is sent only to xAI's Grok
-CLI inference proxy. The separate `grok-api` provider continues to use a
-separately billed xAI API key.
-
-Windows:
-
-```powershell
-./codex-router.ps1 provider-key kimi-api set
-./codex-router.ps1 provider-key deepseek set
-./codex-router.ps1 provider-key grok-api set
-./codex-router.ps1 provider-key anthropic-api set
-./codex-router.ps1 provider-key github-copilot set
-```
-
-Kimi OAuth, Kimi Platform, DeepSeek, xAI, Anthropic, and GitHub Copilot are separate account and billing
-systems. Never put a credential in chat, a command argument, shell history,
-the provider registry, or a tracked file.
-
-GitHub Copilot requires a fine-grained PAT with the **Copilot Requests**
-permission. After storing it, run `./bin/curate-models github-copilot`; the
-provider publishes no fixed model list because model and protocol availability
-depends on the account's plan and organization policy. The router does not read
-the official Copilot CLI credential store.
-
-Noninteractive setup can reuse already configured credentials:
-
-```sh
-./install.sh --auto --providers configured --migrate-known
-```
-
-Or choose an exact set:
-
-```sh
-./install.sh --auto --providers kimi-oauth
-./install.sh --kimi-api-key --auto
-./install.sh --deepseek-api-key --auto
-./install.sh --anthropic-api-key --auto
-./install.sh --auto --providers kimi-oauth,kimi-api,deepseek
-```
-
-`--smoke-test` makes one small live request per provider and may use paid quota;
-it is never enabled by default.
-
-An API key found only in the installer's shell environment is valid for
-foreground commands but is not copied into launchd, systemd, or Task Scheduler.
-Use `provider-key ... set` so the per-user background service has persistent,
-protected access.
-
-## Outbound proxy
-
-The router follows Node's explicit proxy opt-in. Set
-`NODE_USE_ENV_PROXY=1` together with `http_proxy`, `https_proxy`, and
-`no_proxy` (including their uppercase forms) before running setup or install.
-On Node releases that support the flag, `--use-env-proxy` or
-`NODE_OPTIONS=--use-env-proxy` is equivalent. The generated per-user
-background service preserves the opt-in and values so a service started
-outside the login shell uses the same proxy. Without the opt-in, inherited
-proxy variables remain unused by the router.
-
-Include `localhost`, `127.0.0.1`, and `::1` in `no_proxy` because the router's
-own processes communicate over loopback.
-
-`all_proxy` / `ALL_PROXY` is also preserved for child processes that support
-it, but the router's Undici transport requires `http_proxy` or `https_proxy` to
-enable proxy routing. After changing these variables, rerun install to refresh
-the background service definition.
-
-## Installer transaction
-
-Setup performs these operations in order:
-
-1. Validates provider selection and credential presence.
-2. Detects other model-catalog owners and earlier Codex Router variants.
-3. With approval, snapshots and stops only recognized older variants.
-4. Installs locked Node dependencies and pinned LiteLLM in `.venv`.
-5. Generates separate random Codex caller and internal-service keys.
-6. Captures the native Codex model catalog and adds only selected provider models.
-7. Generates gateway routes from the split registry tree under `config/`.
-8. Adds the marked capability-bearing base URL and catalog block. When the user
-   has not set an agent concurrency limit, it also configures six spawned-agent
-   slots so native Kimi/Grok/GPT collaboration does not remain on Codex's small
-   v2 default. Existing `[agents]` limits are preserved.
-9. Protects the Codex config and its backup for the current user.
-10. Installs the platform's per-user background service.
-11. Waits for every local layer to report its expected service identity.
-12. Records the installed commit and provider selection.
-13. Runs the doctor.
-
-If config or service installation fails, the new service and marked config block
-are removed. If a legacy migration was part of the transaction, its exact config
-and service definition are restored as well.
-
-The installer does not kill an unknown process on ports 4200–4203 and does not
-replace an unmarked user-owned `openai_base_url`, `model_catalog_json`, or agent
-concurrency value. Disabling the router removes only its marked concurrency
-default; a user-owned value remains intact.
-
-## Credential-free (idle) install
-
-For validating the router's install, lifecycle, network, and uninstall
-behavior before trusting it with any credential, both installers accept an
-explicit idle mode:
-
-```sh
-./install.sh --target codex --no-provider --no-discovery --no-tray
-```
-
-```powershell
-./install.ps1 -Target codex -NoProvider -NoDiscovery -NoTray
-```
-
-`--no-provider` installs with an explicit empty provider selection: no
-provider is selected, no credential is prompted for or written, and the
-default-provider discovery scan is skipped. It conflicts with `--guided`,
-`--providers`, and the key-prompt flags. On its own it does not disable
-credential discovery — the doctor and tray may still look at what exists, and
-Codex's native passthrough keeps working exactly as it does for an operator
-who hides every provider by hand.
-
-`--no-discovery` (requires `--no-provider`) additionally persists a discovery
-kill-switch in the state directory (`discovery-mode.json`). While it is set:
-
-- Provider credential files, the macOS Keychain, other CLIs' OAuth and
-  session files, and Codex's own `auth.json` are never read.
-- The `codex login status` sign-in probe is never spawned against the real
-  `CODEX_HOME`. (The catalog build still runs `codex debug models --bundled`,
-  which reads a static model list, not credentials.)
-- The merged catalog publishes no models, so Codex's picker is empty by
-  design while pointed at the router.
-- Codex traffic reaching the router gets a local
-  `503 router_idle_no_provider` error instead of native or provider
-  forwarding. Nothing leaves the machine; every listener stays on
-  `127.0.0.1` as always.
-
-The full lifecycle works in this state:
-
-```sh
-./bin/model-router codex status
-./bin/model-router codex doctor    # exits 0; idle state reports as warnings
-./bin/model-router codex stop
-./bin/model-router codex start     # foreground; the service restarts it otherwise
-./bin/model-router codex uninstall
-```
-
-Uninstall is the undo path: it removes the managed config block and, once no
-client integration remains, the background service and its LaunchAgent.
-`rollback` is not — it reverts the managed *source checkout* to the previous
-revision, not the installation.
-
-To leave idle mode, re-run setup or the installer without the flags (for
-example `./bin/setup --guided`); every setup run rewrites the discovery
-marker, so a normal install re-enables discovery. `CODEX_ROUTER_NO_DISCOVERY=1`
-(or `=0`) overrides the marker either way for one process.
-
-## Recognized older installations
-
-Read-only detection:
-
-```sh
-./bin/migrate detect
-```
-
-The migration engine recognizes:
-
-- `io.github.kimi-codex-router` with `~/.codex/kimi-router`
-- `com.ziwenxu.kimi-codex-proxy` with `~/.codex/kimi-proxy`
-- complete or malformed start-only Kimi managed config markers
-
-Approved migration stops only those services, retains their state directories,
-moves their service definitions into `$CODEX_HOME/codex-router/migrations`, and
-stores the original config with protected permissions. Restore it with:
-
-```sh
-./bin/migrate rollback
-```
-
-An unknown catalog owner requires a manual decision; automatic setup stops
-without changing it.
-
-If `model_catalog_json` points to a user-owned native Codex catalog rather than
-another router, you can explicitly keep it as Codex Router's merge base:
-
-```sh
-./install.sh --auto --providers configured --adopt-native-catalog
-```
-
-```powershell
-./install.ps1 -Auto -Providers configured -AdoptNativeCatalog
-```
-
-Adoption is accepted only when the path is absolute, the JSON contains at
-least one native model, none of its slugs are already routed by Codex Router,
-and no custom `openai_base_url` is configured. The file stays user-owned and
-is read in place on every catalog rebuild, so moving, deleting, or making it
-invalid stops the rebuild with an explicit error. Disabling Codex Router
-restores that exact catalog path. A failed install clears a pending adoption
-and leaves the original Codex config intact.
-
-## Restart and verify
-
-`model_catalog_json` is loaded at Codex startup. Fully quit the app, reopen it,
-and create a new task. On macOS use Command-Q; on Windows use the app's Quit
-command or end it from the tray if present.
-
-```sh
-./bin/doctor
-./bin/providers
-codex debug models
-```
-
-The doctor reports exact remediation beneath each failed layer. Safe managed
-state can be rebuilt with:
-
-```sh
-./bin/doctor --fix
-```
-
-Live quota-consuming verification is separate:
-
-```sh
-./bin/smoke-test --yes
-./bin/test-model 'kimi-oauth/k3' --live --yes
-```
-
-## Starting the router when Codex starts
-
-The router normally runs continuously under launchd, and the macOS tray starts
-it again whenever Codex appears. Both learn about a new Codex by polling, so a
-cold start can race: the CLI can send its first request a second or two before
-the gateway is accepting connections.
-
-The optional `codex` shim closes that window by doing the check in the one place
-that is provably earlier than Codex — in front of it:
-
-```sh
-./bin/model-router codex shim install
-./bin/model-router codex shim status
-./bin/model-router codex shim uninstall
-```
-
-It is never installed automatically, because putting a file named `codex` on
-your PATH shadows a command the router was not asked to own.
-
-Install picks the writable directory closest to the real Codex but still ahead
-of it on PATH, and refuses to overwrite any `codex` it did not write. If nothing
-suitable is on PATH, the shim lands in the router's state directory and prints
-the one `export PATH=...` line to add — it does not edit shell startup files on
-your behalf. `status` distinguishes *installed* from *effective*, since a shim
-that ends up behind the real Codex on PATH is a silent no-op.
-
-When the router is already listening, the shim costs one loopback connection and
-no processes at all. When it is not, the shim starts the service, waits up to
-`MODEL_ROUTER_SHIM_WAIT` seconds (45 by default), and then runs Codex regardless
-— a router problem must never become "codex will not start". Set
-`MODEL_ROUTER_SHIM=0` for a single run to bypass the check entirely.
-
-The shim is a bash script and is not available on Windows.
-
-## Update and rollback
-
-```sh
-./bin/update check
-./bin/update
-./bin/rollback
-```
-
-Windows:
-
-```powershell
-./codex-router.ps1 update check
-./codex-router.ps1 update
-./codex-router.ps1 rollback
-```
-
-The updater requires the recognized GitHub origin and a checkout with no edits
-to tracked files. It fetches `origin/main`, retains the current revision under
-`refs/codex-router/rollback`, fast-forwards, and reinstalls. A failed install
-automatically checks out and reinstalls the previous revision. `update check`
-only compares the revisions and changes nothing.
-
-Untracked files never block an update; only edits to tracked files do, and the
-refusal names them. Keep them with `git -C <checkout> stash`, or discard them by
-re-running the same command with `--force` (`./bin/update --force`,
-`./bin/rollback --force`, `./codex-router.ps1 rollback --force`). The bootstrap
-installers take the same escape: `--force` for the `curl | sh` script and
-`-Force` for the `irm | iex` one. Every force path discards tracked edits only;
-none of them delete untracked files.
-
-Setup distinguishes a broken checkout from unfinished configuration. When it
-exits 2 — a declined prompt, a missing credential, an invalid `--providers`
-value — the update is kept, because none of those say anything about the code
-that was just fetched, and discarding it means the next attempt repeats the
-same failure with the same code. Rolling back there is what made a setup-path
-bug impossible to fix by updating: the fix was fetched and then thrown away.
-Any other non-zero exit still restores the previous revision. Re-run setup to
-continue, or `./bin/rollback` (`./codex-router.ps1 rollback` on Windows) to
-return to the retained revision deliberately.
-
-For checkout installs, the reinstall skips dependency work whose inputs are
-unchanged, so an update that carries no `package-lock.json` or LiteLLM pin
-change costs a service restart rather than a full `npm ci` and PyPI resolution.
-`./bin/doctor --fix` rebuilds checkout-owned dependencies regardless, as does
-`./bin/install --force-deps` (`./install.ps1 -CheckoutInstall -ForceDeps` on
-Windows). Homebrew owns the dependency tree in its formula prefix: its normal
-doctor repair regenerates config and services without mutating that tree, and a
-missing or broken package file must be repaired with `brew reinstall
-codex-router`.
-
-When upgrading from a release without caller capabilities, the installer
-generates one, replaces only the marked managed URL, tightens config permissions,
-and restarts the per-user router service. Fully quit and reopen Codex afterward
-so it reloads the new URL.
-
-`./bin/rollback` switches to the cached previous revision and reinstalls it. A
-later `./bin/update` returns the managed checkout to `main` before updating.
-
-For a source archive without `.git`, download and install a newer tagged archive
-instead. Release pages provide SHA-256 checksums and provenance attestations.
-
-## Disable and uninstall
-
-```sh
-./bin/disable
-./bin/enable
-./bin/uninstall
-```
-
-Windows:
-
-```powershell
-./codex-router.ps1 disable
-./codex-router.ps1 enable
-./codex-router.ps1 uninstall
-```
-
-Uninstall removes the marked integration config and current background service.
-It intentionally retains the checkout, native catalog cache, logs, backups,
-migration snapshots, internal key, and provider credentials. This prevents a
-routine uninstall from silently destroying authentication or recovery data.
-Existing Codex Router installs that used the former 4100–4103/4108 defaults are
-migrated on the next install or update: the managed Codex URL and generated
-systemd/launchd/task service are rewritten as one install transaction, and the
-old service is stopped before the new unit is started. Explicit
-`MODEL_ROUTER_*_PORT` (or legacy `CODEX_ROUTER_*_PORT`) environment settings
-remain authoritative for operators who intentionally keep a custom or legacy
-block.
+## 支持条件
+
+- macOS 13 或更新版本
+- Node.js 22.19+ 与 npm
+- Git
+- Codex CLI 或 Desktop
+- Xcode Command Line Tools（需要 Swift companion 时）
+
+安装、配置和服务命令只面向当前 macOS 交付。
+
+## 安装
+
+从 checkout 安装：
+
+    ./install.sh --guided
+
+不需要交互时：
+
+    ./install.sh --auto --providers configured
+
+安装目录应是稳定路径。默认目录为 ~/.local/share/codex-router；后台服务从该 checkout 启动，不从临时目录启动。
+
+没有 provider 凭据时可先做生命周期验证：
+
+    ./install.sh --no-provider --no-discovery --no-tray
+
+这会启动空的 Router；请求会收到本地配置错误，不会发出 provider 请求。
+
+## 配置边界
+
+Router 通过自己的 state 文件保存 provider selection、caller key、internal key、catalog 和 usage。安装、enable、disable、update、repair、uninstall 都不会写 ~/.codex/config.toml。
+
+安装完成后生成 CC Switch snippet：
+
+    ./bin/control catalog render-snippet
+
+把 snippet 粘贴到 CC Switch 的本地 profile，由用户决定 Codex 的 model、provider 和其他设置。Router 不会替用户改写这些设置。
+
+doctor 和 status 只读 Codex 配置并报告诊断。doctor --fix 只修复 Router state、依赖、catalog、服务和 companion；成功执行后 config.toml 必须保持完全相同的字节。
+
+## Provider 凭据
+
+不要把 key 放在命令参数、环境快照、日志、issue 或 tracked 文件中。通过隐藏提示保存：
+
+    ./bin/model-router codex provider-key deepseek set
+    ./bin/model-router codex provider-key kimi-api set
+    ./bin/model-router codex provider-key anthropic-api set
+
+然后选择并发布 provider：
+
+    ./bin/model-router codex providers enable deepseek
+    ./bin/control catalog render-snippet
+
+每个 provider 使用自己的账户、端点和计费。DeepSeek 官方 API 验证只应使用本机受保护配置，不要把 key 复制到仓库。
+
+需要显式同意才会产生配额请求：
+
+    ./bin/smoke-test --yes
+
+## 服务
+
+    ./bin/model-router codex start
+    ./bin/model-router codex stop
+    ./bin/model-router codex status
+    ./bin/model-router codex doctor
+
+默认 Router 端口为 4202，OAuth 转发器为 4201，API 转发器为 4203。服务只监听本机回环地址。验收测试必须使用独立 ServiceTarget、label、端口和 state/support 根目录。
+
+## 更新事务
+
+更新流程如下：
+
+1. 检查 checkout、origin、main 分支和本地 tracked 修改。
+2. 在任何 Git revision 变化前捕获 Router runtime snapshot 并执行 preflight。
+3. 在 migration installReplacement 中执行 fast-forward 和新 revision 安装。
+4. 等待 Router、转发器、catalog 和必要 companion contract 通过。
+5. 成功后清理旧 Router-owned artifacts。
+6. 任一步骤失败时恢复 runtime 和旧 revision，再只重启一次旧服务。
+
+更新和回滚：
+
+    ./bin/model-router codex update
+    ./bin/model-router codex update check
+    ./bin/model-router codex rollback
+
+有 tracked 本地修改时默认拒绝更新；只有明确传 --force 才会丢弃 tracked 修改。untracked 文件不会被清理。
+
+## 卸载
+
+    ./bin/model-router codex uninstall
+
+卸载会删除 Router 自己的服务、catalog、managed skills 和 companion。caller key、internal key、provider keys、Codex 登录、身份验证、用户 credentials、用户 profile 与 config.toml 均受保护并保留原样。
+
+## 本地 Vision
+
+本地模型不再作为 Codex chat route。保留的操作只用于 Vision reader、下载和 headless runtime：
+
+    ./bin/control local-models list
+    ./bin/control local-models inspect qwen2.5vl:3b
+    ./bin/control local-models install qwen2.5vl:3b --yes
+    ./bin/control local-models runtime status
+    ./bin/control local-models runtime start --yes
+    ./bin/control vision-bridge models
+
+local-models set on/off 已移除。下载和卸载不会改 provider selection、chat overlay 或 Router 服务。
+
+## 从源码验证
+
+    npm ci
+    npm run check
+    npm test
+    ./scripts/package-release.sh --output generated/release
+
+测试保持项目默认并发；不要在命令、脚本或子代理参数中加入 test-concurrency 覆盖。source checkout 的测试命令不属于 runtime release；runtime-package.json 声明实际可用的 Node entrypoints、依赖、assets 和文档。发布包的 manifest、archive 和 SHA256SUMS 必须对应同一份 Git HEAD tracked entry list。
+
+## 交接到另一台 Mac
+
+1. 从仓库默认分支 checkout，确认 Node.js 22.19+ 和 npm。
+2. 先运行 npm ci、npm run check、npm test。
+3. 运行 Phase 4 的 Node、source、package fixture，确认 GitHub CI 与本地结果一致。
+4. 使用隔离 acceptance root 做安装、服务、浏览器和 Swift 验收；不要触碰现有 managed installation。
+5. 通过本机受保护的 DeepSeek 官方 API 配置做获准 live probe；不可用的其他 API 标记为 NOT RUN，不伪造通过。
+6. 按 Phase 5 计划继续真实 macOS build、package、launchd、app launch、visual 和 live acceptance。
+
+更多安全约束见 SECURITY.md；项目概览见 README.md。

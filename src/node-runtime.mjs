@@ -110,17 +110,39 @@ function stopChild(child, signal) {
   }
 }
 
-function wait(milliseconds) {
-  return new Promise((resolve) => setTimeout(resolve, Math.max(0, milliseconds)));
+function cancellableWait(milliseconds) {
+  let timer;
+  let resolveWait;
+  const promise = new Promise((resolve) => {
+    resolveWait = resolve;
+    timer = setTimeout(resolve, Math.max(0, milliseconds));
+  });
+  return {
+    promise,
+    cancel() {
+      if (timer === undefined) return;
+      clearTimeout(timer);
+      timer = undefined;
+      resolveWait?.();
+    },
+  };
 }
 
 async function waitForRecords(records, timeoutMs) {
   const pending = records.filter((record) => childAlive(record.child));
   if (!pending.length) return;
-  await Promise.race([
-    Promise.all(pending.map((record) => record.exitPromise)),
-    wait(timeoutMs),
-  ]);
+  const timeout = cancellableWait(timeoutMs);
+  try {
+    await Promise.race([
+      Promise.all(pending.map((record) => record.exitPromise)),
+      timeout.promise,
+    ]);
+  } finally {
+    // A normal graceful exit should not leave a referenced timer behind for the
+    // entire grace window. Do not unref the timer: a still-live owned child must
+    // keep the shutdown wait observable until this bounded wait completes.
+    timeout.cancel();
+  }
 }
 
 /**

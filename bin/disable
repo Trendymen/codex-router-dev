@@ -24,7 +24,5 @@ if [ "${MODEL_ROUTER_TARGET:-codex}" != codex ]; then
   echo "Only the Codex target has a public disable operation. Use bin/uninstall with an explicit legacy client target to remove an old external document safely." >&2
   exit 2
 fi
-node src/config-manager.mjs disable
 retire_service_if_unused
-echo "External model routes disabled. Your model, provider, and profile settings were preserved."
-echo "Fully quit and reopen Codex."
+echo "External model routes disabled. Codex configuration was left untouched."

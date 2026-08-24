@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -11,6 +11,7 @@ import {
   resolveServiceTarget,
 } from "../src/service-target.mjs";
 import { trayRebuildPlan } from "../src/install-plan.mjs";
+import { writeTrayFixtureContext } from "../src/tray-build-plan.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -242,10 +243,8 @@ test("support bundle and control logs consume the resolved target roots", () => 
 });
 
 test("real symlink escape is rejected while nonexistent isolated parents remain valid", (t) => {
-  const root = path.join(os.tmpdir(), "codex-router-real-link");
-  const outside = path.join(os.tmpdir(), "codex-router-real-link-outside");
-  mkdirSync(root, { recursive: true });
-  mkdirSync(outside, { recursive: true });
+  const root = mkdtempSync(path.join(os.tmpdir(), "codex-router-real-link-"));
+  const outside = mkdtempSync(path.join(os.tmpdir(), "codex-router-real-link-outside-"));
   const link = path.join(root, "link");
   try {
     try {
@@ -315,33 +314,47 @@ test("bundle identifier rewrite follows the validated Tray label", async () => {
   assert.doesNotMatch(rewritten, /io\.github\.codex-router\.tray/);
 });
 
-test("tray wrappers resolve acceptance targets from a repository-external cwd", { skip: process.platform !== "darwin" }, () => {
+test("tray fixture plans resolve from a repository-external cwd without mutation", () => {
   const isolationRoot = mkdtempSync(path.join(os.tmpdir(), "codex-router-wrapper-cwd-"));
   const outside = mkdtempSync(path.join(os.tmpdir(), "codex-router-outside-cwd-"));
-  const env = {
-    ...process.env,
-    CODEX_ROUTER_SERVICE_MODE: "acceptance",
-    MODEL_ROUTER_ISOLATION_ROOT: isolationRoot,
-    MODEL_ROUTER_SERVICE_LABEL: "io.github.codex-router.cwd",
-    MODEL_ROUTER_TRAY_SERVICE_LABEL: "io.github.codex-router.cwd.tray",
-    MODEL_ROUTER_OAUTH_PORT: "6901",
-    MODEL_ROUTER_PORT: "6902",
-    MODEL_ROUTER_API_PORT: "6903",
-    MODEL_ROUTER_GROK_OAUTH_PORT: "6908",
-    MODEL_ROUTER_DEVIN_CLI_PORT: "6910",
-    MODEL_ROUTER_TRAY_DRY_RUN: "1",
-  };
   try {
-    for (const script of ["bin/model-router-tray", "scripts/build-macos-tray-app.sh"]) {
-      const result = spawnSync("sh", [path.join(root, script)], {
-        cwd: outside,
-        encoding: "utf8",
-        env,
-      });
-      assert.equal(result.status, 0, `${script}: ${result.stderr}`);
-      assert.match(result.stdout, new RegExp(isolationRoot.replaceAll("\\", "\\\\")));
-      assert.doesNotMatch(result.stdout, /Applications\/Model Router\.app/);
-    }
+    const isolatedSourceRoot = path.join(isolationRoot, "checkout");
+    mkdirSync(isolatedSourceRoot, { recursive: true });
+    const target = resolveServiceTarget({
+      mode: "acceptance",
+      isolationRoot,
+      sourceRoot: isolatedSourceRoot,
+      routerLabel: "io.github.codex-router.cwd",
+      trayLabel: "io.github.codex-router.cwd.tray",
+      ports: { oauth: 6901, router: 6902, api: 6903, grokOauth: 6908, devinCli: 6910 },
+    });
+    const mockRoot = path.join(isolationRoot, "mock-tools");
+    const contextPath = path.join(isolationRoot, "tray-context.json");
+    writeTrayFixtureContext(contextPath, target, {
+      tools: {
+        uname: path.join(mockRoot, "uname"),
+        swift: path.join(mockRoot, "swift"),
+        codesign: path.join(mockRoot, "codesign"),
+        plistBuddy: path.join(mockRoot, "PlistBuddy"),
+      },
+      buildOnly: true,
+      dryRun: true,
+    });
+    const result = spawnSync(
+      process.execPath,
+      [path.join(root, "src", "tray-build-plan.mjs"), "--fixture-field", contextPath, "appPath"],
+      { cwd: outside, encoding: "utf8", env: process.env },
+    );
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout.trim(), target.appPath);
+    const validated = spawnSync(
+      process.execPath,
+      [path.join(root, "src", "tray-build-plan.mjs"), "--fixture-validate-output", contextPath, target.appPath],
+      { cwd: outside, encoding: "utf8", env: process.env },
+    );
+    assert.equal(validated.status, 0, validated.stderr);
+    assert.equal(existsSync(target.appPath), false, "dry-run must not assemble even the isolated app");
+    assert.equal(existsSync(target.trayPlistPath), false, "dry-run must not install a LaunchAgent");
   } finally {
     rmSync(outside, { recursive: true, force: true });
     rmSync(isolationRoot, { recursive: true, force: true });
@@ -350,11 +363,13 @@ test("tray wrappers resolve acceptance targets from a repository-external cwd", 
 
 test("isolated tray replacement has no production kill or legacy cleanup path", () => {
   const source = readFileSync(path.join(root, "bin", "model-router-tray"), "utf8");
-  assert.match(source, /service_mode=/);
+  assert.match(source, /context_mode=/);
+  assert.match(source, /--fixture-context/);
   assert.match(source, /osascript -e.*tray_label.*\|\| true/);
-  assert.match(source, /killall\s+-QUIT\s+ModelRouterTray/);
-  assert.match(source, /MODEL_ROUTER_SERVICE_MODE/);
-  assert.match(source, /legacy_bundle/);
+  assert.match(source, /if \[ "\$context_mode" = "production" \]; then[\s\S]*killall\s+-QUIT\s+ModelRouterTray/);
+  assert.match(source, /if \[ "\$context_mode" = "production" \]; then[\s\S]*legacy_bundle/);
+  assert.doesNotMatch(source, /MODEL_ROUTER_(?:UNAME|CODESIGN|PLIST_BUDDY)_BIN/);
+  assert.doesNotMatch(source, /MODEL_ROUTER_TRAY_BUILD_ONLY/);
 });
 
 test("real Router and Tray plist renderers consume the same isolated target", () => {

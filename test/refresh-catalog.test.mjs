@@ -29,46 +29,32 @@ function recordingRunner({ signed = true, failAt } = {}) {
   };
 }
 
-test("refresh orchestration restores signed routing and republishes the routed catalog", () => {
+test("refresh orchestration leaves the client document alone and republishes the routed catalog", () => {
   const runner = recordingRunner();
   const result = refreshCatalog({ run: runner.run });
   assert.deepEqual(runner.calls, [
-    ["config-manager.mjs", ["status"]],
-    ["config-manager.mjs", ["disable"]],
     ["catalog.mjs", ["--refresh-native"]],
-    ["config-manager.mjs", ["enable"]],
-    ["config-manager.mjs", ["signed-enable"]],
-    ["catalog.mjs", []],
     ["node-snapshot-triggers.mjs", ["registry-update"]],
   ]);
   assert.equal(result.catalogOutput, '{"models":1}\n');
 });
 
-test("refresh orchestration restores the active transport after catalog failure", () => {
-  const runner = recordingRunner({ failAt: 3 });
+test("refresh orchestration leaves the client document alone after catalog failure", () => {
+  const runner = recordingRunner({ failAt: 1 });
   assert.throws(
     () => refreshCatalog({ run: runner.run }),
     /catalog\.mjs exited with status 75.*forced catalog failure/s,
   );
   assert.deepEqual(runner.calls, [
-    ["config-manager.mjs", ["status"]],
-    ["config-manager.mjs", ["disable"]],
     ["catalog.mjs", ["--refresh-native"]],
-    ["config-manager.mjs", ["enable"]],
-    ["config-manager.mjs", ["signed-enable"]],
-    ["catalog.mjs", []],
   ]);
 });
 
-test("ordinary routed refresh also republishes external models after restore", () => {
+test("ordinary routed refresh also republishes external models", () => {
   const runner = recordingRunner({ signed: false });
   refreshCatalog({ run: runner.run });
   assert.deepEqual(runner.calls, [
-    ["config-manager.mjs", ["status"]],
-    ["config-manager.mjs", ["disable"]],
     ["catalog.mjs", ["--refresh-native"]],
-    ["config-manager.mjs", ["enable"]],
-    ["catalog.mjs", []],
     ["node-snapshot-triggers.mjs", ["registry-update"]],
   ]);
 });

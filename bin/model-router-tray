@@ -1,102 +1,131 @@
 #!/bin/sh
 set -eu
 
-if [ "$(/usr/bin/uname -s 2>/dev/null || printf unknown)" != "Darwin" ]; then
+# A fixture context never replaces the public platform gate. Cross-platform
+# tests may render/inspect plans, but only a real macOS host may mutate files.
+uname_bin=/usr/bin/uname
+if [ "$($uname_bin -s 2>/dev/null || printf unknown)" != "Darwin" ]; then
   printf 'codex-router: unsupported_platform\n' >&2
   exit 2
 fi
 
-repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+fixture_context=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --fixture-context)
+      [ "$#" -ge 2 ] || { printf 'codex-router: --fixture-context requires a path.\n' >&2; exit 2; }
+      fixture_context=$2
+      shift 2
+      ;;
+    *)
+      printf 'codex-router: unknown Tray option: %s\n' "$1" >&2
+      exit 2
+      ;;
+  esac
+done
+
+# Production is deliberately not configurable through the environment. The
+# only alternate path is an explicit fixture context produced from a validated
+# acceptance/test ServiceTarget; that context carries every mock tool and path.
+if [ -z "$fixture_context" ]; then
+  repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+  context_mode=production
+else
+  repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+  context_field() {
+    node "$repo_dir/src/tray-build-plan.mjs" --fixture-field "$fixture_context" "$1"
+  }
+  context_mode=$(context_field mode)
+  case "$context_mode" in
+    acceptance|test) ;;
+    *) printf 'codex-router: invalid Tray fixture mode.\n' >&2; exit 2 ;;
+  esac
+fi
 cd "$repo_dir"
 
 target_field() {
-  node --input-type=module -e '
-    import { currentServiceTarget } from "./src/paths.mjs";
-    const field = process.argv[1];
-    const target = currentServiceTarget();
-    if (!(field in target)) process.exit(2);
-    process.stdout.write(String(target[field]));
-  ' "$1"
+  if [ -n "$fixture_context" ]; then
+    node "$repo_dir/src/tray-build-plan.mjs" --fixture-field "$fixture_context" "$1"
+  else
+    node "$repo_dir/src/tray-build-plan.mjs" --production-field "$1"
+  fi
 }
 
 bundle_dir=$(target_field appPath)
 tray_label=$(target_field trayLabel)
 bundle_name=$(basename "$bundle_dir")
 
-case $(/usr/bin/uname -s) in
-  Darwin)
-    if [ "${MODEL_ROUTER_TRAY_DRY_RUN:-0}" = "1" ] && [ "${MODEL_ROUTER_SERVICE_MODE:-${CODEX_ROUTER_SERVICE_MODE:-production}}" != "production" ]; then
-      printf '%s|%s\n' "$bundle_dir" "$tray_label"
-      exit 0
-    fi
-    bundle_parent=$(dirname "$bundle_dir")
-    mkdir -p "$bundle_parent"
-    staging_dir=$(mktemp -d "$bundle_parent/.model-router-tray.XXXXXX")
-    staged_bundle="$staging_dir/$bundle_name"
-    cleanup_staging() {
-      rm -rf "$staging_dir"
-    }
-    trap cleanup_staging EXIT HUP INT TERM
+if [ -n "$fixture_context" ] && [ "$(context_field dryRun)" = "1" ]; then
+  printf '%s|%s\n' "$bundle_dir" "$tray_label"
+  exit 0
+fi
 
-    # Assemble and verify the replacement away from the live app. A failed
-    # build leaves the running tray intact; overwriting its mapped signed pages
-    # in place is what made macOS kill it as an invalid-signature process.
-    "$repo_dir/scripts/build-macos-tray-app.sh" "$staged_bundle" >/dev/null
+bundle_parent=$(dirname "$bundle_dir")
+mkdir -p "$bundle_parent"
+staging_dir=$(mktemp -d "$bundle_parent/.model-router-tray.XXXXXX")
+staged_bundle="$staging_dir/$bundle_name"
+cleanup_staging() {
+  rm -rf "$staging_dir"
+}
+trap cleanup_staging EXIT HUP INT TERM
 
-    # A tray opened by hand is outside launchd's reach, so ask it to quit too.
-    # This happens only after the staged replacement passes codesign verification.
-    service_mode=${MODEL_ROUTER_SERVICE_MODE:-${CODEX_ROUTER_SERVICE_MODE:-production}}
-    if [ "$service_mode" = "production" ]; then
-      if pgrep -x ModelRouterTray >/dev/null 2>&1; then
-        osascript -e "tell application id \"$tray_label\" to quit" >/dev/null 2>&1 \
-          || killall -QUIT ModelRouterTray >/dev/null 2>&1 || true
-        sleep 1
-      fi
-    else
-      # An acceptance/test target may not kill an unrelated process. Its only
-      # legal stop request is the bundle identifier it owns; failure is a
-      # no-op, never a process-wide fallback.
-      osascript -e "tell application id \"$tray_label\" to quit" >/dev/null 2>&1 || true
-    fi
+# Assemble and verify the replacement away from the live app. A failed build
+# leaves the running tray intact; overwriting its mapped signed pages in place
+# is what made macOS kill it as an invalid-signature process.
+if [ -n "$fixture_context" ]; then
+  "$repo_dir/scripts/build-macos-tray-app.sh" "$staged_bundle" --fixture-context "$fixture_context" >/dev/null
+else
+  "$repo_dir/scripts/build-macos-tray-app.sh" "$staged_bundle" >/dev/null
+fi
 
-    previous_bundle="$staging_dir/Previous $bundle_name"
-    if [ -d "$bundle_dir" ]; then
-      mv "$bundle_dir" "$previous_bundle"
-    fi
-    if ! mv "$staged_bundle" "$bundle_dir"; then
-      if [ -d "$previous_bundle" ]; then
-        mv "$previous_bundle" "$bundle_dir"
-      fi
-      printf 'codex-router: could not install the rebuilt tray bundle.\n' >&2
-      exit 1
-    fi
-    rm -rf "$previous_bundle"
-    # launchd owns the companion from here. Installing the agent starts it now,
-    # starts it at every login, and restarts it if it ever exits abnormally --
-    # a login item alone only covers the login case, which left a crashed tray
-    # gone until the next one.
-    node "$repo_dir/src/tray-service.mjs" install >/dev/null
-    # Not silenced: without the stamp every later update rebuilds the companion
-    # from scratch, which is the cost this step exists to avoid. Losing it is
-    # wasteful rather than dangerous, so say so and carry on.
-    node "$repo_dir/src/install-plan.mjs" record-tray >/dev/null \
-      || printf 'codex-router: could not stamp the companion build; the next update will rebuild it.\n' >&2
-    # Companions built before the per-user move sit inside the checkout. The
-    # agent now points at the shared bundle, so the old copy is dead weight
-    # that a stray `open` could still launch alongside the real one.
-    if [ "${MODEL_ROUTER_SERVICE_MODE:-${CODEX_ROUTER_SERVICE_MODE:-production}}" = "production" ]; then
-      legacy_bundle="$repo_dir/dist/Model Router.app"
-      if [ -d "$legacy_bundle" ] && [ "$legacy_bundle" != "$bundle_dir" ]; then
-        rm -rf "$legacy_bundle"
-        printf 'Removed the superseded in-checkout companion: %s\n' "$legacy_bundle"
-      fi
-    fi
-    trap - EXIT HUP INT TERM
-    cleanup_staging
-    printf 'Tray installed and supervised by launchd: %s\n' "$bundle_dir"
-    ;;
-  *)
-    printf 'codex-router: unsupported_platform\n' >&2
-    exit 2
-    ;;
-esac
+# A tray opened by hand is outside launchd's reach, so ask it to quit too.
+# This happens only after the staged replacement passes codesign verification.
+if [ "$context_mode" = "production" ]; then
+  if pgrep -x ModelRouterTray >/dev/null 2>&1; then
+    osascript -e "tell application id \"$tray_label\" to quit" >/dev/null 2>&1 \
+      || killall -QUIT ModelRouterTray >/dev/null 2>&1 || true
+    sleep 1
+  fi
+else
+  # An acceptance/test target may not kill an unrelated process. Its only
+  # legal stop request is the bundle identifier it owns; failure is a no-op.
+  osascript -e "tell application id \"$tray_label\" to quit" >/dev/null 2>&1 || true
+fi
+
+previous_bundle="$staging_dir/Previous $bundle_name"
+if [ -d "$bundle_dir" ]; then
+  mv "$bundle_dir" "$previous_bundle"
+fi
+if ! mv "$staged_bundle" "$bundle_dir"; then
+  if [ -d "$previous_bundle" ]; then
+    mv "$previous_bundle" "$bundle_dir"
+  fi
+  printf 'codex-router: could not install the rebuilt tray bundle.\n' >&2
+  exit 1
+fi
+rm -rf "$previous_bundle"
+if [ -n "$fixture_context" ] && [ "$(context_field buildOnly)" = "1" ]; then
+  trap - EXIT HUP INT TERM
+  cleanup_staging
+  printf '%s\n' "$bundle_dir"
+  exit 0
+fi
+
+# launchd owns the companion from here. Installing the agent starts it now,
+# starts it at every login, and restarts it if it ever exits abnormally.
+node "$repo_dir/src/tray-service.mjs" install >/dev/null
+node "$repo_dir/src/install-plan.mjs" record-tray >/dev/null \
+  || printf 'codex-router: could not stamp the companion build; the next update will rebuild it.\n' >&2
+
+# Companions built before the per-user move sit inside the checkout. The agent
+# now points at the shared bundle, so the old copy is dead weight.
+if [ "$context_mode" = "production" ]; then
+  legacy_bundle="$repo_dir/dist/Model Router.app"
+  if [ -d "$legacy_bundle" ] && [ "$legacy_bundle" != "$bundle_dir" ]; then
+    rm -rf "$legacy_bundle"
+    printf 'Removed the superseded in-checkout companion: %s\n' "$legacy_bundle"
+  fi
+fi
+trap - EXIT HUP INT TERM
+cleanup_staging
+printf 'Tray installed and supervised by launchd: %s\n' "$bundle_dir"

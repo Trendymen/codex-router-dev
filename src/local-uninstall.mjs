@@ -4,7 +4,6 @@ import { fileURLToPath } from "node:url";
 
 import {
   isLocalModelEnabled,
-  LOCAL_MODELS_STATE_PATH,
   setLocalModelEnabled,
 } from "./local-models.mjs";
 import {
@@ -12,15 +11,7 @@ import {
   writeLocalDownload,
 } from "./local-download.mjs";
 import { normalizeLocalModelTag } from "./local-model-ref.mjs";
-import {
-  applyModelOverlayPublication,
-  captureModelOverlayFiles,
-  restoreModelOverlayFiles,
-  restorePublishedModelOverlay,
-  transactModelOverlayMutation,
-} from "./model-overlay-publication.mjs";
-import { withModelOverlayLock } from "./model-overlay-lock.mjs";
-import { currentServiceTarget, PROVIDER_SELECTION_PATH, SOURCE_ROOT } from "./paths.mjs";
+import { currentServiceTarget, SOURCE_ROOT } from "./paths.mjs";
 import {
   CLEANUP_OWNED_RUNTIME_IDS,
   ownedRuntimePaths,
@@ -32,10 +23,8 @@ import {
 import { migrateRuntime } from "./runtime-migration.mjs";
 import { refuseUnsupportedPlatform } from "./platform-gate.mjs";
 import { shimReport } from "./codex-shim.mjs";
-import { USER_MODELS_PATH } from "./user-models.mjs";
 
 const SELF = fileURLToPath(import.meta.url);
-const REPO_ROOT = path.resolve(path.dirname(SELF), "..");
 
 /**
  * Shared Router-runtime uninstall boundary.
@@ -125,7 +114,6 @@ async function uninstallRouterRuntimeFromCli() {
 
       const operations = clientTarget === "codex"
         ? [
-            ["config-manager.mjs", ["disable"]],
             ["skills-install.mjs", ["uninstall"]],
             ["shim-cli.mjs", ["uninstall"]],
           ]
@@ -173,46 +161,16 @@ export async function uninstallLocalModelTransaction(
   {
     enabled = isLocalModelEnabled,
     disable = (model) => setLocalModelEnabled(model, false),
-    capture = () => captureModelOverlayFiles([
-      LOCAL_MODELS_STATE_PATH,
-      USER_MODELS_PATH,
-      PROVIDER_SELECTION_PATH,
-    ]),
-    restoreFiles = restoreModelOverlayFiles,
-    applyPublication = applyModelOverlayPublication,
-    restartService,
     cancelled = () => false,
   } = {},
 ) {
-  return withModelOverlayLock(async () => {
-    // The enabled decision and snapshot must be made after acquiring the
-    // process-wide lock. This operation keeps the lock through publication so
-    // a concurrent route refresh cannot restore a stale local chat entry.
-    const wasEnabled = enabled(tag);
-    const snapshots = await capture();
-    const restore = () => restoreFiles(snapshots);
-    await transactModelOverlayMutation({
-      lock: false,
-      mutate: () => disable(tag),
-      restore,
-      restart: wasEnabled,
-      applyPublication,
-      restartService,
-    });
-    if (cancelled()) {
-      await restorePublishedModelOverlay({
-        restore,
-        restart: wasEnabled,
-        applyPublication,
-        restartService,
-      });
-      return { cancelled: true, removed: false, wasEnabled };
-    }
-
-    // Withdrawal is intentionally non-destructive: local weights remain in
-    // Ollama/LM Studio for a future Vision reader pin.
-    return { cancelled: false, removed: false, withdrawn: true, wasEnabled };
-  });
+  // Local models are Vision inventory only. Remove the local selection record,
+  // but never rebuild a chat overlay, provider selection, or Router service.
+  const wasEnabled = enabled(tag);
+  if (cancelled()) return { cancelled: true, removed: false, wasEnabled };
+  disable(tag);
+  if (cancelled()) return { cancelled: true, removed: false, wasEnabled };
+  return { cancelled: false, removed: false, withdrawn: true, wasEnabled };
 }
 
 async function main() {
@@ -245,37 +203,7 @@ async function main() {
     });
     if (removal.cancelled) return;
 
-    const finalized = spawnSync(
-      process.execPath,
-      [path.join(REPO_ROOT, "src", "control.mjs"), "local-models", "finalize-uninstall", tag],
-      {
-        cwd: REPO_ROOT,
-        env: { ...process.env, MODEL_ROUTER_TARGET: "codex" },
-        encoding: "utf8",
-        stdio: ["ignore", "pipe", "ignore"],
-        windowsHide: true,
-      },
-    );
-    let publication = {};
-    if (typeof finalized.stdout === "string" && finalized.stdout.trim()) {
-      try {
-        publication = JSON.parse(finalized.stdout.trim());
-      } catch {
-        // A successful removal is still truthful even if a future control
-        // build adds human-readable output around the finalization JSON.
-      }
-    }
-    const catalogError = publication.catalogError || (
-      finalized.error || finalized.status !== 0
-        ? "The local Vision route was withdrawn, but the catalog could not be refreshed."
-        : undefined
-    );
-    const restartError = publication.restartError;
-    const detail = catalogError
-      ? "Vision route withdrawn · catalog refresh needed"
-      : restartError
-        ? "Vision route withdrawn · router restart needed"
-        : "Vision route withdrawn · weights retained";
+    const detail = "Vision route withdrawn · weights retained";
     writeLocalDownload({
       ...readLocalDownload(),
       version: 1,
@@ -288,8 +216,6 @@ async function main() {
       updatedAt: Date.now(),
       controllerPid: null,
       workerPid: null,
-      ...(catalogError ? { catalogError } : {}),
-      ...(restartError ? { restartError } : {}),
       error: undefined,
     });
   } catch (error) {

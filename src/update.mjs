@@ -53,7 +53,7 @@ function git(args, options = {}) {
   return typeof output === "string" ? output.trim() : "";
 }
 
-function requireManagedCheckout() {
+function requireManagedCheckout(gitImpl = git) {
   if (process.env.CODEX_ROUTER_PACKAGE_MANAGER === "homebrew") {
     throw new Error(
       "This installation is managed by Homebrew. Upgrade it with `brew upgrade codex-router`.",
@@ -64,7 +64,7 @@ function requireManagedCheckout() {
       "This release is not a Git checkout. Re-run the installation command to upgrade it.",
     );
   }
-  const origin = git(["remote", "get-url", "origin"]);
+  const origin = gitImpl(["remote", "get-url", "origin"]);
   const configured = process.env.CODEX_ROUTER_REPOSITORY_URL;
   const allowed = new Set([
     configured,
@@ -86,8 +86,8 @@ export const DIRTY_PREVIEW_LIMIT = 10;
 // message, so counting untracked files as "local changes" only ever stranded
 // people: one stray file in the checkout and every future update was refused,
 // with nothing in the error to say which file or how to get past it.
-export function localModifications() {
-  return git(["status", "--porcelain", "--untracked-files=no"])
+export function localModifications(gitImpl = git) {
+  return gitImpl(["status", "--porcelain", "--untracked-files=no"])
     .split("\n")
     .map((line) => line.trim())
     .filter(Boolean);
@@ -114,11 +114,11 @@ export function localModificationsMessage(changes, sourceRoot = SOURCE_ROOT) {
 // Called only where the checkout is actually about to be rewritten, so a
 // checkout with edits still answers "is an update available?" and still
 // reinstalls at the same commit.
-function requireReplaceableCheckout(force) {
-  const changes = localModifications();
+function requireReplaceableCheckout(force, gitImpl = git) {
+  const changes = localModifications(gitImpl);
   if (changes.length === 0) return;
   if (!force) throw new Error(localModificationsMessage(changes));
-  git(["reset", "--hard", "HEAD"], { inherit: true });
+  gitImpl(["reset", "--hard", "HEAD"], { inherit: true });
 }
 
 // `posixScript` picks which bin/ entry point the POSIX branch runs. Windows
@@ -299,6 +299,7 @@ export async function runRuntimeMigration({
   target = currentServiceTarget(),
   runtimeRoots,
   snapshot,
+  preflight,
   installReplacement = installCurrentCheckout,
   verifyReplacement = () => verifyInstalledRuntime(target),
   publishReplacement = rebuildNodeSnapshotsAfterUpdate,
@@ -313,6 +314,7 @@ export async function runRuntimeMigration({
   }
   return migrateRuntime({
     snapshot: runtimeSnapshot,
+    preflight,
     installReplacement,
     verifyReplacement,
     publishReplacement,
@@ -377,25 +379,72 @@ function refreshTrayCompanion() {
   }
 }
 
-function revisionExists(revision) {
+function revisionExists(revision, gitImpl = git) {
   try {
-    git(["cat-file", "-e", `${revision}^{commit}`]);
+    gitImpl(["cat-file", "-e", `${revision}^{commit}`]);
     return true;
   } catch {
     return false;
   }
 }
 
-function restoreRevision(revision) {
-  git(["switch", "--detach", revision], { inherit: true });
-  installCurrentCheckout();
+function switchRevision(revision, gitImpl = git) {
+  // Keep the managed checkout on its existing branch. A failed migration uses
+  // this hard reset to restore the old source tree before the one old-service
+  // restart owned by migrateRuntime.
+  gitImpl(["reset", "--hard", revision], { inherit: true });
 }
 
-export function checkForUpdate() {
-  requireManagedCheckout();
-  git(["fetch", "--quiet", "origin", "main"]);
-  const current = git(["rev-parse", "HEAD"]);
-  const available = git(["rev-parse", "origin/main"]);
+function restoreRevision(revision, { gitImpl = git, reinstall = false } = {}) {
+  switchRevision(revision, gitImpl);
+  if (reinstall) installCurrentCheckout();
+}
+
+export async function restoreRuntimeAndRevision(
+  runtimeSnapshot,
+  revision,
+  {
+    restoreRuntime = restoreOwnedRuntime,
+    restoreRevision: restoreRevisionImpl = (value) => switchRevision(value),
+  } = {},
+) {
+  const failures = [];
+  try {
+    await restoreRuntime(runtimeSnapshot);
+  } catch (error) {
+    failures.push(error);
+  }
+  // Always attempt the revision reset, even if restoring the owned runtime
+  // failed. Leaving the checkout on the replacement revision makes the next
+  // service restart boot a mixed runtime and hides the original failure.
+  try {
+    await restoreRevisionImpl(revision);
+  } catch (error) {
+    failures.push(error);
+  }
+  if (failures.length) {
+    throw new AggregateError(
+      failures,
+      "Runtime and source revision restoration failed.",
+      { cause: failures[0] },
+    );
+  }
+  return true;
+}
+
+async function captureRuntimeSnapshot(target, runtime = {}) {
+  if (runtime.snapshot !== undefined) {
+    return typeof runtime.snapshot === "function" ? await runtime.snapshot() : runtime.snapshot;
+  }
+  const paths = ownedRuntimePaths(target, runtime.runtimeRoots || {});
+  return snapshotOwnedRuntime(paths);
+}
+
+export function checkForUpdate({ gitImpl = git } = {}) {
+  requireManagedCheckout(gitImpl);
+  gitImpl(["fetch", "--quiet", "origin", "main"]);
+  const current = gitImpl(["rev-parse", "HEAD"]);
+  const available = gitImpl(["rev-parse", "origin/main"]);
   return { current, available, updateAvailable: current !== available };
 }
 
@@ -423,56 +472,86 @@ export function rebuildNodeSnapshotsAfterUpdate({ run = spawnSync } = {}) {
   return true;
 }
 
-export async function updateCheckout({ force = false, runtime = {} } = {}) {
-  const status = checkForUpdate();
+export async function updateCheckout({
+  force = false,
+  runtime = {},
+  gitImpl = git,
+  target = currentServiceTarget(),
+} = {}) {
+  const status = checkForUpdate({ gitImpl });
   if (!status.updateAvailable) {
     if (!installationNeedsRefresh(readInstallManifestSnapshot(), status.current)) {
       return { ...status, updated: false, reinstalled: false };
     }
-    await runRuntimeMigration({ ...runtime, installReplacement: runtime.installReplacement || installCurrentCheckout });
+    const runtimeSnapshot = await captureRuntimeSnapshot(target, runtime);
+    await runRuntimeMigration({
+      ...runtime,
+      target,
+      snapshot: runtimeSnapshot,
+      preflight: runtime.preflight,
+      installReplacement: runtime.installReplacement || installCurrentCheckout,
+    });
     refreshTrayCompanion();
     return { ...status, updated: false, reinstalled: true };
   }
-  requireReplaceableCheckout(force);
-  let branch = git(["branch", "--show-current"]);
-  if (!branch) {
-    git(["switch", "main"], { inherit: true });
-    branch = "main";
-  }
-  if (branch !== "main") {
-    throw new Error("Updates require the managed checkout to be on its main branch.");
-  }
-  git(["update-ref", "refs/codex-router/rollback", status.current]);
-  git(["merge", "--ff-only", status.available], { inherit: true });
+  // Capture all owned runtime bytes before any checkout mutation. In
+  // particular, a snapshot failure must not leave a merged revision behind.
+  const runtimeSnapshot = await captureRuntimeSnapshot(target, runtime);
+  let branch;
+  const preflight = async (snapshotValue) => {
+    await runtime.preflight?.(snapshotValue);
+    requireReplaceableCheckout(force, gitImpl);
+    branch = gitImpl(["branch", "--show-current"]);
+    if (!branch) {
+      throw new Error("Updates require the managed checkout to be on its main branch.");
+    }
+  };
+  const installReplacement = runtime.installReplacement || (() => {
+    // Revision mutation is part of the replacement step, after snapshot and
+    // preflight have both succeeded. The old revision remains recoverable until
+    // this step is reached.
+    gitImpl(["update-ref", "refs/codex-router/rollback", status.current]);
+    gitImpl(["merge", "--ff-only", status.available], { inherit: true });
+    installCurrentCheckout();
+  });
   await runRuntimeMigration({
     ...runtime,
-    installReplacement: runtime.installReplacement || installCurrentCheckout,
-    restoreSnapshot: runtime.restoreSnapshot || (async (runtimeSnapshot) => {
-      restoreOwnedRuntime(runtimeSnapshot);
-      restoreRevision(status.current);
-    }),
+    target,
+    snapshot: runtimeSnapshot,
+    preflight,
+    installReplacement,
+    restoreSnapshot: runtime.restoreSnapshot || ((snapshotValue) => restoreRuntimeAndRevision(
+      snapshotValue,
+      status.current,
+      { restoreRevision: (revision) => switchRevision(revision, gitImpl) },
+    )),
   });
   refreshTrayCompanion();
   return { ...status, updated: true, reinstalled: true };
 }
 
-export async function rollbackCheckout({ force = false, runtime = {} } = {}) {
-  requireManagedCheckout();
+export async function rollbackCheckout({ force = false, runtime = {}, gitImpl = git } = {}) {
+  requireManagedCheckout(gitImpl);
   // A rollback checks out a different revision, so it overwrites tracked edits
   // exactly the way an update does.
-  requireReplaceableCheckout(force);
-  const current = git(["rev-parse", "HEAD"]);
+  const current = gitImpl(["rev-parse", "HEAD"]);
   let target;
   try {
-    target = git(["rev-parse", "refs/codex-router/rollback"]);
+    target = gitImpl(["rev-parse", "refs/codex-router/rollback"]);
   } catch {
     target = readInstallManifestSnapshot()?.history?.find((entry) => entry.commit)?.commit;
   }
-  if (!target || !revisionExists(target)) {
+  if (!target || !revisionExists(target, gitImpl)) {
     throw new Error("No locally cached working revision is available to roll back to.");
   }
   if (target === current) throw new Error("The rollback revision is already installed.");
-  git(["update-ref", "refs/codex-router/rollback", current]);
+  const runtimeSnapshot = Object.keys(runtime).length
+    ? await captureRuntimeSnapshot(currentServiceTarget(), runtime)
+    : undefined;
+  const preflight = async (snapshotValue) => {
+    await runtime.preflight?.(snapshotValue);
+    requireReplaceableCheckout(force, gitImpl);
+  };
   // A bare checkout without an install manifest is not a managed runtime
   // installation yet (for example, a deterministic control-child fixture),
   // so preserve the old checkout-only rollback path. Real managed installs
@@ -480,14 +559,22 @@ export async function rollbackCheckout({ force = false, runtime = {} } = {}) {
   if (Object.keys(runtime).length || existsSync(INSTALL_MANIFEST_PATH)) {
     await runRuntimeMigration({
       ...runtime,
-      installReplacement: runtime.installReplacement || (() => restoreRevision(target)),
-      restoreSnapshot: runtime.restoreSnapshot || (async (runtimeSnapshot) => {
-        restoreOwnedRuntime(runtimeSnapshot);
-        restoreRevision(current);
+      ...(runtimeSnapshot ? { snapshot: runtimeSnapshot } : {}),
+      preflight,
+      installReplacement: runtime.installReplacement || (() => {
+        gitImpl(["update-ref", "refs/codex-router/rollback", current]);
+        restoreRevision(target, { gitImpl, reinstall: true });
       }),
+      restoreSnapshot: runtime.restoreSnapshot || ((snapshotValue) => restoreRuntimeAndRevision(
+        snapshotValue,
+        current,
+        { restoreRevision: (revision) => switchRevision(revision, gitImpl) },
+      )),
     });
   } else {
-    restoreRevision(target);
+    requireReplaceableCheckout(force, gitImpl);
+    gitImpl(["update-ref", "refs/codex-router/rollback", current]);
+    restoreRevision(target, { gitImpl, reinstall: true });
   }
   return { rolledBack: true, from: current, to: target };
 }

@@ -26,21 +26,20 @@ const PACKAGE_ROOTS = Object.freeze([
 const PACKAGE_FILES = Object.freeze([
   "package.json",
   "package-lock.json",
+  "runtime-package.json",
   "install.sh",
-  "install.ps1",
-  "codex-router.ps1",
-  "model-router.ps1",
   "LICENSE",
   "NOTICE.md",
   "README.md",
   "SECURITY.md",
+  "docs/INSTALL.md",
+  "docs/DEVIN-CLI-PROBE.md",
   "scripts/build-macos-tray-app.sh",
-  "scripts/package-release.sh",
-  "scripts/package-release.mjs",
 ]);
 const REQUIRED_FILES = Object.freeze([
   "package.json",
   "package-lock.json",
+  "runtime-package.json",
   "src/start.mjs",
   "src/router.mjs",
   "src/node-runtime.mjs",
@@ -52,8 +51,6 @@ const REQUIRED_FILES = Object.freeze([
   "apps/macos/ModelRouterTray/Resources/Info.plist",
   "config/deepseek/deepseek.json",
   "scripts/build-macos-tray-app.sh",
-  "scripts/package-release.sh",
-  "scripts/package-release.mjs",
 ]);
 const PACKAGE_FILE_SET = new Set(PACKAGE_FILES);
 const EMPTY_SHA256 = createHash("sha256").update(Buffer.alloc(0)).digest("hex");
@@ -120,8 +117,16 @@ function normalizeRelative(relative) {
   return value;
 }
 
+function forbiddenRuntimePath(relative) {
+  const segments = normalizeRelative(relative).split("/");
+  return segments.some((segment) =>
+    segment === "test" || /^(?:python|electron|tauri)(?:$|[._-])/i.test(segment),
+  );
+}
+
 function allowedPath(relative) {
   const value = normalizeRelative(relative);
+  if (forbiddenRuntimePath(value)) return false;
   if (PACKAGE_FILE_SET.has(value)) return true;
   return PACKAGE_ROOTS.some((root) => value === root || value.startsWith(root + "/"));
 }
@@ -213,6 +218,29 @@ function trackedFile(sourceRoot, sourceRootReal, relative, headEntry, bytes) {
   };
 }
 
+function runtimePackageDocument(sourcePackage, runtimeMetadata) {
+  return {
+    name: runtimeMetadata.name || sourcePackage.name,
+    version: sourcePackage.version,
+    private: false,
+    type: "module",
+    description: "Codex Router runtime package",
+    engines: sourcePackage.engines,
+    scripts: runtimeMetadata.scripts || {},
+    dependencies: runtimeMetadata.dependencies || {},
+  };
+}
+
+function replacePackageEntry(entry, document) {
+  const data = Buffer.from(JSON.stringify(document, null, 2) + "\n", "utf8");
+  return {
+    ...entry,
+    bytes: data.byteLength,
+    sha256: createHash("sha256").update(data).digest("hex"),
+    data,
+  };
+}
+
 function packageEntries(sourceRoot) {
   const sourceRootReal = sourceRootPath(sourceRoot);
   const index = gitHeadTree(sourceRootReal);
@@ -226,8 +254,34 @@ function packageEntries(sourceRoot) {
   for (const required of REQUIRED_FILES) {
     if (!selectedByPath.has(required)) fail("required package dependency is not tracked: " + required);
   }
-  const packageJson = JSON.parse(selectedByPath.get("package.json").data.toString("utf8"));
+  const sourcePackageJson = JSON.parse(selectedByPath.get("package.json").data.toString("utf8"));
   const packageLock = JSON.parse(selectedByPath.get("package-lock.json").data.toString("utf8"));
+  const runtimeMetadata = JSON.parse(selectedByPath.get("runtime-package.json").data.toString("utf8"));
+  if (runtimeMetadata?.schemaVersion !== 1 || runtimeMetadata.runtime !== "node") {
+    fail("runtime-package.json is not a supported Node runtime metadata document.");
+  }
+  const available = (relative) =>
+    selectedByPath.has(relative) || [...selectedByPath.keys()].some((entry) => entry.startsWith(relative + "/"));
+  for (const relative of [
+    ...(runtimeMetadata.entrypoints || []),
+    ...(runtimeMetadata.assets || []),
+    ...(runtimeMetadata.docs || []),
+  ]) {
+    if (typeof relative !== "string" || !available(relative)) {
+      fail("runtime-package.json names an unshipped path: " + String(relative));
+    }
+  }
+  const scriptText = JSON.stringify(runtimeMetadata.scripts || {});
+  if (/npm\s+(?:run\s+)?(?:test|check)|python|electron|tauri/i.test(scriptText)) {
+    fail("runtime-package.json contains an unavailable runtime script.");
+  }
+  const runtimePackageEntry = replacePackageEntry(
+    selectedByPath.get("package.json"),
+    runtimePackageDocument(sourcePackageJson, runtimeMetadata),
+  );
+  selectedByPath.set("package.json", runtimePackageEntry);
+  selected[selected.findIndex((entry) => entry.relative === "package.json")] = runtimePackageEntry;
+  const packageJson = JSON.parse(selectedByPath.get("package.json").data.toString("utf8"));
   const lockRoot = packageLock?.packages?.[""];
   if (!lockRoot || JSON.stringify(lockRoot.dependencies || {}) !== JSON.stringify(packageJson.dependencies || {})) {
     fail("package-lock root dependencies do not match package.json.");
@@ -399,8 +453,10 @@ function manifestFor(entries, packageVersion, sourceCommit) {
     target: "codex",
     platform: "darwin",
     runtime: "node",
+    packageKind: "runtime",
+    runtimeMetadata: "runtime-package.json",
     sections: {
-      router: ["src", "bin", "package.json", "package-lock.json", "install.sh", "install.ps1", "codex-router.ps1", "model-router.ps1", "scripts/package-release.sh", "scripts/package-release.mjs"],
+      router: ["src", "bin", "package.json", "package-lock.json", "runtime-package.json", "install.sh"],
       swiftApp: ["apps/macos/ModelRouterTray"],
       browser: ["apps/desktop/ui"],
       registry: ["config"],
@@ -459,8 +515,17 @@ function main(argv) {
   let sourceRoot = SCRIPT_ROOT;
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index];
-    if (argument === "--output") outputDir = argv[++index];
-    else if (argument === "--source-root") sourceRoot = argv[++index];
+    if (argument === "--output" || argument === "--source-root") {
+      const value = argv[index + 1];
+      if (!value || value.startsWith("--")) {
+        const error = new Error(`${argument} requires a path value.`);
+        error.exitCode = 2;
+        throw error;
+      }
+      if (argument === "--output") outputDir = value;
+      else sourceRoot = value;
+      index += 1;
+    }
     else if (argument === "--help" || argument === "-h") {
       process.stdout.write("Usage: package-release.mjs [--output PATH] [--source-root PATH]\n");
       return 0;
@@ -483,6 +548,6 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
     process.exitCode = main(process.argv.slice(2));
   } catch (error) {
     console.error(error instanceof Error ? error.message : String(error));
-    process.exitCode = 1;
+    process.exitCode = error?.exitCode === 2 ? 2 : 1;
   }
 }

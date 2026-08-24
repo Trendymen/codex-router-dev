@@ -164,6 +164,71 @@ test("public POSIX wrappers use a trusted uname and gate before checkout inspect
   }
 });
 
+test("production Tray scripts ignore fake tool overrides and build-only flags", { skip: process.platform === "darwin" }, () => {
+  const fixture = mkdtempSync(path.join(os.tmpdir(), "platform-gate-tray-production-"));
+  const fakeDir = path.join(fixture, "fake-tools");
+  const trace = path.join(fixture, "fake-tools.trace");
+  mkdirSync(fakeDir);
+  const fake = (name) => {
+    const file = path.join(fakeDir, name);
+    writeFileSync(file, `#!/bin/sh\nprintf '%s\\n' "$0" >>"$FAKE_TRAY_TRACE"\nprintf 'Darwin\\n'\n`);
+    chmodSync(file, 0o700);
+    return file;
+  };
+  try {
+    const env = {
+      ...process.env,
+      FAKE_TRAY_TRACE: trace,
+      MODEL_ROUTER_SERVICE_MODE: "acceptance",
+      MODEL_ROUTER_TRAY_BUILD_ONLY: "1",
+      MODEL_ROUTER_UNAME_BIN: fake("uname"),
+      MODEL_ROUTER_SWIFT_BIN: fake("swift"),
+      MODEL_ROUTER_CODESIGN_BIN: fake("codesign"),
+      MODEL_ROUTER_PLISTBUDDY_BIN: fake("PlistBuddy"),
+      MODEL_ROUTER_ISOLATION_ROOT: path.join(fixture, "isolation"),
+    };
+    for (const script of ["bin/model-router-tray", "scripts/build-macos-tray-app.sh"]) {
+      const result = spawnSync("sh", [path.join(root, script)], {
+        cwd: root,
+        encoding: "utf8",
+        env,
+      });
+      assert.equal(result.status, 2, `${script}: ${result.stdout}\n${result.stderr}`);
+      assert.match(result.stderr, /unsupported_platform/);
+      const fakeContext = path.join(fixture, "forged-context.json");
+      writeFileSync(fakeContext, JSON.stringify({ mode: "acceptance", buildOnly: true }));
+      const fixtureResult = spawnSync(
+        "sh",
+        script === "bin/model-router-tray"
+          ? [path.join(root, script), "--fixture-context", fakeContext]
+          : [
+              path.join(root, script),
+              path.join(fixture, "isolation", "forged.app"),
+              "--fixture-context",
+              fakeContext,
+            ],
+        { cwd: root, encoding: "utf8", env },
+      );
+      assert.equal(fixtureResult.status, 2, `${script} fixture: ${fixtureResult.stdout}\n${fixtureResult.stderr}`);
+      assert.match(fixtureResult.stderr, /unsupported_platform/);
+    }
+    assert.equal(existsSync(trace), false);
+    assert.equal(existsSync(path.join(fixture, "isolation")), false);
+    const traySource = readFileSync(path.join(root, "bin", "model-router-tray"), "utf8");
+    const builderSource = readFileSync(path.join(root, "scripts", "build-macos-tray-app.sh"), "utf8");
+    for (const source of [traySource, builderSource]) {
+      assert.doesNotMatch(source, /\$\{MODEL_ROUTER_(?:UNAME_BIN|SWIFT_BIN|CODESIGN_BIN|PLISTBUDDY_BIN)/);
+      assert.doesNotMatch(source, /\$\{MODEL_ROUTER_TRAY_BUILD_ONLY/);
+    }
+    assert.match(traySource, /uname_bin=\/usr\/bin\/uname/);
+    assert.match(builderSource, /uname_bin=\/usr\/bin\/uname/);
+    assert.match(builderSource, /codesign_bin=\/usr\/bin\/codesign/);
+    assert.match(builderSource, /plistbuddy_bin=\/usr\/libexec\/PlistBuddy/);
+  } finally {
+    rmSync(fixture, { recursive: true, force: true });
+  }
+});
+
 test("the macOS plist renderer remains a read-only cross-platform fixture surface", () => {
   const testRoot = mkdtempSync(path.join(os.tmpdir(), "platform-gate-render-"));
   try {

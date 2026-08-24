@@ -626,9 +626,7 @@ test("local speed benchmark records Ollama eval tokens per second", async () => 
   assert.equal(readLocalBenchmarks()["gemma4:12b"].speedStatus, "measured");
 });
 
-test("a completed local pull checks tool-capable models on automatically", async () => {
-  const enabled = [];
-  const restarts = [];
+test("a completed local pull never publishes a chat route", async () => {
   const result = await downloadLocalModel("https://ollama.com/library/gemma4:12b", {
     ensureRuntime: async () => ({ running: true, managed: true }),
     pull: async (tag, { onProgress }) => {
@@ -636,20 +634,11 @@ test("a completed local pull checks tool-capable models on automatically", async
       onProgress({ detail: "success", percent: 100 });
     },
     capabilitiesFor: () => ["completion", "tools"],
-    enable: async (tag) => enabled.push(tag),
-    restartService: async () => {
-      restarts.push("restart");
-      return true;
-    },
     refreshCatalog: false,
   });
   assert.equal(result.status, "done");
-  assert.deepEqual(enabled, ["gemma4:12b"]);
-  // The running router only loads user models at startup, so a newly checked
-  // local model must also restart the router or its first request falls
-  // through to the native backend.
-  assert.deepEqual(restarts, ["restart"]);
-  assert.equal(readLocalDownload().detail, "ready");
+  assert.equal(result.canChat, false);
+  assert.equal(readLocalDownload().detail, "downloaded · Vision only");
 });
 
 test("control persists a visible terminal error when install preflight fails", () => {

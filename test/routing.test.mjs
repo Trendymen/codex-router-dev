@@ -384,11 +384,18 @@ test("provider vision reads use Node dispatch and never the retired gateway", as
     if (request.url === "/v1/responses") {
       const body = await bodyJson(request);
       providerRequests.push(body);
-      const text = body.model === qwen.upstreamModel ? "## Vision\nNode path." : "## Answer\nDone.";
+      const isVisionModel = body.model.startsWith("qwen3.");
+      const text = isVisionModel ? "## Vision\nNode path." : "## Answer\nDone.";
+      const output = isVisionModel
+        ? [
+            { type: "reasoning", id: `rsn_${body.model}`, output_index: 0, summary: [{ type: "summary_text", text: "brief" }], content: [] },
+            { type: "message", role: "assistant", output_index: 1, content: [{ type: "output_text", text }] },
+          ]
+        : [{ type: "message", role: "assistant", content: [{ type: "output_text", text }] }];
       json(response, 200, {
         id: `resp_${body.model}`,
         output_text: text,
-        output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text }] }],
+        output,
         usage: { input_tokens: 2, output_tokens: 2 },
       });
       return;

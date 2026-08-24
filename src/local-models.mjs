@@ -13,7 +13,6 @@ import path from "node:path";
 
 import { protectPrivateFile } from "./file-security.mjs";
 import { STATE_DIR } from "./paths.mjs";
-import { readUserModels, writeUserModels } from "./user-models.mjs";
 import {
   canonicalLocalModelTag,
   localModelDisplayName,
@@ -121,9 +120,7 @@ export function setLocalModelEnabled(tag, enabled, { capabilitiesFor } = {}) {
     (entry) => canonicalLocalModelTag(entry) !== canonical,
   );
   const current = new Set(enabled ? [...remaining, canonical] : remaining);
-  const selection = writeSelection({ version: 1, enabled: [...current].sort() });
-  syncLocalUserModels({ enabled: selection.enabled, ...(capabilitiesFor ? { capabilitiesFor } : {}) });
-  return selection;
+  return writeSelection({ version: 1, enabled: [...current].sort() });
 }
 
 // Deliberately failure-tolerant. The selection file is shared state that other
@@ -144,11 +141,10 @@ export function syncLocalUserModels({
   enabled = readLocalModelSelection().enabled,
   capabilitiesFor = (tag) => localModelCapabilities(tag),
 } = {}) {
-  const others = readUserModels().filter((model) => model.provider !== LOCAL_PROVIDER_ID);
-  // Remove stale local chat entries from the user overlay, but never touch
-  // LOCAL_MODELS_STATE_PATH, Ollama's model directory, downloads, probes, or
-  // benchmarks.  The selected tags remain available to Vision controls.
-  writeUserModels(others);
+  // Kept as a compatibility/read-only seam for older callers. Local models are
+  // Vision inventory only; no user chat overlay is created or rewritten.
+  void enabled;
+  void capabilitiesFor;
   return [];
 }
 

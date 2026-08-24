@@ -46,7 +46,7 @@ function fixtureRoot() {
   }
   // The implementation helper is deliberately copied even when this test is
   // run before the parent Task stages the new file into the source index.
-  for (const relative of ["scripts/package-release.mjs", "scripts/package-release.sh"]) {
+  for (const relative of ["runtime-package.json", "scripts/package-release.mjs", "scripts/package-release.sh"]) {
     const source = path.join(root, relative);
     if (!lstatSync(source).isFile()) throw new Error(`fixture source is not regular: ${relative}`);
     const destination = path.join(fixture, relative);

@@ -171,13 +171,6 @@ export function applyKnownMigrations() {
   const snapshotDir = path.join(MIGRATIONS_DIR, safeTimestamp());
   mkdirSync(snapshotDir, { recursive: true, mode: 0o700 });
   chmodSync(snapshotDir, 0o700);
-  let configBackup;
-  if (existsSync(CONFIG_PATH)) {
-    configBackup = path.join(snapshotDir, "config.toml.before-migration");
-    copyFileSync(CONFIG_PATH, configBackup);
-    protectPrivateFile(configBackup);
-  }
-
   const services = detected.installations.map((installation) => {
     const plistBackup = installation.plistPresent
       ? path.join(snapshotDir, `${installation.label}.plist`)
@@ -197,7 +190,6 @@ export function applyKnownMigrations() {
     version: 1,
     createdAt: new Date().toISOString(),
     snapshotDir,
-    configBackup: configBackup || null,
     services,
     newServiceLabel: SERVICE_LABEL,
   };
@@ -217,11 +209,6 @@ export function applyKnownMigrations() {
         protectPrivateFile(service.plistBackup);
       }
     }
-    execFileSync(
-      process.execPath,
-      [path.join(SOURCE_ROOT, "src", "config-manager.mjs"), "disable"],
-      { stdio: "ignore", env: process.env },
-    );
   } catch (error) {
     try {
       rollbackLatestMigration({ removeNewService: false });
@@ -261,10 +248,6 @@ export function rollbackLatestMigration(options = {}) {
     } catch {
       // Restoration can continue when the new service was never installed.
     }
-  }
-  if (snapshot.configBackup && existsSync(snapshot.configBackup)) {
-    copyFileSync(snapshot.configBackup, CONFIG_PATH);
-    protectPrivateFile(CONFIG_PATH);
   }
   for (const service of snapshot.services || []) {
     if (service.plistBackup && existsSync(service.plistBackup)) {

@@ -1251,7 +1251,11 @@ async function dispatchVisionNodeProvider({ engine, request, signal }) {
     signal,
     failoverCandidates: [],
   });
-  const body = result.model.effectiveTransport === "anthropic-messages"
+  // The dispatcher selects the final provider and attaches the protocol
+  // adapter only after that selection. Vision reads consume the buffered body,
+  // so they must use the same transformed bytes as the normal relay; returning
+  // result.response directly would skip Responses tool/reasoning restoration.
+  const body = result.transforms?.length
     ? await readDispatchBody(result)
     : Buffer.from(await result.response.arrayBuffer());
   return new Response(body, {

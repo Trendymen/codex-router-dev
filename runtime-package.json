@@ -1,0 +1,40 @@
+{
+  "schemaVersion": 1,
+  "name": "codex-model-router-runtime",
+  "runtime": "node",
+  "platform": "darwin",
+  "target": "codex",
+  "dependencies": {
+    "proper-lockfile": "4.1.2",
+    "undici": "8.10.0"
+  },
+  "entrypoints": [
+    "src/start.mjs",
+    "src/router.mjs",
+    "src/node-runtime.mjs",
+    "src/control.mjs",
+    "src/doctor.mjs",
+    "src/update.mjs",
+    "bin/install",
+    "bin/model-router",
+    "bin/model-router-tray",
+    "scripts/build-macos-tray-app.sh"
+  ],
+  "assets": [
+    "apps/desktop/ui",
+    "apps/macos/ModelRouterTray",
+    "config"
+  ],
+  "docs": [
+    "README.md",
+    "SECURITY.md",
+    "docs/INSTALL.md",
+    "docs/DEVIN-CLI-PROBE.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "start": "node src/start.mjs",
+    "doctor": "node src/doctor.mjs",
+    "build-tray": "bin/model-router-tray"
+  }
+}

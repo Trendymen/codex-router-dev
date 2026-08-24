@@ -5,11 +5,10 @@ import { SOURCE_ROOT } from "./paths.mjs";
 
 const SERVICE_SCRIPT = path.join(SOURCE_ROOT, "src", "service.mjs");
 
-// The router reads its model registry at process start, so a local-model route
-// added through `control local-models set` is only routable after the
-// background service reloads it. Probe the service first: dev checkouts and
-// test harnesses run the router in the foreground, where there is nothing to
-// restart.
+// Keep this helper for lifecycle controls that genuinely need a service reload.
+// Local model downloads are Vision-only and never call it to publish a chat
+// route. Probe the service first: dev checkouts and test harnesses run the
+// router in the foreground, where there is nothing to restart.
 export function routerServiceStatus({ spawn = spawnSync, env = process.env } = {}) {
   const result = spawn(process.execPath, [SERVICE_SCRIPT, "status"], {
     cwd: SOURCE_ROOT,

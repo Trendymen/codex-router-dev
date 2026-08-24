@@ -121,18 +121,12 @@ case "$(install_step node-deps)" in
 esac
 
 node src/secret.mjs ensure
-config_enabled=false
 service_installed=false
-config_manager=src/config-manager.mjs
-config_enable_command=enable
-config_disable_command=disable
 rollback() {
   if [ "$service_installed" = true ]; then
     node src/service.mjs uninstall >/dev/null 2>&1 || true
   fi
-  if [ "$config_enabled" = true ]; then
-    node "$config_manager" "$config_disable_command" >/dev/null 2>&1 || true
-  elif [ "$adopt_native_catalog" = true ]; then
+  if [ "$adopt_native_catalog" = true ]; then
     node src/native-catalog-source.mjs clear-pending >/dev/null 2>&1 || true
   fi
 }
@@ -157,12 +151,6 @@ if [ "$prepare_only" = true ]; then
   exit 0
 fi
 
-config_enabled=true
-if [ "$adopt_native_catalog" = true ]; then
-  node "$config_manager" "$config_enable_command" --adopt-native-catalog
-else
-  node "$config_manager" "$config_enable_command"
-fi
 service_installed=true
 node src/service.mjs install
 node src/wait-health.mjs
@@ -196,7 +184,6 @@ case "$tray_plan" in
     echo "Menu-bar companion already matches its sources; skipping the tray build."
     ;;
 esac
-config_enabled=false
 service_installed=false
 trap - EXIT HUP INT TERM
 
@@ -208,7 +195,8 @@ if [ "$target" = codex ]; then
 fi
 
 echo "Installed the selected external model routes for Codex."
-echo "Fully quit and reopen Codex, then start a new task."
+echo "Codex configuration was left untouched. Paste the following CC Switch snippet if needed:"
+node src/control.mjs catalog render-snippet
 echo "Kimi API key: $repo_dir/bin/provider-key kimi-api set"
 echo "DeepSeek API key: $repo_dir/bin/provider-key deepseek set"
 echo "xAI API key: $repo_dir/bin/provider-key grok-api set"

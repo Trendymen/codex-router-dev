@@ -11,14 +11,14 @@ import {
 } from "./model-overlay-publication.mjs";
 import { withModelOverlayLock } from "./model-overlay-lock.mjs";
 import { withNativeContextVariants } from "./native-context-variants.mjs";
+import { readCodexConfigStatus } from "./codex-config-status.mjs";
 // The publish marker lives under the shared state directory, which does not
 // vary by target, so reading it here does not disturb the per-target probes
 // below that re-import paths with their own MODEL_ROUTER_TARGET.
-import { PORTS, PROVIDER_SELECTION_PATH } from "./paths.mjs";
+import { CONFIG_PATH, PORTS, PROVIDER_SELECTION_PATH } from "./paths.mjs";
 // Same reasoning: presence is a property of the shared plane, not of a target,
 // so the overview can resolve it statically without perturbing those probes.
 import { presenceSnapshot } from "./presence-state.mjs";
-import { USER_MODELS_PATH } from "./user-models.mjs";
 import { buildCapabilityManifest, SUPPORTED_PROVIDER_IDS } from "./capability-manifest.mjs";
 
 // Codex control plane for the tray/UI. Provider selection and publication are
@@ -90,14 +90,8 @@ function configuredDefaultModel(configPath) {
 }
 
 function codexConfigSnapshot() {
-  const result = spawnSync(
-    process.execPath,
-    [path.join(REPO_ROOT, "src", "config-manager.mjs"), "status"],
-    { env: { ...process.env, MODEL_ROUTER_TARGET: "codex" }, encoding: "utf8" },
-  );
-  if (result.status !== 0) return undefined;
   try {
-    return JSON.parse(result.stdout);
+    return readCodexConfigStatus(existsSync(CONFIG_PATH) ? readFileSync(CONFIG_PATH, "utf8") : "");
   } catch {
     return undefined;
   }
@@ -734,193 +728,11 @@ async function deleteProviderCredential(providerId) {
   );
 }
 
-async function setLoginFreeMode(desired) {
-  if (desired !== "on" && desired !== "off") {
-    throw new Error("Usage: control auth-mode <on|off>");
-  }
-  let loginFreeModel;
-  if (desired === "on") {
-    const { providerOnboardingSnapshot } = await import("./provider-onboarding.mjs");
-    const { readProviderSelection, selectedListedModels } = await import("./provider-selection.mjs");
-    const { MODEL_BY_SLUG } = await import("./model-registry.mjs");
-    const { readNativeAliases } = await import("./native-alias.mjs");
-    const selected = new Set(readProviderSelection());
-    const readyProviders = new Set(
-      providerOnboardingSnapshot().providers
-        .filter((provider) => selected.has(provider.id) && provider.configured)
-        .map((provider) => provider.id),
-    );
-    if (readyProviders.size === 0) {
-      throw new Error(
-        "Connect and enable at least one external provider before turning on login-free mode.",
-      );
-    }
-    const currentModel = codexConfigSnapshot()?.model;
-    const currentRoute =
-      MODEL_BY_SLUG.get(currentModel) ??
-      MODEL_BY_SLUG.get(readNativeAliases()[currentModel]);
-    loginFreeModel =
-      currentRoute && readyProviders.has(currentRoute.provider)
-        ? currentRoute.slug
-        : selectedListedModels().find((model) => readyProviders.has(model.provider))?.slug;
-    if (!loginFreeModel) {
-      throw new Error("No enabled model is available for the connected external providers.");
-    }
-  }
-  const catalog = spawnSync(
-    process.execPath,
-    [path.join(REPO_ROOT, "src", "catalog.mjs")],
-    {
-      cwd: REPO_ROOT,
-      env: {
-        ...process.env,
-        MODEL_ROUTER_TARGET: "codex",
-        MODEL_ROUTER_LOGIN_FREE: desired === "on" ? "1" : "0",
-      },
-      encoding: "utf8",
-    },
+async function rejectCodexConfigMutation(command, value) {
+  throw new Error(
+    "Codex " + command + " is no longer changed by the Router (requested " + String(value) + "). " +
+    "Use control catalog render-snippet and change the client profile in CC Switch.",
   );
-  if (catalog.status !== 0) {
-    throw new Error((catalog.stderr || "Codex model catalog could not be refreshed.").trim());
-  }
-  if (loginFreeModel) {
-    const { nativeAliasFor } = await import("./native-alias.mjs");
-    loginFreeModel = nativeAliasFor(loginFreeModel) || loginFreeModel;
-  }
-  const command = desired === "on" ? "login-free-enable" : "login-free-disable";
-  const commandArgs = [path.join(REPO_ROOT, "src", "config-manager.mjs"), command];
-  if (loginFreeModel) commandArgs.push(loginFreeModel);
-  const result = spawnSync(
-    process.execPath,
-    commandArgs,
-    {
-      cwd: REPO_ROOT,
-      env: { ...process.env, MODEL_ROUTER_TARGET: "codex" },
-      encoding: "utf8",
-    },
-  );
-  if (result.status !== 0) {
-    throw new Error((result.stderr || "Codex provider mode could not be changed.").trim());
-  }
-  process.stdout.write(result.stdout);
-}
-
-async function setSignedRouting(desired) {
-  if (desired !== "on" && desired !== "off") {
-    throw new Error("Usage: control signed-routing <on|off>");
-  }
-  if (desired === "on") {
-    const { selectedConfiguredListedModels } = await import("./provider-selection.mjs");
-    if (selectedConfiguredListedModels().length === 0) {
-      throw new Error(
-        "Connect and enable at least one external provider before turning on signed routing.",
-      );
-    }
-  }
-  const command = desired === "on" ? "signed-enable" : "signed-disable";
-  const runConfig = (configCommand = command) => spawnSync(
-    process.execPath,
-    [path.join(REPO_ROOT, "src", "config-manager.mjs"), configCommand],
-    {
-      cwd: REPO_ROOT,
-      env: { ...process.env, MODEL_ROUTER_TARGET: "codex" },
-      encoding: "utf8",
-    },
-  );
-  const runCatalog = (routing = desired, { allowTestFault = true } = {}) => {
-    const environment = {
-      ...process.env,
-      MODEL_ROUTER_TARGET: "codex",
-      MODEL_ROUTER_SIGNED_ROUTING: routing === "on" ? "1" : "0",
-    };
-    if (!allowTestFault) delete environment.MODEL_ROUTER_TEST_FAIL_AFTER_CATALOG_WRITE;
-    return spawnSync(
-      process.execPath,
-      [path.join(REPO_ROOT, "src", "catalog.mjs")],
-      {
-      cwd: REPO_ROOT,
-      env: environment,
-      encoding: "utf8",
-      },
-    );
-  };
-  // Enabling routes the transport first, so a partially completed operation
-  // can only hide external models. Disabling hides them first, so they can
-  // never escape through the restored direct provider endpoint.
-  let result;
-  let catalog;
-  if (desired === "on") {
-    result = runConfig();
-    if (result.status === 0) catalog = runCatalog();
-  } else {
-    catalog = runCatalog();
-    if (catalog.status === 0) result = runConfig();
-  }
-  if (result && result.status !== 0) {
-    throw new Error((result.stderr || "Signed router mode could not be changed.").trim());
-  }
-  if (catalog.status !== 0) {
-    if (desired === "on") {
-      // A catalog process can fail after replacing one of its files. Before
-      // restoring the user's direct provider, prove that a clean native-only
-      // rebuild succeeds. If it does not, keep the signed router transport in
-      // place: external entries against the router are safer than sending one
-      // through a provider endpoint we no longer own.
-      const safeCatalog = runCatalog("off", { allowTestFault: false });
-      if (safeCatalog.status !== 0) {
-        throw new AggregateError(
-          [
-            new Error((catalog.stderr || "Codex model catalog could not be refreshed.").trim()),
-            new Error((safeCatalog.stderr || "The native-only rollback catalog failed.").trim()),
-          ],
-          "Signed routing remains active because the catalog could not be rolled back safely.",
-        );
-      }
-      const rollback = runConfig("signed-disable");
-      if (rollback.status !== 0) {
-        throw new AggregateError(
-          [
-            new Error((catalog.stderr || "Codex model catalog could not be refreshed.").trim()),
-            new Error((rollback.stderr || "Signed router configuration rollback failed.").trim()),
-          ],
-          "The catalog was made native-only, but signed router configuration could not be restored.",
-        );
-      }
-    }
-    throw new Error((catalog.stderr || "Codex model catalog could not be refreshed.").trim());
-  }
-  if (!result) {
-    throw new Error("Signed router mode could not be changed.");
-  }
-  process.stdout.write(result.stdout);
-}
-
-async function setLoginFreeModel(slug) {
-  const value = String(slug || "").trim();
-  if (!value) throw new Error("Usage: control model-set <model-slug>");
-  const config = codexConfigSnapshot();
-  if (!config?.login_free) {
-    throw new Error("Switching the tray model requires login-free mode.");
-  }
-  const { selectedConfiguredListedModels } = await import("./provider-selection.mjs");
-  if (!selectedConfiguredListedModels().some((model) => model.slug === value)) {
-    throw new Error(`${value} is not an enabled, authenticated external model.`);
-  }
-  const { nativeAliasFor } = await import("./native-alias.mjs");
-  const configModel = nativeAliasFor(value) || value;
-  const result = spawnSync(
-    process.execPath,
-    [path.join(REPO_ROOT, "src", "config-manager.mjs"), "login-free-enable", configModel],
-    {
-      cwd: REPO_ROOT,
-      env: { ...process.env, MODEL_ROUTER_TARGET: "codex" },
-      encoding: "utf8",
-    },
-  );
-  if (result.status !== 0) {
-    throw new Error((result.stderr || "The Codex model could not be changed.").trim());
-  }
-  process.stdout.write(result.stdout);
 }
 
 async function updateAndVerifyCodex() {
@@ -1025,30 +837,6 @@ function refreshModelSettingsCatalog() {
       (result.stderr || "The model settings catalog could not be refreshed.").trim(),
     );
   }
-}
-
-async function restartRouterForLocalRoutes() {
-  // User-model routes live in files the running router only reads at startup,
-  // so a local model toggle needs the same service reload curated-model apply
-  // performs. Foreground/dev routers have no service and are skipped.
-  const { restartRouterServiceIfInstalled } = await import("./router-restart.mjs");
-  const restarted = restartRouterServiceIfInstalled();
-  if (restarted) {
-    process.stderr.write("Router service restarted so local routes are live.\n");
-  }
-  return restarted;
-}
-
-async function finalizeLocalModelPublication() {
-  // Finalization runs in a separate process after a detached uninstall worker
-  // has removed the weights. It still needs the same lock as a full mutation,
-  // or it could publish a snapshot between another operation's state write and
-  // its catalog publication.
-  return withModelOverlayLock(() => applyModelOverlayPublication({
-    warningOnly: true,
-    restart: true,
-    restartService: restartRouterForLocalRoutes,
-  }));
 }
 
 // What this model says it supports, read from the merged catalog Codex reads
@@ -1706,12 +1494,8 @@ async function handleLocalModels(action, value, ...rest) {
   // made that combination unexpressible.
   const options = rest.filter((item) => typeof item === "string");
   const flags = new Set(options.filter((item) => item.startsWith("--")));
-  const positional = options.find((item) => !item.startsWith("--"));
   const {
-    isLocalModelEnabled,
-    LOCAL_MODELS_STATE_PATH,
     localModelsSnapshot,
-    setLocalModelEnabled,
   } = await import("./local-models.mjs");
   const { readBenchmarkResults } = await import("./vision-benchmark.mjs");
   const { readLocalBenchmarks } = await import("./local-benchmark.mjs");
@@ -1950,49 +1734,14 @@ async function handleLocalModels(action, value, ...rest) {
       throw error;
     }
   }
-  if (action === "finalize-uninstall") {
-    // Ollama removal has already completed by the time this cleanup step is
-    // reached.  Catalog/gateway refresh and a service restart are follow-up
-    // publication work: if either one is unavailable, report the warning but
-    // do not turn a successfully removed model into a false removal failure.
-    const warnings = await finalizeLocalModelPublication();
-    process.stdout.write(`${JSON.stringify({
-      finalized: true,
-      tag: value || null,
-      ...warnings,
-    })}\n`);
-    return;
-  }
-  if (action === "set") {
-    if (!["on", "off"].includes(positional)) {
-      throw new Error("Usage: control local-models set <model-tag> <on|off>");
-    }
-    const enabled = positional === "on";
-    // Compared across spellings: the downloader stores `gemma3:latest` and a
-    // hand-typed `gemma3` is the same model, so a raw string match here would
-    // skip the router restart that publishes the route change.
-    await transactModelOverlayMutation({
-      files: [
-        LOCAL_MODELS_STATE_PATH,
-        USER_MODELS_PATH,
-        PROVIDER_SELECTION_PATH,
-      ],
-      mutate: () => setLocalModelEnabled(value, enabled),
-      // Evaluated after the transaction lock is held, so a queued toggle does
-      // not make its restart decision from a stale pre-lock read.
-      restart: () => isLocalModelEnabled(value) !== enabled,
-      restartService: restartRouterForLocalRoutes,
-    });
-  } else {
-    throw new Error(
+  throw new Error(
       "Usage: control local-models list [--json]|inspect <tag-or-url>|" +
         "install <tag-or-url> [--yes] [--force]|" +
         "runtime status|runtime start [--yes]|runtime update --yes|" +
-        "cancel [<tag>]|set <tag> <on|off>\n" +
+        "cancel [<tag>]\n" +
         "  --yes    consent to installing/starting Ollama itself (headless)\n" +
         "  --force  download a model rated too large for this machine anyway",
-    );
-  }
+  );
   process.stdout.write(`${JSON.stringify(await snapshot())}\n`);
 }
 
@@ -2277,11 +2026,11 @@ if (args.includes("--probe")) {
     await saveProviderCredential(args[1]);
   }
 } else if (args[0] === "auth-mode") {
-  await setLoginFreeMode(args[1]);
+  await rejectCodexConfigMutation("auth-mode", args[1]);
 } else if (args[0] === "signed-routing") {
-  await setSignedRouting(args[1]);
+  await rejectCodexConfigMutation("signed-routing", args[1]);
 } else if (args[0] === "model-set") {
-  await setLoginFreeModel(args[1]);
+  await rejectCodexConfigMutation("model-set", args[1]);
 } else if (args[0] === "subagents") {
   await handleSubagents(args[1], args[2], args[3], args.slice(2));
 } else if (args[0] === "tool-result-aging") {

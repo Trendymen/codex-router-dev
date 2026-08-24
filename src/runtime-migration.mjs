@@ -30,6 +30,12 @@ export async function migrateRuntime(steps = {}) {
     : steps.snapshot;
   if (snapshot === undefined) throw new Error("Runtime migration requires a snapshot.");
 
+  // A migration caller may need to validate the revision, checkout, and target
+  // before it is allowed to mutate a revision. Keep this boundary outside the
+  // replacement try/catch: a failed preflight has not changed the installed
+  // runtime and therefore must not trigger a restore/restart side effect.
+  await invoke(steps.preflight, snapshot);
+
   try {
     await invoke(steps.installReplacement, snapshot);
     if (typeof steps.verifyReplacement === "function") {

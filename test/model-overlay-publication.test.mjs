@@ -264,7 +264,7 @@ test("completed operations retain a post-publication restart failure as a warnin
   assert.deepEqual(warnings, { restartError: "service restart failed" });
 });
 
-test("a completed local pull reports publication failure without becoming failed", async () => {
+test("a completed local pull stays Vision-only without chat publication", async () => {
   const events = [];
   const result = await downloadLocalModel("publication-test:latest", {
     ensureRuntime: async () => ({ running: true }),
@@ -281,14 +281,15 @@ test("a completed local pull reports publication failure without becoming failed
     }),
   });
 
-  assert.deepEqual(events, ["download", "overlay", "publish"]);
+  assert.deepEqual(events, ["download"]);
   assert.equal(result.status, "done");
-  assert.equal(result.catalogError, "installed target could not be refreshed");
+  assert.equal(result.canChat, false);
+  assert.equal(result.catalogError, undefined);
   assert.equal(readLocalDownload().status, "done");
-  assert.match(readLocalDownload().detail, /catalog refresh needed/);
+  assert.match(readLocalDownload().detail, /Vision only/);
 });
 
-test("control and both detached workers use the shared publication finalizer", () => {
+test("control and Vision worker use the shared publication finalizer; local chat does not", () => {
   const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
   const sources = Object.fromEntries(
     ["control.mjs", "local-download.mjs", "vision-download.mjs"].map((name) => [
@@ -297,7 +298,8 @@ test("control and both detached workers use the shared publication finalizer", (
     ]),
   );
 
-  for (const [name, source] of Object.entries(sources)) {
+  for (const name of ["control.mjs", "vision-download.mjs"]) {
+    const source = sources[name];
     assert.ok(
       source.includes('from "./model-overlay-publication.mjs"'),
       `${name} must import the shared publication module`,
@@ -307,8 +309,8 @@ test("control and both detached workers use the shared publication finalizer", (
       `${name} must use the shared publication helper`,
     );
   }
-  assert.match(sources["control.mjs"], /applyModelOverlayPublication\(/);
-  for (const name of ["local-download.mjs", "vision-download.mjs"]) {
+  assert.match(sources["control.mjs"], /transactModelOverlayMutation\(/);
+  for (const name of ["vision-download.mjs"]) {
     assert.ok(
       sources[name].includes("finalizePublication"),
       `${name} must expose a publication finalizer hook`,
@@ -318,8 +320,5 @@ test("control and both detached workers use the shared publication finalizer", (
       `${name} must invoke the shared publication helper`,
     );
   }
-  assert.ok(
-    [...sources["control.mjs"].matchAll(/applyModelOverlayPublication|transactModelOverlayMutation|finalizeLocalModelPublication/g)].length >= 4,
-    "control must publish vision, sync toggle, and uninstall-finalization mutations",
-  );
+  assert.doesNotMatch(sources["local-download.mjs"], /model-overlay-publication|applyModelOverlayPublication|finalizePublication/);
 });

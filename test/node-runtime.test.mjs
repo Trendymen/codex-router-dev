@@ -217,7 +217,7 @@ test("stop waits for graceful exits, shares its promise, and escalates once", as
   const runtime = await startNodeRuntime({
     ...specs(),
     childFactory: async (spec) => {
-      const child = new DelayedChild(spec.name, { termDelayMs: 20, ignoreTerm: spec.name === "api" });
+      const child = new DelayedChild(spec.name, { termDelayMs: 1_000, ignoreTerm: spec.name === "api" });
       children.push(child);
       return child;
     },

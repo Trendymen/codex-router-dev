@@ -31,19 +31,23 @@ jobs:
         run: |
           package_version=$(node -p 'require("./package.json").version')
           test "v$package_version" = "$GITHUB_REF_NAME"
-      - name: Build source archives
+          test "$(git rev-parse "$GITHUB_REF_NAME^{commit}")" = "$(git rev-parse HEAD)"
+      - name: Build verified source package
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p dist
-          prefix="codex-router-${GITHUB_REF_NAME#v}/"
-          git archive --format=tar.gz --prefix="$prefix" -o "dist/codex-router-${GITHUB_REF_NAME#v}.tar.gz" "$GITHUB_REF_NAME"
-          git archive --format=zip --prefix="$prefix" -o "dist/codex-router-${GITHUB_REF_NAME#v}.zip" "$GITHUB_REF_NAME"
-      - name: Checksum every asset
-        shell: bash
-        run: |
-          cd dist
-          sha256sum codex-router-* > SHA256SUMS
+          ./scripts/package-release.sh --output "$GITHUB_WORKSPACE/dist"
+          node --input-type=module - <<'NODE'
+          import { readFileSync } from "node:fs";
+          import process from "node:process";
+          const manifest = JSON.parse(readFileSync("dist/manifest.json", "utf8"));
+          const head = process.env.GITHUB_SHA;
+          if (manifest.sourceCommit !== head) throw new Error(`manifest sourceCommit ${manifest.sourceCommit} != ${head}`);
+          if (`v${manifest.packageVersion}` !== process.env.GITHUB_REF_NAME) throw new Error("manifest package version does not match tag");
+          if (!manifest.files?.length) throw new Error("manifest contains no files");
+          NODE
+          sha256sum -c <(sed 's#  #  dist/#' dist/SHA256SUMS)
       - uses: actions/attest-build-provenance@v4
         with:
           subject-path: "dist/*"

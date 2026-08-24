@@ -24,52 +24,15 @@ function checked(run, script, args) {
   return result;
 }
 
-function restoreTransport(run, signed) {
-  checked(run, "config-manager.mjs", ["enable"]);
-  if (signed) checked(run, "config-manager.mjs", ["signed-enable"]);
-  checked(run, "catalog.mjs", []);
-}
-
 export function refreshCatalog({ run = nodeRunner } = {}) {
-  const statusResult = checked(run, "config-manager.mjs", ["status"]);
-  let status;
-  try {
-    status = JSON.parse(statusResult.stdout);
-  } catch {
-    throw new Error("config-manager.mjs status returned invalid JSON.");
-  }
-  const routed = status.mode === "router";
-  const signed = status.signed_routing === true;
-  let restoreNeeded = false;
-  let catalogResult;
-  try {
-    if (routed) {
-      checked(run, "config-manager.mjs", ["disable"]);
-      restoreNeeded = true;
-    }
-    catalogResult = checked(run, "catalog.mjs", ["--refresh-native"]);
-    if (restoreNeeded) {
-      restoreTransport(run, signed);
-      restoreNeeded = false;
-    }
-    // Catalog capture established the base merged/native template. Completing
-    // refresh now invalidates stale contract proofs and republishes one unified
-    // Node generation; the trigger itself makes no provider request.
-    checked(run, "node-snapshot-triggers.mjs", ["registry-update"]);
-  } catch (error) {
-    if (restoreNeeded) {
-      try {
-        restoreTransport(run, signed);
-        restoreNeeded = false;
-      } catch (restoreError) {
-        throw new AggregateError(
-          [error, restoreError],
-          "Catalog refresh failed and the previous routing transport could not be restored.",
-        );
-      }
-    }
-    throw error;
-  }
+  // Catalog construction is now independent of the Codex client document. It
+  // reads that document when it needs a native model hint, but never disables or
+  // re-enables a client transport just to refresh Router-owned state.
+  const catalogResult = checked(run, "catalog.mjs", ["--refresh-native"]);
+  // Catalog capture established the base merged/native template. Completing
+  // refresh now invalidates stale contract proofs and republishes one unified
+  // Node generation; the trigger itself makes no provider request.
+  checked(run, "node-snapshot-triggers.mjs", ["registry-update"]);
   return { catalogOutput: catalogResult.stdout || "" };
 }
 

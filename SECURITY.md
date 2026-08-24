@@ -1,166 +1,51 @@
-# Security model
+# 安全模型
 
-The router has its own trust root separate from Codex's: a random caller key,
-an internal service key, a private state directory, per-provider credential
-files, and a dedicated service identity and port range. Kimi OAuth is the
-intentional exception: the router reuses the official Kimi CLI session under
-`~/.kimi-code`.
+Codex Router 是只绑定本机回环接口的 macOS Node 服务。它的安全边界是：不改写 Codex 身份验证与用户配置、只管理自己的 state、只从 tracked Git HEAD 构建 release package，并对文件、URL、日志和进程使用 fail-closed 检查。
 
-## Credential separation
+## 保护对象
 
-Codex Router keeps every credential class on a distinct path:
-
-- ChatGPT/Codex authentication is allow-listed only for native GPT, image, and
-  standalone web-search requests.
-- Kimi Code OAuth is read from the official Kimi CLI directory and sent only to
-  the Kimi Code managed endpoint.
-- Kimi Platform API keys are sent only to the configured Kimi Platform endpoint.
-- DeepSeek API keys are sent only to the configured DeepSeek endpoint.
-- A GitHub Copilot fine-grained PAT is validated through GitHub's Copilot
-  account endpoint and sent only to the GitHub-owned inference endpoint that
-  account metadata selects.
-
-External requests never receive ChatGPT account IDs, Codex installation IDs,
-attestation headers, or the caller's authorization header. The loopback gateway
-uses a random internal key, which the final forwarder replaces with exactly one
-provider credential.
-
-No provider credential is written to the model registry, catalog, Codex config,
-generated LiteLLM config, logs, or health responses. Codex config does contain a
-random, local-only caller capability as part of the managed loopback URL. The
-config, its backup, migration snapshots, and diagnostic output are therefore
-protected or redacted.
-
-## Local secret storage
-
-Router state lives under `$CODEX_HOME/codex-router` by default:
-
-| File | Purpose | Mode |
+| 对象 | 用途 | 保护要求 |
 | --- | --- | --- |
-| `internal-secret` | Random loopback service key | `600` |
-| `caller-secret` | Random capability used by that app target's router requests | `600` |
-| `kimi-api-key.secret` | Optional Kimi Platform key | `600` |
-| `deepseek-api-key.secret` | Optional DeepSeek key | `600` |
-| `clinepass-api-key.secret` | Optional ClinePass key | `600` |
-| `xai-api-key.secret` | Optional xAI key | `600` |
-| `anthropic-api-key.secret` | Optional Anthropic key | `600` |
-| `github-copilot-token.secret` | Optional fine-grained GitHub token with Copilot Requests permission | `600` |
-| `native-models.json` | Cached native Codex catalog | `600` |
-| `merged-models.json` | Native plus registry model catalog | `600` |
-| `litellm.yaml` | Generated routes with environment references only | `600` |
-| `enabled-providers.json` | Picker visibility, no credential values | `600` |
-| `install-manifest.json` | Installed version and rollback metadata | `600` |
-| `migrations/` | Protected config/service rollback snapshots | private |
-| `support/` | Locally generated diagnostic bundles | `600` files |
+| caller-secret | Codex/CC Switch 调用 Router 的 capability | 私有目录、600、从日志脱敏 |
+| internal-secret | Router 内部子服务认证 | 私有目录、600、从日志脱敏 |
+| provider key | 外部 provider 认证 | 私有目录、600、禁止出现在参数和日志 |
+| provider selection | Router 自己的启用集合 | 原子写入、同一事务发布 catalog |
+| catalog generations | Codex 可见的 Router models | 原子发布、旧 generation 可恢复 |
+| install manifest | 版本、revision 和 rollback 元数据 | 600、只记录 Router-owned 路径 |
+| usage/log state | 运行诊断与计费摘要 | 脱敏、限制大小、不可回传密钥 |
 
-The router can read provider keys from process environment or compatible
-legacy macOS Keychain services. The interactive helper writes protected local
-files so the per-user background service can access them without copying
-secrets into its service definition. Files use mode `600` on POSIX systems. On
-Windows, the helper removes inherited ACL entries and grants access only to the
-current user SID.
+Router 不拥有 ~/.codex/config.toml。安装、启用、禁用、更新、修复、状态、诊断和卸载都不得写它，也不得删除其中的用户表、注释、身份验证或 profile。CC Switch snippet 由 control catalog render-snippet 输出，用户在客户端侧决定是否采用。
 
-Installers deliberately do not copy API-key environment variables into launchd,
-systemd, or Task Scheduler definitions. Environment-only credentials work for a
-foreground router process, but background setup requires a protected file.
-Compatible legacy Keychain lookup is a migration path only.
+## 文件与路径
 
-Kimi OAuth remains under `$KIMI_CODE_HOME` or `~/.kimi-code`; Codex Router does
-not copy it into its own state directory.
+- 所有 Router state 目录创建为 700；私有文件创建为 600。
+- atomic writer 在临时文件完成内容与权限保护后才 rename。
+- 受保护 runtime 只通过显式 artifact allowlist 解析；拒绝 dot segment、绝对越界、symlink、junction、hardlink 和未知 artifact id。
+- release packer 读取 Git HEAD 的 stage-0 regular blobs，不读取 dirty 工作树、未跟踪文件或目录递归副本。
+- cleanup 不接受通配符或任意递归路径；未知文件保留并报告。
 
-Never commit the state directory, a provider credential, a Kimi credential file, or
-a generated config from a live installation.
+## 网络与进程
 
-## Network boundary
+- Router、OAuth forwarder、API forwarder 和可用 provider forwarder 只绑定 127.0.0.1。
+- 外部请求必须先经过 caller capability 校验；caller key 不转发给 provider。
+- child process 都属于当前 Router runtime；启动失败会清理已经启动的 child，停止流程先发 SIGTERM，再在 grace window 后使用 SIGKILL。
+- 健康检查区分 Router 未监听与某个 Node dependency degraded；响应只返回固定服务名，不返回 URL、key 或 provider payload。
+- live provider probe 必须显式获准，并使用本机受保护凭据；失败响应正文不写入日志。
 
-The router, LiteLLM gateway, OAuth forwarder, and API forwarder bind only to
-`127.0.0.1`. Every model route requires a random caller capability, which Codex carries
-in the managed URL.
-Internal gateway and forwarder routes require a separate random service key,
-and credential-detail health responses are authenticated.
-Model requests must use JSON; requests with browser-origin headers are rejected,
-and the router sends no CORS permission headers. This remains compatible with
-Codex API-key sessions that do not attach a bearer header to the loopback hop.
+## 更新与恢复
 
-This blocks drive-by browser requests and processes running without access to
-the user's protected files. It does not create a security boundary against
-malicious code already running as the same OS user, which can generally read
-that user's Codex config and process state. Do not change listeners to
-`0.0.0.0`, tunnel the ports, or expose them on a shared network. These controls
-are not internet-facing authentication.
+更新事务在任何 Git revision mutation 前完成 runtime snapshot 和 preflight。replacement 只有在 Router、forwarder、catalog 与 companion contract 全部验证后才提交清理。失败路径按顺序恢复 Router-owned runtime、旧 revision，并只重启一次旧服务；恢复失败与原始错误一起报告。
 
-Codex may include the request URL in its own error output. Treat the full URL as
-sensitive even though it is loopback-only; redact the generated path before
-sharing screenshots or logs.
+snapshot 包含原始字节、模式和 allowlist identity。恢复不触碰 Codex config.toml、CC Switch 数据库、用户 credentials、历史文件或不属于 Router 的模型权重。
 
-API base URL overrides are trusted-user configuration. A malicious override can
-send the matching provider credential to another server. Inspect background
-service environment changes and never accept an untrusted registry override.
+## Release package
 
-For GitHub Copilot, the account-selected inference endpoint is allowlisted to
-HTTPS GitHub Copilot hosts before the token is sent. A base URL override is
-trusted-user configuration and receives the same token, so it must be protected
-like every other provider override. Validated account routing is cached briefly
-in process memory and refreshed once after an upstream 401.
+发布前必须确认 tag 指向当前 HEAD、package version 与 tag 一致。scripts/package-release.sh 生成 source archive、manifest.json 和 SHA256SUMS；manifest、archive 和 checksum 使用同一份 tracked file entry list。发布 workflow 不使用 git archive 回退路径。
 
-An install made with `--no-provider --no-discovery` (see
-[docs/INSTALL.md](docs/INSTALL.md)) is verifiable in this frame: zero provider
-credential reads or writes, zero Keychain lookups, zero reads of other CLIs'
-OAuth or session files, zero reads of Codex's `auth.json`, no `codex login
-status` spawn against the real `CODEX_HOME`, and no outbound provider or
-native connection — traffic gets a local `503 router_idle_no_provider`. Every
-credential reader funnels through the persisted `discovery-mode.json`
-kill-switch. The one Codex spawn that remains during install is `codex debug
-models --bundled`, which reads the binary's static model list, not
-credentials.
+runtime release 不宣称提供 npm run check 或 npm test；runtime-package.json 声明实际可用的 Node scripts、依赖、entrypoints、当前文档、Router source、catalog、browser assets 和 Swift source，且所有 Markdown 本地链接在解包后仍然存在。
 
-## Configuration safety
+## 报告
 
-The config manager:
+请不要在 issue 或聊天中贴 provider key、caller URL、完整 support bundle、用户 config.toml 或未经脱敏的日志。报告问题时提供版本、commit、命令、退出码和已脱敏的错误摘要。
 
-- Writes only a marked `openai_base_url` and `model_catalog_json` block.
-- Preserves `model`, `model_provider`, reasoning settings, profiles, and ChatGPT
-  authentication.
-- Refuses to replace an unmarked user-owned base URL or catalog.
-- Creates `~/.codex/config.toml.pre-codex-router` before its first change.
-- Atomically rewrites the config and restricts it to the current user.
-- Recognizes and removes the earlier Kimi-specific managed block during upgrade.
-- Snapshots recognized old service definitions and exact config before migration.
-- Refuses unknown router catalogs and unrecognized origin URLs during update.
-
-Review the scoped difference with:
-
-```sh
-diff -u ~/.codex/config.toml.pre-codex-router ~/.codex/config.toml
-```
-
-## Dependency and release hygiene
-
-LiteLLM is version-pinned because it processes prompts, tool calls, streams, and
-provider responses. Node dependencies are locked by `package-lock.json`. CI runs
-syntax, audit, and route/state tests on macOS, Linux, and Windows. Tagged source
-archives include SHA-256 checksums and GitHub build-provenance attestations.
-
-The convenience bootstrap commands track the repository's default branch. Users
-who need a fully reviewable or pinned install should download a tagged archive,
-verify `SHA256SUMS` and its provenance, inspect it, and run the local installer.
-
-Model discovery is read-only and never edits the registry. The live compatibility
-suite requires both `--live` and `--yes` because it sends prompts and consumes
-provider quota. Repository workflows receive provider keys only through GitHub
-Secrets; pull-request CI never receives them.
-
-Support bundles exclude logs by default and are never uploaded automatically.
-The optional redacted log tail can still contain private prompt or response text
-and must be inspected before sharing.
-
-Network-facing error handlers do not return or log raw exception text. Detailed
-credential state is available only through authenticated local health checks and
-the redacted doctor/support workflows.
-
-## Reporting a vulnerability
-
-Use [GitHub Private Vulnerability Reporting](https://github.com/duolahypercho/codex-router/security/advisories/new).
-Do not include technical vulnerability details, access tokens, API keys,
-credential files, full prompts, response bodies, or unredacted logs in a public
-issue.
+完整安装流程见 [docs/INSTALL.md](docs/INSTALL.md)，项目概览见 [README.md](README.md)，许可证见 [LICENSE](LICENSE)。

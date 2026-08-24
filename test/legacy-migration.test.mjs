@@ -28,7 +28,7 @@ const {
 } = await import("../src/legacy-migration.mjs");
 const { privateFileIsProtected } = await import("../src/file-security.mjs");
 
-test("known prototype migration snapshots, cleans, and restores exact state", () => {
+test("known prototype migration stops legacy service and preserves Codex config bytes", () => {
   mkdirSync(codexHome, { recursive: true });
   mkdirSync(launchAgents, { recursive: true });
   const configPath = path.join(codexHome, "config.toml");
@@ -55,15 +55,12 @@ model_reasoning_effort = "xhigh"
     assert.equal(migration.migrated, true);
     assert.equal(existsSync(plistPath), false);
     assert.equal(privateFileIsProtected(migration.manifestPath), true);
-    assert.equal(privateFileIsProtected(migration.snapshot.configBackup), true);
-    const cleaned = readFileSync(configPath, "utf8");
-    assert.doesNotMatch(cleaned, /openai_base_url|model_catalog_json|kimi-codex-router-managed/);
-    assert.match(cleaned, /model = "kimi-oauth\/k3"/);
-    assert.match(cleaned, /\[profiles\.work\]/);
+    assert.equal(migration.snapshot.configBackup, undefined);
+    assert.equal(readFileSync(configPath, "utf8"), original);
 
     rollbackLatestMigration();
     assert.equal(readFileSync(configPath, "utf8"), original);
-    assert.equal(privateFileIsProtected(configPath), true);
+    assert.equal(privateFileIsProtected(configPath), false);
     assert.equal(readFileSync(plistPath, "utf8"), "prototype plist\n");
   } finally {
     rmSync(testRoot, { recursive: true, force: true });
