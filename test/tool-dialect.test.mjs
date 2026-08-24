@@ -9,9 +9,28 @@ import {
   restoreToolEvent,
   validateForcedToolResult,
 } from "../src/tool-dialect.mjs";
+import toolGlmOracle from "./acceptance/oracles/tool-glm.json" with { type: "json" };
 
 const functionsProfile = { provider: "deepseek", toolDialect: "responses-functions" };
 const glmProfile = { provider: "glm", toolDialect: "responses-functions" };
+
+test("Appendix C tool consumer dispatches every checked-in tool/GLM oracle row", () => {
+  const dispatch = {
+    "tool-names-conversion": ({ contract }) => assert.equal(encodedToolName(contract.input.kind, contract.input.name), contract.expected.encodedName),
+    "forced-tool-boundaries": ({ contract }) => {
+      const build = encodeToolDialect({ tools: [{ type: "function", name: contract.input.toolChoice.name, parameters: { type: "object" } }], toolChoice: contract.input.toolChoice, input: [], profile: functionsProfile });
+      assert.equal(build.forcedRequirement.kind, contract.expected.forcedKind);
+      assert.equal(build.forcedRequirement.name, contract.expected.forcedName);
+    },
+    "glm-messages-continuation": ({ contract }) => {
+      const build = encodeToolDialect({ tools: [{ type: "function", name: "paint", parameters: { type: "object" } }], toolChoice: "required", input: [], profile: glmProfile });
+      assert.equal(build.tools[0].name, contract.expected.nativeToolName, contract.fixture);
+      assert.equal(build.forcedRequirement, undefined, contract.fixture);
+    },
+  };
+  assert.deepEqual(Object.keys(dispatch).sort(), toolGlmOracle.rows.map(({ id }) => id).sort());
+  for (const row of toolGlmOracle.rows) dispatch[row.id](row);
+});
 
 const customTool = { type: "custom", name: "computer", description: "Drive the computer" };
 const customCall = {

@@ -22,6 +22,7 @@ import {
   publishCatalogGeneration,
   validateCatalogSchema,
 } from "../src/catalog-generation.mjs";
+import ownershipCatalogOracle from "./acceptance/oracles/ownership-catalog.json" with { type: "json" };
 
 const artifactNames = [
   "merged-models.json",
@@ -31,6 +32,27 @@ const artifactNames = [
   "swift-models.json",
   "browser-models.json",
 ];
+
+function dispatchCatalogOracleRows(rows) {
+  const dispatch = {
+    "catalog-lifecycle-atomicity": ({ contract }) => {
+      const actual = validateCatalogSchema(contract.input.catalog, { type: "object", required: ["models"], properties: { models: { type: "array" } }, additionalProperties: false });
+      assert.equal(actual.models.length, contract.expected.modelCount);
+    },
+  };
+  assert.deepEqual(Object.keys(dispatch).sort(), rows.map(({ id }) => id).sort());
+  for (const row of rows) dispatch[row.id](row);
+}
+
+test("Appendix E catalog consumer dispatches its checked-in catalog oracle row", () => {
+  dispatchCatalogOracleRows(ownershipCatalogOracle.rows.filter(({ id }) => id === "catalog-lifecycle-atomicity"));
+});
+
+test("变异 Appendix E catalog oracle 后，同一 catalog consumer 必须失败", () => {
+  const tampered = structuredClone(ownershipCatalogOracle.rows.filter(({ id }) => id === "catalog-lifecycle-atomicity"));
+  tampered[0].contract.expected.modelCount = 1;
+  assert.throws(() => dispatchCatalogOracleRows(tampered));
+});
 
 function artifacts(label) {
   const catalog = {

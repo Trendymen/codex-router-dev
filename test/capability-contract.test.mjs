@@ -95,6 +95,31 @@ test("Node command table exactly covers the independent oracle", () => {
   assert.deepEqual(manifestRows, fixtureRows);
 });
 
+test("Appendix F oracle has complete unique commands, UI presentation, and inverse absence", () => {
+  const expectedCapabilities = ["lifecycle", "doctor-update", "native-session-usage", "provider-credentials", "provider-model-state", "protocol-proof", "picker-catalog", "subagents", "failover", "tool-result-aging", "usage", "vision", "presence", "cc-switch"];
+  assert.deepEqual(fixture.capabilities.map(({ id }) => id), expectedCapabilities);
+  assert.equal(new Set(fixture.nodeCommands).size, fixture.nodeCommands.length);
+  assert.equal(fixture.capabilities.reduce((count, row) => count + row.nodeCommands.length, 0), fixture.nodeCommands.length);
+  for (const row of fixture.capabilities) {
+    assert.equal(new Set(row.nodeCommands).size, row.nodeCommands.length, row.id);
+    assert.ok(row.nodeCommands.every((command) => fixture.nodeCommands.includes(command)), row.id);
+    assert.match(row.swift, /^(?:full|read-only|none)$/, row.id);
+    assert.match(row.browser, /^(?:full|write-session|protected|none)$/, row.id);
+    assert.ok(row.confirmation.every((command) => row.nodeCommands.includes(command)), `${row.id}: confirmation`);
+    assert.ok(row.quotaWarning.every((command) => row.nodeCommands.includes(command)), `${row.id}: quota warning`);
+  }
+  const presentation = fixture.commandMetadata;
+  assert.equal(presentation.schemaVersion, fixture.capabilitySchemaVersion);
+  for (const [kind, commands] of Object.entries({ protectedInput: presentation.protectedInput, confirmation: presentation.confirmation, quotaWarning: presentation.quotaWarning, resultKind: Object.keys(presentation.resultKind) })) {
+    assert.equal(new Set(commands).size, commands.length, kind);
+    assert.ok(commands.every((command) => fixture.nodeCommands.includes(command)), kind);
+  }
+  const definitions = desktopCommandDefinitions();
+  for (const forbidden of fixture.forbiddenCommands) assert.equal(definitions.has(forbidden), false, forbidden);
+  const manifest = buildCapabilityManifest();
+  for (const row of fixture.capabilities) assert.deepEqual(manifest.capabilities.find(({ id }) => id === row.id)?.nodeCommands, row.nodeCommands, row.id);
+});
+
 test("capability manifest publishes the independent command metadata", () => {
   const manifest = buildCapabilityManifest({
     providers: [{ id: "deepseek", enabled: true }],

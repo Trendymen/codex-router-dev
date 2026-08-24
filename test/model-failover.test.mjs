@@ -3,6 +3,7 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
+import retryFailoverOracle from "./acceptance/oracles/retry-failover.json" with { type: "json" };
 
 const stateDir = mkdtempSync(path.join(os.tmpdir(), "model-failover-test-"));
 process.env.CODEX_ROUTER_STATE_DIR = stateDir;
@@ -27,6 +28,28 @@ const {
 } = await import("../src/model-failover.mjs");
 
 const NOW = Date.parse("2026-08-15T12:00:00.000Z");
+
+function dispatchFailoverOracleRows(rows) {
+  const dispatch = {
+    failover: ({ contract }) => {
+      const actual = classifyRoutedFailure({ ...contract.input, now: NOW });
+      assert.equal(actual.swap, contract.expected.swap);
+      assert.equal(actual.reason, contract.expected.reason);
+    },
+  };
+  assert.deepEqual(Object.keys(dispatch).sort(), rows.map(({ id }) => id).sort());
+  for (const row of rows) dispatch[row.id](row);
+}
+
+test("Appendix D failover consumer dispatches its checked-in failover oracle row", () => {
+  dispatchFailoverOracleRows(retryFailoverOracle.rows.filter(({ id }) => id === "failover"));
+});
+
+test("变异 Appendix D failover oracle 后，同一 failover consumer 必须失败", () => {
+  const tampered = structuredClone(retryFailoverOracle.rows.filter(({ id }) => id === "failover"));
+  tampered[0].contract.expected.reason = "tampered";
+  assert.throws(() => dispatchFailoverOracleRows(tampered));
+});
 
 function quotaBody(message) {
   return JSON.stringify({ error: { message } });

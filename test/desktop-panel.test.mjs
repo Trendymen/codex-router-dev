@@ -13,6 +13,7 @@ import {
 } from "../src/desktop-panel.mjs";
 import { browserCommandIds, renderCapabilitySurface } from "../apps/desktop/ui/model.mjs";
 import fixture from "./fixtures/required-capabilities.json" with { type: "json" };
+import browserSecurityOracle from "./acceptance/oracles/browser-security.json" with { type: "json" };
 
 // The panel is served by the router, so these drive the real handler over a
 // real socket rather than calling it in-process: the routing, the headers and
@@ -39,6 +40,15 @@ function serve(handlerOptions = {}) {
     });
   });
 }
+
+test("Appendix J desktop consumer dispatches every checked-in browser-security oracle row", () => {
+  const dispatch = {
+    "browser-security": ({ contract }) => assert.equal(isPanelRoute(contract.input.route), contract.expected.accepted),
+  };
+  const rows = browserSecurityOracle.rows.filter(({ id }) => id === "browser-security");
+  assert.deepEqual(Object.keys(dispatch).sort(), rows.map(({ id }) => id).sort());
+  for (const row of rows) dispatch[row.id](row);
+});
 
 test("panel routes are recognised, and nothing else is", () => {
   assert.equal(isPanelRoute("/panel"), true);

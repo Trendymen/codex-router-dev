@@ -11,12 +11,48 @@ import {
   selectedFinalParts,
 } from "../src/reasoning-summary-compat.mjs";
 import { routerError } from "../src/public-error.mjs";
+import reasoningOracle from "./acceptance/oracles/reasoning.json" with { type: "json" };
 
 const fixtures = new URL("./fixtures/reasoning-events/", import.meta.url);
 
 function fixture(name) {
   return JSON.parse(readFileSync(new URL(`${name}.json`, fixtures), "utf8"));
 }
+
+async function dispatchReasoningOracleRows(rows) {
+  const dispatch = {
+    "identity-state": ({ contract }) => {
+      const actual = normalizeRawReasoningResponse(contract.input).output[0];
+      assert.equal(actual.type, contract.expected.itemType);
+      assert.equal(actual.id, contract.expected.itemId);
+    },
+    "stream-final": async ({ contract }) => {
+      const source = fixture(contract.fixture);
+      const output = await transform(source.events.map(sse), { responseId: "resp_oracle", model: model(source.finalShape) });
+      const parsed = events(output);
+      assert.equal(parsed.at(-1).type, contract.expected.terminal);
+      assert.ok(parsed.some((event) => event.delta === contract.expected.summaryDelta));
+    },
+    "abort-nonstream": ({ contract }) => assert.deepEqual(selectedFinalParts(contract.input.sourceKind, contract.input.item), contract.expected.parts),
+    errors: ({ contract }) => {
+      const actual = routerError(contract.input.code).body.error;
+      assert.equal(actual.type, contract.error.type);
+      assert.equal(actual.code, contract.error.code);
+    },
+  };
+  assert.deepEqual(Object.keys(dispatch).sort(), rows.map(({ id }) => id).sort());
+  for (const row of rows) await dispatch[row.id](row);
+}
+
+test("Appendix A consumer dispatches every checked-in reasoning oracle row to its production assertion", async () => {
+  await dispatchReasoningOracleRows(reasoningOracle.rows);
+});
+
+test("变异 Appendix A oracle 后，同一 reasoning consumer 必须失败", async () => {
+  const tampered = structuredClone(reasoningOracle.rows);
+  tampered.find((row) => row.id === "abort-nonstream").contract.expected.parts = ["tampered"];
+  await assert.rejects(() => dispatchReasoningOracleRows(tampered));
+});
 
 function sse(event) {
   return `data: ${JSON.stringify(event)}\n\n`;

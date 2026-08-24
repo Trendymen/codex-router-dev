@@ -1,38 +1,836 @@
 [
-  {"id":"NM-APP-A-IDENTITY","specLoci":["Appendix A"],"owner":"src/reasoning-summary-compat.mjs","evidence":[{"type":"unit","source":"test","artifact":"test/reasoning-summary-compat.test.mjs"}]},
-  {"id":"NM-APP-A-STREAM","specLoci":["Appendix A"],"owner":"src/reasoning-summary-compat.mjs","evidence":[{"type":"unit","source":"test","artifact":"test/reasoning-summary-compat.test.mjs"}]},
-  {"id":"NM-APP-A-TERMINAL","specLoci":["Appendix A"],"owner":"src/reasoning-summary-compat.mjs","evidence":[{"type":"unit","source":"test","artifact":"test/reasoning-summary-compat.test.mjs"}]},
-  {"id":"NM-APP-B-ROUTES","specLoci":["Appendix B"],"owner":"src/node-route-registry.mjs","evidence":[{"type":"unit","source":"test","artifact":"test/registry.test.mjs"}]},
-  {"id":"NM-APP-B-CANARY","specLoci":["Appendix B"],"owner":"src/protocol-proof.mjs","evidence":[{"type":"unit","source":"test","artifact":"test/protocol-proof.test.mjs"}]},
-  {"id":"NM-APP-C-TOOLS","specLoci":["Appendix C"],"owner":"src/tool-dialect.mjs","evidence":[{"type":"unit","source":"test","artifact":"test/tool-dialect.test.mjs"}]},
-  {"id":"NM-APP-C-GLM-REQUEST","specLoci":["Appendix C"],"owner":"src/anthropic-messages-adapter.mjs","evidence":[{"type":"unit","source":"test","artifact":"test/anthropic-messages-adapter.test.mjs"}]},
-  {"id":"NM-APP-C-GLM-STREAM","specLoci":["Appendix C"],"owner":"src/anthropic-messages-adapter.mjs","evidence":[{"type":"unit","source":"test","artifact":"test/anthropic-messages-adapter.test.mjs"}]},
-  {"id":"NM-APP-D-RETRY","specLoci":["Appendix D"],"owner":"src/model-failover.mjs","evidence":[{"type":"unit","source":"test","artifact":"test/model-failover.test.mjs"}]},
-  {"id":"NM-APP-D-FAILOVER","specLoci":["Appendix D"],"owner":"src/model-failover-router.mjs","evidence":[{"type":"unit","source":"test","artifact":"test/model-failover-router.test.mjs"}]},
-  {"id":"NM-APP-E-OWNERSHIP","specLoci":["Appendix E"],"owner":"src/config-manager.mjs","evidence":[{"type":"unit","source":"test","artifact":"test/config-manager.test.mjs"}]},
-  {"id":"NM-APP-E-CATALOG","specLoci":["Appendix E"],"owner":"src/catalog-rebuild.mjs","evidence":[{"type":"unit","source":"test","artifact":"test/catalog-rebuild.test.mjs"}]},
-  {"id":"NM-APP-F-CAPABILITIES","specLoci":["Appendix F"],"owner":"src/capability-contract.mjs","evidence":[{"type":"unit","source":"test","artifact":"test/capability-contract.test.mjs"},{"type":"ui","source":"fixture","artifact":"generated/acceptance/runtime-capabilities.md"}]},
-  {"id":"NM-APP-F-PROOF-CONTROL","specLoci":["Appendix F"],"owner":"src/protocol-proof.mjs","evidence":[{"type":"unit","source":"test","artifact":"test/protocol-proof-verifier.test.mjs"},{"type":"live","source":"quota-approved-probe","artifact":"generated/acceptance/live-proofs.md"}]},
-  {"id":"NM-APP-G-UPGRADE","specLoci":["Appendix G"],"owner":"src/runtime-migration.mjs","evidence":[{"type":"unit","source":"test","artifact":"test/upgrade-preservation.test.mjs"},{"type":"isolated-install","source":"harness","artifact":"generated/acceptance/upgrade/report.md"}]},
-  {"id":"NM-APP-G-PLATFORM","specLoci":["Appendix G"],"owner":"src/platform-gate.mjs","evidence":[{"type":"unit","source":"test","artifact":"test/platform-gate.test.mjs"}]},
-  {"id":"NM-APP-H-VISION","specLoci":["Appendix H"],"owner":"src/vision-bridge.mjs","evidence":[{"type":"unit","source":"test","artifact":"test/vision-bridge.test.mjs"}]},
-  {"id":"NM-APP-I-ERRORS","specLoci":["Appendix I"],"owner":"src/error-translation.mjs","evidence":[{"type":"unit","source":"test","artifact":"test/error-translation.test.mjs"}]},
-  {"id":"NM-APP-I-REDACTION","specLoci":["Appendix I"],"owner":"src/public-error-redaction.mjs","evidence":[{"type":"unit","source":"test","artifact":"test/public-error-redaction.test.mjs"}]},
-  {"id":"NM-APP-J-BOOTSTRAP","specLoci":["Appendix J"],"owner":"src/panel-sessions.mjs","evidence":[{"type":"unit","source":"test","artifact":"test/panel-sessions.test.mjs"}]},
-  {"id":"NM-APP-J-MUTATIONS","specLoci":["Appendix J"],"owner":"src/panel-sessions.mjs","evidence":[{"type":"unit","source":"test","artifact":"test/panel-sessions.test.mjs"},{"type":"visual","source":"screenshot","artifact":"generated/acceptance/browser/confirmation-flow.png"}]},
-  {"id":"NM-APP-J-HEADERS","specLoci":["Appendix J"],"owner":"src/panel.mjs","evidence":[{"type":"unit","source":"test","artifact":"test/panel.test.mjs"}]},
-  {"id":"NM-TEST-15.1","specLoci":["15.1"],"owner":"src/node-provider-adapter.mjs","evidence":[{"type":"unit","source":"test","artifact":"test/node-provider-adapter.test.mjs"}]},
-  {"id":"NM-TEST-15.2","specLoci":["15.2"],"owner":"src/provider-dispatch.mjs","evidence":[{"type":"unit","source":"test","artifact":"test/provider-dispatch.test.mjs"}]},
-  {"id":"NM-TEST-15.3","specLoci":["15.3"],"owner":"src/catalog.mjs","evidence":[{"type":"unit","source":"test","artifact":"test/catalog.test.mjs"},{"type":"runtime","source":"isolated-router","artifact":"generated/acceptance/runtime-protocol.md"}]},
-  {"id":"NM-TEST-15.4","specLoci":["15.4"],"owner":"apps/macos/ModelRouterTray","evidence":[{"type":"ui","source":"fixture","artifact":"generated/acceptance/ui-contract.md"},{"type":"visual","source":"human-inspection","artifact":"generated/acceptance/swift/visual-findings.md"}]},
-  {"id":"NM-TEST-15.5","specLoci":["15.5"],"owner":"scripts/verify-node-only-build.mjs","evidence":[{"type":"build","source":"audit","artifact":"generated/acceptance/build-audit.json"},{"type":"isolated-install","source":"harness","artifact":"generated/acceptance/clean-install/report.md"}]},
-  {"id":"NM-SUCCESS-17.1","specLoci":["17.1"],"owner":"src/node-provider-adapter.mjs","evidence":[{"type":"runtime","source":"isolated-router","artifact":"generated/acceptance/runtime-protocol.md"}]},
-  {"id":"NM-SUCCESS-17.2","specLoci":["17.2"],"owner":"src/reasoning-summary-compat.mjs","evidence":[{"type":"unit","source":"test","artifact":"test/reasoning-summary-compat.test.mjs"},{"type":"runtime","source":"isolated-router","artifact":"generated/acceptance/runtime-protocol.md"}]},
-  {"id":"NM-SUCCESS-17.3","specLoci":["17.3"],"owner":"src/standalone-search.mjs","evidence":[{"type":"runtime","source":"isolated-router","artifact":"generated/acceptance/runtime-search.md"}]},
-  {"id":"NM-SUCCESS-17.4","specLoci":["17.4"],"owner":"src/tool-dialect.mjs","evidence":[{"type":"unit","source":"test","artifact":"test/tool-dialect.test.mjs"},{"type":"runtime","source":"isolated-router","artifact":"generated/acceptance/runtime-tools.md"}]},
-  {"id":"NM-SUCCESS-17.5","specLoci":["17.5"],"owner":"src/catalog-rebuild.mjs","evidence":[{"type":"unit","source":"test","artifact":"test/catalog-rebuild.test.mjs"},{"type":"runtime","source":"isolated-router","artifact":"generated/acceptance/catalog-stability.md"}]},
-  {"id":"NM-SUCCESS-17.6","specLoci":["17.6"],"owner":"src/capability-contract.mjs","evidence":[{"type":"ui","source":"fixture","artifact":"generated/acceptance/ui-contract.md"},{"type":"visual","source":"human-inspection","artifact":"generated/acceptance/browser/visual-findings.md"}]},
-  {"id":"NM-SUCCESS-17.7","specLoci":["17.7"],"owner":"src/capability-contract.mjs","evidence":[{"type":"ui","source":"fixture","artifact":"generated/acceptance/ui-contract.md"},{"type":"visual","source":"screenshot","artifact":"generated/acceptance/browser/unsupported-controls-absent.png"}]},
-  {"id":"NM-SUCCESS-17.8","specLoci":["17.8"],"owner":"scripts/verify-node-only-build.mjs","evidence":[{"type":"build","source":"audit","artifact":"generated/acceptance/build-audit.json"},{"type":"isolated-install","source":"harness","artifact":"generated/acceptance/clean-install/report.md"}]},
-  {"id":"NM-SUCCESS-17.9","specLoci":["17.9"],"owner":"src/service-target.mjs","evidence":[{"type":"isolated-install","source":"harness","artifact":"generated/acceptance/isolation-proof.md"}]}
+  {
+    "id": "reasoning-identity-state",
+    "oracle": "test/acceptance/oracles/reasoning.json",
+    "owners": [
+      "src/reasoning-summary-compat.mjs"
+    ],
+    "requiredEvidence": [
+      {
+        "kind": "unit",
+        "requirementId": "r01",
+        "profile": "task1-node-test",
+        "provider": null,
+        "initialState": "pending",
+        "allowedNotRunReasons": []
+      },
+      {
+        "kind": "live",
+        "requirementId": "r02",
+        "profile": "task4-live",
+        "provider": "deepseek",
+        "initialState": "pending",
+        "allowedNotRunReasons": [
+          "quota_approval_absent"
+        ]
+      }
+    ]
+  },
+  {
+    "id": "reasoning-stream-final",
+    "oracle": "test/acceptance/oracles/reasoning.json",
+    "owners": [
+      "src/reasoning-summary-compat.mjs"
+    ],
+    "requiredEvidence": [
+      {
+        "kind": "unit",
+        "requirementId": "r03",
+        "profile": "task1-node-test",
+        "provider": null,
+        "initialState": "pending",
+        "allowedNotRunReasons": []
+      },
+      {
+        "kind": "live",
+        "requirementId": "r04",
+        "profile": "task4-live",
+        "provider": "deepseek",
+        "initialState": "pending",
+        "allowedNotRunReasons": [
+          "quota_approval_absent"
+        ]
+      }
+    ]
+  },
+  {
+    "id": "reasoning-abort-nonstream",
+    "oracle": "test/acceptance/oracles/reasoning.json",
+    "owners": [
+      "src/reasoning-summary-compat.mjs"
+    ],
+    "requiredEvidence": [
+      {
+        "kind": "unit",
+        "requirementId": "r05",
+        "profile": "task1-node-test",
+        "provider": null,
+        "initialState": "pending",
+        "allowedNotRunReasons": []
+      },
+      {
+        "kind": "runtime",
+        "requirementId": "r06",
+        "profile": "task3-runtime",
+        "provider": null,
+        "initialState": "pending",
+        "allowedNotRunReasons": []
+      }
+    ]
+  },
+  {
+    "id": "reasoning-errors",
+    "oracle": "test/acceptance/oracles/reasoning.json",
+    "owners": [
+      "src/reasoning-summary-compat.mjs",
+      "src/public-error.mjs"
+    ],
+    "requiredEvidence": [
+      {
+        "kind": "unit",
+        "requirementId": "r07",
+        "profile": "task1-node-test",
+        "provider": null,
+        "initialState": "pending",
+        "allowedNotRunReasons": []
+      }
+    ]
+  },
+  {
+    "id": "stable-routes",
+    "oracle": "test/fixtures/node-route-matrix.json",
+    "owners": [
+      "src/model-contract.mjs",
+      "src/model-registry.mjs"
+    ],
+    "requiredEvidence": [
+      {
+        "kind": "unit",
+        "requirementId": "r08",
+        "profile": "task1-node-test",
+        "provider": null,
+        "initialState": "pending",
+        "allowedNotRunReasons": []
+      },
+      {
+        "kind": "live",
+        "requirementId": "r09",
+        "profile": "task4-live",
+        "provider": "deepseek",
+        "initialState": "pending",
+        "allowedNotRunReasons": [
+          "quota_approval_absent"
+        ]
+      },
+      {
+        "kind": "live",
+        "requirementId": "r10",
+        "profile": "task4-live",
+        "provider": "qwen-plan",
+        "initialState": "not_run",
+        "allowedNotRunReasons": [
+          "out_of_current_provider_scope"
+        ]
+      }
+    ]
+  },
+  {
+    "id": "experimental-proof-gates",
+    "oracle": "test/fixtures/node-route-matrix.json",
+    "owners": [
+      "src/model-contract.mjs",
+      "src/protocol-proof.mjs"
+    ],
+    "requiredEvidence": [
+      {
+        "kind": "unit",
+        "requirementId": "r11",
+        "profile": "task1-node-test",
+        "provider": null,
+        "initialState": "pending",
+        "allowedNotRunReasons": []
+      },
+      {
+        "kind": "live",
+        "requirementId": "r12",
+        "profile": "task4-live",
+        "provider": "bailian",
+        "initialState": "not_run",
+        "allowedNotRunReasons": [
+          "out_of_current_provider_scope"
+        ]
+      }
+    ]
+  },
+  {
+    "id": "tool-names-conversion",
+    "oracle": "test/acceptance/oracles/tool-glm.json",
+    "owners": [
+      "src/tool-dialect.mjs"
+    ],
+    "requiredEvidence": [
+      {
+        "kind": "unit",
+        "requirementId": "r13",
+        "profile": "task1-node-test",
+        "provider": null,
+        "initialState": "pending",
+        "allowedNotRunReasons": []
+      }
+    ]
+  },
+  {
+    "id": "forced-tool-boundaries",
+    "oracle": "test/acceptance/oracles/tool-glm.json",
+    "owners": [
+      "src/tool-dialect.mjs"
+    ],
+    "requiredEvidence": [
+      {
+        "kind": "unit",
+        "requirementId": "r14",
+        "profile": "task1-node-test",
+        "provider": null,
+        "initialState": "pending",
+        "allowedNotRunReasons": []
+      }
+    ]
+  },
+  {
+    "id": "glm-messages-continuation",
+    "oracle": "test/acceptance/oracles/tool-glm.json",
+    "owners": [
+      "src/anthropic-messages-adapter.mjs",
+      "src/tool-dialect.mjs"
+    ],
+    "requiredEvidence": [
+      {
+        "kind": "unit",
+        "requirementId": "r15",
+        "profile": "task1-node-test",
+        "provider": null,
+        "initialState": "pending",
+        "allowedNotRunReasons": []
+      },
+      {
+        "kind": "live",
+        "requirementId": "r16",
+        "profile": "task4-live",
+        "provider": "glm",
+        "initialState": "not_run",
+        "allowedNotRunReasons": [
+          "out_of_current_provider_scope"
+        ]
+      }
+    ]
+  },
+  {
+    "id": "retry",
+    "oracle": "test/acceptance/oracles/retry-failover.json",
+    "owners": [
+      "src/upstream-retry.mjs"
+    ],
+    "requiredEvidence": [
+      {
+        "kind": "unit",
+        "requirementId": "r17",
+        "profile": "task1-node-test",
+        "provider": null,
+        "initialState": "pending",
+        "allowedNotRunReasons": []
+      }
+    ]
+  },
+  {
+    "id": "failover",
+    "oracle": "test/acceptance/oracles/retry-failover.json",
+    "owners": [
+      "src/model-failover.mjs"
+    ],
+    "requiredEvidence": [
+      {
+        "kind": "unit",
+        "requirementId": "r18",
+        "profile": "task1-node-test",
+        "provider": null,
+        "initialState": "pending",
+        "allowedNotRunReasons": []
+      },
+      {
+        "kind": "runtime",
+        "requirementId": "r19",
+        "profile": "task3-runtime",
+        "provider": null,
+        "initialState": "pending",
+        "allowedNotRunReasons": []
+      }
+    ]
+  },
+  {
+    "id": "ownership-writes",
+    "oracle": "test/acceptance/oracles/ownership-catalog.json",
+    "owners": [
+      "src/state-owner.mjs"
+    ],
+    "requiredEvidence": [
+      {
+        "kind": "unit",
+        "requirementId": "r20",
+        "profile": "task1-node-test",
+        "provider": null,
+        "initialState": "pending",
+        "allowedNotRunReasons": []
+      }
+    ]
+  },
+  {
+    "id": "catalog-lifecycle-atomicity",
+    "oracle": "test/acceptance/oracles/ownership-catalog.json",
+    "owners": [
+      "src/catalog-generation.mjs"
+    ],
+    "requiredEvidence": [
+      {
+        "kind": "unit",
+        "requirementId": "r21",
+        "profile": "task1-node-test",
+        "provider": null,
+        "initialState": "pending",
+        "allowedNotRunReasons": []
+      },
+      {
+        "kind": "runtime",
+        "requirementId": "r22",
+        "profile": "task3-runtime",
+        "provider": null,
+        "initialState": "pending",
+        "allowedNotRunReasons": []
+      }
+    ]
+  },
+  {
+    "id": "capability-command-ui",
+    "oracle": "test/fixtures/required-capabilities.json",
+    "owners": [
+      "src/capability-manifest.mjs",
+      "src/desktop-commands.mjs"
+    ],
+    "requiredEvidence": [
+      {
+        "kind": "unit",
+        "requirementId": "r23",
+        "profile": "task1-node-test",
+        "provider": null,
+        "initialState": "pending",
+        "allowedNotRunReasons": []
+      },
+      {
+        "kind": "ui",
+        "requirementId": "r24",
+        "profile": "task3-ui",
+        "provider": null,
+        "initialState": "pending",
+        "allowedNotRunReasons": []
+      }
+    ]
+  },
+  {
+    "id": "protocol-proof-lifecycle",
+    "oracle": "test/fixtures/required-capabilities.json",
+    "owners": [
+      "src/protocol-proof-verifier.mjs"
+    ],
+    "requiredEvidence": [
+      {
+        "kind": "unit",
+        "requirementId": "r25",
+        "profile": "task1-node-test",
+        "provider": null,
+        "initialState": "pending",
+        "allowedNotRunReasons": []
+      }
+    ]
+  },
+  {
+    "id": "upgrade-preservation",
+    "oracle": "test/acceptance/oracles/upgrade-platform.json",
+    "owners": [
+      "src/owned-runtime-paths.mjs"
+    ],
+    "requiredEvidence": [
+      {
+        "kind": "unit",
+        "requirementId": "r26",
+        "profile": "task1-node-test",
+        "provider": null,
+        "initialState": "pending",
+        "allowedNotRunReasons": []
+      },
+      {
+        "kind": "isolated-install",
+        "requirementId": "r27",
+        "profile": "task2-isolated-install",
+        "provider": null,
+        "initialState": "pending",
+        "allowedNotRunReasons": []
+      }
+    ]
+  },
+  {
+    "id": "platform-removal",
+    "oracle": "test/acceptance/oracles/upgrade-platform.json",
+    "owners": [
+      "src/platform-gate.mjs"
+    ],
+    "requiredEvidence": [
+      {
+        "kind": "unit",
+        "requirementId": "r28",
+        "profile": "task1-node-test",
+        "provider": null,
+        "initialState": "pending",
+        "allowedNotRunReasons": []
+      },
+      {
+        "kind": "runtime",
+        "requirementId": "r29",
+        "profile": "task3-runtime",
+        "provider": null,
+        "initialState": "pending",
+        "allowedNotRunReasons": []
+      }
+    ]
+  },
+  {
+    "id": "vision-allow",
+    "oracle": "test/acceptance/oracles/vision-allow.json",
+    "owners": [
+      "src/vision-bridge.mjs"
+    ],
+    "requiredEvidence": [
+      {
+        "kind": "unit",
+        "requirementId": "r30",
+        "profile": "task1-node-test",
+        "provider": null,
+        "initialState": "pending",
+        "allowedNotRunReasons": []
+      },
+      {
+        "kind": "visual",
+        "requirementId": "r31",
+        "profile": "task3-visual",
+        "provider": null,
+        "initialState": "pending",
+        "allowedNotRunReasons": []
+      }
+    ]
+  },
+  {
+    "id": "public-errors",
+    "oracle": "test/acceptance/oracles/public-error.json",
+    "owners": [
+      "src/public-error.mjs"
+    ],
+    "requiredEvidence": [
+      {
+        "kind": "unit",
+        "requirementId": "r32",
+        "profile": "task1-node-test",
+        "provider": null,
+        "initialState": "pending",
+        "allowedNotRunReasons": []
+      }
+    ]
+  },
+  {
+    "id": "redaction-leaks",
+    "oracle": "test/acceptance/oracles/public-error.json",
+    "owners": [
+      "src/public-error.mjs"
+    ],
+    "requiredEvidence": [
+      {
+        "kind": "unit",
+        "requirementId": "r33",
+        "profile": "task1-node-test",
+        "provider": null,
+        "initialState": "pending",
+        "allowedNotRunReasons": []
+      }
+    ]
+  },
+  {
+    "id": "write-sessions",
+    "oracle": "test/acceptance/oracles/browser-security.json",
+    "owners": [
+      "src/panel-sessions.mjs"
+    ],
+    "requiredEvidence": [
+      {
+        "kind": "unit",
+        "requirementId": "r34",
+        "profile": "task1-node-test",
+        "provider": null,
+        "initialState": "pending",
+        "allowedNotRunReasons": []
+      },
+      {
+        "kind": "ui",
+        "requirementId": "r35",
+        "profile": "task3-ui",
+        "provider": null,
+        "initialState": "pending",
+        "allowedNotRunReasons": []
+      }
+    ]
+  },
+  {
+    "id": "browser-security",
+    "oracle": "test/acceptance/oracles/browser-security.json",
+    "owners": [
+      "src/desktop-panel.mjs",
+      "src/panel-sessions.mjs"
+    ],
+    "requiredEvidence": [
+      {
+        "kind": "unit",
+        "requirementId": "r36",
+        "profile": "task1-node-test",
+        "provider": null,
+        "initialState": "pending",
+        "allowedNotRunReasons": []
+      },
+      {
+        "kind": "visual",
+        "requirementId": "r37",
+        "profile": "task3-visual",
+        "provider": null,
+        "initialState": "pending",
+        "allowedNotRunReasons": []
+      }
+    ]
+  },
+  {
+    "id": "testing-unit",
+    "oracle": "test/acceptance/oracles/testing-success.json",
+    "owners": [
+      "test/acceptance-oracles.test.mjs"
+    ],
+    "requiredEvidence": [
+      {
+        "kind": "unit",
+        "requirementId": "r38",
+        "profile": "task1-node-test",
+        "provider": null,
+        "initialState": "pending",
+        "allowedNotRunReasons": []
+      }
+    ]
+  },
+  {
+    "id": "testing-node-build",
+    "oracle": "test/acceptance/oracles/testing-success.json",
+    "owners": [
+      "scripts/verify-node-only-build.mjs"
+    ],
+    "requiredEvidence": [
+      {
+        "kind": "build",
+        "requirementId": "r39",
+        "profile": "task1-node-check",
+        "provider": null,
+        "initialState": "pending",
+        "allowedNotRunReasons": []
+      }
+    ]
+  },
+  {
+    "id": "testing-swift-build",
+    "oracle": "test/acceptance/oracles/testing-success.json",
+    "owners": [
+      "apps/macos/ModelRouterTray/Package.swift"
+    ],
+    "requiredEvidence": [
+      {
+        "kind": "build",
+        "requirementId": "r40",
+        "profile": "task1-swift-build",
+        "provider": null,
+        "initialState": "pending",
+        "allowedNotRunReasons": []
+      }
+    ]
+  },
+  {
+    "id": "testing-runtime",
+    "oracle": "test/acceptance/oracles/testing-success.json",
+    "owners": [
+      "src/router.mjs"
+    ],
+    "requiredEvidence": [
+      {
+        "kind": "runtime",
+        "requirementId": "r41",
+        "profile": "task3-runtime",
+        "provider": null,
+        "initialState": "pending",
+        "allowedNotRunReasons": []
+      }
+    ]
+  },
+  {
+    "id": "testing-live-provider",
+    "oracle": "test/acceptance/oracles/testing-success.json",
+    "owners": [
+      "src/router.mjs"
+    ],
+    "requiredEvidence": [
+      {
+        "kind": "live",
+        "requirementId": "r42",
+        "profile": "task4-live",
+        "provider": "deepseek",
+        "initialState": "pending",
+        "allowedNotRunReasons": [
+          "quota_approval_absent"
+        ]
+      },
+      {
+        "kind": "live",
+        "requirementId": "r43",
+        "profile": "task4-live",
+        "provider": "qwen-plan",
+        "initialState": "not_run",
+        "allowedNotRunReasons": [
+          "out_of_current_provider_scope"
+        ]
+      }
+    ]
+  },
+  {
+    "id": "success-node-router",
+    "oracle": "test/acceptance/oracles/testing-success.json",
+    "owners": [
+      "src/router.mjs"
+    ],
+    "requiredEvidence": [
+      {
+        "kind": "unit",
+        "requirementId": "r44",
+        "profile": "task1-node-test",
+        "provider": null,
+        "initialState": "pending",
+        "allowedNotRunReasons": []
+      },
+      {
+        "kind": "runtime",
+        "requirementId": "r45",
+        "profile": "task3-runtime",
+        "provider": null,
+        "initialState": "pending",
+        "allowedNotRunReasons": []
+      }
+    ]
+  },
+  {
+    "id": "success-desktop-app",
+    "oracle": "test/acceptance/oracles/testing-success.json",
+    "owners": [
+      "apps/macos/ModelRouterTray/Sources/ModelRouterTrayApp.swift"
+    ],
+    "requiredEvidence": [
+      {
+        "kind": "build",
+        "requirementId": "r46",
+        "profile": "task1-build",
+        "provider": null,
+        "initialState": "pending",
+        "allowedNotRunReasons": []
+      },
+      {
+        "kind": "ui",
+        "requirementId": "r47",
+        "profile": "task3-ui",
+        "provider": null,
+        "initialState": "pending",
+        "allowedNotRunReasons": []
+      }
+    ]
+  },
+  {
+    "id": "success-browser-panel",
+    "oracle": "test/acceptance/oracles/testing-success.json",
+    "owners": [
+      "src/desktop-panel.mjs"
+    ],
+    "requiredEvidence": [
+      {
+        "kind": "unit",
+        "requirementId": "r48",
+        "profile": "task1-node-test",
+        "provider": null,
+        "initialState": "pending",
+        "allowedNotRunReasons": []
+      },
+      {
+        "kind": "visual",
+        "requirementId": "r49",
+        "profile": "task3-visual",
+        "provider": null,
+        "initialState": "pending",
+        "allowedNotRunReasons": []
+      }
+    ]
+  },
+  {
+    "id": "success-catalog",
+    "oracle": "test/acceptance/oracles/testing-success.json",
+    "owners": [
+      "src/catalog-generation.mjs"
+    ],
+    "requiredEvidence": [
+      {
+        "kind": "unit",
+        "requirementId": "r50",
+        "profile": "task1-node-test",
+        "provider": null,
+        "initialState": "pending",
+        "allowedNotRunReasons": []
+      },
+      {
+        "kind": "runtime",
+        "requirementId": "r51",
+        "profile": "task3-runtime",
+        "provider": null,
+        "initialState": "pending",
+        "allowedNotRunReasons": []
+      }
+    ]
+  },
+  {
+    "id": "success-upgrade",
+    "oracle": "test/acceptance/oracles/testing-success.json",
+    "owners": [
+      "src/owned-runtime-paths.mjs"
+    ],
+    "requiredEvidence": [
+      {
+        "kind": "unit",
+        "requirementId": "r52",
+        "profile": "task1-node-test",
+        "provider": null,
+        "initialState": "pending",
+        "allowedNotRunReasons": []
+      },
+      {
+        "kind": "isolated-install",
+        "requirementId": "r53",
+        "profile": "task2-isolated-install",
+        "provider": null,
+        "initialState": "pending",
+        "allowedNotRunReasons": []
+      }
+    ]
+  },
+  {
+    "id": "success-platform",
+    "oracle": "test/acceptance/oracles/testing-success.json",
+    "owners": [
+      "src/platform-gate.mjs"
+    ],
+    "requiredEvidence": [
+      {
+        "kind": "unit",
+        "requirementId": "r54",
+        "profile": "task1-node-test",
+        "provider": null,
+        "initialState": "pending",
+        "allowedNotRunReasons": []
+      },
+      {
+        "kind": "runtime",
+        "requirementId": "r55",
+        "profile": "task3-runtime",
+        "provider": null,
+        "initialState": "pending",
+        "allowedNotRunReasons": []
+      }
+    ]
+  },
+  {
+    "id": "success-vision",
+    "oracle": "test/acceptance/oracles/testing-success.json",
+    "owners": [
+      "src/vision-bridge.mjs"
+    ],
+    "requiredEvidence": [
+      {
+        "kind": "unit",
+        "requirementId": "r56",
+        "profile": "task1-node-test",
+        "provider": null,
+        "initialState": "pending",
+        "allowedNotRunReasons": []
+      },
+      {
+        "kind": "visual",
+        "requirementId": "r57",
+        "profile": "task3-visual",
+        "provider": null,
+        "initialState": "pending",
+        "allowedNotRunReasons": []
+      }
+    ]
+  },
+  {
+    "id": "success-public-errors",
+    "oracle": "test/acceptance/oracles/testing-success.json",
+    "owners": [
+      "src/public-error.mjs"
+    ],
+    "requiredEvidence": [
+      {
+        "kind": "unit",
+        "requirementId": "r58",
+        "profile": "task1-node-test",
+        "provider": null,
+        "initialState": "pending",
+        "allowedNotRunReasons": []
+      },
+      {
+        "kind": "ui",
+        "requirementId": "r59",
+        "profile": "task3-ui",
+        "provider": null,
+        "initialState": "pending",
+        "allowedNotRunReasons": []
+      }
+    ]
+  },
+  {
+    "id": "success-testing-evidence",
+    "oracle": "test/acceptance/oracles/testing-success.json",
+    "owners": [
+      "scripts/verify-node-only-build.mjs"
+    ],
+    "requiredEvidence": [
+      {
+        "kind": "build",
+        "requirementId": "r60",
+        "profile": "task1-artifact-audit",
+        "provider": null,
+        "initialState": "pending",
+        "allowedNotRunReasons": []
+      },
+      {
+        "kind": "visual",
+        "requirementId": "r61",
+        "profile": "task3-visual",
+        "provider": null,
+        "initialState": "pending",
+        "allowedNotRunReasons": []
+      }
+    ]
+  }
 ]

@@ -29,6 +29,7 @@ import {
   restoreOwnedRuntime,
   snapshotOwnedRuntime,
 } from "../src/owned-runtime-paths.mjs";
+import upgradePlatformOracle from "./acceptance/oracles/upgrade-platform.json" with { type: "json" };
 
 function fixture() {
   const root = mkdtempSync(path.join(os.tmpdir(), "codex-router-runtime-preserve-"));
@@ -56,6 +57,23 @@ function fixture() {
   };
   return { root, target, runtimeRoots, paths: ownedRuntimePaths(target, runtimeRoots) };
 }
+
+test("Appendix G upgrade consumer dispatches every checked-in upgrade/platform oracle row", () => {
+  const { root, paths } = fixture();
+  try {
+    const dispatch = {
+      "upgrade-preservation": ({ contract }) => {
+        const snapshot = snapshotOwnedRuntime(paths);
+        assert.equal(snapshot.version, contract.expected.snapshotVersion, contract.fixture);
+        assert.equal(snapshot.entries["router-plist"].bytes.toString("utf8"), contract.expected.routerPlist.replace("\\n", "\n"), contract.fixture);
+      },
+    };
+    const rows = upgradePlatformOracle.rows.filter(({ id }) => id === "upgrade-preservation");
+    assert.deepEqual(Object.keys(dispatch).sort(), rows.map(({ id }) => id).sort());
+    for (const row of rows) dispatch[row.id](row);
+  }
+  finally { rmSync(root, { recursive: true, force: true }); }
+});
 
 test("runtime snapshots preserve exact bytes, existence, and mode before replacement", () => {
   const { root, target, paths } = fixture();

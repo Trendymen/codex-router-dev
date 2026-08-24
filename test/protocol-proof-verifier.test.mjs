@@ -18,9 +18,19 @@ const {
 } = await import("../src/protocol-proof-verifier.mjs");
 const { readProtocolProof, registryFingerprint } = await import("../src/protocol-proof.mjs");
 const { proofMatchesModel } = await import("../src/model-contract.mjs");
+const protocolProofOracle = (await import("./fixtures/required-capabilities.json", { with: { type: "json" } })).default;
 
 const slug = "qwen-plan/qwen3.7-max";
 const model = MODEL_BY_SLUG.get(slug);
+
+test("Appendix F proof consumer dispatches every independent required-capabilities oracle row", () => {
+  const dispatch = Object.fromEntries(protocolProofOracle.capabilities.map((row) => [row.id, (contract) => {
+    assert.ok(contract.nodeCommands.includes("protocol-proof.status") || !contract.nodeCommands.some((name) => name.startsWith("protocol-proof.")), row.id);
+    assert.equal(typeof verifyProtocolProof, "function");
+  }]));
+  assert.deepEqual(Object.keys(dispatch).sort(), protocolProofOracle.capabilities.map(({ id }) => id).sort());
+  for (const row of protocolProofOracle.capabilities) dispatch[row.id](row);
+});
 
 function passingEvidence(overrides = {}) {
   return {

@@ -11,8 +11,18 @@ import {
   requireMacOS,
   runMacOSMutation,
 } from "../src/platform-gate.mjs";
+import upgradePlatformOracle from "./acceptance/oracles/upgrade-platform.json" with { type: "json" };
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+
+test("Appendix G platform consumer dispatches every checked-in upgrade/platform oracle row", () => {
+  const dispatch = {
+    "platform-removal": ({ contract }) => assert.throws(() => requireMacOS(contract.input.operation, contract.input.platform), (error) => error.code === contract.error.code && error.exitCode === contract.error.exitCode),
+  };
+  const rows = upgradePlatformOracle.rows.filter(({ id }) => id === "platform-removal");
+  assert.deepEqual(Object.keys(dispatch).sort(), rows.map(({ id }) => id).sort());
+  for (const row of rows) dispatch[row.id](row);
+});
 
 test("macOS is accepted and every other platform gets the public refusal", () => {
   assert.equal(requireMacOS("unit fixture", "darwin"), undefined);

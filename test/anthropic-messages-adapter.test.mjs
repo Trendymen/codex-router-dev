@@ -5,6 +5,7 @@ import { pipeline } from "node:stream/promises";
 
 import { buildAnthropicMessagesRequest, adaptAnthropicMessages, AnthropicMessagesAdapterError } from "../src/anthropic-messages-adapter.mjs";
 import { sealReasoningEnvelope, reasoningTextHash, reasoningItemId } from "../src/reasoning-envelope.mjs";
+import toolGlmOracle from "./acceptance/oracles/tool-glm.json" with { type: "json" };
 
 const KEY = "task5-internal-key-with-enough-entropy";
 const MODEL = {
@@ -31,6 +32,19 @@ function payload(overrides = {}) {
     ...overrides,
   };
 }
+
+test("Appendix C GLM consumer dispatches every checked-in tool/GLM oracle row", () => {
+  const dispatch = {
+    "glm-messages-continuation": ({ contract }) => {
+      const json = buildAnthropicMessagesRequest({ model: MODEL, payload: payload({ reasoning: { effort: contract.input.effort }, max_output_tokens: contract.input.maxOutputTokens }), credential: { value: "provider-secret" }, internalKey: KEY }).json;
+      assert.equal(json.model, contract.expected.upstreamModel);
+      assert.equal(json.thinking.budget_tokens, contract.expected.thinkingBudget);
+    },
+  };
+  const rows = toolGlmOracle.rows.filter(({ id }) => id === "glm-messages-continuation");
+  assert.deepEqual(Object.keys(dispatch).sort(), rows.map(({ id }) => id).sort());
+  for (const row of rows) dispatch[row.id](row);
+});
 
 function frame(type, value) { return `event: ${type}\ndata: ${JSON.stringify(value)}\n\n`; }
 

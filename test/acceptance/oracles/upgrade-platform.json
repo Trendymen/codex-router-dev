@@ -1,0 +1,1 @@
+{"version":1,"rows":[{"id":"upgrade-preservation","contract":{"fixture":"owned-runtime","expected":{"snapshotVersion":2,"routerPlist":"old-router-plist\\n"}}},{"id":"platform-removal","contract":{"input":{"operation":"oracle mutation","platform":"linux"},"error":{"code":"unsupported_platform","exitCode":2}}}]}

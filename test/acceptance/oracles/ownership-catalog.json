@@ -1,0 +1,1 @@
+{"version":1,"rows":[{"id":"ownership-writes","contract":{"input":{"owner":"foreign-owner"},"expected":{"foreign":true}}},{"id":"catalog-lifecycle-atomicity","contract":{"input":{"catalog":{"models":[]}},"expected":{"modelCount":0}}}]}

@@ -9,6 +9,7 @@ import {
   routerError,
 } from "../src/public-error.mjs";
 import { redactSensitive } from "../src/sensitive-redactor.mjs";
+import publicErrorOracle from "./acceptance/oracles/public-error.json" with { type: "json" };
 
 const DECOYS = {
   apiKey: "task1-api-key-decoy-31c7e33b",
@@ -29,6 +30,19 @@ const DECOYS = {
   body: "task1-body-decoy-b846809b",
   capability: "task1-capability-decoy-9c081779",
 };
+
+test("Appendix I consumer dispatches every checked-in public-error oracle row", () => {
+  const dispatch = {
+    "public-errors": ({ contract }) => {
+      const actual = routerError(contract.input.code).body.error;
+      assert.equal(actual.type, contract.expected.type);
+      assert.equal(actual.code, contract.expected.code);
+    },
+    "redaction-leaks": ({ contract }) => assert.equal(redactSensitive(`Authorization: Bearer ${contract.input.secret}`).includes(contract.input.secret), contract.expected.secretVisible),
+  };
+  assert.deepEqual(Object.keys(dispatch).sort(), publicErrorOracle.rows.map(({ id }) => id).sort());
+  for (const row of publicErrorOracle.rows) dispatch[row.id](row);
+});
 
 const SERIALIZED_DECOYS = Object.values(DECOYS);
 

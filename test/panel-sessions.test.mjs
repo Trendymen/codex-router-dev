@@ -9,11 +9,26 @@ import {
   operationFingerprint,
   validatePanelRequest,
 } from "../src/panel-sessions.mjs";
+import browserSecurityOracle from "./acceptance/oracles/browser-security.json" with { type: "json" };
 
 function sequenceRandomBytes() {
   let value = 1;
   return (size) => Buffer.alloc(size, value++);
 }
+
+test("Appendix J session consumer dispatches every checked-in browser-security oracle row", () => {
+  const dispatch = {
+    "write-sessions": ({ contract }) => {
+      const store = createPanelSessionStore({ randomBytes: sequenceRandomBytes() });
+      const session = store.consumeNonce(store.mintNonce().nonce);
+      assert.equal(Buffer.from(session.sessionId, "base64url").length, contract.expected.sessionBytes);
+      assert.equal(Buffer.from(session.csrfToken, "base64url").length, contract.expected.csrfBytes);
+    },
+  };
+  const rows = browserSecurityOracle.rows.filter(({ id }) => id === "write-sessions");
+  assert.deepEqual(Object.keys(dispatch).sort(), rows.map(({ id }) => id).sort());
+  for (const row of rows) dispatch[row.id](row);
+});
 
 function request(overrides = {}) {
   return {

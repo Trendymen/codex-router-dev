@@ -1,0 +1,1 @@
+{"version":1,"rows":[{"id":"write-sessions","contract":{"input":{"nonceBytes":32,"ttlMs":30000},"expected":{"sessionBytes":32,"csrfBytes":32}}},{"id":"browser-security","contract":{"input":{"route":"/panel/../../etc/passwd"},"expected":{"accepted":false}}}]}

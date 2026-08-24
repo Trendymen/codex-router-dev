@@ -9,7 +9,8 @@
   },
   "scripts": {
     "check": "node scripts-check.mjs",
-    "audit:node-only-build": "node scripts/verify-node-only-build.mjs generated/build-root",
+    "audit:node-only-build": "node scripts/verify-node-only-build.mjs generated/acceptance/task1-build/build-root",
+    "test:acceptance-contract": "node --test test/acceptance-matrix.test.mjs test/acceptance-oracles.test.mjs test/prepare-acceptance-build.test.mjs test/verify-acceptance.test.mjs test/verify-task-scope.test.mjs",
     "test": "node --test test/*.test.mjs"
   },
   "dependencies": {

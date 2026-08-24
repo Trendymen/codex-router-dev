@@ -1,0 +1,1 @@
+{"version":1,"rows":[{"id":"public-errors","contract":{"input":{"code":"unsupported_platform"},"expected":{"type":"router_error","code":"unsupported_platform"}}},{"id":"redaction-leaks","contract":{"input":{"secret":"task1-api-key-decoy-31c7e33b"},"expected":{"secretVisible":false}}}]}

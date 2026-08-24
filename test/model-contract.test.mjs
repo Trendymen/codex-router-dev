@@ -99,6 +99,37 @@ test("Appendix B oracle matches every Node model registry field", () => {
   }
 });
 
+test("Appendix B oracle has the exact unique slug set and complete proof-gated row contract", () => {
+  const expectedSlugs = [
+    "deepseek/deepseek-v4-flash", "deepseek/deepseek-v4-pro", "qwen-plan/qwen3.8-max", "qwen-plan/deepseek-v4-flash-0731",
+    "qwen-plan/qwen3.8-max-preview", "qwen-plan/qwen3.7-max", "qwen-plan/qwen3.7-plus", "qwen-plan/qwen3.6-flash",
+    "qwen-plan/deepseek-v4-pro", "qwen-plan/deepseek-v4-pro-0813", "qwen-plan/glm-5.2", "qwen-plan-responses/glm-5.2",
+  ];
+  const rows = Object.entries(oracle);
+  assert.equal(new Set(rows.map(([slug]) => slug)).size, rows.length);
+  assert.deepEqual(rows.map(([slug]) => slug).sort(), expectedSlugs.sort());
+  for (const [slug, row] of rows) {
+    for (const field of ["provider", "credentialOwner", "upstreamModel", "transport", "toolDialect", "reasoningDisplayMode", "finalShape", "purpose", "rollout", "listed"]) assert.ok(Object.hasOwn(row, field), `${slug}: ${field}`);
+    assert.equal(typeof row.provider, "string", slug);
+    assert.equal(typeof row.credentialOwner, "string", slug);
+    assert.equal(typeof row.upstreamModel, "string", slug);
+    assert.match(row.transport, /^(?:openai-responses|anthropic-messages)$/, slug);
+    assert.match(row.toolDialect, /^responses-functions$/, slug);
+    assert.match(row.reasoningDisplayMode, /^(?:summary-compat|raw-preserve)$/, slug);
+    assert.match(row.finalShape, /^(?:raw-content|hybrid-summary|anthropic-thinking|unverified)$/, slug);
+    assert.match(row.purpose, /^(?:primary|compatibility)$/, slug);
+    assert.match(row.rollout, /^(?:stable|experimental)$/, slug);
+    assert.equal(typeof row.listed, "boolean", slug);
+    const model = MODEL_BY_SLUG.get(slug);
+    const resolved = resolveNodeModel(model, stateFor(model));
+    assert.equal(resolved.routable, true, slug);
+    if (row.rollout === "experimental") {
+      assert.equal(resolveNodeModel(model, { providerEnabled: true, canaryEnabled: true, proof: null }).routable, false, `${slug}: proof required`);
+      assert.equal(resolved.effectiveFinalReasoningShape, "raw-content", `${slug}: measured proof shape`);
+    } else assert.equal(resolved.effectiveFinalReasoningShape, row.finalShape, slug);
+  }
+});
+
 test("Node routing contains every Appendix B row and no legacy registry model", () => {
   const proofs = new Map(
     Object.keys(oracle)

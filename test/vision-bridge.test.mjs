@@ -68,12 +68,21 @@ const {
   VISION_RECORD_MAX_CHARS,
 } = await import("../src/vision-bridge.mjs");
 const { nativeVisionEngines } = await import("../src/vision-engines.mjs");
+const visionAllowOracle = (await import("./acceptance/oracles/vision-allow.json", { with: { type: "json" } })).default;
 // Task 5 TDD contract: this import is intentionally added before the policy
 // exists so the focused gate proves the Appendix H matrix starts RED.
 const {
   allowedVisionReaders,
   resolveVisionReader,
 } = await import("../src/vision-reader-policy.mjs");
+
+test("Appendix H consumer dispatches every checked-in vision allow oracle row", () => {
+  const dispatch = {
+    "vision-allow": ({ contract }) => assert.equal(inputHasImage([{ content: [{ type: "input_image", image_url: contract.input.imageUrl }] }]), contract.expected.hasImage),
+  };
+  assert.deepEqual(Object.keys(dispatch).sort(), visionAllowOracle.rows.map(({ id }) => id).sort());
+  for (const row of visionAllowOracle.rows) dispatch[row.id](row);
+});
 
 after(() => {
   if (livePurgeBefore.exists) {

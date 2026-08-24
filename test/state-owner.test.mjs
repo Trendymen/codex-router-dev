@@ -13,6 +13,8 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import ownershipCatalogOracle from "./acceptance/oracles/ownership-catalog.json" with { type: "json" };
+import { stateOwnershipStatus } from "../src/state-owner.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -21,6 +23,26 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 // Windows). Resolve the fixture the same way instead of asserting POSIX
 // separators that only ever match on macOS and Linux.
 const FOREIGN_OWNER = path.resolve("/somewhere/else/codex-router");
+
+function dispatchOwnershipOracleRows(rows) {
+  const dispatch = {
+    "ownership-writes": ({ contract }) => withState({ owner: contract.input.owner === "foreign-owner" ? FOREIGN_OWNER : undefined }, (stateDir) => {
+      assert.equal(ownershipStatus(stateDir).foreign, contract.expected.foreign, contract.input.owner);
+    }),
+  };
+  assert.deepEqual(Object.keys(dispatch).sort(), rows.map(({ id }) => id).sort());
+  for (const row of rows) dispatch[row.id](row);
+}
+
+test("Appendix E ownership consumer dispatches its checked-in ownership oracle row", () => {
+  dispatchOwnershipOracleRows(ownershipCatalogOracle.rows.filter(({ id }) => id === "ownership-writes"));
+});
+
+test("变异 Appendix E ownership oracle 后，同一 ownership consumer 必须失败", () => {
+  const tampered = structuredClone(ownershipCatalogOracle.rows.filter(({ id }) => id === "ownership-writes"));
+  tampered[0].contract.expected.foreign = false;
+  assert.throws(() => dispatchOwnershipOracleRows(tampered));
+});
 
 // A state directory records the checkout that installed it. Regenerating the
 // catalog or gateway config from a different checkout desynchronizes what Codex

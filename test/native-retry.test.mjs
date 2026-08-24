@@ -11,10 +11,34 @@ import { zstdDecompressSync } from "node:zlib";
 import { callerBaseUrl } from "../src/caller-auth.mjs";
 import { fetchWithRetry } from "../src/upstream-retry.mjs";
 import { openPort } from "./port-pool.mjs";
+import retryFailoverOracle from "./acceptance/oracles/retry-failover.json" with { type: "json" };
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const INTERNAL_KEY = "test-internal-service-key-with-sufficient-length";
 const CALLER_KEY = "test-router-caller-capability-with-sufficient-length";
+
+async function dispatchRetryOracleRows(rows) {
+  const dispatch = {
+    retry: async ({ contract }) => {
+      let attempts = 0;
+      const response = await fetchWithRetry("https://oracle.invalid", {}, { retries: contract.input.retries, backoffMs: 0, fetchImpl: async () => (++attempts === 1 ? new Response("edge", { status: contract.input.status }) : new Response("ok", { status: 200 })) });
+      assert.equal(attempts, contract.expected.attempts);
+      assert.equal(response.retries, contract.expected.retries);
+    },
+  };
+  assert.deepEqual(Object.keys(dispatch).sort(), rows.map(({ id }) => id).sort());
+  for (const row of rows) await dispatch[row.id](row);
+}
+
+test("Appendix D retry consumer dispatches its checked-in retry oracle row", async () => {
+  await dispatchRetryOracleRows(retryFailoverOracle.rows.filter(({ id }) => id === "retry"));
+});
+
+test("变异 Appendix D retry oracle 后，同一 retry consumer 必须失败", async () => {
+  const tampered = structuredClone(retryFailoverOracle.rows.filter(({ id }) => id === "retry"));
+  tampered[0].contract.expected.attempts = 3;
+  await assert.rejects(() => dispatchRetryOracleRows(tampered));
+});
 
 // The body ChatGPT's edge actually returns. "before headers" is the property
 // that makes the request replayable: no response bytes ever existed.
