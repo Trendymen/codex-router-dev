@@ -68,7 +68,15 @@ if [ -z "$bundle_dir" ]; then
 fi
 if [ -n "$fixture_context" ]; then
   context_source_root=$(context_field sourceRoot)
-  [ "$repo_dir" = "$context_source_root" ] || {
+  if ! canonical_context_source_root=$(CDPATH= cd -- "$context_source_root" 2>/dev/null && pwd -P); then
+    printf 'codex-router: fixture sourceRoot invalid or does not match this checkout.\n' >&2
+    exit 2
+  fi
+  [ -n "$canonical_context_source_root" ] || {
+    printf 'codex-router: fixture sourceRoot invalid or does not match this checkout.\n' >&2
+    exit 2
+  }
+  [ "$repo_dir" = "$canonical_context_source_root" ] || {
     printf 'codex-router: fixture sourceRoot does not match this checkout.\n' >&2
     exit 2
   }

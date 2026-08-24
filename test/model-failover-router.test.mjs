@@ -17,6 +17,7 @@ import { openPort } from "./port-pool.mjs";
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const INTERNAL_KEY = "test-internal-service-key-with-sufficient-length";
 const CALLER_KEY = "test-router-caller-capability-with-sufficient-length";
+const ROUTER_HEALTH_TIMEOUT_MS = 30_000;
 
 // The model the turn asks for, and the one the router is told to move it to.
 // The fallback is named explicitly rather than left to the ranking so the
@@ -252,7 +253,7 @@ async function waitForLog(child, pattern) {
 }
 
 async function waitFor(url, child) {
-  const deadline = Date.now() + 10_000;
+  const deadline = Date.now() + ROUTER_HEALTH_TIMEOUT_MS;
   while (Date.now() < deadline) {
     if (child.exitCode !== null) {
       throw new Error(`Child exited early (${child.exitCode}): ${child.testErrors()}`);

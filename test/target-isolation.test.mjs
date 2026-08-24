@@ -406,6 +406,15 @@ test("tray build-plan CLI runs through a symlink or junction entrypoint", (t) =>
   }
 });
 
+test("tray builder canonicalizes fixture source roots before the checkout match", () => {
+  const source = readFileSync(path.join(root, "scripts", "build-macos-tray-app.sh"), "utf8");
+  assert.match(source, /context_source_root=\$\(context_field sourceRoot\)/);
+  assert.match(source, /CDPATH= cd -- "\$context_source_root"/);
+  assert.match(source, /pwd -P/);
+  assert.match(source, /fixture sourceRoot invalid or does not match this checkout/);
+  assert.match(source, /fixture sourceRoot does not match this checkout/);
+});
+
 test("isolated tray replacement has no production kill or legacy cleanup path", () => {
   const source = readFileSync(path.join(root, "bin", "model-router-tray"), "utf8");
   assert.match(source, /context_mode=/);

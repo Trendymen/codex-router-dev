@@ -33,7 +33,10 @@ const PURGE_LOCK_POLL_MS = 10;
 const PURGE_LOCK_RELEASE_ATTEMPTS = 4;
 const PURGE_LOCK_RELEASE_RETRY_MS = 10;
 const PURGE_LOCK_RELEASE_MAX_RETRY_MS = 80;
-const PURGE_LOCK_EMPTY_RETRY_ATTEMPTS = 4;
+// Darwin can expose a lock directory as empty between an old owner unlink and
+// a successor rename. Thirty-two bounded attempts cover the observed same-ms
+// churn while remaining finite: at most 31 waits (10+20+40+28*80 = 2310 ms).
+const PURGE_LOCK_EMPTY_RETRY_ATTEMPTS = 32;
 const PURGE_LOCK_EMPTY_RETRY_MS = 10;
 const PURGE_LOCK_EMPTY_RETRY_MAX_MS = 80;
 const PURGE_LOCK_READ_ATTEMPTS = 4;

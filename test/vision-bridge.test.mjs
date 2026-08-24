@@ -1082,6 +1082,56 @@ test("owner release retries rmdir after ENOTEMPTY re-reads an empty successor di
   }
 });
 
+test("owner release survives extended legal empty-successor ENOTEMPTY churn", () => {
+  const state = mkdtempSync(path.join(os.tmpdir(), "vision-purge-empty-successor-churn-"));
+  const purgePath = path.join(state, "vision-cache-purge.json");
+  const lockPath = `${purgePath}.lock`;
+  const ownerToken = "owner-a-token";
+  const ownerPath = path.join(lockPath, `owner-${ownerToken}.json`);
+  const ownerText = `${JSON.stringify({ pid: process.pid, token: ownerToken })}\n`;
+  let directoryReads = 0;
+  let removeAttempts = 0;
+  const waits = [];
+  try {
+    mkdirSync(lockPath);
+    writeFileSync(ownerPath, ownerText);
+    const result = releaseVisionCachePurgeLock(lockPath, {
+      platform: "darwin",
+      ownerPath,
+      ownerToken,
+      wait(milliseconds) { waits.push(milliseconds); },
+      fs: {
+        readDirectory(target) {
+          assert.equal(target, lockPath);
+          directoryReads += 1;
+          return directoryReads === 1 ? [path.basename(ownerPath)] : [];
+        },
+        readFile(target) {
+          if (target === ownerPath) return ownerText;
+          throw Object.assign(new Error("successor is between owner publications"), { code: "ENOENT" });
+        },
+        removeFile(target) {
+          assert.equal(target, ownerPath);
+          unlinkSync(target);
+        },
+        removeDirectory(target) {
+          assert.equal(target, lockPath);
+          removeAttempts += 1;
+          if (removeAttempts <= 8) {
+            throw Object.assign(new Error("successor churn left the directory transiently non-empty"), { code: "ENOTEMPTY" });
+          }
+        },
+      },
+    });
+    assert.equal(result, true);
+    assert.equal(removeAttempts, 9);
+    assert.equal(directoryReads, 9);
+    assert.deepEqual(waits, [10, 20, 40, 80, 80, 80, 80, 80]);
+  } finally {
+    rmSync(state, { recursive: true, force: true });
+  }
+});
+
 test("an empty re-read never authorizes deleting a successor that appears before the retry", () => {
   const state = mkdtempSync(path.join(os.tmpdir(), "vision-purge-empty-successor-replaced-"));
   const purgePath = path.join(state, "vision-cache-purge.json");
