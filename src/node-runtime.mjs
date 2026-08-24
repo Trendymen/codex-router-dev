@@ -159,6 +159,7 @@ export async function startNodeRuntime(config = {}) {
   const startupTimeoutMs = Number.isFinite(config.startupTimeoutMs) && config.startupTimeoutMs >= 0
     ? config.startupTimeoutMs
     : DEFAULT_STARTUP_TIMEOUT_MS;
+  const platform = config.platform || process.platform;
   const startupDeadline = Date.now() + startupTimeoutMs;
   let stopping = false;
   let stopPromise;
@@ -190,6 +191,23 @@ export async function startNodeRuntime(config = {}) {
     stopping = true;
     stopPromise = (async () => {
       const owned = records.slice();
+      if (platform === "win32") {
+        // On Windows Node maps SIGTERM to TerminateProcess. Sending SIGKILL
+        // while libuv is still closing that ChildProcess handle can abort the
+        // host with UV_HANDLE_CLOSING (0xC0000409). Stop and wait for each
+        // child in order; a requested Windows termination is already forceful,
+        // so never issue a second kill against the same closing handle.
+        for (const record of owned) {
+          if (!childAlive(record.child)) continue;
+          stopChild(record.child, signal);
+          await waitForRecords([record], config.stopGraceMs ?? DEFAULT_STOP_GRACE_MS);
+          if (childAlive(record.child) && record.child.killed !== true) {
+            stopChild(record.child, "SIGKILL");
+          }
+          await waitForRecords([record], config.stopKillWaitMs ?? DEFAULT_STOP_KILL_WAIT_MS);
+        }
+        return;
+      }
       for (const record of owned) stopChild(record.child, signal);
       await waitForRecords(owned, config.stopGraceMs ?? DEFAULT_STOP_GRACE_MS);
       const stillAlive = owned.filter((record) => childAlive(record.child));

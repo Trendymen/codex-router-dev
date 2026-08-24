@@ -85,6 +85,34 @@ class DelayedChild extends EventEmitter {
   }
 }
 
+class WindowsClosingChild extends EventEmitter {
+  constructor(name, events) {
+    super();
+    this.name = name;
+    this.events = events;
+    this.exitCode = null;
+    this.signalCode = null;
+    this.killed = false;
+    this.kills = [];
+    this.closing = false;
+  }
+
+  kill(signal = "SIGTERM") {
+    if (this.closing) throw new Error(`${this.name} kill raced a closing Windows handle`);
+    this.killed = true;
+    this.closing = true;
+    this.kills.push(signal);
+    this.events.push(`${this.name}:${signal}`);
+    setTimeout(() => {
+      this.exitCode = 0;
+      this.signalCode = signal;
+      this.events.push(`${this.name}:exit`);
+      this.emit("exit", this.exitCode, signal);
+    }, 5);
+    return true;
+  }
+}
+
 function specs() {
   return {
     forwarders: [
@@ -216,6 +244,7 @@ test("stop waits for graceful exits, shares its promise, and escalates once", as
   const children = [];
   const runtime = await startNodeRuntime({
     ...specs(),
+    platform: "linux",
     childFactory: async (spec) => {
       const child = new DelayedChild(spec.name, { termDelayMs: 1_000, ignoreTerm: spec.name === "api" });
       children.push(child);
@@ -235,6 +264,27 @@ test("stop waits for graceful exits, shares its promise, and escalates once", as
     ["SIGTERM", "SIGKILL"],
   ]);
   assert.deepEqual(children.map((child) => child.exitCode), [137, 137, 137]);
+});
+
+test("Windows stop owns one child at a time and never kills a handle that is closing", async () => {
+  const events = [];
+  const children = [];
+  const runtime = await startNodeRuntime({
+    ...specs(),
+    platform: "win32",
+    childFactory: async (spec) => {
+      const child = new WindowsClosingChild(spec.name, events);
+      children.push(child);
+      return child;
+    },
+    waitForHealth: async () => {},
+    stopGraceMs: 1,
+    stopKillWaitMs: 30,
+  });
+  await runtime.stop("SIGTERM");
+  assert.deepEqual(children.map((child) => child.kills), [["SIGTERM"], ["SIGTERM"], ["SIGTERM"]]);
+  assert.equal(events.indexOf("oauth:exit") < events.indexOf("api:SIGTERM"), true);
+  assert.equal(events.indexOf("api:exit") < events.indexOf("router:SIGTERM"), true);
 });
 
 test("forwarder startup runs concurrently under one bounded startup deadline", async () => {

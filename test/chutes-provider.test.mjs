@@ -61,13 +61,14 @@ test("the macOS tray labels Chutes as a metered API route", () => {
   );
 });
 
-test("both installer frontends pass provider selection to setup, which accepts Chutes", { skip: process.platform !== "darwin" }, () => {
+test("the macOS installer passes Chutes to setup and the Windows frontend refuses", { skip: process.platform !== "darwin" }, () => {
   const testRoot = mkdtempSync(path.join(os.tmpdir(), "chutes-installer-test-"));
   try {
     const posix = readFileSync(path.join(root, "install.sh"), "utf8");
     const windows = readFileSync(path.join(root, "install.ps1"), "utf8");
     assert.match(posix, /--providers "\$providers"/);
-    assert.match(windows, /\$SetupArguments \+= @\("--providers", \$Providers\)/);
+    assert.match(windows, /unsupported_platform/);
+    assert.doesNotMatch(windows, /\$SetupArguments \+= @\("--providers", \$Providers\)/);
 
     writeChutesCredential(testRoot, "TEST_CHUTES_INSTALL_KEY");
     const env = isolatedEnvironment(testRoot);

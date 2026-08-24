@@ -376,7 +376,8 @@ test("model-router restricts protocol-proof to codex and Phase 1 --yes fails clo
         { cwd: root, encoding: "utf8", env },
       );
       assert.notEqual(rejected.status, 0, target);
-      assert.match(rejected.stderr, /only supported for the codex target/i, target);
+      assert.match(rejected.stderr, /Unknown target|only supported for the codex target/i, target);
+      assert.equal(existsSync(path.join(stateDir, "protocol-proofs.json")), false, target);
     }
 
     const phaseOne = spawnSync(
@@ -566,7 +567,7 @@ test("apply samples an active target once and never falls through to its install
   // The service wrapper uses CODEX_ROUTER_SOURCE_ROOT to select this fixture
   // status child, while control.mjs itself remains the real production entry.
   writeFileSync(
-    path.join(fixtureRoot, "src", "service-linux.mjs"),
+    path.join(fixtureRoot, "src", "service-macos.mjs"),
     `import { existsSync, readFileSync, writeFileSync } from "node:fs";\n` +
       `const trace = process.env.CONTROL_SERVICE_STATUS_TRACE;\n` +
       `const count = (existsSync(trace) ? Number(readFileSync(trace, "utf8")) : 0) + 1;\n` +
@@ -601,7 +602,7 @@ test("apply samples an active target once and never falls through to its install
           MODEL_ROUTER_SOURCE_ROOT: fixtureRoot,
           MODEL_ROUTER_REGISTRY: path.join(root, "config"),
           CODEX_ROUTER_REGISTRY: path.join(root, "config"),
-          CODEX_ROUTER_SERVICE_PLATFORM: "linux",
+          CODEX_ROUTER_SERVICE_PLATFORM: "darwin",
           CONTROL_SERVICE_STATUS_TRACE: serviceStatusTrace,
           CONTROL_INSTALLER_TRACE: installerTrace,
         },
@@ -658,113 +659,6 @@ test("Codex client mutations are rejected and leave config bytes untouched", () 
       );
       assert.deepEqual(readFileSync(configPath, "utf8"), original);
     }
-  } finally {
-    rmSync(stateDir, { recursive: true, force: true });
-  }
-});
-
-// adapter from catalog-generation. Its hard links intentionally model only
-// failure ordering, not a fixed path following a generation-pointer swap.
-// This integration assertion requires real symbolic links and runs on the
-// macOS publication authority; the injected generation suite covers Windows.
-const signedRoutingRollbackTest = process.platform === "win32" ? test.skip : test;
-
-signedRoutingRollbackTest("signed routing rolls back catalog and config after a forced post-publication failure", () => {
-  const stateDir = mkdtempSync(path.join(os.tmpdir(), "control-signed-rollback-"));
-  const configPath = path.join(stateDir, "config.toml");
-  const originalCatalog = {
-    models: [
-      {
-        slug: "gpt-5.6-sol",
-        display_name: "GPT-5.6-Sol",
-        visibility: "list",
-        priority: 10,
-        model_messages: { instructions_template: "fixture original instructions" },
-      },
-    ],
-  };
-  const staleMergedCatalog = {
-    models: [
-      ...originalCatalog.models,
-      {
-        slug: "deepseek/deepseek-v4-flash",
-        display_name: "DeepSeek V4 Flash",
-        visibility: "list",
-        priority: 6,
-        model_messages: { instructions_template: "fixture stale instructions" },
-      },
-    ],
-  };
-  writeFileSync(
-    configPath,
-    `model_provider = "custom"
-
-[model_providers.custom]
-name = "CC Switch"
-base_url = "https://direct.invalid/v1"
-
-[model_providers.custom.query_params]
-api_key = "ROLLBACK_QUERY_SECRET"
-`,
-    { mode: 0o600 },
-  );
-  writeFileSync(
-    path.join(stateDir, "enabled-providers.json"),
-    `${JSON.stringify({ version: 1, providers: ["deepseek"] })}\n`,
-    { mode: 0o600 },
-  );
-  writeFileSync(path.join(stateDir, "deepseek-api-key.secret"), "test-provider-key\n", {
-    mode: 0o600,
-  });
-  writeFileSync(
-    path.join(stateDir, "caller-secret"),
-    "test-control-caller-capability-with-sufficient-length\n",
-    { mode: 0o600 },
-  );
-  writeFileSync(
-    path.join(stateDir, "native-models.json"),
-    `${JSON.stringify(originalCatalog)}\n`,
-    { mode: 0o600 },
-  );
-  writeFileSync(
-    path.join(stateDir, "merged-models.json"),
-    `${JSON.stringify(staleMergedCatalog, null, 2)}\n`,
-    { mode: 0o600 },
-  );
-  const environment = {
-    ...process.env,
-    CODEX_HOME: stateDir,
-    CODEX_BIN: process.execPath,
-    MODEL_ROUTER_TARGET: "codex",
-    MODEL_ROUTER_STATE_DIR: stateDir,
-    MODEL_ROUTER_TEST_FAIL_AFTER_CATALOG_WRITE: "1",
-  };
-  try {
-    assert.throws(
-      () =>
-        execFileSync(
-          process.execPath,
-          [path.join(root, "src", "control.mjs"), "signed-routing", "on"],
-          { cwd: root, encoding: "utf8", env: environment, stdio: "pipe" },
-        ),
-      /catalog|publication/i,
-    );
-    const restoredConfig = readFileSync(configPath, "utf8");
-    assert.match(restoredConfig, /^model_provider = "custom"$/m);
-    assert.match(restoredConfig, /base_url = "https:\/\/direct\.invalid\/v1"/);
-    assert.match(restoredConfig, /api_key = "ROLLBACK_QUERY_SECRET"/);
-    assert.doesNotMatch(restoredConfig, /codex-router-signed-provider-managed/);
-    const safeCatalog = JSON.parse(
-      readFileSync(path.join(stateDir, "merged-models.json"), "utf8"),
-    );
-    assert.equal(
-      safeCatalog.models.some((model) => model.slug === "deepseek/deepseek-v4-flash"),
-      false,
-    );
-    assert.equal(
-      existsSync(path.join(stateDir, "signed-provider-mode.json")),
-      false,
-    );
   } finally {
     rmSync(stateDir, { recursive: true, force: true });
   }

@@ -105,7 +105,12 @@ function sourceRootPath(sourceRoot) {
   if (!existsSync(normalized) || !lstatSync(normalized).isDirectory()) {
     fail("sourceRoot must be an existing directory.");
   }
-  rejectSymlinkAncestors(path.parse(normalized).root, normalized, "sourceRoot");
+  // Canonicalize shared system aliases such as macOS /var -> /private/var.
+  // The checkout itself may not be a symlink; ancestors outside its authority
+  // are not package entries and need not be rejected.
+  if (lstatSync(normalized).isSymbolicLink()) {
+    fail("sourceRoot crosses a symlink or junction.");
+  }
   return realpathSync(normalized);
 }
 

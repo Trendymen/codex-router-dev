@@ -1117,8 +1117,8 @@ api_key = "LEGACY_V2_QUERY_SECRET"
 });
 
 test(
-  "refresh-catalog restores signed routing instead of leaving the selected provider direct",
-  { skip: process.platform === "win32" },
+  "refresh-catalog preserves the active Codex config bytes",
+  { skip: process.platform !== "darwin" },
   () => {
     const codexHome = mkdtempSync(path.join(os.tmpdir(), "codex-router-signed-refresh-"));
     const stateDir = path.join(codexHome, "router-state");
@@ -1151,6 +1151,7 @@ esac
     );
     try {
       run("signed-enable", codexHome, stateDir);
+      const beforeRefresh = readFileSync(configPath);
       writeFileSync(
         path.join(stateDir, "enabled-providers.json"),
         `${JSON.stringify({ version: 1, providers: ["deepseek"] })}\n`,
@@ -1172,6 +1173,7 @@ esac
           MODEL_ROUTER_TARGET: "codex",
         },
       });
+      assert.deepEqual(readFileSync(configPath), beforeRefresh);
       const status = run("status", codexHome, stateDir);
       assert.equal(status.signed_routing, true);
       assert.equal(status.model_provider, "custom");

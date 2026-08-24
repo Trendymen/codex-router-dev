@@ -58,7 +58,11 @@ function inside(root, value, name) {
   if (relative === "" || relative === "." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
     throw new Error(`${name} must be inside the isolated root.`);
   }
-  if (existingPathHasLink(value, root) || existingPathHasLink(root)) {
+  // A shared system ancestor may itself be an alias (macOS /var ->
+  // /private/var). Refuse links at the isolated root and below, but do not
+  // reject a target merely because root and value traverse the same canonical
+  // system alias.
+  if (existingPathHasLink(value, root)) {
     throw new Error(`${name} cannot cross a symlink or junction.`);
   }
   return value;
@@ -95,7 +99,7 @@ export function validatePathWithin(parent, candidate, name = "path") {
     }
     return current;
   };
-  const inspectAncestors = (valueToInspect) => {
+  const inspectAncestors = (valueToInspect, stopAt) => {
     let current = valueToInspect;
     while (true) {
       if (existsSync(current)) {
@@ -109,6 +113,7 @@ export function validatePathWithin(parent, candidate, name = "path") {
           throw new Error(`Cannot inspect ${name}: ${error.message}`, { cause: error });
         }
       }
+      if (current === stopAt) return;
       const parentPath = path.dirname(current);
       if (parentPath === current) return;
       current = parentPath;
@@ -120,8 +125,7 @@ export function validatePathWithin(parent, candidate, name = "path") {
     const suffix = path.relative(existing, valueToInspect);
     return path.resolve(existingReal, suffix);
   };
-  inspectAncestors(root);
-  inspectAncestors(value);
+  inspectAncestors(value, root);
   const canonicalRoot = canonical(root);
   const canonicalValue = canonical(value);
   const canonicalRelative = path.relative(canonicalRoot, canonicalValue);

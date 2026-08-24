@@ -14,9 +14,9 @@ class CodexRouter < Formula
     (bin/"codex-router").write <<~SH
       #!/bin/sh
       source_root=$(CDPATH= cd -- "#{opt_libexec}" && pwd -P)
-      export PATH="#{Formula["node"].opt_bin}:$PATH"
+      export PATH="#{formula_opt_bin("node")}:$PATH"
       export CODEX_ROUTER_SOURCE_ROOT="$source_root"
-      export CODEX_ROUTER_NODE_BIN="#{Formula["node"].opt_bin}/node"
+      export CODEX_ROUTER_NODE_BIN="#{formula_opt_bin("node")}/node"
       export CODEX_ROUTER_PACKAGE_MANAGER=homebrew
       exec "$source_root/bin/model-router" codex "$@"
     SH
@@ -41,14 +41,14 @@ class CodexRouter < Formula
       Finish the one-time Codex integration with:
         codex-router setup --guided
 
-      Before `brew uninstall codex-router`, remove the per-user service and
-      managed Codex config with:
+      Before `brew uninstall codex-router`, remove the per-user Router service
+      and runtime integration with:
         codex-router uninstall
     EOS
   end
 
   test do
-    system Formula["node"].opt_bin/"node", libexec/"src/install-plan.mjs", "status", "node-deps"
+    system formula_opt_bin("node")/"node", libexec/"src/install-plan.mjs", "status", "node-deps"
     output = shell_output("#{bin}/codex-router providers list --json")
     assert_match '"providers":', output
   end
