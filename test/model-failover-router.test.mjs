@@ -1521,9 +1521,18 @@ test("failover walks past a candidate that is also out of usage", async () => {
       RESPONSES_MODEL.upstreamModel,
     ]);
     // The candidate that also reported empty is cooled down on its own account.
-    const events = await waitForUsageEvents(child.stateDir, 2, child);
-    assert.equal(events.at(-1).failoverFrom, PRIMARY.slug);
-    assert.equal(events.at(-1).model, RESPONSES_MODEL.slug);
+    const events = await waitForUsageEvents(child.stateDir, 3, child);
+    assert.deepEqual(
+      events.map((event) => [event.model, event.status]),
+      [
+        [PRIMARY.slug, 429],
+        [FALLBACK.slug, 429],
+        [RESPONSES_MODEL.slug, 200],
+      ],
+    );
+    const served = events[2];
+    assert.equal(served.failoverFrom, PRIMARY.slug);
+    assert.equal(served.model, RESPONSES_MODEL.slug);
   } finally {
     await stopChild(child);
     await closeServer(gw.server);

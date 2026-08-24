@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
 import { gunzipSync } from "node:zlib";
-import { mkdirSync, readFileSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -30,10 +30,12 @@ function archiveEntries(archivePath) {
     const text = (start, length) => header.subarray(start, start + length).toString("utf8").replace(/\0.*$/, "");
     const name = text(0, 100);
     const prefix = text(345, 155);
+    const mode = Number.parseInt(text(100, 8).trim() || "0", 8);
     const size = Number.parseInt(text(124, 12).trim() || "0", 8);
     const archivePath = (prefix ? `${prefix}/` : "") + name.replace(/\/$/, "");
     entries.set(archivePath, {
       data: Buffer.from(bytes.subarray(offset + 512, offset + 512 + size)),
+      mode,
       size,
       type: header[156] === 0x35 ? "directory" : "file",
     });
@@ -236,7 +238,11 @@ test("runtime release contains only usable runtime metadata and current handoff 
         if (archiveEntry.type !== "file" || !archivePath.startsWith("codex-router/")) continue;
         const target = path.join(unpack, archivePath.slice("codex-router/".length));
         mkdirSync(path.dirname(target), { recursive: true });
-        writeFileSync(target, archiveEntry.data);
+        writeFileSync(target, archiveEntry.data, { mode: archiveEntry.mode });
+      }
+      assert.equal(entries.get("codex-router/bin/model-router-tray").mode & 0o111, 0o111);
+      if (process.platform !== "win32") {
+        assert.equal(statSync(path.join(unpack, "bin", "model-router-tray")).mode & 0o111, 0o111);
       }
       for (const entrypoint of metadata.entrypoints) {
         const archiveEntry = entries.get(`codex-router/${entrypoint}`);
