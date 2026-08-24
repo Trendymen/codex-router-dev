@@ -4,6 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { redactSensitive } from "../src/sensitive-redactor.mjs";
+import { privateFileIsProtected, writePrivateFile } from "../src/file-security.mjs";
 import { migrateRuntime } from "../src/runtime-migration.mjs";
 import { recordAcceptanceEvidence } from "./verify-acceptance.mjs";
 import { acquireIsolationLease, assertCliPreflight, assertIsolatedEnvironment, assertPortsAvailable, assertPushedHarness, createIsolatedEnvironment, createLocalRuntime, planIsolatedEnvironment } from "./verify-isolated-install.mjs";
@@ -51,7 +52,8 @@ function equal(items) {
 
 function equalProtected(items, env) {
   const owned = new Set([env.target.routerPlistPath, env.target.trayPlistPath]);
-  return equal(items.filter((item) => !owned.has(item.file)));
+  const protectedItems = items.filter((item) => !owned.has(item.file));
+  return equal(protectedItems) && protectedItems.every((item) => !item.existed || privateFileIsProtected(item.file));
 }
 
 function requireCallbacks(releasedFixture) {
@@ -312,6 +314,7 @@ function sharedSecretFiles(env) {
 function captureSharedSecrets(env) {
   return sharedSecretFiles(env).map((file) => {
     if (!existsSync(file)) throw new Error(`runtime installer did not provision shared secret: ${file}`);
+    if (!privateFileIsProtected(file)) throw new Error(`runtime installer did not protect shared secret: ${file}`);
     return { file, bytes: readFileSync(file), mode: statSync(file).mode & 0o777 };
   });
 }
@@ -358,8 +361,7 @@ async function productionCase(state, { sourceCommit, oldCommit, plan }) {
   if (JSON.stringify(state.env.target.ports) !== JSON.stringify(plan.target.ports)) throw new Error("upgrade case target drifted after preflight");
   state.oldEnv = createIsolatedEnvironment({ root, sourceName: "released-checkout", nonce, sourceCommit: oldCommit });
   mkdirSync(path.dirname(state.env.credentialsPath), { recursive: true, mode: 0o700 });
-  writeFileSync(state.env.credentialsPath, "protected-caller\n", { mode: 0o600 });
-  chmodSync(state.env.credentialsPath, 0o600);
+  writePrivateFile(state.env.credentialsPath, "protected-caller\n", { directoryMode: 0o700 });
   state.runtime = await createLocalRuntime(state.env, { sourceCommit });
   state.oldRuntime = await createLocalRuntime(state.oldEnv, { sourceCommit: oldCommit, allowReleased: true, requireSwift: false });
   state.oldIdentity = await setupReleasedRuntime({ oldRuntime: state.oldRuntime, oldEnv: state.oldEnv, oldCommit });

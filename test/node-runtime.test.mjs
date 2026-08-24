@@ -128,6 +128,15 @@ test("topology contains Router and only required Node forwarders", () => {
   assert.match(topology.router.args.at(-1), /src[\\/]router\.mjs$/);
 });
 
+test("topology passes an explicit catalog environment unchanged to the Router child", () => {
+  const catalog = path.join(root, "generated", "acceptance", "catalog.json");
+  const topology = nodeRuntimeTopology({
+    sourceRoot: root,
+    environment: { CODEX_ROUTER_CATALOG: catalog },
+  });
+  assert.equal(topology.router.env.CODEX_ROUTER_CATALOG, catalog);
+});
+
 test("a forwarder spawn failure stops already-started children and rethrows the original error", async () => {
   const created = recorder({ failAt: 2 });
   await assert.rejects(

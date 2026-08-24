@@ -17,6 +17,7 @@ import { environmentProxyOptedIn } from "./proxy-environment.mjs";
 import { clearServiceProcessState, writeServiceProcessState } from "./service-process.mjs";
 import { nodeRuntimeTopology, startNodeRuntime } from "./node-runtime.mjs";
 import { rebuildAfterStartup } from "./node-snapshot-triggers.mjs";
+import { routerCatalogPath } from "./start-environment.mjs";
 
 if (!existsSync(INTERNAL_SECRET_PATH)) {
   throw new Error("Internal service key is missing; run ./bin/install.");
@@ -59,7 +60,7 @@ const commonEnv = {
   CODEX_ROUTER_GROK_OAUTH_HEALTH_URL: loopback(PORTS.grokOauth, "/health"),
   CODEX_ROUTER_DEVIN_CLI_HEALTH_URL: loopback(PORTS.devinCli, "/health"),
   CODEX_ROUTER_DEVIN_CLI_HEALTH_ENABLED: devinCliRouted ? "1" : "0",
-  CODEX_ROUTER_CATALOG: MERGED_CATALOG_PATH,
+  CODEX_ROUTER_CATALOG: routerCatalogPath(process.env, MERGED_CATALOG_PATH),
   CODEX_ROUTER_OAUTH_PORT: String(PORTS.oauth),
   CODEX_ROUTER_API_PORT: String(PORTS.api),
   CODEX_ROUTER_PORT: String(PORTS.router),

@@ -10,6 +10,7 @@ import {
   preparePrivateJson,
   privateFileIsProtected,
   protectPrivateFile,
+  windowsAclIsPrivateForCurrentUser,
   writePrivateJson,
   windowsFullControlGrant,
 } from "../src/file-security.mjs";
@@ -124,6 +125,21 @@ test("Windows numeric SID grants use the icacls SID prefix", () => {
   assert.throws(() => windowsFullControlGrant("runner@example.com"), /invalid Windows user SID/);
 });
 
+test("Windows private ACL rejects non-owner allow entries and inherited access", () => {
+  const current = "S-1-5-21-101-202-303-1001";
+  const owner = { sid: current, type: "Allow", inherited: false, rights: "FullControl" };
+  assert.equal(windowsAclIsPrivateForCurrentUser({ protected: true, currentSid: current, rules: [owner] }), true);
+  for (const sid of ["S-1-1-0", "S-1-5-32-545"]) {
+    assert.equal(windowsAclIsPrivateForCurrentUser({
+      protected: true,
+      currentSid: current,
+      rules: [owner, { sid, type: "Allow", inherited: false, rights: "ReadAndExecute" }],
+    }), false);
+  }
+  assert.equal(windowsAclIsPrivateForCurrentUser({ protected: true, currentSid: current, rules: [{ ...owner, inherited: true }] }), false);
+  assert.equal(windowsAclIsPrivateForCurrentUser({ protected: false, currentSid: current, rules: [owner] }), false);
+});
+
 test(
   "Windows private-file ACL is protected for the current identity",
   { skip: process.platform !== "win32" },
@@ -148,6 +164,8 @@ test(
         },
       ).trim();
       assert.equal(privateFileIsProtected(target), true, acl);
+      execFileSync("icacls.exe", [target, "/grant", "*S-1-1-0:(R)"], { stdio: "ignore" });
+      assert.equal(privateFileIsProtected(target), false, "Everyone allow ACE must make a private file unsafe");
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }

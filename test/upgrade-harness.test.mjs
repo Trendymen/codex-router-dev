@@ -4,13 +4,15 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, st
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 import { createIsolatedEnvironment, planIsolatedEnvironment } from "../scripts/verify-isolated-install.mjs";
+import { privateFileIsProtected, protectPrivateFile, writePrivateFile } from "../src/file-security.mjs";
 import { installReplacementPreservingProtected, preflightProductionCases, releasePlans, runUpgradeCases, settleUpgradeRun, setupReleasedRuntime, verifyUpgradeAndRollback } from "../scripts/verify-upgrade-preservation.mjs";
 
 function fixture() {
   const root = mkdtempSync(path.join(os.tmpdir(), "codex-router-upgrade-harness-"));
-  const sourceRoot = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
+  const sourceRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
   return { root, sourceRoot };
 }
 
@@ -19,6 +21,7 @@ function seed(env) {
   env.write(path.relative(env.root, env.target.routerPlistPath), "old-router\n", 0o640);
   env.mkdir(env.stateRoot);
   env.write(path.relative(env.root, env.credentialsPath), "protected-caller\n", 0o600);
+  protectPrivateFile(env.credentialsPath);
   chmodSync(env.target.routerPlistPath, 0o640);
 }
 
@@ -53,6 +56,7 @@ function callbacks(env, { failurePoint = null, calls = [] } = {}) {
           continue;
         }
         env.write(path.relative(env.root, item.file), item.bytes, item.mode);
+        if (item.file === env.credentialsPath) protectPrivateFile(item.file);
       }
     },
     cleanupReplacementOwned: async () => {
@@ -119,8 +123,8 @@ test("released runtime installs shared secrets before start and the replacement 
       callbacks: {
         install: async (oldEnv) => {
           events.push("old:install");
-          oldEnv.write(path.relative(oldEnv.root, path.join(oldEnv.stateRoot, "caller-secret")), "shared-caller\n", 0o600);
-          oldEnv.write(path.relative(oldEnv.root, path.join(oldEnv.stateRoot, "internal-secret")), "shared-internal\n", 0o600);
+          writePrivateFile(path.join(oldEnv.stateRoot, "caller-secret"), "shared-caller\n", { directoryMode: 0o700 });
+          writePrivateFile(path.join(oldEnv.stateRoot, "internal-secret"), "shared-internal\n", { directoryMode: 0o700 });
         },
         health: async () => {
           events.push("old:health");
@@ -136,6 +140,8 @@ test("released runtime installs shared secrets before start and the replacement 
     assert.deepEqual(events, ["old:install", "old:start", "old:health"]);
     assert.equal(oldIdentity.sourceCommit, "released");
     assert.deepEqual(readFileSync(path.join(env.stateRoot, "caller-secret")), Buffer.from("shared-caller\n"));
+    assert.equal(privateFileIsProtected(path.join(env.stateRoot, "caller-secret")), true);
+    assert.equal(privateFileIsProtected(path.join(env.stateRoot, "internal-secret")), true);
 
     const replacement = {
       callbacks: {
@@ -367,7 +373,7 @@ test("per-case factories isolate bootstrap residue from the later health case an
         };
         active.cleanup = async () => {
           assert.deepEqual(readFileSync(env.credentialsPath), initial);
-          assert.equal(statSync(env.credentialsPath).mode & 0o777, 0o600);
+          assert.equal(privateFileIsProtected(env.credentialsPath), true);
           seen.push({ name: state.name, root: env.root, success: true });
         };
         return { env, releasedFixture: { release: "released", replacement: "current", callbacks: active } };

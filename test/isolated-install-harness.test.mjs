@@ -4,16 +4,48 @@ import { createServer } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 import { callerBaseUrl } from "../src/caller-auth.mjs";
+import { privateFileIsProtected, protectPrivateFile } from "../src/file-security.mjs";
 import { redactSensitive } from "../src/sensitive-redactor.mjs";
-import { acquireIsolationLease, assertCliPreflight, assertPortsAvailable, assertPushedHarness, completeIsolatedInstaller, createIsolatedEnvironment, createLocalProviderFixture, guardIsolatedRuntimeCallback, isolationLeasePath, ownedProcessAlive, planIsolatedEnvironment, readInstalledCallerSecret, validDownstreamResponsesLifecycle, verifyCleanInstall } from "../scripts/verify-isolated-install.mjs";
+import { acceptanceCatalogFixture, privateRegularFile, runtimeEnv, acquireIsolationLease, assertCliPreflight, assertPortsAvailable, assertPushedHarness, completeIsolatedInstaller, createIsolatedEnvironment, createLocalProviderFixture, guardIsolatedRuntimeCallback, isolationLeasePath, ownedProcessAlive, planIsolatedEnvironment, readInstalledCallerSecret, validDownstreamResponsesLifecycle, verifyCleanInstall, writeAcceptanceCatalog } from "../scripts/verify-isolated-install.mjs";
+
+const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 function fixture() {
   const root = mkdtempSync(path.join(os.tmpdir(), "codex-router-isolated-install-"));
-  const sourceRoot = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
-  return { root, sourceRoot };
+  return { root, sourceRoot: repositoryRoot };
 }
+
+function assertPrivateFile(file) {
+  assert.equal(privateFileIsProtected(file), true, `private file is not protected: ${file}`);
+}
+
+test("Windows private-file validation binds an ACL result to the opened file identity", () => {
+  const opened = { dev: 7, ino: 11, mode: 0o100600, isFile: () => true, isSymbolicLink: () => false };
+  const replacement = { ...opened, ino: 12 };
+  let reads = 0;
+  assert.equal(privateRegularFile("C:\\acceptance\\caller-secret", opened, {
+    platform: "win32",
+    lstat: () => (++reads === 1 ? opened : replacement),
+    protectedFile: () => true,
+  }), false);
+  assert.equal(privateRegularFile("C:\\acceptance\\caller-secret", opened, {
+    platform: "win32",
+    lstat: () => opened,
+    protectedFile: () => true,
+  }), true);
+  const bigintOpened = { dev: 9n, ino: 9007199254740993n, mode: 0o100600, isFile: () => true, isSymbolicLink: () => false };
+  assert.equal(privateRegularFile("C:\\acceptance\\caller-secret", bigintOpened, {
+    platform: "win32",
+    lstat: (_file, options) => {
+      assert.deepEqual(options, { bigint: true });
+      return bigintOpened;
+    },
+    protectedFile: () => true,
+  }), true);
+});
 
 test("isolated environment owns every mutable target and rejects production collisions before callbacks", () => {
   const { root, sourceRoot } = fixture();
@@ -102,14 +134,17 @@ test("installed caller capability is atomically read from the private installer 
     const env = createIsolatedEnvironment({ root, sourceRoot, nonce: "installer-secret" });
     mkdirSync(env.stateRoot, { recursive: true, mode: 0o700 });
     writeFileSync(path.join(env.stateRoot, "caller-secret"), `${installerSecret}\n`, { mode: 0o600 });
+    protectPrivateFile(path.join(env.stateRoot, "caller-secret"));
     assert.equal(readInstalledCallerSecret(env), installerSecret);
     const base = callerBaseUrl(env.target.ports.router, readInstalledCallerSecret(env));
     assert.match(base, new RegExp(installerSecret));
     assert.doesNotMatch(redactSensitive(`caller URL ${base}`, { profile: "log" }), new RegExp(installerSecret));
 
-    chmodSync(path.join(env.stateRoot, "caller-secret"), 0o644);
-    assert.throws(() => readInstalledCallerSecret(env), /private mode/);
-    chmodSync(path.join(env.stateRoot, "caller-secret"), 0o600);
+    if (process.platform !== "win32") {
+      chmodSync(path.join(env.stateRoot, "caller-secret"), 0o644);
+      assert.throws(() => readInstalledCallerSecret(env), /private mode/);
+      chmodSync(path.join(env.stateRoot, "caller-secret"), 0o600);
+    }
     writeFileSync(path.join(env.stateRoot, "caller-secret"), "x".repeat(4_097), { mode: 0o600 });
     assert.throws(() => readInstalledCallerSecret(env), /invalid size/);
     rmSync(path.join(env.stateRoot, "caller-secret"));
@@ -189,6 +224,20 @@ test("downstream client lifecycle requires Responses created and completed event
   assert.equal(validDownstreamResponsesLifecycle("event: response.created\ndata: not-json\n\ndata: {\"type\":\"response.completed\"}\n\n"), false);
 });
 
+test("acceptance catalog remains pinned when the stable publisher path is overwritten", () => {
+  const { root, sourceRoot } = fixture();
+  try {
+    const env = createIsolatedEnvironment({ root, sourceRoot, nonce: "catalog-override" });
+    mkdirSync(env.stateRoot, { recursive: true, mode: 0o700 });
+    writeAcceptanceCatalog(env);
+    writeFileSync(path.join(env.stateRoot, "merged-models.json"), JSON.stringify({ models: [{ slug: "native/accidental" }] }), { mode: 0o600 });
+    assert.equal(runtimeEnv(env).CODEX_ROUTER_CATALOG, env.acceptanceCatalogPath);
+    assert.deepEqual(JSON.parse(readFileSync(env.acceptanceCatalogPath, "utf8")), acceptanceCatalogFixture());
+    assert.equal(lstatSync(env.acceptanceCatalogPath).isSymbolicLink(), false);
+    assertPrivateFile(env.acceptanceCatalogPath);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test("clean install harness proves the full isolated service and command contract through injected callbacks", async () => {
   const { root, sourceRoot } = fixture();
   try {
@@ -211,7 +260,7 @@ test("clean install harness proves the full isolated service and command contrac
     assert.deepEqual(result.status, "passed");
     assert.deepEqual(calls, ["prerequisites", "install", "launch", "start", "auth", "health", "route:responses", "route:messages", "catalog", "browser", "swift", "lifecycle:stop", "lifecycle:start", "lifecycle:restart", "uninstall"]);
     assert.equal(readFileSync(path.join(root, "installer.txt"), "utf8"), "node-only\n");
-    assert.equal(statSync(path.join(root, "installer.txt")).mode & 0o777, 0o600);
+    if (process.platform !== "win32") assert.equal(statSync(path.join(root, "installer.txt")).mode & 0o777, 0o600);
     assert.equal(existsSync(path.join(root, "evidence", "clean-install.json")), true);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });

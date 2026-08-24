@@ -35,6 +35,20 @@ export function windowsFullControlGrant(sid) {
   return `*${sid}:(F)`;
 }
 
+/**
+ * `protectPrivateFile` deliberately produces a closed ACL: one explicit,
+ * non-inherited FullControl allow for the current SID.  Treat anything wider
+ * as unsafe rather than attempting to infer whether a group is harmless.
+ */
+export function windowsAclIsPrivateForCurrentUser({ protected: rulesProtected, currentSid, rules } = {}) {
+  if (rulesProtected !== true || !/^S-\d+(?:-\d+)+$/i.test(String(currentSid || "")) || !Array.isArray(rules) || rules.length === 0) return false;
+  return rules.every((rule) => rule
+    && rule.inherited !== true
+    && rule.type === "Allow"
+    && rule.sid === currentSid
+    && String(rule.rights || "").split(",").map((right) => right.trim()).includes("FullControl"));
+}
+
 export function protectPrivateFile(target) {
   chmodSync(target, 0o600);
   if (process.platform !== "win32") return target;
@@ -170,14 +184,11 @@ export function privateFileIsProtected(target) {
     // object without importing a PowerShell module.
     "$acl = [System.IO.File]::GetAccessControl($env:CODEX_ROUTER_PRIVATE_FILE)",
     "$identity = [Security.Principal.WindowsIdentity]::GetCurrent()",
-    "$sid = $identity.User.Value",
-    "$name = $identity.Name",
-    "$allowed = $false",
-    "foreach ($rule in $acl.Access) { $ruleIdentity = $rule.IdentityReference.Value; $matches = $ruleIdentity -eq $sid -or $ruleIdentity -eq $name; if (-not $matches) { try { $matches = $rule.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value -eq $sid } catch { $matches = $false } }; if ($matches -and $rule.AccessControlType -eq 'Allow') { $allowed = $true } }",
-    "[Console]::Out.Write(($acl.AreAccessRulesProtected -and $allowed).ToString())",
+    "$rules = @($acl.Access | ForEach-Object { $ruleSid = ''; try { $ruleSid = $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value } catch {}; [pscustomobject]@{ sid = $ruleSid; type = $_.AccessControlType.ToString(); inherited = $_.IsInherited; rights = $_.FileSystemRights.ToString() } })",
+    "[pscustomobject]@{ protected = $acl.AreAccessRulesProtected; currentSid = $identity.User.Value; rules = $rules } | ConvertTo-Json -Compress -Depth 4",
   ].join("; ");
   try {
-    return execFileSync(
+    const output = execFileSync(
       "powershell.exe",
       ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
       {
@@ -185,7 +196,9 @@ export function privateFileIsProtected(target) {
         env: { ...process.env, CODEX_ROUTER_PRIVATE_FILE: target },
         stdio: ["ignore", "pipe", "ignore"],
       },
-    ).trim().toLowerCase() === "true";
+    ).trim();
+    const acl = JSON.parse(output);
+    return windowsAclIsPrivateForCurrentUser({ ...acl, rules: Array.isArray(acl?.rules) ? acl.rules : [acl?.rules] });
   } catch {
     return false;
   }
