@@ -132,6 +132,7 @@ test("a curated Devin model that cannot bind its port fails startup by name", { 
   const { ready, exit, errors } = await runStartup({ curatedDevinModel: true, occupyDevinPort: true });
   assert.equal(ready, false, errors);
   assert.match(errors, /startup failed: Devin CLI forwarder exited before becoming healthy\./, errors);
+  assert.doesNotMatch(errors, /UV_HANDLE_CLOSING|src\\win\\async\.c/, errors);
   assert.equal(exit.code, 1, errors);
 });
 

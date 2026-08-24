@@ -142,4 +142,4 @@ try {
     }
   }
 }
-process.exit(exitCode);
+process.exitCode = exitCode;

@@ -36,6 +36,15 @@ function runGit(cwd, args) {
   return execFileSync("git", args, { cwd, stdio: "ignore" });
 }
 
+function removeFixtureTree(target) {
+  rmSync(target, {
+    recursive: true,
+    force: true,
+    maxRetries: 5,
+    retryDelay: 50,
+  });
+}
+
 function fixtureRoot() {
   const fixture = mkdtempSync(path.join(os.tmpdir(), "node-only-package-fixture-"));
   for (const relative of gitFiles()) {
@@ -131,9 +140,9 @@ test("release package is built from tracked regular files and has a verified det
     assert.ok(first.manifest.files.every(({ type, mode, bytes, sha256: digest }) =>
       ["file", "directory"].includes(type) && /^0[0-7]{3}$/.test(mode) && Number.isInteger(bytes) && /^[0-9a-f]{64}$/.test(digest)));
   } finally {
-    rmSync(fixture, { recursive: true, force: true });
-    rmSync(firstOutput, { recursive: true, force: true });
-    rmSync(secondOutput, { recursive: true, force: true });
+    removeFixtureTree(fixture);
+    removeFixtureTree(firstOutput);
+    removeFixtureTree(secondOutput);
   }
 });
 
@@ -150,8 +159,8 @@ test("release package reads committed HEAD blobs instead of dirty tracked files"
     assert.deepEqual(actual, expected);
     assert.equal(result.manifest.sourceCommit, execFileSync("git", ["rev-parse", "HEAD"], { cwd: fixture, encoding: "utf8" }).trim());
   } finally {
-    rmSync(fixture, { recursive: true, force: true });
-    rmSync(output, { recursive: true, force: true });
+    removeFixtureTree(fixture);
+    removeFixtureTree(output);
   }
 });
 
@@ -168,8 +177,8 @@ test("release package rejects unsafe committed package versions before output", 
     assert.throws(() => buildReleasePackage({ sourceRoot: fixture, outputDir: output }), /version|semantic|unsafe/i);
     assert.deepEqual(readdirSync(output), []);
   } finally {
-    rmSync(fixture, { recursive: true, force: true });
-    rmSync(output, { recursive: true, force: true });
+    removeFixtureTree(fixture);
+    removeFixtureTree(output);
   }
 });
 
@@ -231,11 +240,11 @@ test("packager refuses missing tracked dependencies, symlinks, hardlinks, and do
     assert.throws(() => buildReleasePackage({ sourceRoot: clean, outputDir: dottedOutput }), /\.\.|dot segment/i);
     assert.throws(() => buildReleasePackage({ sourceRoot: `${clean}${path.sep}..${path.sep}${path.basename(clean)}`, outputDir: output }), /\.\.|dot segment/i);
   } finally {
-    rmSync(missing, { recursive: true, force: true });
-    rmSync(symlinked, { recursive: true, force: true });
-    rmSync(hardlinked, { recursive: true, force: true });
-    rmSync(clean, { recursive: true, force: true });
-    rmSync(output, { recursive: true, force: true });
+    removeFixtureTree(missing);
+    removeFixtureTree(symlinked);
+    removeFixtureTree(hardlinked);
+    removeFixtureTree(clean);
+    removeFixtureTree(output);
   }
 });
 
@@ -260,6 +269,6 @@ test("tray output validation rejects traversal and symlinked target parents", ()
       assert.throws(() => validatePathWithin(parentLink, path.join(parentLink, "bundle"), "bundle"), /symlink|junction|link/i);
     }
   } finally {
-    rmSync(rootDir, { recursive: true, force: true });
+    removeFixtureTree(rootDir);
   }
 });

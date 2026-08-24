@@ -7,7 +7,6 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
-  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import os from "node:os";
@@ -28,12 +27,10 @@ function homebrewDoctorEnv(testRoot) {
     CODEX_HOME: path.join(testRoot, "codex-home"),
     CODEX_ROUTER_PACKAGE_MANAGER: "homebrew",
     CODEX_ROUTER_SOURCE_ROOT: testRoot,
+    MODEL_ROUTER_REGISTRY: path.join(root, "config"),
+    CODEX_ROUTER_REGISTRY: path.join(root, "config"),
     MODEL_ROUTER_STATE_DIR: path.join(testRoot, "state"),
   };
-}
-
-function linkRegistry(testRoot) {
-  symlinkSync(path.join(root, "config"), path.join(testRoot, "config"), "dir");
 }
 
 test("Homebrew repair stays with the package manager", () => {
@@ -62,10 +59,12 @@ test(
   () => {
     const testRoot = mkdtempSync(path.join(os.tmpdir(), "codex-homebrew-doctor-healthy-"));
     const binDir = path.join(testRoot, "bin");
+    const srcDir = path.join(testRoot, "src");
     const installLog = path.join(testRoot, "install-args.log");
     mkdirSync(binDir, { recursive: true });
+    mkdirSync(srcDir, { recursive: true });
     try {
-      linkRegistry(testRoot);
+      writeFileSync(path.join(srcDir, "service.mjs"), "process.exit(0);\n");
       writeFileSync(
         path.join(binDir, "install"),
         '#!/bin/sh\nprintf "%s\\n" "$*" > "$CODEX_ROUTER_TEST_INSTALL_ARGS"\nexit 23\n',

@@ -361,6 +361,51 @@ test("tray fixture plans resolve from a repository-external cwd without mutation
   }
 });
 
+test("tray build-plan CLI runs through a symlink or junction entrypoint", (t) => {
+  const isolationRoot = mkdtempSync(path.join(os.tmpdir(), "codex-router-wrapper-link-"));
+  const outside = mkdtempSync(path.join(os.tmpdir(), "codex-router-wrapper-link-cwd-"));
+  const aliasRoot = path.join(isolationRoot, "src-alias");
+  try {
+    try {
+      symlinkSync(path.join(root, "src"), aliasRoot, process.platform === "win32" ? "junction" : "dir");
+    } catch (error) {
+      t.skip(`symlink fixture unavailable: ${error.code || error.message}`);
+      return;
+    }
+    const isolatedSourceRoot = path.join(isolationRoot, "checkout");
+    mkdirSync(isolatedSourceRoot, { recursive: true });
+    const target = resolveServiceTarget({
+      mode: "acceptance",
+      isolationRoot,
+      sourceRoot: isolatedSourceRoot,
+      routerLabel: "io.github.codex-router.link-cli",
+      trayLabel: "io.github.codex-router.link-cli.tray",
+      ports: { oauth: 6911, router: 6912, api: 6913, grokOauth: 6918, devinCli: 6920 },
+    });
+    const contextPath = path.join(isolationRoot, "tray-context.json");
+    writeTrayFixtureContext(contextPath, target, {
+      tools: {
+        uname: path.join(isolationRoot, "mock-tools", "uname"),
+        swift: path.join(isolationRoot, "mock-tools", "swift"),
+        codesign: path.join(isolationRoot, "mock-tools", "codesign"),
+        plistBuddy: path.join(isolationRoot, "mock-tools", "PlistBuddy"),
+      },
+      buildOnly: true,
+      dryRun: true,
+    });
+    const result = spawnSync(
+      process.execPath,
+      [path.join(aliasRoot, "tray-build-plan.mjs"), "--fixture-field", contextPath, "appPath"],
+      { cwd: outside, encoding: "utf8", env: process.env },
+    );
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout.trim(), target.appPath);
+  } finally {
+    rmSync(outside, { recursive: true, force: true });
+    rmSync(isolationRoot, { recursive: true, force: true });
+  }
+});
+
 test("isolated tray replacement has no production kill or legacy cleanup path", () => {
   const source = readFileSync(path.join(root, "bin", "model-router-tray"), "utf8");
   assert.match(source, /context_mode=/);
