@@ -5,11 +5,13 @@
 ## 当前状态
 
 - Phase 4 已在默认分支 `main` 完成，最终 SPEC_COMPLIANCE 与 CODE_QUALITY 均为 `APPROVED`。
-- Phase 4 批准头：`5a1860a55dbee8a0130040a17acfec514aeea3a2`。
+- Phase 4 最终实现审查批准头：`5a1860a55dbee8a0130040a17acfec514aeea3a2`。
+- Phase 4 CI 验证代码头：`f476d20cc734a39dfabc0a94f03de5ab5b034fde`。
 - 开发始终在当前主工作区完成，没有创建或切换 Git worktree、没有切换功能分支。
 - 当前产品目标是 macOS 上的 Codex CLI/Desktop。公开 DSH/Gemini target、Python/LiteLLM gateway、Rust/Tauri/Electron/Control Center 交付均已移除。
 - Windows 本机没有执行真实 macOS build、package install、LaunchAgent、app launch、视觉验收或 live provider 请求。
-- GitHub CI：首次 Phase 4 推送后补充确切 run URL 与最终结果。
+- GitHub CI：[run 32716879162](https://github.com/Trendymen/codex-router-dev/actions/runs/32716879162) 全绿；Ubuntu、Windows、macOS 与 Homebrew formula 四个 job 均为 `success`。
+- Phase 5 尚未开始；本交接只记录 Phase 4 已验证状态。
 
 ## Phase 4 交付摘要
 
@@ -22,14 +24,26 @@
 - `0589abb` — 移除旧 Python/LiteLLM/Rust/Tauri/Electron runtime，迁移完整 Node direct pipeline。
 - `8daef0f` — Node-only macOS LaunchAgent、确定性 runtime package 与 Swift source fingerprint。
 - `5a1860a` — Phase 4 final integration fix：Codex config no-write、update ordering、Vision-only local、release/docs/package closure、可信平台 gate。
+- `2c4b552` — 首轮 CI 修复：Homebrew API、跨平台旧契约、macOS shared-path canonicalization。
+- `5b193c2` — Node 24 Windows natural process drain、Tray CLI canonical entrypoint、Node-only Homebrew repair fixture。
+- `232b4cb` — macOS runtime package executable mode 与精确三跳 failover usage 断言。
+- `f476d20` — macOS Tray sourceRoot canonical match、Vision purge successor churn 有界重试与高负载测试稳定性。
 
-最终 Windows 验证：
+最终本地验证：
 
 - `npm run check`：通过。
-- Phase 4 pre-push：66 pass / 1 macOS 条件 skip / 0 fail。
-- final platform/package/target：39 pass / 0 fail / 0 skip。
-- fresh 默认 `npm test`：2362 total / 2327 pass / 35 existing skips / 0 fail。
+- Node 24.19.0 fresh 默认全量：2363 total / 2331 pass / 32 conditional skips / 0 fail。
+- Vision suite：114 pass / 0 fail；same-ms 8-child purge 场景连续 10 次通过。
+- Phase 4 final：13 pass / 0 fail；target isolation：18 pass / 0 fail。
+- Windows Node 24 Devin 端口冲突负场景连续 10 次通过，不再出现 `UV_HANDLE_CLOSING`。
 - 测试均使用项目默认并发，没有传 `--test-concurrency`。
+
+GitHub CI 验证：
+
+- Ubuntu：check、默认全量、audit、removed-runtime audit、shell 与 installer help 全部通过。
+- Windows：Node 24 check、默认全量、audit、removed-runtime audit 与 PowerShell shim parse 全部通过。
+- macOS：Node 24 check、默认全量、audit、removed-runtime audit、Swift Tray、shell 与 installer help 全部通过。
+- Homebrew：Node-only formula audit 通过。
 
 ## Mac 开始前
 
@@ -47,6 +61,7 @@ npm test
 ```
 
 Node 必须为 22.19.0 或更高版本。开始任何 acceptance 前先确认工作树 clean，并重新读取全局与仓库 `AGENTS.md`。
+GitHub CI 当前使用 Node 24；macOS 续接建议也使用 Node 24，以复现相同 runtime/test 条件。
 
 ## Phase 5 入口与范围
 
