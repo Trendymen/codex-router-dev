@@ -4,6 +4,7 @@ param(
   [switch]$CheckoutInstall,
   [switch]$ForceDeps,
   [switch]$PrepareOnly,
+  [switch]$DeferCatalogPublication,
   [switch]$MigrateKnown,
   [string]$Target,
   [string]$Providers,

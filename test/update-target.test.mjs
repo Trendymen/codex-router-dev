@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { readFileSync } from "node:fs";
 
 import {
   checkForUpdate,
@@ -27,11 +28,25 @@ test("checkout updates preserve the codex target on every platform", () => {
   const posixCodex = currentCheckoutInstaller("darwin", "codex");
   assert.match(posixCodex.command, /bin[\\/]install$/);
   assert.deepEqual(posixCodex.args, []);
+
+  const deferredPosix = currentCheckoutInstaller("darwin", "codex", { deferCatalogPublication: true });
+  assert.deepEqual(deferredPosix.args, ["--defer-catalog-publication"]);
+  const deferredWindows = currentCheckoutInstaller("win32", "codex", { deferCatalogPublication: true });
+  assert.ok(deferredWindows.args.includes("-DeferCatalogPublication"));
 });
 
-test("a completed update invokes the non-live registry snapshot trigger", () => {
+test("deferred installers publish in the locked parent and startup consumes no LaunchAgent bypass", () => {
+  const installer = readFileSync(path.join(repoRoot, "bin", "install"), "utf8");
+  const startup = readFileSync(path.join(repoRoot, "src", "start.mjs"), "utf8");
+  const launchAgent = readFileSync(path.join(repoRoot, "src", "service-macos.mjs"), "utf8");
+  assert.match(installer, /defer_catalog_publication.*true[\s\S]*The locked update parent performs the in-process publication/);
+  assert.match(startup, /consumeStartupRebuildDefer\(\).*rebuildAfterStartup/s);
+  assert.doesNotMatch(launchAgent, /STARTUP_REBUILD_DEFER|startup-rebuild-defer/i);
+});
+
+test("a completed update invokes the non-live registry snapshot trigger", async () => {
   const calls = [];
-  rebuildNodeSnapshotsAfterUpdate({
+  await rebuildNodeSnapshotsAfterUpdate({
     run: (command, args, options) => {
       calls.push({ command, args, options });
       return { status: 0, stderr: "" };

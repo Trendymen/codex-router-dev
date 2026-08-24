@@ -13,6 +13,10 @@ const DEFAULT_RETRY_MS = 250;
 // heartbeat makes a live async transaction safe to wait on.
 const DEFAULT_STALE_MS = 10 * 60_000;
 const DEFAULT_HEARTBEAT_MS = 10_000;
+// This capability is deliberately module-private.  A caller that happens to
+// know a lock path must not be able to claim it holds the lock, and a context
+// from a completed transaction must not reopen a re-entrant path later.
+const HELD_CONTEXTS = new WeakMap();
 
 function positiveInteger(value, fallback, minimum = 1) {
   return Number.isFinite(value)
@@ -22,6 +26,13 @@ function positiveInteger(value, fallback, minimum = 1) {
 
 export function modelOverlayLockTarget(stateDir = STATE_DIR) {
   return path.join(stateDir, "model-overlay-transaction");
+}
+
+export function assertModelOverlayLockHeld(context, stateDir = STATE_DIR) {
+  if (!context || HELD_CONTEXTS.get(context) !== path.resolve(stateDir)) {
+    throw new Error("Model-overlay alreadyLocked context is absent, forged, or bound to another state directory.");
+  }
+  return context;
 }
 
 function lockWaitError(waitMs, cause) {
@@ -37,9 +48,9 @@ function lockWaitError(waitMs, cause) {
 
 /**
  * Serialize the complete model-overlay transaction across CLI, tray, desktop,
- * and detached worker processes. The catalog publisher has its own lock and
- * is entered by a fresh child while this lock is held; the two locks therefore
- * never nest in one process and read-only catalog/status calls remain unlocked.
+ * and detached worker processes.  Whenever both locks are required, this is
+ * the outer lock and catalog-publication is acquired inside it.  Reversing
+ * that order can deadlock a state mutation against a migration/uninstall.
  */
 export async function withModelOverlayLock(
   operation,
@@ -85,10 +96,12 @@ export async function withModelOverlayLock(
     throw error;
   }
 
+  const context = Object.freeze({});
+  HELD_CONTEXTS.set(context, path.resolve(stateDir));
   let result;
   let operationError;
   try {
-    result = await operation();
+    result = await operation(context);
   } catch (error) {
     operationError = error;
   }
@@ -99,6 +112,7 @@ export async function withModelOverlayLock(
   } catch (error) {
     releaseError = error;
   }
+  HELD_CONTEXTS.delete(context);
 
   if (operationError) {
     if (releaseError && typeof operationError === "object") {

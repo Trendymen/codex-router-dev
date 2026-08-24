@@ -11,9 +11,9 @@ import {
 import path from "node:path";
 
 import { buildRoutedCatalog, publishCatalogGeneration } from "./catalog-generation.mjs";
-import { withCatalogPublicationLock } from "./catalog-publication-lock.mjs";
+import { assertCatalogPublicationLockHeld, withCatalogPublicationLock } from "./catalog-publication-lock.mjs";
 import { protectPrivateFile } from "./file-security.mjs";
-import { withModelOverlayLock } from "./model-overlay-lock.mjs";
+import { assertModelOverlayLockHeld, withModelOverlayLock } from "./model-overlay-lock.mjs";
 import {
   MERGED_CATALOG_PATH,
   NATIVE_CATALOG_PATH,
@@ -198,14 +198,17 @@ export async function rebuildNodeSnapshots(reason, {
   buildFiles = buildNodeSnapshotFiles,
   publish = (files) => publishCatalogGeneration({ files }),
   catalogLock = withCatalogPublicationLock,
-  alreadyLocked = false,
+  catalogLockContext,
 } = {}) {
   const rebuild = async () => {
     const files = await buildFiles({ reason });
     const publication = await publish(files, { reason });
     return Object.freeze({ reason, files, publication });
   };
-  if (alreadyLocked) return rebuild();
+  if (catalogLockContext) {
+    assertCatalogPublicationLockHeld(catalogLockContext);
+    return rebuild();
+  }
   // One shared rebuild drains a concurrent burst, then performs at most one
   // follow-up pass for changes observed while its files were being built.
   const waiter = deferred();
@@ -265,9 +268,11 @@ export async function transactNodeStateMutation({
   rebuild = rebuildNodeSnapshots,
   buildFiles,
   publish,
+  modelOverlayLockContext,
+  catalogLockContext,
 } = {}) {
   if (typeof mutate !== "function") throw new Error("A Node state transaction requires mutate().");
-  const commit = async () => {
+  const commit = async (heldCatalogContext = catalogLockContext) => {
     const snapshots = await capture(files || []);
     try {
       await mutate();
@@ -275,7 +280,7 @@ export async function transactNodeStateMutation({
         buildFiles,
         publish,
         catalogLock,
-        alreadyLocked: true,
+        catalogLockContext: heldCatalogContext,
       });
     } catch (operationError) {
       try {
@@ -290,7 +295,24 @@ export async function transactNodeStateMutation({
       throw operationError;
     }
   };
-  // Do not invert this ordering. Existing overlay callers own the outer lock;
-  // callers that compose this helper can inject the already-held seam above.
-  return modelOverlayLock(() => catalogLock(commit));
+  // There is one legal order for the two locks: overlay then catalog.  A
+  // catalog-only context is not enough to enter this mutation, because taking
+  // overlay below it recreates the AB/BA cycle with migration/uninstall.
+  if (catalogLockContext && !modelOverlayLockContext) {
+    throw new Error("Node state transaction received a catalog context without its outer model-overlay context.");
+  }
+  if (modelOverlayLockContext) {
+    assertModelOverlayLockHeld(modelOverlayLockContext);
+    if (catalogLockContext) {
+      assertCatalogPublicationLockHeld(catalogLockContext);
+      return commit(catalogLockContext);
+    }
+    return catalogLock((heldCatalogContext) => commit(heldCatalogContext));
+  }
+  return modelOverlayLock((heldOverlayContext) => catalogLock(
+    (heldCatalogContext) => {
+      assertModelOverlayLockHeld(heldOverlayContext);
+      return commit(heldCatalogContext);
+    },
+  ));
 }

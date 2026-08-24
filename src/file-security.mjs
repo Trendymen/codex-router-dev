@@ -13,6 +13,14 @@ import path from "node:path";
 
 let windowsSid;
 
+// Windows keeps these protected-file owner ACEs after icacls removes
+// inheritance on hosted runners.  Use their numeric SIDs because localized
+// account names are not a stable security boundary.
+const WINDOWS_TRUSTED_PRIVATE_FILE_SIDS = new Set([
+  "S-1-5-18", // LocalSystem
+  "S-1-5-32-544", // BUILTIN\\Administrators
+]);
+
 function currentWindowsSid() {
   if (windowsSid) return windowsSid;
   const script =
@@ -36,17 +44,21 @@ export function windowsFullControlGrant(sid) {
 }
 
 /**
- * `protectPrivateFile` deliberately produces a closed ACL: one explicit,
- * non-inherited FullControl allow for the current SID.  Treat anything wider
- * as unsafe rather than attempting to infer whether a group is harmless.
+ * `protectPrivateFile` deliberately produces a closed ACL: explicit,
+ * non-inherited FullControl allows for the current SID and Windows' trusted
+ * system owner SIDs only. Treat anything wider as unsafe rather than trying
+ * to infer whether a group is harmless.
  */
 export function windowsAclIsPrivateForCurrentUser({ protected: rulesProtected, currentSid, rules } = {}) {
   if (rulesProtected !== true || !/^S-\d+(?:-\d+)+$/i.test(String(currentSid || "")) || !Array.isArray(rules) || rules.length === 0) return false;
-  return rules.every((rule) => rule
+  const trustedSids = new Set([currentSid, ...WINDOWS_TRUSTED_PRIVATE_FILE_SIDS]);
+  const trustedRule = (rule) => rule
     && rule.inherited !== true
     && rule.type === "Allow"
-    && rule.sid === currentSid
-    && String(rule.rights || "").split(",").map((right) => right.trim()).includes("FullControl"));
+    && trustedSids.has(rule.sid)
+    && String(rule.rights || "").split(",").map((right) => right.trim()).includes("FullControl");
+  return rules.some((rule) => trustedRule(rule) && rule.sid === currentSid)
+    && rules.every(trustedRule);
 }
 
 export function protectPrivateFile(target) {

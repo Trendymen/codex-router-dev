@@ -21,6 +21,8 @@ import {
   snapshotOwnedRuntime,
 } from "./owned-runtime-paths.mjs";
 import { migrateRuntime } from "./runtime-migration.mjs";
+import { withCatalogPublicationLock } from "./catalog-publication-lock.mjs";
+import { withModelOverlayLock } from "./model-overlay-lock.mjs";
 import { refuseUnsupportedPlatform } from "./platform-gate.mjs";
 import { shimReport } from "./codex-shim.mjs";
 
@@ -44,7 +46,12 @@ export async function uninstallRouterRuntimeTransaction({
   cleanupOld,
   restoreSnapshot,
   restartOldService,
+  catalogLock = withCatalogPublicationLock,
+  overlayLock = withModelOverlayLock,
 } = {}) {
+  if (snapshot !== undefined && typeof snapshot !== "function") {
+    throw new Error("Router runtime uninstall requires a deferred snapshot callback; pre-captured snapshot objects are rejected.");
+  }
   const resolvedTarget = target || snapshot?.target;
   const paths = resolvedTarget ? ownedRuntimePaths(resolvedTarget, runtimeRoots || snapshot?.options || {}) : undefined;
   if (!paths) throw new Error("Router runtime uninstall requires a validated ServiceTarget.");
@@ -55,8 +62,8 @@ export async function uninstallRouterRuntimeTransaction({
     }
   }
   const resolved = ids.map((id) => resolveOwnedArtifact(id, paths));
-  return migrateRuntime({
-    snapshot,
+  return overlayLock(async () => catalogLock(async () => migrateRuntime({
+    snapshot: snapshot ? await snapshot() : snapshotOwnedRuntime(paths),
     installReplacement,
     verifyReplacement,
     cleanupOld: cleanupOld || (async (runtimeSnapshot) => {
@@ -67,7 +74,7 @@ export async function uninstallRouterRuntimeTransaction({
     // The resolved list is passed to an injected cleanup operation for the
     // acceptance harness; production cleanup uses the same resolver again.
     ...(cleanupOld ? { cleanupOld: async (runtimeSnapshot) => cleanupOld(resolved, runtimeSnapshot) } : {}),
-  });
+  }), { stateDir: paths.target.stateRoot }), { stateDir: paths.target.stateRoot });
 }
 
 function runServiceMutation(action) {
@@ -84,7 +91,6 @@ async function uninstallRouterRuntimeFromCli() {
   const target = currentServiceTarget();
   const shim = target.mode === "production" ? shimReport() : undefined;
   const paths = ownedRuntimePaths(target, shim?.installed && shim.shim ? { shimPath: shim.shim } : {});
-  const snapshot = snapshotOwnedRuntime(paths);
   const clientTarget = process.argv[3] === "--client-target" ? process.argv[4] : undefined;
   if (!clientTarget || !["codex", "dsh", "gemini"].includes(clientTarget)) {
     throw new Error("Router runtime uninstall requires --client-target codex|dsh|gemini.");
@@ -92,7 +98,7 @@ async function uninstallRouterRuntimeFromCli() {
   let removesSharedRuntime = false;
   const result = await uninstallRouterRuntimeTransaction({
     target,
-    snapshot,
+    snapshot: undefined,
     installReplacement: async () => {
       const installed = spawnSync(
         process.execPath,

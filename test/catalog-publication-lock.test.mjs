@@ -14,9 +14,14 @@ import { spawn } from "node:child_process";
 import test from "node:test";
 
 import {
+  assertCatalogPublicationLockHeld,
   catalogPublicationLockTarget,
   withCatalogPublicationLock,
 } from "../src/catalog-publication-lock.mjs";
+import {
+  assertModelOverlayLockHeld,
+  withModelOverlayLock,
+} from "../src/model-overlay-lock.mjs";
 
 const root = path.resolve(".");
 const helperUrl = pathToFileURL(
@@ -171,6 +176,62 @@ test("catalog publication lock releases after failure without losing rollback sa
       }),
       "after failure",
     );
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("catalog publication lock issues an unforgeable, state-bound reentrant context", async () => {
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), "codex-router-catalog-context-"));
+  try {
+    assert.throws(() => assertCatalogPublicationLockHeld({}), /forged|alreadyLocked|context/i);
+    await withCatalogPublicationLock(async (context) => {
+      assert.equal(assertCatalogPublicationLockHeld(context, stateDir), context);
+      assert.throws(() => assertCatalogPublicationLockHeld(context, `${stateDir}-other`), /bound|state/i);
+    }, { stateDir, waitMs: 200, retryMs: 25 });
+    // The capability expires with the release; an operation cannot cache it
+    // and use it as an arbitrary future lock bypass.
+    let expired;
+    await withCatalogPublicationLock(async (context) => { expired = context; }, { stateDir, waitMs: 200, retryMs: 25 });
+    assert.throws(() => assertCatalogPublicationLockHeld(expired, stateDir), /forged|alreadyLocked|context/i);
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("model-overlay lock issues an unforgeable, state-bound capability that expires on release", async () => {
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), "codex-router-overlay-context-"));
+  try {
+    assert.throws(() => assertModelOverlayLockHeld({}), /forged|alreadyLocked|context/i);
+    let expired;
+    await withModelOverlayLock(async (context) => {
+      expired = context;
+      assert.equal(assertModelOverlayLockHeld(context, stateDir), context);
+      assert.throws(() => assertModelOverlayLockHeld(context, `${stateDir}-other`), /bound|state/i);
+    }, { stateDir, waitMs: 200, retryMs: 25 });
+    assert.throws(() => assertModelOverlayLockHeld(expired, stateDir), /forged|alreadyLocked|context/i);
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("overlay-to-catalog callers serialize without AB/BA deadlock and permit reentrant catalog work", async () => {
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), "codex-router-lock-order-"));
+  const events = [];
+  const transaction = (name) => withModelOverlayLock(
+    () => withCatalogPublicationLock(async (context) => {
+      events.push(`${name}:catalog`);
+      assert.equal(assertCatalogPublicationLockHeld(context, stateDir), context);
+      await delay(15);
+    }, { stateDir, waitMs: 1_000, retryMs: 5, staleMs: 2_000, heartbeatMs: 1_000 }),
+    { stateDir, waitMs: 1_000, retryMs: 5, staleMs: 2_000, heartbeatMs: 1_000 },
+  );
+  try {
+    await Promise.race([
+      Promise.all([transaction("mutation"), transaction("migration")]),
+      delay(2_000).then(() => { throw new Error("AB/BA lock-order timeout"); }),
+    ]);
+    assert.deepEqual(events.sort(), ["migration:catalog", "mutation:catalog"]);
   } finally {
     rmSync(stateDir, { recursive: true, force: true });
   }

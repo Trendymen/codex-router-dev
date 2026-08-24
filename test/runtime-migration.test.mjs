@@ -1,5 +1,14 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -9,8 +18,28 @@ import { ownedRuntimePaths, restoreOwnedRuntime, snapshotOwnedRuntime } from "..
 import { migrateRuntime } from "../src/runtime-migration.mjs";
 import { runRuntimeMigration, verifySwiftCommandContract } from "../src/update.mjs";
 import { buildCapabilityManifest } from "../src/capability-manifest.mjs";
+import { withCatalogPublicationLock } from "../src/catalog-publication-lock.mjs";
 
 const snapshot = Object.freeze({ version: 1, entries: Object.freeze({}) });
+const MANAGED_CATALOG_FILES = [
+  "merged-models.json", "routed-models.json", "node-routes.json",
+  "control-models.json", "swift-models.json", "browser-models.json",
+];
+
+function installManagedCatalogTopology(target, label) {
+  const generations = path.join(target.stateRoot, "catalog-generations");
+  const generation = `generation-${label}`;
+  const directory = path.join(generations, generation);
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  for (const name of MANAGED_CATALOG_FILES) {
+    writeFileSync(path.join(directory, name), `${name}:${label}\n`, { mode: 0o600 });
+    chmodSync(path.join(directory, name), 0o600);
+  }
+  symlinkSync(generation, path.join(generations, "current"), "dir");
+  for (const name of MANAGED_CATALOG_FILES) {
+    symlinkSync(`catalog-generations/current/${name}`, path.join(target.stateRoot, name), "file");
+  }
+}
 
 test("migration commits only after install and every replacement contract passes", async () => {
   const events = [];
@@ -156,6 +185,44 @@ test("rollback errors remain visible without replacing the primary failure", asy
   );
 });
 
+test("migration preserves its primary failure when managed catalog restore refuses a tampered topology", {
+  skip: process.platform === "win32" && "Windows CI must not assume symlink privilege",
+}, async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "codex-router-runtime-catalog-migration-"));
+  const target = resolveServiceTarget({
+    mode: "test",
+    platform: process.platform,
+    isolationRoot: root,
+    sourceRoot: path.join(root, "checkout"),
+    routerLabel: "com.example.codex-router-catalog-migration",
+    trayLabel: "com.example.codex-router-catalog-migration.tray",
+    ports: { oauth: 46421, router: 46422, api: 46423, grokOauth: 46428, devinCli: 46430 },
+  });
+  try {
+    mkdirSync(target.stateRoot, { recursive: true });
+    installManagedCatalogTopology(target, "migration");
+    const runtimeRoots = { userHome: root, codexHome: root, dshHome: path.join(root, "dsh"), geminiHome: path.join(root, "gemini") };
+    const saved = snapshotOwnedRuntime(ownedRuntimePaths(target, runtimeRoots));
+    const stable = path.join(target.stateRoot, "merged-models.json");
+    rmSync(stable, { force: true });
+    symlinkSync("catalog-generations/current/routed-models.json", stable, "file");
+    const primary = new Error("health failed");
+    await assert.rejects(migrateRuntime({
+      snapshot: saved,
+      verifyRouterHealth: async () => { throw primary; },
+      restoreSnapshot: async (value) => restoreOwnedRuntime(value),
+      restartOldService: async () => {},
+    }), (error) => {
+      assert.equal(error instanceof AggregateError, true);
+      assert.equal(error.errors[0], primary);
+      assert.match(String(error.errors[1]), /catalog|topology|link|target/i);
+      return true;
+    });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("Swift verifier runs the built-app probe and rejects a mismatched command manifest", () => {
   const root = mkdtempSync(path.join(os.tmpdir(), "codex-router-swift-probe-"));
   const target = resolveServiceTarget({
@@ -233,6 +300,93 @@ test("public runtime migration binds explicit runtime roots to its snapshot", as
       }),
       /different ServiceTarget|runtime roots|snapshot/i,
     );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("best-effort deferred completion and cleanup never replace migration success or its primary failure", async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "codex-router-runtime-defer-finally-"));
+  const target = resolveServiceTarget({
+    mode: "test", platform: process.platform, isolationRoot: root,
+    sourceRoot: path.join(root, "checkout"), routerLabel: "com.example.defer-finally",
+    trayLabel: "com.example.defer-finally.tray",
+    ports: { oauth: 46541, router: 46542, api: 46543, grokOauth: 46548, devinCli: 46550 },
+  });
+  const runtimeRoots = { userHome: root, codexHome: root, dshHome: path.join(root, "dsh"), geminiHome: path.join(root, "gemini") };
+  const replacement = { token: "a".repeat(32), transactionToken: "b".repeat(32) };
+  const rollback = { token: "c".repeat(32), transactionToken: "d".repeat(32) };
+  try {
+    const snapshot = snapshotOwnedRuntime(ownedRuntimePaths(target, runtimeRoots));
+    const cleaned = [];
+    const common = {
+      target, runtimeRoots, snapshot, preflight: async () => {}, verifyReplacement: async () => {},
+      publishReplacement: async () => {}, cleanupOld: async () => {}, restoreSnapshot: async () => {},
+      signalStartupRebuildCompletion: () => { throw new Error("signal unavailable"); },
+      cleanupStartupRebuildDefer: (handle) => { cleaned.push(handle); throw new Error("cleanup unavailable"); },
+    };
+    assert.deepEqual(await runRuntimeMigration({ ...common, installReplacement: async () => replacement, restartOldService: async () => rollback }), { ok: true, cleaned: true });
+    assert.deepEqual(cleaned, [replacement, undefined]);
+
+    cleaned.length = 0;
+    const primary = new Error("primary verify failure");
+    await assert.rejects(
+      runRuntimeMigration({ ...common, installReplacement: async () => replacement, verifyReplacement: async () => { throw primary; }, restartOldService: async () => rollback }),
+      (error) => error === primary,
+    );
+    assert.deepEqual(cleaned, [replacement, rollback]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("runtime migration holds the catalog publication lock through rollback before a later publisher may commit", async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "codex-router-runtime-publication-lock-"));
+  const target = resolveServiceTarget({
+    mode: "test",
+    platform: process.platform,
+    isolationRoot: root,
+    sourceRoot: path.join(root, "checkout"),
+    routerLabel: "com.example.codex-router-publication-lock",
+    trayLabel: "com.example.codex-router-publication-lock.tray",
+    ports: { oauth: 46521, router: 46522, api: 46523, grokOauth: 46528, devinCli: 46530 },
+  });
+  const runtimeRoots = { userHome: root, codexHome: root, dshHome: path.join(root, "dsh"), geminiHome: path.join(root, "gemini") };
+  let continueFailure;
+  const releaseFailure = new Promise((resolve) => { continueFailure = resolve; });
+  let snapshotTaken;
+  const snapshotReady = new Promise((resolve) => { snapshotTaken = resolve; });
+  const events = [];
+  try {
+    mkdirSync(target.stateRoot, { recursive: true });
+    const migration = runRuntimeMigration({
+      target,
+      runtimeRoots,
+      snapshot: () => {
+        events.push("snapshot");
+        snapshotTaken();
+        return snapshotOwnedRuntime(ownedRuntimePaths(target, runtimeRoots));
+      },
+      preflight: async () => {},
+      installReplacement: async () => { await releaseFailure; throw new Error("replacement failed"); },
+      verifyReplacement: async () => {},
+      publishReplacement: async () => {},
+      cleanupOld: async () => {},
+      restoreSnapshot: async () => events.push("restore"),
+      restartOldService: async () => events.push("restart"),
+    });
+    await snapshotReady;
+    let publisherEntered = false;
+    const publisher = withCatalogPublicationLock(async () => {
+      publisherEntered = true;
+      events.push("publisher");
+    }, { stateDir: target.stateRoot, waitMs: 2_000, retryMs: 10, staleMs: 2_000, heartbeatMs: 1_000 });
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    assert.equal(publisherEntered, false, "publisher entered while migration still owned the lock");
+    continueFailure();
+    await assert.rejects(migration, /replacement failed/);
+    await publisher;
+    assert.deepEqual(events, ["snapshot", "restore", "restart", "publisher"]);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

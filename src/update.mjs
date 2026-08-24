@@ -13,6 +13,13 @@ import {
   snapshotOwnedRuntime,
 } from "./owned-runtime-paths.mjs";
 import { migrateRuntime } from "./runtime-migration.mjs";
+import { withCatalogPublicationLock } from "./catalog-publication-lock.mjs";
+import { withModelOverlayLock } from "./model-overlay-lock.mjs";
+import {
+  armStartupRebuildDefer,
+  cleanupStartupRebuildDefer,
+  signalStartupRebuildCompletion,
+} from "./startup-rebuild-defer.mjs";
 import { waitForRouterHealth } from "./router-health.mjs";
 import { buildCapabilityManifest } from "./capability-manifest.mjs";
 import { desktopCommandDefinitions } from "./desktop-commands.mjs";
@@ -168,7 +175,7 @@ function requireReplaceableCheckout(force, target, gitImpl) {
 export function currentCheckoutInstaller(
   platform = process.platform,
   target = TARGET,
-  { posixScript = "install", sourceRoot = SOURCE_ROOT } = {},
+  { posixScript = "install", sourceRoot = SOURCE_ROOT, deferCatalogPublication = false } = {},
 ) {
   return platform === "win32"
     ? {
@@ -183,22 +190,32 @@ export function currentCheckoutInstaller(
           "-CheckoutInstall",
           "-Target",
           target,
+          ...(deferCatalogPublication ? ["-DeferCatalogPublication"] : []),
         ],
       }
-    : { command: path.join(sourceRoot, "bin", posixScript), args: [] };
+    : { command: path.join(sourceRoot, "bin", posixScript), args: deferCatalogPublication ? ["--defer-catalog-publication"] : [] };
 }
 
-function installCurrentCheckout(target = currentServiceTarget()) {
-  const installer = currentCheckoutInstaller(target.platform, TARGET, { sourceRoot: target.sourceRoot });
-  const result = spawnSync(installer.command, installer.args, {
-    cwd: target.sourceRoot,
-    stdio: "inherit",
-    env: { ...process.env, MODEL_ROUTER_TARGET: TARGET },
-  });
-  if (result.error) throw result.error;
-  if (result.status !== 0) {
-    throw new Error(`Installer exited with status ${result.status}.`);
+function installCurrentCheckout(target = currentServiceTarget(), { deferCatalogPublication = false } = {}) {
+  const startupMarker = deferCatalogPublication
+    ? armStartupRebuildDefer({ stateDir: target.stateRoot })
+    : undefined;
+  const installer = currentCheckoutInstaller(target.platform, TARGET, { sourceRoot: target.sourceRoot, deferCatalogPublication });
+  try {
+    const result = spawnSync(installer.command, installer.args, {
+      cwd: target.sourceRoot,
+      stdio: "inherit",
+      env: { ...process.env, MODEL_ROUTER_TARGET: TARGET },
+    });
+    if (result.error) throw result.error;
+    if (result.status !== 0) {
+      throw new Error(`Installer exited with status ${result.status}.`);
+    }
+  } catch (error) {
+    cleanupStartupRebuildDefer(startupMarker);
+    throw error;
   }
+  return startupMarker;
 }
 
 export async function verifyBrowserCapabilityContract(target, { fetchImpl = fetch, callerKey: suppliedCallerKey } = {}) {
@@ -317,16 +334,24 @@ async function verifyInstalledRuntime(target) {
   return true;
 }
 
-function restartOldRuntime(target) {
+function restartOldRuntime(target, { deferStartupRebuild = false } = {}) {
   if (target.platform !== "darwin") return true;
-  const result = spawnSync(
-    process.execPath,
-    [path.join(target.sourceRoot, "src", "service.mjs"), "restart"],
-    { cwd: target.sourceRoot, env: process.env, stdio: "inherit" },
-  );
-  if (result.error) throw result.error;
-  if (result.status !== 0) throw new Error(`Old Router service restart exited with ${result.status}.`);
-  return true;
+  const startupMarker = deferStartupRebuild
+    ? armStartupRebuildDefer({ stateDir: target.stateRoot })
+    : undefined;
+  try {
+    const result = spawnSync(
+      process.execPath,
+      [path.join(target.sourceRoot, "src", "service.mjs"), "restart"],
+      { cwd: target.sourceRoot, env: process.env, stdio: "inherit" },
+    );
+    if (result.error) throw result.error;
+    if (result.status !== 0) throw new Error(`Old Router service restart exited with ${result.status}.`);
+  } catch (error) {
+    cleanupStartupRebuildDefer(startupMarker);
+    throw error;
+  }
+  return startupMarker || true;
 }
 
 /**
@@ -343,26 +368,64 @@ export async function runRuntimeMigration(options = {}) {
     cleanupOld,
   } = options;
   requireNonProductionRuntimeCallbacks(target, options, "runtime migration", MIGRATION_RUNTIME_CALLBACKS);
-  const installReplacement = options.installReplacement || (() => installCurrentCheckout(target));
-  const verifyReplacement = options.verifyReplacement || (() => verifyInstalledRuntime(target));
-  const publishReplacement = options.publishReplacement || (() => rebuildNodeSnapshotsAfterUpdate({ target }));
-  const restoreSnapshot = options.restoreSnapshot || ((value) => restoreOwnedRuntime(value));
-  const restartOldService = options.restartOldService || (() => restartOldRuntime(target));
-  const paths = ownedRuntimePaths(target, runtimeRoots || snapshot?.options || {});
-  const runtimeSnapshot = snapshot || snapshotOwnedRuntime(paths);
-  if (snapshot && (snapshot.target !== target || JSON.stringify(snapshot.options) !== JSON.stringify(paths.options))) {
-    throw new Error("Runtime migration snapshot is bound to a different ServiceTarget or runtime roots.");
+  const catalogLock = options.catalogLock || withCatalogPublicationLock;
+  const overlayLock = options.overlayLock || withModelOverlayLock;
+  const signalCompletion = options.signalStartupRebuildCompletion || signalStartupRebuildCompletion;
+  const cleanupDefer = options.cleanupStartupRebuildDefer || cleanupStartupRebuildDefer;
+  let replacementMarker;
+  let rollbackMarker;
+  let committed = false;
+  try {
+    const result = await overlayLock(async (modelOverlayLockContext) => catalogLock(async (catalogLockContext) => {
+    const paths = ownedRuntimePaths(target, runtimeRoots || (typeof snapshot === "object" ? snapshot?.options : undefined) || {});
+    const runtimeSnapshot = typeof snapshot === "function"
+      ? await snapshot()
+      : snapshot || snapshotOwnedRuntime(paths);
+    if (runtimeSnapshot && (runtimeSnapshot.target !== target || JSON.stringify(runtimeSnapshot.options) !== JSON.stringify(paths.options))) {
+      throw new Error("Runtime migration snapshot is bound to a different ServiceTarget or runtime roots.");
+    }
+    const installReplacement = options.installReplacement || (() => installCurrentCheckout(target, { deferCatalogPublication: true }));
+    const verifyReplacement = options.verifyReplacement || (() => verifyInstalledRuntime(target));
+    const publishReplacement = options.publishReplacement || (() => rebuildNodeSnapshotsAfterUpdate({
+      target,
+      modelOverlayLockContext,
+      catalogLockContext,
+    }));
+    const restoreSnapshot = options.restoreSnapshot || ((value) => restoreOwnedRuntime(value));
+    const restartOldService = options.restartOldService || (() => restartOldRuntime(target, { deferStartupRebuild: true }));
+    return migrateRuntime({
+      snapshot: runtimeSnapshot,
+      preflight,
+      installReplacement: async (value) => {
+        const marker = await installReplacement(value);
+        if (marker?.token) replacementMarker = marker;
+      },
+      verifyReplacement,
+      publishReplacement: (value) => publishReplacement(value, {
+        modelOverlayLockContext,
+        catalogLockContext,
+      }),
+      cleanupOld: cleanupOld || ((value) => removeOwnedRuntime(paths, { ids: OLD_RUNTIME_ARTIFACTS, snapshot: value })),
+      restoreSnapshot,
+      restartOldService: async (value) => {
+        const marker = await restartOldService(value);
+        if (marker?.token) rollbackMarker = marker;
+      },
+    });
+    }, { stateDir: target.stateRoot }), { stateDir: target.stateRoot });
+    committed = true;
+    return result;
+  } finally {
+    // Completion is deliberately outside both locks. A service that has
+    // already passed health can now self-heal through its ordinary startup
+    // rebuild without ever waiting on its updater parent.
+    const completedMarker = committed ? replacementMarker : rollbackMarker;
+    // The child also self-heals on exact parent death, so completion signalling
+    // is best-effort and must never mask an update success or primary failure.
+    try { if (completedMarker) signalCompletion(completedMarker); } catch {}
+    try { cleanupDefer(replacementMarker); } catch {}
+    try { cleanupDefer(rollbackMarker); } catch {}
   }
-  return migrateRuntime({
-    snapshot: runtimeSnapshot,
-    preflight,
-    installReplacement,
-    verifyReplacement,
-    publishReplacement,
-    cleanupOld: cleanupOld || ((runtimeSnapshot) => removeOwnedRuntime(paths, { ids: OLD_RUNTIME_ARTIFACTS, snapshot: runtimeSnapshot })),
-    restoreSnapshot,
-    restartOldService,
-  });
 }
 
 function registeredTrayBundlePath(label) {
@@ -440,9 +503,17 @@ function switchRevision(revision, gitImpl = git) {
   gitImpl(["reset", "--hard", revision], { inherit: true });
 }
 
-function restoreRevision(revision, { gitImpl = git, reinstall = false, target = currentServiceTarget() } = {}) {
+function restoreRevision(
+  revision,
+  {
+    gitImpl = git,
+    reinstall = false,
+    deferCatalogPublication = false,
+    target = currentServiceTarget(),
+  } = {},
+) {
   switchRevision(revision, gitImpl);
-  if (reinstall) installCurrentCheckout(target);
+  if (reinstall) return installCurrentCheckout(target, { deferCatalogPublication });
 }
 
 export async function restoreRuntimeAndRevision(
@@ -499,7 +570,24 @@ export function installationNeedsRefresh(manifest, revision) {
 }
 
 /** Complete update publication after the installer has rebuilt the base catalog. */
-export function rebuildNodeSnapshotsAfterUpdate({ run = spawnSync, target = currentServiceTarget() } = {}) {
+export async function rebuildNodeSnapshotsAfterUpdate({
+  run = spawnSync,
+  target = currentServiceTarget(),
+  modelOverlayLockContext,
+  catalogLockContext,
+} = {}) {
+  if (catalogLockContext) {
+    const [{ rebuildAfterRegistryUpdate }, { nodeRegistryModels }] = await Promise.all([
+      import("./node-snapshot-triggers.mjs"),
+      import("./model-contract.mjs"),
+    ]);
+    await rebuildAfterRegistryUpdate({
+      models: nodeRegistryModels(),
+      modelOverlayLockContext,
+      catalogLockContext,
+    });
+    return true;
+  }
   const result = run(
     process.execPath,
     [path.join(target.sourceRoot, "src", "node-snapshot-triggers.mjs"), "registry-update"],
@@ -531,13 +619,12 @@ export async function updateCheckout({
     if (!installationNeedsRefresh(readInstallManifestSnapshot(target), status.current)) {
       return { ...status, updated: false, reinstalled: false };
     }
-    const runtimeSnapshot = await captureRuntimeSnapshot(target, runtime);
     await runRuntimeMigration({
       ...runtime,
       target,
-      snapshot: runtimeSnapshot,
+      snapshot: () => captureRuntimeSnapshot(target, runtime),
       preflight: runtime.preflight,
-      installReplacement: runtime.installReplacement || (() => installCurrentCheckout(target)),
+      installReplacement: runtime.installReplacement || (() => installCurrentCheckout(target, { deferCatalogPublication: true })),
       restartOldService: runtime.restartOldService,
       restoreSnapshot: runtime.restoreSnapshot,
     });
@@ -546,7 +633,6 @@ export async function updateCheckout({
   }
   // Capture all owned runtime bytes before any checkout mutation. In
   // particular, a snapshot failure must not leave a merged revision behind.
-  const runtimeSnapshot = await captureRuntimeSnapshot(target, runtime);
   let branch;
   const preflight = async (snapshotValue) => {
     await runtime.preflight?.(snapshotValue);
@@ -562,12 +648,12 @@ export async function updateCheckout({
     // this step is reached.
     scopedGit(["update-ref", "refs/codex-router/rollback", status.current]);
     scopedGit(["merge", "--ff-only", status.available], { inherit: true });
-    installCurrentCheckout(target);
+    return installCurrentCheckout(target, { deferCatalogPublication: true });
   });
   await runRuntimeMigration({
     ...runtime,
     target,
-    snapshot: runtimeSnapshot,
+    snapshot: () => captureRuntimeSnapshot(target, runtime),
     preflight,
     installReplacement,
     restoreSnapshot: runtime.restoreSnapshot || ((snapshotValue) => restoreRuntimeAndRevision(
@@ -599,7 +685,7 @@ export async function rollbackCheckout({ force = false, runtime = {}, gitImpl, t
   }
   if (rollbackTarget === current) throw new Error("The rollback revision is already installed.");
   const runtimeSnapshot = Object.keys(runtime).length
-    ? await captureRuntimeSnapshot(target, runtime)
+    ? () => captureRuntimeSnapshot(target, runtime)
     : undefined;
   const preflight = async (snapshotValue) => {
     await runtime.preflight?.(snapshotValue);
@@ -617,7 +703,12 @@ export async function rollbackCheckout({ force = false, runtime = {}, gitImpl, t
       preflight,
       installReplacement: runtime.installReplacement || (() => {
         scopedGit(["update-ref", "refs/codex-router/rollback", current]);
-        restoreRevision(rollbackTarget, { gitImpl: scopedGit, reinstall: true, target });
+        return restoreRevision(rollbackTarget, {
+          gitImpl: scopedGit,
+          reinstall: true,
+          deferCatalogPublication: true,
+          target,
+        });
       }),
       restoreSnapshot: runtime.restoreSnapshot || ((snapshotValue) => restoreRuntimeAndRevision(
         snapshotValue,

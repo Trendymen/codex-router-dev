@@ -11,6 +11,7 @@ prepare_only=false
 migrate_known=false
 adopt_native_catalog=false
 force_deps=false
+defer_catalog_publication=false
 target=${MODEL_ROUTER_TARGET:-codex}
 
 # Installing is the sanctioned way for a checkout to take over a state
@@ -30,7 +31,8 @@ for argument in "$@"; do
     --migrate-known) migrate_known=true ;;
     --adopt-native-catalog) adopt_native_catalog=true ;;
     --force-deps) force_deps=true ;;
-    *) echo "Usage: $0 [--prepare-only] [--migrate-known] [--adopt-native-catalog] [--force-deps]" >&2; exit 2 ;;
+    --defer-catalog-publication) defer_catalog_publication=true ;;
+    *) echo "Usage: $0 [--prepare-only] [--migrate-known] [--adopt-native-catalog] [--force-deps] [--defer-catalog-publication]" >&2; exit 2 ;;
   esac
 done
 
@@ -140,7 +142,9 @@ fi
 # Codex to ask, so the catalog is built only when Codex is the target or an
 # earlier Codex install already left one behind.
 state_dir=${MODEL_ROUTER_STATE_DIR:-${CODEX_ROUTER_STATE_DIR:-${KIMI_CODEX_STATE_DIR:-${CODEX_HOME:-$HOME/.codex}/codex-router}}}
-if [ -s "$state_dir/native-models.json" ]; then
+if [ "$defer_catalog_publication" = true ]; then
+  : # The locked update parent performs the in-process publication after install.
+elif [ -s "$state_dir/native-models.json" ]; then
   node src/catalog.mjs
 else
   node src/catalog.mjs --refresh-native --bundled-native

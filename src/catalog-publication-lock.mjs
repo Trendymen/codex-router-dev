@@ -13,6 +13,7 @@ const DEFAULT_RETRY_MS = 250;
 // seconds whenever the process can run timers.
 const DEFAULT_STALE_MS = 10 * 60_000;
 const DEFAULT_HEARTBEAT_MS = 10_000;
+const HELD_CONTEXTS = new WeakMap();
 
 function positiveInteger(value, fallback, minimum = 1) {
   return Number.isFinite(value)
@@ -22,6 +23,13 @@ function positiveInteger(value, fallback, minimum = 1) {
 
 export function catalogPublicationLockTarget(stateDir = STATE_DIR) {
   return path.join(stateDir, "catalog-publication");
+}
+
+export function assertCatalogPublicationLockHeld(context, stateDir = STATE_DIR) {
+  if (!context || HELD_CONTEXTS.get(context) !== path.resolve(stateDir)) {
+    throw new Error("Catalog publication alreadyLocked context is absent, forged, or bound to another state directory.");
+  }
+  return context;
 }
 
 function lockWaitError(waitMs, cause) {
@@ -89,10 +97,12 @@ export async function withCatalogPublicationLock(
     throw error;
   }
 
+  const context = Object.freeze({});
+  HELD_CONTEXTS.set(context, path.resolve(stateDir));
   let result;
   let operationError;
   try {
-    result = await operation();
+    result = await operation(context);
   } catch (error) {
     operationError = error;
   }
@@ -103,6 +113,7 @@ export async function withCatalogPublicationLock(
   } catch (error) {
     releaseError = error;
   }
+  HELD_CONTEXTS.delete(context);
 
   // A release failure must not replace an operation error: catalog.mjs marks
   // safely rolled-back publication errors with catalogRollbackSafe, and the

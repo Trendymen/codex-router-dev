@@ -5,10 +5,13 @@ import {
   existsSync,
   fchmodSync,
   fsyncSync,
+  linkSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   openSync,
   readFileSync,
+  readlinkSync,
   readdirSync,
   renameSync,
   rmSync,
@@ -30,6 +33,31 @@ import {
   snapshotOwnedRuntime,
 } from "../src/owned-runtime-paths.mjs";
 import upgradePlatformOracle from "./acceptance/oracles/upgrade-platform.json" with { type: "json" };
+
+const MANAGED_CATALOG_FILES = [
+  "merged-models.json",
+  "routed-models.json",
+  "node-routes.json",
+  "control-models.json",
+  "swift-models.json",
+  "browser-models.json",
+];
+
+function installManagedCatalogTopology(target, label = "snapshot") {
+  const generations = path.join(target.stateRoot, "catalog-generations");
+  const generation = `generation-${label}`;
+  const generationDir = path.join(generations, generation);
+  mkdirSync(generationDir, { recursive: true, mode: 0o700 });
+  for (const name of MANAGED_CATALOG_FILES) {
+    writeFileSync(path.join(generationDir, name), `${name}:${label}\n`, { mode: 0o600 });
+    chmodSync(path.join(generationDir, name), 0o600);
+  }
+  symlinkSync(generation, path.join(generations, "current"), "dir");
+  for (const name of MANAGED_CATALOG_FILES) {
+    symlinkSync(`catalog-generations/current/${name}`, path.join(target.stateRoot, name), "file");
+  }
+  return { generation, generationDir };
+}
 
 function fixture() {
   const root = mkdtempSync(path.join(os.tmpdir(), "codex-router-runtime-preserve-"));
@@ -92,6 +120,453 @@ test("runtime snapshots preserve exact bytes, existence, and mode before replace
     assert.equal(statSync(target.routerPlistPath).mode & 0o7777, snapshot.entries["router-plist"].mode);
     assert.equal(existsSync(target.trayPlistPath), false);
     assert.deepEqual(readFileSync(path.join(target.stateRoot, "caller-secret")), Buffer.from("caller-secret-that-must-survive\n"));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("managed catalog topology snapshots the authoritative generation instead of rejecting its six stable links", {
+  skip: process.platform === "win32" && "Windows CI must not assume symlink privilege",
+}, () => {
+  const { root, target, runtimeRoots } = fixture();
+  try {
+    const topology = installManagedCatalogTopology(target);
+    const paths = ownedRuntimePaths(target, runtimeRoots);
+    const snapshot = snapshotOwnedRuntime(paths);
+    assert.equal(snapshot.catalogTopology.generation, topology.generation);
+    assert.equal(snapshot.entries["state-catalog"].type, "catalog-topology-link");
+    assert.deepEqual(snapshot.catalogTopology.files["merged-models.json"].bytes, Buffer.from("merged-models.json:snapshot\n"));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("managed catalog topology recreates a private generation when the snapshotted authority was deleted", {
+  skip: process.platform === "win32" && "Windows CI must not assume symlink privilege",
+}, () => {
+  const { root, target, runtimeRoots } = fixture();
+  try {
+    const topology = installManagedCatalogTopology(target, "deleted");
+    const snapshot = snapshotOwnedRuntime(ownedRuntimePaths(target, runtimeRoots));
+    rmSync(topology.generationDir, { recursive: true, force: true });
+
+    restoreOwnedRuntime(snapshot);
+
+    const current = readlinkSync(path.join(target.stateRoot, "catalog-generations", "current"));
+    assert.match(current, /^restore-/);
+    for (const name of MANAGED_CATALOG_FILES) {
+      const restored = path.join(target.stateRoot, "catalog-generations", current, name);
+      assert.deepEqual(readFileSync(restored), Buffer.from(`${name}:deleted\n`));
+      assert.equal(statSync(restored).mode & 0o777, 0o600);
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("managed catalog topology does not reuse a generation whose captured bytes no longer match", {
+  skip: process.platform === "win32" && "Windows CI must not assume symlink privilege",
+}, () => {
+  const { root, target, runtimeRoots } = fixture();
+  try {
+    const topology = installManagedCatalogTopology(target, "changed");
+    const snapshot = snapshotOwnedRuntime(ownedRuntimePaths(target, runtimeRoots));
+    writeFileSync(path.join(topology.generationDir, "merged-models.json"), "mutated\n", { mode: 0o600 });
+    chmodSync(path.join(topology.generationDir, "merged-models.json"), 0o600);
+
+    restoreOwnedRuntime(snapshot);
+
+    const current = readlinkSync(path.join(target.stateRoot, "catalog-generations", "current"));
+    assert.match(current, /^restore-/);
+    assert.notEqual(current, topology.generation);
+    assert.deepEqual(readFileSync(path.join(target.stateRoot, "catalog-generations", current, "merged-models.json")), Buffer.from("merged-models.json:changed\n"));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("managed catalog topology rejects dangling, redirected, and hard-linked catalog authorities", {
+  skip: process.platform === "win32" && "Windows CI must not assume symlink privilege",
+}, () => {
+  const cases = ["dangling-stable", "redirected-stable", "hard-linked-generation"];
+  for (const label of cases) {
+    const { root, target, runtimeRoots } = fixture();
+    try {
+      const topology = installManagedCatalogTopology(target, label);
+      if (label === "dangling-stable") {
+        rmSync(path.join(target.stateRoot, "catalog-generations", "current"), { force: true });
+      } else if (label === "redirected-stable") {
+        const stable = path.join(target.stateRoot, "merged-models.json");
+        rmSync(stable, { force: true });
+        symlinkSync("catalog-generations/current/routed-models.json", stable, "file");
+      } else {
+        const artifact = path.join(topology.generationDir, "merged-models.json");
+        const alias = path.join(root, "foreign-alias.json");
+        writeFileSync(alias, "foreign\n", { mode: 0o600 });
+        rmSync(artifact, { force: true });
+        linkSync(alias, artifact);
+      }
+      assert.throws(
+        () => snapshotOwnedRuntime(ownedRuntimePaths(target, runtimeRoots)),
+        /catalog|topology|link|generation|private|hard/i,
+        label,
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("managed catalog topology restore fails closed when a stable link was replaced", {
+  skip: process.platform === "win32" && "Windows CI must not assume symlink privilege",
+}, () => {
+  const { root, target, runtimeRoots } = fixture();
+  try {
+    installManagedCatalogTopology(target, "restore-tamper");
+    const snapshot = snapshotOwnedRuntime(ownedRuntimePaths(target, runtimeRoots));
+    const stable = path.join(target.stateRoot, "merged-models.json");
+    rmSync(stable, { force: true });
+    symlinkSync("catalog-generations/current/routed-models.json", stable, "file");
+    assert.throws(() => restoreOwnedRuntime(snapshot), /catalog|topology|link|target/i);
+    assert.equal(readlinkSync(stable), "catalog-generations/current/routed-models.json");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a forged catalog topology snapshot cannot mutate a different state root", {
+  skip: process.platform === "win32" && "Windows CI must not assume symlink privilege",
+}, () => {
+  const { root, target, runtimeRoots } = fixture();
+  const externalRoot = mkdtempSync(path.join(os.tmpdir(), "codex-router-runtime-external-catalog-"));
+  try {
+    installManagedCatalogTopology(target, "bound");
+    const snapshot = snapshotOwnedRuntime(ownedRuntimePaths(target, runtimeRoots));
+    installManagedCatalogTopology({ stateRoot: externalRoot }, "external");
+    const externalCurrent = path.join(externalRoot, "catalog-generations", "current");
+    const before = readlinkSync(externalCurrent);
+    const forged = {
+      ...snapshot,
+      catalogTopology: {
+        ...snapshot.catalogTopology,
+        stateRoot: externalRoot,
+        generationsDir: path.join(externalRoot, "catalog-generations"),
+      },
+    };
+    assert.throws(() => restoreOwnedRuntime(forged), /snapshot|state root|topology|resolver|bound/i);
+    assert.equal(readlinkSync(externalCurrent), before);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    rmSync(externalRoot, { recursive: true, force: true });
+  }
+});
+
+test("catalog topology snapshot requires BigInt identities before any restore write", {
+  skip: process.platform === "win32" && "Windows CI must not assume symlink privilege",
+}, () => {
+  const { root, target, runtimeRoots } = fixture();
+  try {
+    const topology = installManagedCatalogTopology(target, "identity-schema");
+    const snapshot = snapshotOwnedRuntime(ownedRuntimePaths(target, runtimeRoots));
+    const forged = {
+      ...snapshot,
+      catalogTopology: {
+        ...snapshot.catalogTopology,
+        identities: {
+          ...snapshot.catalogTopology.identities,
+          stateIdentity: { dev: Number(snapshot.catalogTopology.identities.stateIdentity.dev), ino: 1 },
+        },
+      },
+    };
+    assert.throws(() => restoreOwnedRuntime(forged), /BigInt|identity|topology/i);
+    assert.equal(readlinkSync(path.join(target.stateRoot, "catalog-generations", "current")), topology.generation);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("catalog snapshot detects post-capture byte mutation before it can switch current", {
+  skip: process.platform === "win32" && "Windows CI must not assume symlink privilege",
+}, () => {
+  const { root, target, runtimeRoots } = fixture();
+  try {
+    const topology = installManagedCatalogTopology(target, "digest");
+    const snapshot = snapshotOwnedRuntime(ownedRuntimePaths(target, runtimeRoots));
+    snapshot.catalogTopology.files["merged-models.json"].bytes[0] ^= 1;
+    const current = path.join(target.stateRoot, "catalog-generations", "current");
+    assert.throws(() => restoreOwnedRuntime(snapshot), /snapshot|artifact|digest|topology/i);
+    assert.equal(readlinkSync(current), topology.generation);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("catalog topology requires exactly six generation files and rejects any topology authority mixed with legacy files", {
+  skip: process.platform === "win32" && "Windows CI must not assume symlink privilege",
+}, () => {
+  const cases = ["extra-generation-file", "mixed-legacy-authority"];
+  for (const label of cases) {
+    const { root, target, runtimeRoots } = fixture();
+    try {
+      if (label === "extra-generation-file") {
+        const topology = installManagedCatalogTopology(target, label);
+        writeFileSync(path.join(topology.generationDir, "foreign.json"), "{}\n", { mode: 0o600 });
+      } else {
+        mkdirSync(path.join(target.stateRoot, "catalog-generations"), { recursive: true });
+        writeFileSync(path.join(target.stateRoot, "merged-models.json"), "legacy\n", { mode: 0o600 });
+      }
+      assert.throws(() => snapshotOwnedRuntime(ownedRuntimePaths(target, runtimeRoots)), /catalog|topology|generation|mixed|exact/i, label);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("an originally missing runtime artifact cannot be replaced by a dangling link during restore", {
+  skip: process.platform === "win32" && "Windows CI must not assume symlink privilege",
+}, () => {
+  const { root, target, paths } = fixture();
+  try {
+    const snapshot = snapshotOwnedRuntime({ ...paths, ids: ["state-dsh-catalog"] });
+    const missing = path.join(target.stateRoot, "dsh-models.json");
+    symlinkSync("gone.json", missing, "file");
+    assert.throws(() => restoreOwnedRuntime(snapshot), /symlink|junction|link|missing/i);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("catalog topology applies Windows ACL privacy through an injectable filesystem without requiring mode 0600", {
+  skip: process.platform === "win32" && "Windows CI test uses the production ACL seam on the host filesystem",
+}, () => {
+  const { root, target, runtimeRoots } = fixture();
+  try {
+    const topology = installManagedCatalogTopology(target, "windows-acl");
+    for (const name of MANAGED_CATALOG_FILES) chmodSync(path.join(topology.generationDir, name), 0o640);
+    const snapshot = snapshotOwnedRuntime(ownedRuntimePaths(target, runtimeRoots), {
+      fs: {
+        platform: "win32",
+        verifyProtected: () => true,
+        readlink(targetPath) {
+          if (targetPath === path.join(target.stateRoot, "catalog-generations", "current")) return "generation-windows-acl";
+          const name = path.basename(targetPath);
+          if (MANAGED_CATALOG_FILES.includes(name)) return `catalog-generations\\current\\${name}`;
+          return readlinkSync(targetPath);
+        },
+      },
+    });
+    assert.equal(snapshot.catalogTopology.files["merged-models.json"].mode, 0o640);
+    assert.throws(() => snapshotOwnedRuntime(ownedRuntimePaths(target, runtimeRoots), {
+      fs: { platform: "win32", verifyProtected: () => false },
+    }), /ACL|private|catalog/i);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Windows adapter restores a missing generation through normalized links, ACL privacy, and privilege failure cleanup", () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "codex-router-runtime-win-catalog-"));
+  const target = resolveServiceTarget({
+    mode: "test",
+    platform: "win32",
+    isolationRoot: root,
+    sourceRoot: path.join(root, "checkout"),
+    routerLabel: "com.example.codex-router-win-catalog",
+    trayLabel: "com.example.codex-router-win-catalog.tray",
+    ports: { oauth: 46601, router: 46602, api: 46603, grokOauth: 46608, devinCli: 46610 },
+  });
+  const runtimeRoots = { userHome: root, codexHome: root, dshHome: path.join(root, "dsh"), geminiHome: path.join(root, "gemini") };
+  let protectedCalls = 0;
+  let verifiedCalls = 0;
+  const adapter = {
+    platform: "win32",
+    protect: () => { protectedCalls += 1; },
+    verifyProtected: () => { verifiedCalls += 1; return true; },
+    readlink(targetPath) {
+      if (targetPath === path.join(target.stateRoot, "catalog-generations", "current")) return readlinkSync(targetPath);
+      const name = path.basename(targetPath);
+      if (MANAGED_CATALOG_FILES.includes(name)) return `catalog-generations\\current\\${name}`;
+      return readlinkSync(targetPath);
+    },
+  };
+  try {
+    mkdirSync(target.stateRoot, { recursive: true });
+    const topology = installManagedCatalogTopology(target, "win");
+    for (const name of MANAGED_CATALOG_FILES) chmodSync(path.join(topology.generationDir, name), 0o640);
+    const snapshot = snapshotOwnedRuntime(ownedRuntimePaths(target, runtimeRoots), { fs: adapter });
+    rmSync(topology.generationDir, { recursive: true, force: true });
+    const generations = path.join(target.stateRoot, "catalog-generations");
+    assert.throws(() => restoreOwnedRuntime(snapshot, {
+      fs: { ...adapter, symlink: () => { throw new Error("Windows symlink privilege denied"); } },
+    }), /privilege|symlink|restore/i);
+    assert.equal(readdirSync(generations).some((name) => name.startsWith("restore-")), false);
+    let renameAttempts = 0;
+    restoreOwnedRuntime(snapshot, { fs: {
+      ...adapter,
+      rename(source, destination) {
+        renameAttempts += 1;
+        if (renameAttempts === 1) {
+          const error = new Error("transient sharing violation");
+          error.code = "EPERM";
+          throw error;
+        }
+        return renameSync(source, destination);
+      },
+    } });
+    assert.match(readlinkSync(path.join(generations, "current")), /^restore-/);
+    assert.equal(renameAttempts, 2);
+    assert.ok(protectedCalls >= MANAGED_CATALOG_FILES.length);
+    assert.ok(verifiedCalls >= MANAGED_CATALOG_FILES.length);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("catalog pointer restore removes staged generations and rolls back its pointer after every injected commit fault", {
+  skip: process.platform === "win32" && "Windows CI must not assume symlink privilege",
+}, () => {
+  for (const fault of ["symlink", "rename", "fsync", "validate"]) {
+    const { root, target, runtimeRoots } = fixture();
+    try {
+      const topology = installManagedCatalogTopology(target, `atomic-${fault}`);
+      const snapshot = snapshotOwnedRuntime(ownedRuntimePaths(target, runtimeRoots));
+      writeFileSync(path.join(topology.generationDir, "merged-models.json"), "mutated\n", { mode: 0o600 });
+      chmodSync(path.join(topology.generationDir, "merged-models.json"), 0o600);
+      const generations = path.join(target.stateRoot, "catalog-generations");
+      let generationFsyncs = 0;
+      let readlinks = 0;
+      let renameCalls = 0;
+      const descriptors = new Map();
+      assert.throws(() => restoreOwnedRuntime(snapshot, {
+        fs: {
+          ...(fault === "rename" ? { platform: "win32" } : {}),
+          symlink(source, destination, type) {
+            if (fault === "symlink" && path.basename(destination).includes("catalog-current-restore")) throw new Error("injected pointer symlink");
+            return symlinkSync(source, destination, type);
+          },
+          rename(source, destination) {
+            if (fault === "rename" && destination === path.join(generations, "current")) {
+              renameCalls += 1;
+              const error = new Error("injected persistent sharing violation");
+              error.code = "EBUSY";
+              throw error;
+            }
+            return renameSync(source, destination);
+          },
+          open(file, flags, mode) {
+            const descriptor = mode === undefined ? openSync(file, flags) : openSync(file, flags, mode);
+            descriptors.set(descriptor, file);
+            return descriptor;
+          },
+          fsync(descriptor) {
+            if (descriptors.get(descriptor) === generations) {
+              generationFsyncs += 1;
+              if (fault === "fsync" && generationFsyncs === 2) throw new Error("injected postcommit fsync");
+            }
+            return fsyncSync(descriptor);
+          },
+          close(descriptor) {
+            descriptors.delete(descriptor);
+            return closeSync(descriptor);
+          },
+          readlink(targetPath) {
+            readlinks += 1;
+            if (fault === "validate" && readlinks > 7) throw new Error("injected postcommit validation");
+            return readlinkSync(targetPath);
+          },
+        },
+      }), /injected|catalog|restore/i, fault);
+      assert.equal(readlinkSync(path.join(generations, "current")), topology.generation, fault);
+      assert.equal(readdirSync(generations).some((name) => name.startsWith("restore-")), false, fault);
+      if (fault === "rename") assert.equal(renameCalls, 2, "Windows retry bound");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("catalog restore aborts before writes when an ancestor identity is swapped to an external directory or link", {
+  skip: process.platform === "win32" && "Windows CI must not assume symlink privilege",
+}, () => {
+  for (const kind of ["directory", "link"]) {
+    const { root, target, runtimeRoots } = fixture();
+    const external = mkdtempSync(path.join(os.tmpdir(), "codex-router-runtime-ancestor-external-"));
+    try {
+    const topology = installManagedCatalogTopology(target, "ancestor-swap");
+    const snapshot = snapshotOwnedRuntime(ownedRuntimePaths(target, runtimeRoots));
+    writeFileSync(path.join(topology.generationDir, "merged-models.json"), "mutated\n", { mode: 0o600 });
+    const marker = path.join(external, "must-not-change");
+    writeFileSync(marker, "external\n", { mode: 0o600 });
+    const swap = kind === "link" ? path.join(root, "swapped-state-root") : external;
+    if (kind === "link") symlinkSync(external, swap, "dir");
+    let stateRootReads = 0;
+    assert.throws(() => restoreOwnedRuntime(snapshot, {
+      fs: {
+        lstat(targetPath, options) {
+          if (targetPath === target.stateRoot && ++stateRootReads >= 2) return lstatSync(swap, options);
+          return lstatSync(targetPath, options);
+        },
+      },
+    }), /identity|directory|symlink|catalog/i);
+    assert.deepEqual(readFileSync(marker), Buffer.from("external\n"));
+    assert.equal(readdirSync(path.join(target.stateRoot, "catalog-generations")).some((name) => name.startsWith("restore-")), false, kind);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+      rmSync(external, { recursive: true, force: true });
+    }
+  }
+});
+
+test("catalog restore rejects a late replacement of its newly-created generation before any external write", {
+  skip: process.platform === "win32" && "Windows CI must not assume symlink privilege",
+}, () => {
+  for (const kind of ["directory", "link"]) {
+    const { root, target, runtimeRoots } = fixture();
+    const external = mkdtempSync(path.join(os.tmpdir(), "codex-router-runtime-new-generation-swap-"));
+    try {
+      const topology = installManagedCatalogTopology(target, `new-generation-${kind}`);
+      const snapshot = snapshotOwnedRuntime(ownedRuntimePaths(target, runtimeRoots));
+      writeFileSync(path.join(topology.generationDir, "merged-models.json"), "mutated\n", { mode: 0o600 });
+      const marker = path.join(external, "must-not-change");
+      writeFileSync(marker, "external\n", { mode: 0o600 });
+      let generationStats = 0;
+      assert.throws(() => restoreOwnedRuntime(snapshot, {
+        fs: {
+          lstat(targetPath, options) {
+            if (path.basename(targetPath).startsWith("restore-") && ++generationStats === 2) {
+              const parked = `${targetPath}.parked`;
+              renameSync(targetPath, parked);
+              if (kind === "directory") renameSync(external, targetPath);
+              else symlinkSync(external, targetPath, "dir");
+            }
+            return lstatSync(targetPath, options);
+          },
+        },
+      }), /identity|directory|symlink|catalog/i, kind);
+      const markerPath = kind === "directory" ? path.join(target.stateRoot, "catalog-generations", "restore-") : marker;
+      if (kind === "directory") {
+        const generations = path.join(target.stateRoot, "catalog-generations");
+        const swapped = readdirSync(generations).find((name) => name.startsWith("restore-") && !name.endsWith(".parked"));
+        assert.deepEqual(readFileSync(path.join(generations, swapped, "must-not-change")), Buffer.from("external\n"));
+      } else {
+        assert.deepEqual(readFileSync(markerPath), Buffer.from("external\n"));
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+      rmSync(external, { recursive: true, force: true });
+    }
+  }
+});
+
+test("a dangling non-catalog owned symlink is rejected during resolver preflight", {
+  skip: process.platform === "win32" && "Windows CI must not assume symlink privilege",
+}, () => {
+  const { root, target, runtimeRoots } = fixture();
+  try {
+    const secret = path.join(target.stateRoot, "caller-secret");
+    rmSync(secret, { force: true });
+    symlinkSync("missing-secret", secret, "file");
+    assert.throws(() => ownedRuntimePaths(target, runtimeRoots), /symlink|junction|link/i);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

@@ -20,7 +20,7 @@ Router 不拥有 ~/.codex/config.toml。安装、启用、禁用、更新、修�
 
 - 所有 Router state 目录创建为 700；私有文件创建为 600。
 - atomic writer 在临时文件完成内容与权限保护后才 rename。
-- 受保护 runtime 只通过显式 artifact allowlist 解析；拒绝 dot segment、绝对越界、symlink、junction、hardlink 和未知 artifact id。
+- 受保护 runtime 只通过显式 artifact allowlist 解析；拒绝 dot segment、绝对越界、symlink、junction、hardlink 和未知 artifact id。唯一受控例外是六个 state catalog stable path：它们必须精确链接到 `catalog-generations/current/<固定文件名>`，`current` 必须链接到同目录下的直接 generation，且该 generation 只能含六个 600、单链接、私有 regular artifact；绝不接受 junction、绝对或回退目标、嵌套 target、dangling link 或 Windows 的链接权限降级。
 - release packer 读取 Git HEAD 的 stage-0 regular blobs，不读取 dirty 工作树、未跟踪文件或目录递归副本。
 - cleanup 不接受通配符或任意递归路径；未知文件保留并报告。
 
@@ -36,7 +36,7 @@ Router 不拥有 ~/.codex/config.toml。安装、启用、禁用、更新、修�
 
 更新事务在任何 Git revision mutation 前完成 runtime snapshot 和 preflight。replacement 只有在 Router、forwarder、catalog 与 companion contract 全部验证后才提交清理。失败路径按顺序恢复 Router-owned runtime、旧 revision，并只重启一次旧服务；恢复失败与原始错误一起报告。
 
-snapshot 包含原始字节、模式和 allowlist identity。恢复不触碰 Codex config.toml、CC Switch 数据库、用户 credentials、历史文件或不属于 Router 的模型权重。
+snapshot 包含原始字节、模式和 allowlist identity。对于受控 catalog topology，snapshot 以 resolver-bound ServiceTarget 的 state root 为唯一边界，记录 pointer identity、generation、六个 artifact 的字节/模式与 digest；所有 snapshot entry 和 topology 在任何写入前完成校验。恢复始终保留 stable link topology：原 generation 仍精确匹配时只原子切回 pointer；若 generation 被删除或失配则先写入新的私有 generation 再切换 pointer。pointer 提交后的 fsync 或验证失败会切回旧 pointer 并删除未激活的新 generation；清理失败与 primary error 聚合。任何未知、混合或被篡改的 stable topology 都 fail-closed，不会把链接降级恢复成 regular file。恢复不触碰 Codex config.toml、CC Switch 数据库、用户 credentials、历史文件或不属于 Router 的模型权重。
 
 ## Release package
 

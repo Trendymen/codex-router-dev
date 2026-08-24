@@ -18,6 +18,11 @@ import { clearServiceProcessState, writeServiceProcessState } from "./service-pr
 import { nodeRuntimeTopology, startNodeRuntime } from "./node-runtime.mjs";
 import { rebuildAfterStartup } from "./node-snapshot-triggers.mjs";
 import { routerCatalogPath } from "./start-environment.mjs";
+import {
+  consumeStartupRebuildDefer,
+  scheduleStartupRebuildSelfHeal,
+  spawnDeferredStartupRebuild,
+} from "./startup-rebuild-defer.mjs";
 
 if (!existsSync(INTERNAL_SECRET_PATH)) {
   throw new Error("Internal service key is missing; run ./bin/install.");
@@ -71,10 +76,25 @@ const commonEnv = {
 
 let runtime;
 let shuttingDown = false;
+let deferredRebuildController;
+let deferredRebuildPromise;
+let shutdownFailure;
 
 async function stopRuntime(signal = "SIGTERM") {
   shuttingDown = true;
-  if (runtime) await runtime.stop(signal);
+  deferredRebuildController?.abort();
+  try {
+    if (deferredRebuildPromise) await deferredRebuildPromise;
+  } catch (error) {
+    shutdownFailure ||= error;
+  }
+  deferredRebuildController = undefined;
+  deferredRebuildPromise = undefined;
+  try {
+    if (runtime) await runtime.stop(signal);
+  } catch (error) {
+    shutdownFailure ||= error;
+  }
 }
 
 for (const signal of ["SIGINT", "SIGTERM"]) {
@@ -84,7 +104,8 @@ for (const signal of ["SIGINT", "SIGTERM"]) {
 }
 
 async function main() {
-  await rebuildAfterStartup();
+  const deferredRebuild = consumeStartupRebuildDefer();
+  if (!deferredRebuild) await rebuildAfterStartup();
   runtime = await startNodeRuntime({
     ...nodeRuntimeTopology({
       sourceRoot: SOURCE_ROOT,
@@ -97,8 +118,28 @@ async function main() {
     isShuttingDown: () => shuttingDown,
   });
 
+  if (deferredRebuild) {
+    // The updater owns publication while its two locks are held.  Once it
+    // signals completion (or dies), this service independently acquires the
+    // normal catalog lock and rebuilds once, so defer is never permanent.
+    deferredRebuildController = new AbortController();
+    deferredRebuildPromise = scheduleStartupRebuildSelfHeal(deferredRebuild, {
+      rebuild: ({ signal }) => spawnDeferredStartupRebuild({ signal }),
+      signal: deferredRebuildController.signal,
+      onError: (error) => {
+        console.error(`[codex-router] deferred startup rebuild failed (${error?.code || error?.category || "unknown"}).`);
+      },
+      onRetry: (error, { attempt, delayMs, category }) => {
+        if (attempt === 1 || (attempt & (attempt - 1)) === 0) {
+          console.error(`[codex-router] deferred startup rebuild retry ${attempt} (${category}) in ${delayMs}ms (${error?.code || error?.category || "retryable"}).`);
+        }
+      },
+    });
+  }
+
   console.error("[codex-router] ready (authenticated loopback endpoint)");
   const result = await runtime.exited;
+  if (shutdownFailure) return 1;
   if (!shuttingDown) {
     if (result.error) {
       console.error(`[codex-router] ${result.label} failed: ${result.error.message || String(result.error)}.`);
@@ -135,6 +176,10 @@ try {
   }
 } finally {
   await stopRuntime();
+  if (shutdownFailure) {
+    console.error(`[codex-router] shutdown failed (${shutdownFailure?.code || shutdownFailure?.category || "unknown"}).`);
+    exitCode ||= 1;
+  }
   if (serviceProcessRecorded) {
     try {
       clearServiceProcessState();

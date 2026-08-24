@@ -33,6 +33,8 @@ const {
   ROUTED_CATALOG_PATH,
 } = await import("../src/paths.mjs");
 const { setExperimentalModel, experimentalModelEnabled } = await import("../src/experimental-models.mjs");
+const { withCatalogPublicationLock } = await import("../src/catalog-publication-lock.mjs");
+const { withModelOverlayLock } = await import("../src/model-overlay-lock.mjs");
 
 const primarySlug = "qwen-plan/qwen3.7-max";
 const siblingSlug = "qwen-plan/qwen3.7-plus";
@@ -119,6 +121,38 @@ test("transaction serializes concurrent protected RMW mutations without dropping
   await Promise.all([writeEntry("first", 1), writeEntry("second", 2)]);
 
   assert.deepEqual(JSON.parse(readFileSync(target, "utf8")), { first: 1, second: 2 });
+});
+
+test("transaction and an outer overlay-to-catalog migration finish before the AB/BA deadline", async () => {
+  const target = path.join(stateDir, "lock-order.json");
+  writeFileSync(target, "{}");
+  const mutate = (key) => () => {
+    const before = JSON.parse(readFileSync(target, "utf8"));
+    writeFileSync(target, JSON.stringify({ ...before, [key]: true }));
+  };
+  const regular = transactNodeStateMutation({
+    files: [target],
+    reason: "regular-lock-order",
+    mutate: mutate("regular"),
+    ...rebuildOptions("regular-lock-order"),
+  });
+  const outer = withModelOverlayLock((modelOverlayLockContext) => withCatalogPublicationLock(
+    (catalogLockContext) => transactNodeStateMutation({
+      files: [target],
+      reason: "outer-lock-order",
+      mutate: mutate("outer"),
+      modelOverlayLockContext,
+      catalogLockContext,
+      ...rebuildOptions("outer-lock-order"),
+    }),
+    { stateDir, waitMs: 1_000, retryMs: 5, staleMs: 2_000, heartbeatMs: 1_000 },
+  ), { stateDir, waitMs: 1_000, retryMs: 5, staleMs: 2_000, heartbeatMs: 1_000 });
+
+  await Promise.race([
+    Promise.all([regular, outer]),
+    new Promise((_, reject) => setTimeout(() => reject(new Error("AB/BA transaction deadline exceeded")), 2_000)),
+  ]);
+  assert.deepEqual(JSON.parse(readFileSync(target, "utf8")), { regular: true, outer: true });
 });
 
 test("default Node snapshot rebuild republishes one complete generation from the current catalog", async () => {
