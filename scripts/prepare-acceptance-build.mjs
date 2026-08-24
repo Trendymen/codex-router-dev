@@ -43,6 +43,27 @@ function cliIsolationRoot(value) {
   return within(cwd, path.resolve(cwd, classified.value), "relative isolationRoot");
 }
 
+function cliManifest(value) {
+  const classified = classifyCliIsolationRoot(value);
+  if (classified.absolute) return classified.value;
+  const cwd = realpathSync(process.cwd()); let cursor = cwd;
+  for (const part of classified.components) { cursor = path.join(cursor, part); if (!existsSync(cursor) || lstatSync(cursor).isSymbolicLink()) throw new Error("relative manifest must be an existing regular file without symbolic links"); }
+  const target = within(cwd, canonicalPath(path.resolve(cwd, classified.value), "manifest"), "relative manifest");
+  if (!statSync(target).isFile()) throw new Error("relative manifest must be an existing regular file");
+  return target;
+}
+
+function cliEvidence(value) {
+  if (value === undefined) return undefined;
+  const classified = classifyCliIsolationRoot(value);
+  if (classified.absolute) return classified.value;
+  const cwd = realpathSync(process.cwd()); let cursor = cwd;
+  for (const part of classified.components) { cursor = path.join(cursor, part); if (existsSync(cursor) && lstatSync(cursor).isSymbolicLink()) throw new Error("relative evidence must not cross a symbolic link"); }
+  const target = within(cwd, canonicalPath(path.resolve(cwd, classified.value), "evidence"), "relative evidence");
+  if (existsSync(target) && !statSync(target).isFile()) throw new Error("relative evidence must be a regular file");
+  return target;
+}
+
 function canonicalPath(value, name) {
   const resolved = absolute(value, name);
   const missing = [];
@@ -362,8 +383,8 @@ function cli() {
     process.stdout.write(`${path.join(manifest.isolationRoot, MANIFEST)}\n`);
     return;
   }
-  if (command === "test-swift" || command === "build-swift") { executeAcceptanceSwift({ manifest: value("--manifest"), action: command, evidence: value("--evidence", true) }); return; }
-  if (command === "finalize") { finalizeAcceptanceBuild({ manifest: value("--manifest") }); return; }
+  if (command === "test-swift" || command === "build-swift") { executeAcceptanceSwift({ manifest: cliManifest(value("--manifest")), action: command, evidence: cliEvidence(value("--evidence", true)) }); return; }
+  if (command === "finalize") { finalizeAcceptanceBuild({ manifest: cliManifest(value("--manifest")) }); return; }
   throw new Error("Usage: prepare-acceptance-build prepare|test-swift|build-swift|finalize");
 }
 

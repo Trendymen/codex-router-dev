@@ -53,6 +53,10 @@ test("prepare CLI 从仓库 cwd 接受相对 isolation root，但 manifest 与�
       assert.equal(path.relative(realpathSync(absoluteRoot), value).startsWith(".."), false);
     }
     const outside = mkdtempSync(path.join(os.tmpdir(), "acceptance-relative-cwd-"));
+    const evidence = path.join(relative, "evidence.json");
+    for (const action of ["test-swift", "build-swift"]) assert.equal(run([action, "--manifest", path.join(relative, "acceptance-build.json"), "--evidence", evidence], root).status, 0);
+    assert.equal(run(["finalize", "--manifest", path.join(relative, "acceptance-build.json")], root).status, 0);
+    assert.equal(existsSync(path.join(absoluteRoot, "evidence.json")), true);
     try { for (const action of ["test-swift", "build-swift", "finalize"]) assert.equal(run([action, "--manifest", path.join(absoluteRoot, "acceptance-build.json")], outside).status, 0); }
     finally { rmSync(outside, { recursive: true, force: true }); }
   } finally { rmSync(absoluteRoot, { recursive: true, force: true }); }
