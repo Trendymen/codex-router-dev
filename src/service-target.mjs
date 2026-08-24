@@ -1,4 +1,4 @@
-import { existsSync, lstatSync } from "node:fs";
+import { existsSync, lstatSync, realpathSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -60,6 +60,73 @@ function inside(root, value, name) {
   }
   if (existingPathHasLink(value, root) || existingPathHasLink(root)) {
     throw new Error(`${name} cannot cross a symlink or junction.`);
+  }
+  return value;
+}
+
+/**
+ * Validate a caller-provided bundle/output path below a resolved target
+ * parent. The check is deliberately stricter than path.normalize: traversal
+ * spelling and every existing symlink/junction are refused before a caller
+ * can create, replace, remove, or sign anything below the target.
+ */
+export function validatePathWithin(parent, candidate, name = "path") {
+  if (typeof parent !== "string" || !path.isAbsolute(parent)) {
+    throw new Error("parent must be an absolute path.");
+  }
+  if (typeof candidate !== "string" || !path.isAbsolute(candidate)) {
+    throw new Error(`${name} must be an absolute path.`);
+  }
+  if (/(?:^|[\\/])\.\.(?:[\\/]|$)/.test(candidate)) {
+    throw new Error(`${name} contains a dot segment.`);
+  }
+  const root = path.normalize(parent);
+  const value = path.normalize(candidate);
+  const relative = path.relative(root, value);
+  if (!relative || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    throw new Error(`${name} must be below parent.`);
+  }
+  const nearestExisting = (valueToInspect) => {
+    let current = valueToInspect;
+    while (!existsSync(current)) {
+      const parentPath = path.dirname(current);
+      if (parentPath === current) return current;
+      current = parentPath;
+    }
+    return current;
+  };
+  const inspectAncestors = (valueToInspect) => {
+    let current = valueToInspect;
+    while (true) {
+      if (existsSync(current)) {
+        try {
+          if (lstatSync(current).isSymbolicLink()) {
+            throw new Error(`${name} crosses a symlink or junction.`);
+          }
+          realpathSync(current);
+        } catch (error) {
+          if (error?.message?.includes("crosses a symlink")) throw error;
+          throw new Error(`Cannot inspect ${name}: ${error.message}`, { cause: error });
+        }
+      }
+      const parentPath = path.dirname(current);
+      if (parentPath === current) return;
+      current = parentPath;
+    }
+  };
+  const canonical = (valueToInspect) => {
+    const existing = nearestExisting(valueToInspect);
+    const existingReal = realpathSync(existing);
+    const suffix = path.relative(existing, valueToInspect);
+    return path.resolve(existingReal, suffix);
+  };
+  inspectAncestors(root);
+  inspectAncestors(value);
+  const canonicalRoot = canonical(root);
+  const canonicalValue = canonical(value);
+  const canonicalRelative = path.relative(canonicalRoot, canonicalValue);
+  if (!canonicalRelative || canonicalRelative.startsWith(`..${path.sep}`) || path.isAbsolute(canonicalRelative)) {
+    throw new Error(`${name} resolves outside parent.`);
   }
   return value;
 }

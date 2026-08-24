@@ -6,7 +6,7 @@ if [ "$(/usr/bin/uname -s 2>/dev/null || printf unknown)" != "Darwin" ]; then
   exit 2
 fi
 
-repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
 cd "$repo_dir"
 tray_dir="$repo_dir/apps/macos/ModelRouterTray"
 # One companion per user, not one per checkout. A default inside the
@@ -16,7 +16,10 @@ tray_dir="$repo_dir/apps/macos/ModelRouterTray"
 # The Node target owns the default bundle path. An explicit argument is used by
 # the staged replacement path; a no-argument invocation resolves the same
 # validated ServiceTarget instead of rebuilding a production path locally.
-if [ "$#" -gt 0 ]; then
+if [ "$#" -gt 1 ]; then
+  printf 'codex-router: tray build accepts at most one bundle path.\n' >&2
+  exit 2
+elif [ "$#" -eq 1 ]; then
   bundle_dir=$1
 else
   bundle_dir=$(node --input-type=module -e '
@@ -28,13 +31,11 @@ target_parent=$(dirname "$(node --input-type=module -e '
   import { currentServiceTarget } from "./src/paths.mjs";
   process.stdout.write(currentServiceTarget().appPath);
 ')")
-case "$bundle_dir" in
-  "$target_parent"/*) ;;
-  *)
-    printf 'codex-router: tray bundle staging path is outside the resolved ServiceTarget.\n' >&2
-    exit 2
-    ;;
-esac
+bundle_dir=$(node --input-type=module -e '
+  import { validatePathWithin } from "./src/service-target.mjs";
+  const [parent, candidate] = process.argv.slice(1);
+  process.stdout.write(validatePathWithin(parent, candidate, "tray bundle"));
+' "$target_parent" "$bundle_dir")
 tray_label=$(node --input-type=module -e '
   import { currentServiceTarget } from "./src/paths.mjs";
   process.stdout.write(currentServiceTarget().trayLabel);
@@ -44,11 +45,26 @@ if [ "${MODEL_ROUTER_TRAY_DRY_RUN:-0}" = "1" ] && [ "${MODEL_ROUTER_SERVICE_MODE
   exit 0
 fi
 configuration=${MODEL_ROUTER_TRAY_CONFIGURATION:-release}
+case "$configuration" in
+  debug|release) ;;
+  *)
+    printf 'codex-router: tray configuration must be debug or release.\n' >&2
+    exit 2
+    ;;
+esac
 binary_dir="$tray_dir/.build/$configuration"
 
 # Callers capture this script's stdout as the bundle path, so compiler
 # progress must not land there.
 swift build -c "$configuration" --package-path "$tray_dir" 1>&2
+[ -x "$binary_dir/ModelRouterTray" ] || {
+  printf 'codex-router: Swift tray build did not produce ModelRouterTray.\n' >&2
+  exit 1
+}
+[ -f "$tray_dir/Resources/Info.plist" ] || {
+  printf 'codex-router: Swift tray Info.plist is missing.\n' >&2
+  exit 1
+}
 mkdir -p "$bundle_dir/Contents/MacOS" "$bundle_dir/Contents/Resources"
 cp "$binary_dir/ModelRouterTray" "$bundle_dir/Contents/MacOS/ModelRouterTray"
 cp "$tray_dir/Resources/Info.plist" "$bundle_dir/Contents/Info.plist"

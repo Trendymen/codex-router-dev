@@ -5,6 +5,7 @@ import path from "node:path";
 import test from "node:test";
 
 import {
+  nodeMeetsMinimum,
   STEPS,
   recordStep,
   stepStatus,
@@ -36,6 +37,15 @@ test("non-macOS tray planning is unsupported and has no executable path", () => 
   assert.equal(trayRebuildPlan({ platform: "linux" }), "unsupported");
   assert.equal(trayRebuildPlan({ platform: "win32" }), "unsupported");
   assert.equal(traySourceFingerprint(undefined, "linux"), "");
+});
+
+test("Node minimum is compared numerically, not lexically", () => {
+  assert.equal(nodeMeetsMinimum("22.19.0"), true);
+  assert.equal(nodeMeetsMinimum("22.20.1"), true);
+  assert.equal(nodeMeetsMinimum("23.0.0"), true);
+  assert.equal(nodeMeetsMinimum("22.9.0"), false);
+  assert.equal(nodeMeetsMinimum("21.99.99"), false);
+  assert.equal(nodeMeetsMinimum("v22.18.9"), false);
 });
 
 test("unknown legacy dependency steps fail closed", () => {

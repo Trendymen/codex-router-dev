@@ -28,10 +28,14 @@ const domain = target.launchDomain || `gui/${userId}`;
 const service = target.routerService || `${domain}/${SERVICE_LABEL}`;
 const launchctl = "/bin/launchctl";
 const launchctlRetryWait = new Int32Array(new SharedArrayBuffer(4));
-const nodeBinary = process.env.CODEX_ROUTER_NODE_BIN || process.execPath;
-if (!path.isAbsolute(nodeBinary)) {
-  throw new Error("CODEX_ROUTER_NODE_BIN must be an absolute path.");
+function absoluteNodeBinary(value) {
+  const result = value || process.execPath;
+  if (!path.isAbsolute(result)) {
+    throw new Error("CODEX_ROUTER_NODE_BIN must be an absolute path.");
+  }
+  return result;
 }
+const nodeBinary = absoluteNodeBinary(process.env.CODEX_ROUTER_NODE_BIN);
 
 function xml(value) {
   return String(value)
@@ -42,58 +46,71 @@ function xml(value) {
     .replaceAll("'", "&apos;");
 }
 
-function environmentEntries() {
+export function renderEnvironmentEntries({
+  serviceTarget = target,
+  nodePath = nodeBinary,
+  environment = process.env,
+} = {}) {
   const values = {
-    PATH: process.env.PATH || "/usr/local/bin:/usr/bin:/bin",
+    PATH: environment.PATH || "/usr/local/bin:/usr/bin:/bin",
     MODEL_ROUTER_TARGET: TARGET,
-    MODEL_ROUTER_STATE_DIR: target.stateRoot,
+    MODEL_ROUTER_STATE_DIR: serviceTarget.stateRoot,
     MODEL_ROUTER_QUIET: "1",
-    MODEL_ROUTER_OAUTH_PORT: String(target.ports.oauth),
-    MODEL_ROUTER_PORT: String(target.ports.router),
-    MODEL_ROUTER_API_PORT: String(target.ports.api),
-    CODEX_HOME,
-    CODEX_ROUTER_STATE_DIR: target.stateRoot,
-    KIMI_CODEX_STATE_DIR: target.stateRoot,
+    MODEL_ROUTER_OAUTH_PORT: String(serviceTarget.ports.oauth),
+    MODEL_ROUTER_PORT: String(serviceTarget.ports.router),
+    MODEL_ROUTER_API_PORT: String(serviceTarget.ports.api),
+    MODEL_ROUTER_GROK_OAUTH_PORT: String(serviceTarget.ports.grokOauth),
+    MODEL_ROUTER_DEVIN_CLI_PORT: String(serviceTarget.ports.devinCli),
+    CODEX_HOME: environment.CODEX_HOME || CODEX_HOME,
+    CODEX_ROUTER_STATE_DIR: serviceTarget.stateRoot,
+    KIMI_CODEX_STATE_DIR: serviceTarget.stateRoot,
     CODEX_ROUTER_QUIET: "1",
     KIMI_PROXY_QUIET: "1",
-    CODEX_ROUTER_OAUTH_PORT: String(target.ports.oauth),
-    CODEX_ROUTER_PORT: String(target.ports.router),
-    CODEX_ROUTER_API_PORT: String(target.ports.api),
-    ...serviceProxyEnvironment(),
-    ...(process.env.CODEX_ROUTER_SOURCE_ROOT
-      ? { CODEX_ROUTER_SOURCE_ROOT: target.sourceRoot }
+    CODEX_ROUTER_OAUTH_PORT: String(serviceTarget.ports.oauth),
+    CODEX_ROUTER_PORT: String(serviceTarget.ports.router),
+    CODEX_ROUTER_API_PORT: String(serviceTarget.ports.api),
+    CODEX_ROUTER_GROK_OAUTH_PORT: String(serviceTarget.ports.grokOauth),
+    CODEX_ROUTER_DEVIN_CLI_PORT: String(serviceTarget.ports.devinCli),
+    ...serviceProxyEnvironment(environment),
+    ...(environment.CODEX_ROUTER_SOURCE_ROOT
+      ? { CODEX_ROUTER_SOURCE_ROOT: serviceTarget.sourceRoot }
       : {}),
-    ...(process.env.CODEX_ROUTER_NODE_BIN
-      ? { CODEX_ROUTER_NODE_BIN: nodeBinary }
+    ...(environment.CODEX_ROUTER_NODE_BIN
+      ? { CODEX_ROUTER_NODE_BIN: nodePath }
       : {}),
-    ...(process.env.CODEX_ROUTER_PACKAGE_MANAGER
-      ? { CODEX_ROUTER_PACKAGE_MANAGER: process.env.CODEX_ROUTER_PACKAGE_MANAGER }
+    ...(environment.CODEX_ROUTER_PACKAGE_MANAGER
+      ? { CODEX_ROUTER_PACKAGE_MANAGER: environment.CODEX_ROUTER_PACKAGE_MANAGER }
       : {}),
   };
-  if (process.env.KIMI_CODE_HOME) values.KIMI_CODE_HOME = process.env.KIMI_CODE_HOME;
+  if (environment.KIMI_CODE_HOME) values.KIMI_CODE_HOME = environment.KIMI_CODE_HOME;
   return Object.entries(values)
     .map(([key, value]) => `    <key>${xml(key)}</key>\n    <string>${xml(value)}</string>`)
     .join("\n");
 }
 
-function plist() {
-  const start = path.join(target.sourceRoot, "src", "start.mjs");
+export function renderLaunchAgent({
+  serviceTarget = target,
+  nodePath = nodeBinary,
+  environment = process.env,
+} = {}) {
+  const absoluteNode = absoluteNodeBinary(nodePath);
+  const start = path.join(serviceTarget.sourceRoot, "src", "start.mjs");
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>${xml(target.routerLabel)}</string>
+  <string>${xml(serviceTarget.routerLabel)}</string>
   <key>ProgramArguments</key>
   <array>
-    <string>${xml(nodeBinary)}</string>
+    <string>${xml(absoluteNode)}</string>
     <string>${xml(start)}</string>
   </array>
   <key>WorkingDirectory</key>
-  <string>${xml(target.sourceRoot)}</string>
+  <string>${xml(serviceTarget.sourceRoot)}</string>
   <key>EnvironmentVariables</key>
   <dict>
-${environmentEntries()}
+${renderEnvironmentEntries({ serviceTarget, nodePath: absoluteNode, environment })}
   </dict>
   <key>RunAtLoad</key>
   <true/>
@@ -104,12 +121,16 @@ ${environmentEntries()}
   <key>ThrottleInterval</key>
   <integer>10</integer>
   <key>StandardOutPath</key>
-  <string>${xml(target.logPath)}</string>
+  <string>${xml(serviceTarget.logPath)}</string>
   <key>StandardErrorPath</key>
-  <string>${xml(target.logPath)}</string>
+  <string>${xml(serviceTarget.logPath)}</string>
 </dict>
 </plist>
 `;
+}
+
+function plist() {
+  return renderLaunchAgent();
 }
 
 function run(args, options = {}) {
@@ -152,6 +173,7 @@ function bootout(targetService = service) {
 function writePlist() {
   mkdirSync(path.dirname(target.routerPlistPath), { recursive: true });
   mkdirSync(target.stateRoot, { recursive: true, mode: 0o700 });
+  chmodSync(target.stateRoot, 0o700);
   const temporary = `${target.routerPlistPath}.tmp.${process.pid}`;
   // Proxy URLs may carry credentials, so the generated plist is private just
   // like the state it launches with.
