@@ -2421,12 +2421,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
       Task { @MainActor in
         do {
           let result = try await DesktopCommandBridge().execute(
-            "platform_info",
+            "lifecycle.status",
             arguments: [:],
             protectedInput: nil,
             capabilitySchemaVersion: 1
           )
-          FileHandle.standardOutput.write(result)
+          guard let lifecycle = try JSONSerialization.jsonObject(with: result) as? [String: Any],
+            lifecycle["ok"] as? Bool == true,
+            let value = lifecycle["value"] as? [String: Any],
+            let capabilityManifest = value["capabilities"]
+          else { throw RouterError("The Router capability probe returned no manifest.") }
+          let probeEnvelope: [String: Any] = [
+            "ok": true,
+            "value": ["capabilityManifest": capabilityManifest],
+          ]
+          FileHandle.standardOutput.write(try JSONSerialization.data(withJSONObject: probeEnvelope))
           FileHandle.standardOutput.write(Data("\n".utf8))
           exit(0)
         } catch {

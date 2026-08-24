@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
@@ -48,6 +49,47 @@ function runBridge(command, payload, extraEnv = {}) {
   try { envelope = JSON.parse(result.stdout); } catch { envelope = undefined; }
   return { ...result, envelope };
 }
+
+test("built Swift capability probe returns the lifecycle.status manifest envelope", { skip: process.platform !== "darwin" }, () => {
+  const trayRoot = path.join(root, "apps", "macos", "ModelRouterTray");
+  const build = spawnSync("swift", ["build", "--product", "ModelRouterTray"], {
+    cwd: trayRoot,
+    encoding: "utf8",
+    timeout: 120_000,
+    windowsHide: true,
+  });
+  assert.equal(build.status, 0, build.stderr || build.stdout);
+  const appRoot = mkdtempSync(path.join(os.tmpdir(), "codex-router-swift-probe-"));
+  try {
+    const binary = path.join(trayRoot, ".build", "debug", "ModelRouterTray");
+    const bundleBinary = path.join(appRoot, "Model Router.app", "Contents", "MacOS", "ModelRouterTray");
+    const plist = path.join(appRoot, "Model Router.app", "Contents", "Info.plist");
+    mkdirSync(path.dirname(bundleBinary), { recursive: true });
+    copyFileSync(binary, bundleBinary);
+    writeFileSync(
+      plist,
+      readFileSync(path.join(trayRoot, "Resources", "Info.plist"), "utf8").replace(
+        "</dict>",
+        `  <key>ModelRouterSourceRoot</key>\n  <string>${root}</string>\n</dict>`,
+      ),
+    );
+    const probe = spawnSync(bundleBinary, ["--codex-router-capability-probe"], {
+      cwd: root,
+      encoding: "utf8",
+      timeout: 15_000,
+      windowsHide: true,
+    });
+    assert.equal(probe.status, 0, probe.stderr || probe.stdout);
+    const envelope = JSON.parse(probe.stdout);
+    assert.equal(envelope.ok, true);
+    assert.deepEqual(
+      envelope.value?.capabilityManifest?.commands?.map(({ name }) => name).sort(),
+      buildCapabilityManifest().commands.map(({ name }) => name).sort(),
+    );
+  } finally {
+    rmSync(appRoot, { recursive: true, force: true });
+  }
+});
 
 test("Swift renders the real swift capability set through manifest expressions", () => {
   const manifest = buildCapabilityManifest();
