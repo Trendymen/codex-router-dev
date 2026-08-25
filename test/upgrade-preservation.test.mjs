@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import {
   chmodSync,
   closeSync,
@@ -17,6 +18,7 @@ import {
   rmSync,
   statSync,
   symlinkSync,
+  unlinkSync,
   writeSync,
   writeFileSync,
 } from "node:fs";
@@ -410,6 +412,20 @@ test("Windows adapter restores a missing generation through normalized links, AC
           error.code = "EPERM";
           throw error;
         }
+        // Windows cannot rename a new symlink over an existing current
+        // pointer.  Model that native boundary explicitly: a correct restore
+        // must first move current to a private rollback sibling, then retry
+        // the new pointer into the now-empty current name.
+        if (destination === path.join(generations, "current")) {
+          try {
+            lstatSync(destination);
+            const error = new Error("Windows cannot replace an existing pointer");
+            error.code = "EEXIST";
+            throw error;
+          } catch (error) {
+            if (error?.code !== "ENOENT") throw error;
+          }
+        }
         return renameSync(source, destination);
       },
     } });
@@ -420,6 +436,219 @@ test("Windows adapter restores a missing generation through normalized links, AC
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("Windows catalog pointer replacement retains recoverable state across every interrupted swap stage", () => {
+  const cases = [
+    { id: "retains-tombstone", shouldFail: false, expected: { current: "restored", displaced: true, next: false, restored: true, foreignResidue: true } },
+    { id: "unknown-current", expected: { current: "foreign", displaced: true, next: true, restored: true, foreignResidue: true } },
+    { id: "next-tombstone-binding-mismatch", expected: { current: "foreign", displaced: true, next: true, restored: true, foreignResidue: true } },
+    { id: "restore-displaced-to-current", expected: { current: null, displaced: true, next: true, restored: true, foreignResidue: true } },
+    { id: "swap-displaced-before-unlink", expected: { current: "original", displaced: true, next: true, restored: true, foreignResidue: true } },
+  ];
+  for (const scenario of cases) {
+    const { root, target, runtimeRoots } = fixture();
+    try {
+      const topology = installManagedCatalogTopology(target, `windows-${scenario.id}`);
+      const snapshot = snapshotOwnedRuntime(ownedRuntimePaths(target, runtimeRoots));
+      rmSync(topology.generationDir, { recursive: true, force: true });
+      const generations = path.join(target.stateRoot, "catalog-generations");
+      const current = path.join(generations, "current");
+      const foreign = "foreign-current";
+      const transient = (message, code = "EBUSY") => Object.assign(new Error(message), { code });
+      let failure;
+      try { restoreOwnedRuntime(snapshot, { fs: {
+        platform: "win32",
+        rename(source, destination) {
+          const sourceName = path.basename(source);
+          const destinationName = path.basename(destination);
+          if ((scenario.id === "unknown-current" || scenario.id === "next-tombstone-binding-mismatch") && source === current && destinationName.startsWith("current.catalog-current-displaced")) {
+            renameSync(source, destination);
+            mkdirSync(path.join(generations, foreign), { recursive: true, mode: 0o700 });
+            symlinkSync(foreign, current, "dir");
+            return;
+          }
+          if (scenario.id === "next-tombstone-binding-mismatch" && sourceName.startsWith("current.catalog-current-restore") && destinationName.includes("catalog-pointer-remove")) {
+            renameSync(source, destination);
+            const replacement = readlinkSync(destination);
+            unlinkSync(destination);
+            symlinkSync(replacement, destination, "dir");
+            return;
+          }
+          if (scenario.id === "swap-displaced-before-unlink" && sourceName.startsWith("current.catalog-current-displaced") && destinationName.includes("catalog-pointer-remove")) {
+            unlinkSync(source);
+            mkdirSync(path.join(generations, foreign), { recursive: true, mode: 0o700 });
+            symlinkSync(foreign, source, "dir");
+            return renameSync(source, destination);
+          }
+          if (scenario.id === "rollback-current-to-source" && source === current && destinationName.startsWith("current.catalog-current-restore")) throw transient("injected current-to-source rollback failure");
+          if (scenario.id === "restore-displaced-to-current" && destination === current && (sourceName.startsWith("current.catalog-current-restore") || sourceName.startsWith("current.catalog-current-displaced"))) throw transient("injected displaced restore failure");
+          return renameSync(source, destination);
+        },
+        unlink(value) {
+          if (scenario.id === "retains-tombstone" && path.basename(value).includes("catalog-pointer-remove")) throw new Error("unsafe final tombstone unlink");
+          return unlinkSync(value);
+        },
+      } }); } catch (error) { failure = error; }
+      if (scenario.shouldFail !== false) assert.match(String(failure?.message || ""), /Windows catalog pointer|injected|restore/i, scenario.id);
+      const names = readdirSync(generations);
+      const targetOf = (value) => { try { return readlinkSync(value); } catch { return null; } };
+      const displaced = names.filter((name) => name.startsWith("current.catalog-current-displaced"));
+      const next = names.filter((name) => name.startsWith("current.catalog-current-restore"));
+      const restored = names.filter((name) => name.startsWith("restore-"));
+      const currentTarget = targetOf(current);
+      if (scenario.expected.current === "restored") assert.match(currentTarget || "", /^restore-/, `${scenario.id}: current`);
+      else assert.equal(currentTarget, scenario.expected.current === "original" ? topology.generation : scenario.expected.current === "foreign" ? foreign : null, `${scenario.id}: current`);
+      assert.equal(displaced.length > 0, scenario.expected.displaced, `${scenario.id}: displaced residue`);
+      assert.equal(next.length > 0, scenario.expected.next, `${scenario.id}: next residue (${names.join(",")})`);
+      assert.equal(restored.length > 0, scenario.expected.restored, `${scenario.id}: restored generation`);
+      const foreignResidue = names.find((name) => name.includes("catalog-pointer-remove"));
+      assert.equal(Boolean(foreignResidue), scenario.expected.foreignResidue === true, `${scenario.id}: unknown cleanup residue`);
+      if (scenario.id === "swap-displaced-before-unlink") assert.equal(targetOf(path.join(generations, foreignResidue)), foreign, `${scenario.id}: unknown residue was not deleted`);
+      if (scenario.id === "unknown-current") assert.equal(targetOf(path.join(generations, displaced[0])), topology.generation);
+      if (scenario.id === "restore-displaced-to-current") assert.equal(targetOf(path.join(generations, displaced[0])), topology.generation);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("Windows catalog pointer identity compares exact BigInt inode values beyond Number precision", () => {
+  const { root, target, runtimeRoots } = fixture();
+  try {
+    const topology = installManagedCatalogTopology(target, "windows-bigint");
+    const snapshot = snapshotOwnedRuntime(ownedRuntimePaths(target, runtimeRoots));
+    rmSync(topology.generationDir, { recursive: true, force: true });
+    const generations = path.join(target.stateRoot, "catalog-generations");
+    const current = path.join(generations, "current");
+    let bigintPointerStats = 0;
+    assert.throws(() => restoreOwnedRuntime(snapshot, { fs: {
+      platform: "win32",
+      lstat(value, options) {
+        const entry = lstatSync(value, options);
+        if (options?.bigint && (value === current || path.basename(value).startsWith("current.catalog-current-displaced"))) {
+          bigintPointerStats += 1;
+          const moved = path.basename(value).startsWith("current.catalog-current-displaced");
+          return { ...entry, dev: 7n, ino: moved ? 9007199254740993n : 9007199254740992n };
+        }
+        return entry;
+      },
+    } }), /identity|pointer|restore/i);
+    assert.ok(bigintPointerStats >= 2, "pointer lstat must request exact bigint identities before and after displacement");
+    assert.equal(readdirSync(generations).some((name) => name.startsWith("restore-")), true, "a pointer identity ambiguity must preserve the created generation for recovery");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Windows outer rollback preserves both old and new recovery pointers when a second transaction meets an unknown current", () => {
+  const { root, target, runtimeRoots } = fixture();
+  try {
+    const topology = installManagedCatalogTopology(target, "windows-outer-rollback");
+    const snapshot = snapshotOwnedRuntime(ownedRuntimePaths(target, runtimeRoots));
+    rmSync(topology.generationDir, { recursive: true, force: true });
+    const generations = path.join(target.stateRoot, "catalog-generations");
+    const current = path.join(generations, "current");
+    const foreign = "foreign-outer-current";
+    let initialSwitch = false;
+    let primary;
+    let failure;
+    try { restoreOwnedRuntime(snapshot, { fs: {
+      platform: "win32",
+      rename(source, destination) {
+        const sourceName = path.basename(source);
+        const destinationName = path.basename(destination);
+        if (sourceName.startsWith("current.catalog-current-restore") && destination === current) {
+          initialSwitch = true;
+          return renameSync(source, destination);
+        }
+        if (initialSwitch && source === current && destinationName.startsWith("current.catalog-current-displaced")) {
+          renameSync(source, destination);
+          mkdirSync(path.join(generations, foreign), { recursive: true, mode: 0o700 });
+          symlinkSync(foreign, current, "dir");
+          return;
+        }
+        return renameSync(source, destination);
+      },
+      readlink(value) {
+        if (initialSwitch && value === path.join(target.stateRoot, "merged-models.json")) {
+          primary ||= new Error("injected validation after initial pointer switch");
+          throw primary;
+        }
+        return readlinkSync(value);
+      },
+    } }); } catch (error) { failure = error; }
+    assert.ok(failure instanceof Error);
+    const messages = [failure.message, ...(failure.errors || []).map((entry) => entry.message)].join("\n");
+    assert.match(messages, /injected validation after initial pointer switch/);
+    assert.match(messages, /rollback|pointer/i, "primary and rollback failures remain observable");
+    const names = readdirSync(generations);
+    const targetOf = (value) => { try { return readlinkSync(value); } catch { return null; } };
+    assert.equal(targetOf(current), foreign, "unknown current is never overwritten during failed outer rollback");
+    const rollback = names.find((name) => name.startsWith("current.catalog-current-rollback"));
+    const displaced = names.find((name) => name.startsWith("current.catalog-current-displaced") && /^restore-/.test(targetOf(path.join(generations, name)) || ""));
+    assert.ok(rollback, "old pointer rollback link is retained for recovery");
+    assert.ok(displaced, "new pointer displacement is retained for recovery");
+    assert.equal(targetOf(path.join(generations, rollback)), topology.generation);
+    assert.match(targetOf(path.join(generations, displaced)) || "", /^restore-/);
+    assert.equal(names.some((name) => name.startsWith("restore-")), true, "new generation remains while a displaced pointer still references it");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Windows outer rollback retains a secondary tombstone that still binds the restored generation", () => {
+  const { root, target, runtimeRoots } = fixture();
+  try {
+    const topology = installManagedCatalogTopology(target, "windows-secondary-residue");
+    const snapshot = snapshotOwnedRuntime(ownedRuntimePaths(target, runtimeRoots));
+    rmSync(topology.generationDir, { recursive: true, force: true });
+    const generations = path.join(target.stateRoot, "catalog-generations");
+    const current = path.join(generations, "current");
+    let initialSwitch = false;
+    assert.throws(() => restoreOwnedRuntime(snapshot, { fs: {
+      platform: "win32",
+      rename(source, destination) {
+        if (path.basename(source).startsWith("current.catalog-current-restore") && destination === current) initialSwitch = true;
+        return renameSync(source, destination);
+      },
+      readlink(value) {
+        if (initialSwitch && value === path.join(target.stateRoot, "merged-models.json")) throw new Error("injected validation for secondary tombstone");
+        return readlinkSync(value);
+      },
+    } }), /Managed catalog current restore failed/);
+    const names = readdirSync(generations);
+    const targetOf = (value) => { try { return readlinkSync(value); } catch { return null; } };
+    assert.equal(targetOf(current), topology.generation, "outer rollback restores the prior current pointer");
+    const secondary = names.find((name) => name.includes("catalog-pointer-remove") && /^restore-/.test(targetOf(path.join(generations, name)) || ""));
+    assert.ok(secondary, "secondary cleanup tombstone retaining the new pointer must remain explicit");
+    assert.equal(names.some((name) => name.startsWith("restore-")), true, "generation remains while the secondary tombstone references it");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Windows tombstone ceiling is global, rejects lookalikes, and preserves the original pointer identity", () => {
+  const { root, target, runtimeRoots } = fixture();
+  try {
+    const topology = installManagedCatalogTopology(target, "windows-tombstone-ceiling");
+    const snapshot = snapshotOwnedRuntime(ownedRuntimePaths(target, runtimeRoots));
+    const generations = path.join(target.stateRoot, "catalog-generations");
+    const current = path.join(generations, "current");
+    const before = lstatSync(current, { bigint: true });
+    for (let index = 0; index < 64; index += 1) {
+      symlinkSync(topology.generation, path.join(generations, `current.catalog-current-displaced.${process.pid}.${randomUUID()}.catalog-pointer-remove.${process.pid}.${randomUUID()}`), "dir");
+    }
+    symlinkSync(topology.generation, path.join(generations, "unknown.catalog-pointer-remove.1.not-managed"), "dir");
+    rmSync(topology.generationDir, { recursive: true, force: true });
+    let failure;
+    try { restoreOwnedRuntime(snapshot, { fs: { platform: "win32" } }); } catch (error) { failure = error; }
+    assert.ok(failure instanceof Error);
+    assert.match([failure.message, ...(failure.errors || []).map((entry) => entry.message)].join("\n"), /tombstone limit|maintenance/i);
+    const after = lstatSync(current, { bigint: true });
+    assert.deepEqual({ dev: after.dev, ino: after.ino }, { dev: before.dev, ino: before.ino });
+    assert.equal(readlinkSync(current), topology.generation);
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
 test("catalog pointer restore removes staged generations and rolls back its pointer after every injected commit fault", {
@@ -445,7 +674,7 @@ test("catalog pointer restore removes staged generations and rolls back its poin
             return symlinkSync(source, destination, type);
           },
           rename(source, destination) {
-            if (fault === "rename" && destination === path.join(generations, "current")) {
+            if (fault === "rename" && destination === path.join(generations, "current") && path.basename(source).startsWith("current.catalog-current-restore")) {
               renameCalls += 1;
               const error = new Error("injected persistent sharing violation");
               error.code = "EBUSY";
@@ -477,7 +706,7 @@ test("catalog pointer restore removes staged generations and rolls back its poin
         },
       }), /injected|catalog|restore/i, fault);
       assert.equal(readlinkSync(path.join(generations, "current")), topology.generation, fault);
-      assert.equal(readdirSync(generations).some((name) => name.startsWith("restore-")), false, fault);
+      assert.equal(readdirSync(generations).some((name) => name.startsWith("restore-")), ["rename", "validate"].includes(fault), fault);
       if (fault === "rename") assert.equal(renameCalls, 2, "Windows retry bound");
     } finally {
       rmSync(root, { recursive: true, force: true });

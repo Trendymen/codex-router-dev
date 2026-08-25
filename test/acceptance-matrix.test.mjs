@@ -566,10 +566,15 @@ test("bin/install 的 production variable-command 授权接受当前精确来源
     const target = path.join(root, "bin", "install");
     mkdirSync(path.dirname(target), { recursive: true });
     cpSync(source, target);
+    // Windows copies do not retain POSIX executable bits.  Register the
+    // script's logical release mode so the Windows semantic fallback audits
+    // the same shell source as the POSIX artifact walk.
+    chmodSync(target, 0o755);
+    logicalModes.set(target, 0o755);
     assert.equal(findingsFor(root).includes("runtime-command-unresolved:bin/install"), false, findingsFor(root).join(", "));
     writeFileSync(target, readFileSync(target, "utf8").replace(/\r\n/g, "\n").replaceAll("\n", "\r\n"));
     assert.equal(findingsFor(root).includes("runtime-command-unresolved:bin/install"), false, findingsFor(root).join(", "));
-    writeFileSync(target, `${readFileSync(target, "utf8")}\n# source identity drift\n`);
+    writeFileSync(target, `${readFileSync(target, "utf8")}\r\nphase5_identity_drift=1\r\n`);
     assert.ok(findingsFor(root).includes("runtime-command-unresolved:bin/install"), findingsFor(root).join(", "));
   } finally { rmSync(root, { recursive: true, force: true }); }
 });

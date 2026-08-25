@@ -774,7 +774,7 @@ function siblingPath(target, tag) {
 }
 
 const WINDOWS_POINTER_RETRY_CODES = new Set(["EPERM", "EBUSY"]);
-function renameCatalogPointer(source, target, fs) {
+function renameCatalogPointerWithRetry(source, target, fs) {
   let firstError;
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
@@ -785,6 +785,151 @@ function renameCatalogPointer(source, target, fs) {
       if (attempt === 1) throw firstError;
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
     }
+  }
+}
+
+function pointerIdentity(entry) {
+  return Object.freeze({ dev: BigInt(entry.dev), ino: BigInt(entry.ino) });
+}
+
+function samePointerIdentity(left, right) {
+  return left?.dev === right?.dev && left?.ino === right?.ino;
+}
+
+function pointerLstatIfPresent(value, fs) {
+  try {
+    return fs.lstat(value, { bigint: true });
+  } catch (error) {
+    if (error?.code === "ENOENT") return undefined;
+    throw error;
+  }
+}
+
+function pointerBinding(pointer, fs, label) {
+  const entry = pointerLstatIfPresent(pointer, fs);
+  if (!entry?.isSymbolicLink()) throw new Error(`${label} is missing or is not a symbolic-link pointer: ${pointer}`);
+  return Object.freeze({ identity: pointerIdentity(entry), target: fs.readlink(pointer) });
+}
+
+function samePointerBinding(left, right) {
+  return samePointerIdentity(left?.identity, right?.identity) && left?.target === right?.target;
+}
+
+function assertPointerBinding(pointer, expected, fs, label) {
+  const actual = pointerBinding(pointer, fs, label);
+  if (!samePointerBinding(actual, expected)) throw new Error(`${label} changed identity or target during catalog pointer replacement.`);
+  return actual;
+}
+
+function pointerTargets(pointer, generation, fs) {
+  const entry = pointerLstatIfPresent(pointer, fs);
+  return Boolean(entry?.isSymbolicLink() && fs.readlink(pointer) === generation);
+}
+
+function removeVerifiedPointer(pointer, expected, fs, label) {
+  assertPointerBinding(pointer, expected, fs, label);
+  // Tombstones are intentionally not unlinked on Windows.  Bound their count
+  // per pointer so recovery evidence cannot grow without limit; an operator
+  // must run a future handle-aware audited maintenance path before more swaps.
+  const managedTombstone = /^current\.catalog-current-(?:displaced|restore|rollback)\.\d+\.[0-9a-f-]+(?:\.catalog-pointer-remove\.\d+\.[0-9a-f-]+)+$/i;
+  if (fs.readdir(path.dirname(pointer)).filter((name) => managedTombstone.test(name)).length >= 64) {
+    throw new Error(`Catalog pointer tombstone limit reached for ${pointer}; audited maintenance is required before another replacement.`);
+  }
+  const tombstone = siblingPath(pointer, "catalog-pointer-remove");
+  renameCatalogPointerWithRetry(pointer, tombstone, fs);
+  try {
+    assertPointerBinding(tombstone, expected, fs, `${label} tombstone`);
+  } catch (error) {
+    Object.defineProperty(error, "catalogPointerResidue", { value: tombstone });
+    throw error;
+  }
+  // Node cannot unlink an already-open Windows handle by identity.  A final
+  // path unlink would reintroduce a replace-between-check-and-delete race, so
+  // retain the verified private tombstone as explicit recovery evidence.  A
+  // later audited maintenance pass may consume it only after a fresh binding.
+  return tombstone;
+}
+
+function pointerTransactionError(primary, state, failures = []) {
+  const error = failures.length
+    ? new AggregateError([primary, ...failures], "Windows catalog pointer replacement failed and could not be rolled back.", { cause: primary })
+    : new Error("Windows catalog pointer replacement failed.", { cause: primary });
+  Object.defineProperty(error, "catalogPointerTransaction", { value: Object.freeze(state) });
+  return error;
+}
+
+function recordPointerFailure(error, residues, seen = new Set()) {
+  if (!error || (typeof error !== "object" && typeof error !== "function") || seen.has(error)) return;
+  seen.add(error);
+  if (typeof error.catalogPointerResidue === "string") residues.add(error.catalogPointerResidue);
+  const transaction = error.catalogPointerTransaction;
+  if (transaction) {
+    for (const residue of transaction.residues || []) if (typeof residue === "string") residues.add(residue);
+    if (typeof transaction.displaced === "string") residues.add(transaction.displaced);
+  }
+  for (const nested of error.errors || []) recordPointerFailure(nested, residues, seen);
+  recordPointerFailure(error.cause, residues, seen);
+}
+
+function renameCatalogPointer(source, target, fs) {
+  if (fsPlatform(fs) !== "win32") {
+    renameCatalogPointerWithRetry(source, target, fs);
+    return { installed: true, rollbackComplete: false, displaced: null };
+  }
+  // Windows cannot rename a new link over an existing link/junction.  Move the
+  // old pointer aside first, then install the new one into the vacant name.
+  // Every move is bounded for transient sharing violations; any post-move
+  // failure restores the old pointer before the error escapes.
+  const existing = pointerLstatIfPresent(target, fs);
+  if (!existing) {
+    renameCatalogPointerWithRetry(source, target, fs);
+    return { installed: true, rollbackComplete: false, displaced: null };
+  }
+  if (!existing.isSymbolicLink()) throw new Error(`Refusing to replace a non-link catalog pointer: ${target}`);
+  const expected = Object.freeze({ identity: pointerIdentity(existing), target: fs.readlink(target) });
+  const sourceBinding = pointerBinding(source, fs, "new catalog pointer");
+  const displaced = siblingPath(target, "catalog-current-displaced");
+  let displacedOld = false;
+  let installed = false;
+  try {
+    assertPointerBinding(target, expected, fs, "existing catalog pointer");
+    renameCatalogPointerWithRetry(target, displaced, fs);
+    displacedOld = true;
+    assertPointerBinding(displaced, expected, fs, "displaced catalog pointer");
+    if (pointerLstatIfPresent(target, fs)) throw new Error("Windows catalog pointer name reappeared before replacement.");
+    assertPointerBinding(source, sourceBinding, fs, "new catalog pointer");
+    renameCatalogPointerWithRetry(source, target, fs);
+    installed = true;
+    assertPointerBinding(target, sourceBinding, fs, "installed catalog pointer");
+    const residue = removeVerifiedPointer(displaced, expected, fs, "displaced catalog pointer");
+    return { installed: true, rollbackComplete: false, displaced: null, residues: [residue] };
+  } catch (error) {
+    const rollbackFailures = [];
+    let rollbackComplete = false;
+    if (installed) {
+      try {
+        if (pointerLstatIfPresent(target, fs)) {
+          assertPointerBinding(target, sourceBinding, fs, "installed catalog pointer before rollback");
+          renameCatalogPointerWithRetry(target, source, fs);
+          assertPointerBinding(source, sourceBinding, fs, "restaged catalog pointer after rollback");
+        }
+      } catch (rollbackError) { rollbackFailures.push(rollbackError); }
+    }
+    if (displacedOld) {
+      try {
+        if (pointerLstatIfPresent(target, fs)) {
+          rollbackFailures.push(new Error(`Windows catalog pointer rollback is incomplete: ${target} was recreated while ${displaced} retains the prior pointer.`));
+        } else if (!pointerLstatIfPresent(displaced, fs)) {
+          rollbackFailures.push(new Error(`Windows catalog pointer rollback is incomplete: displaced prior pointer is missing at ${displaced}.`));
+        } else {
+          assertPointerBinding(displaced, expected, fs, "displaced catalog pointer before rollback");
+          renameCatalogPointerWithRetry(displaced, target, fs);
+          assertPointerBinding(target, expected, fs, "restored catalog pointer");
+          rollbackComplete = true;
+        }
+      } catch (rollbackError) { rollbackFailures.push(rollbackError); }
+    }
+    throw pointerTransactionError(error, { installed, rollbackComplete, displaced: error?.catalogPointerResidue || displaced, expected, residues: [error?.catalogPointerResidue || displaced] }, rollbackFailures);
   }
 }
 
@@ -1153,18 +1298,22 @@ function restoreManagedCatalogTopology(topology, snapshot, fs) {
   assertSource();
   const currentDir = path.join(topology.generationsDir, "current");
   const next = siblingPath(currentDir, "catalog-current-restore");
+  const installedPointerResidues = new Set();
+  let nextBinding;
   let pointerInstalled = false;
   let pointerRolledBack = false;
   try {
     assertRoots();
     assertSource();
     fs.symlink(source.generation, next, "dir");
+    if (fsPlatform(fs) === "win32") nextBinding = pointerBinding(next, fs, "catalog restore pointer");
     assertRoots();
     assertSource();
     assertRoots();
     assertSource();
-    renameCatalogPointer(next, currentDir, fs);
-    pointerInstalled = true;
+    const pointer = renameCatalogPointer(next, currentDir, fs);
+    for (const residue of pointer.residues || []) installedPointerResidues.add(residue);
+    pointerInstalled = pointer.installed;
     assertRoots();
     assertSource();
     fsyncDirectory(topology.generationsDir, fs);
@@ -1181,34 +1330,89 @@ function restoreManagedCatalogTopology(topology, snapshot, fs) {
     return;
   } catch (error) {
     const cleanupFailures = [];
-    if (pointerInstalled) {
+    const transaction = error?.catalogPointerTransaction;
+    let rollbackTransaction;
+    let rollbackBinding;
+    const recoveryResidues = new Set([...installedPointerResidues]);
+    recordPointerFailure(error, recoveryResidues);
+    if (transaction) {
+      pointerInstalled ||= transaction.installed === true;
+      pointerRolledBack ||= transaction.rollbackComplete === true;
+    }
+    if (pointerInstalled && !pointerRolledBack) {
       const rollback = siblingPath(currentDir, "catalog-current-rollback");
       try {
         fs.symlink(current.generation, rollback, "dir");
-        renameCatalogPointer(rollback, currentDir, fs);
+        if (fsPlatform(fs) === "win32") rollbackBinding = pointerBinding(rollback, fs, "catalog rollback pointer");
+        const rollbackResult = renameCatalogPointer(rollback, currentDir, fs);
+        for (const residue of rollbackResult.residues || []) recoveryResidues.add(residue);
         fsyncDirectory(topology.generationsDir, fs);
-        pointerRolledBack = true;
+        pointerRolledBack = rollbackResult.installed && pointerTargets(currentDir, current.generation, fs);
       } catch (rollbackError) {
+        rollbackTransaction = rollbackError?.catalogPointerTransaction;
+        recordPointerFailure(rollbackError, recoveryResidues);
+        if (rollbackTransaction?.installed === true) {
+          try { pointerRolledBack ||= pointerTargets(currentDir, current.generation, fs); } catch (bindingError) { cleanupFailures.push(bindingError); }
+        }
         cleanupFailures.push(rollbackError);
       } finally {
         try {
-          if (lstatIfPresent(rollback, fs)) fs.unlink(rollback);
+          if (pointerLstatIfPresent(rollback, fs)) {
+            if (fsPlatform(fs) !== "win32") {
+              fs.unlink(rollback);
+            } else if (!pointerRolledBack || !pointerTargets(currentDir, current.generation, fs) || !rollbackBinding) {
+              throw new Error(`Preserving rollback pointer at ${rollback} because the old catalog pointer is not bound at current.`);
+            } else {
+              recoveryResidues.add(removeVerifiedPointer(rollback, rollbackBinding, fs, "catalog rollback pointer"));
+            }
+          }
         } catch (cleanupError) {
+          recordPointerFailure(cleanupError, recoveryResidues);
           cleanupFailures.push(cleanupError);
         }
       }
     }
+    for (const [index, pointerTransaction] of [transaction, rollbackTransaction].entries()) {
+      if (!pointerRolledBack || !pointerTransaction?.displaced) continue;
+      try {
+        const displaced = pointerLstatIfPresent(pointerTransaction.displaced, fs);
+        if (!displaced) continue;
+        if (!pointerTransaction.expected || !pointerTargets(currentDir, current.generation, fs) || !samePointerBinding(pointerBinding(pointerTransaction.displaced, fs, "displaced catalog pointer residue"), pointerTransaction.expected)) {
+          throw new Error(`Windows catalog pointer rollback left an unbound displaced-pointer residue at transaction ${index}.`);
+        }
+        recoveryResidues.add(removeVerifiedPointer(pointerTransaction.displaced, pointerTransaction.expected, fs, "displaced catalog pointer residue"));
+      } catch (cleanupError) {
+        recordPointerFailure(cleanupError, recoveryResidues);
+        cleanupFailures.push(cleanupError);
+      }
+    }
     try {
-      if (lstatIfPresent(next, fs)) fs.unlink(next);
+      if (pointerLstatIfPresent(next, fs)) {
+        if (fsPlatform(fs) !== "win32") fs.unlink(next);
+        else if (!nextBinding) throw new Error(`Preserving unbound catalog restore pointer at ${next}.`);
+        else recoveryResidues.add(removeVerifiedPointer(next, nextBinding, fs, "catalog restore pointer"));
+      }
     } catch (cleanupError) {
+      recordPointerFailure(cleanupError, recoveryResidues);
       cleanupFailures.push(cleanupError);
     }
-    if (createdGeneration && (!pointerInstalled || pointerRolledBack)) {
+    let sourceStillReferenced = false;
+    try {
+      const residues = [next, ...recoveryResidues];
+      sourceStillReferenced = [currentDir, ...residues.filter(Boolean)].some((pointer) => pointerTargets(pointer, source.generation, fs));
+    } catch (referenceError) {
+      sourceStillReferenced = true;
+      cleanupFailures.push(referenceError);
+    }
+    if (createdGeneration && sourceStillReferenced) {
+      cleanupFailures.push(new Error(`Preserving restored catalog generation because a live pointer still references ${source.generation}.`));
+    } else if (createdGeneration && (!pointerInstalled || pointerRolledBack)) {
       try {
         assertRoots();
         assertSource();
         if (lstatIfPresent(createdGeneration.generationDir, fs)) removeExact(createdGeneration.generationDir, fs);
       } catch (cleanupError) {
+        recordPointerFailure(cleanupError, recoveryResidues);
         cleanupFailures.push(cleanupError);
       }
     }

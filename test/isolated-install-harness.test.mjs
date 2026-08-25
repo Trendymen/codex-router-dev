@@ -234,13 +234,16 @@ test("acceptance runtime fixture seam admits only an owned loopback-safe observa
   } finally { await new Promise((resolve) => server.close(resolve)); }
 });
 
-test("an injected acceptance fixture is used once by real start and is closed after restart cleanup", async () => {
+test("an injected acceptance fixture is used once by real materialized start and is closed after restart cleanup", {
+  skip: process.platform !== "darwin" && "the production launch target is macOS-only; portable fixture-schema tests run above",
+}, async () => {
   const acceptanceRoot = path.join(repositoryRoot, "generated", "acceptance");
   mkdirSync(acceptanceRoot, { recursive: true, mode: 0o700 });
   const root = mkdtempSync(path.join(acceptanceRoot, `task3-fixture-runtime-${process.pid}-`));
   const sourceCommit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repositoryRoot, encoding: "utf8" }).trim();
   let injectedFixture;
   let factoryCalls = 0;
+  let installerCalls = 0;
   let runtime;
   try {
     const env = createIsolatedEnvironment({ root, nonce: `fixture-runtime-${process.pid}`, sourceCommit });
@@ -248,6 +251,13 @@ test("an injected acceptance fixture is used once by real start and is closed af
       sourceCommit,
       allowReleased: true,
       requireSwift: false,
+      installerRunner: (isolated) => {
+        installerCalls += 1;
+        mkdirSync(isolated.stateRoot, { recursive: true, mode: 0o700 });
+        writeFileSync(path.join(isolated.stateRoot, "caller-secret"), "fixture_only_caller_capability_0123456789abcdef\n", { mode: 0o600 });
+        writeFileSync(path.join(isolated.stateRoot, "internal-secret"), "fixture_only_internal_capability_0123456789abcdef\n", { mode: 0o600 });
+        return "fixture-only materialized-start setup";
+      },
       providerFixtureFactory: async ({ registerServer }) => {
         factoryCalls += 1;
         injectedFixture = await createLocalProviderFixture({ registerServer });
@@ -259,6 +269,7 @@ test("an injected acceptance fixture is used once by real start and is closed af
     await runtime.callbacks.route(env, "responses");
     await runtime.callbacks.route(env, "messages");
     await runtime.callbacks.lifecycle(env, "restart");
+    assert.equal(installerCalls, 1);
     assert.equal(factoryCalls, 1);
     assert.deepEqual(injectedFixture.requests.map(({ path, transport }) => ({ path, transport })), [{ path: "/v1/responses", transport: "responses" }, { path: "/v1/messages", transport: "messages" }]);
   } finally {
