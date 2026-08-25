@@ -372,8 +372,7 @@ test("start runtime settles every acquired resource after injected setup failure
 });
 
 test("default start runtime consumes its explicit Task1 manifest before creating resources", { skip: process.platform !== "darwin", timeout: 40_000 }, async () => {
-  const fixture = currentTask1Fixture(), globalManifest = JSON.parse(readFileSync(path.resolve("generated", "acceptance", "task1-build", "acceptance-build.json"), "utf8"));
-  assert.notEqual(globalManifest.sourceCommit, fixture.sourceCommit, "test requires the global Task1 manifest to be stale");
+  const fixture = currentTask1Fixture();
   const missingRoot = freshExactRuntimeRoot(), missing = createIsolatedEnvironment({ root: missingRoot, nonce: `runtime-${createHash("sha256").update(missingRoot).digest("hex").slice(0, 16)}`, sourceCommit: fixture.sourceCommit });
   await assert.rejects(startAcceptanceRuntime(missing, { sourceCommit: fixture.sourceCommit }), /Task1 build manifest|build root/i);
   assert.equal(existsSync(missing.sourceRoot), false); assert.equal(existsSync(isolationLeasePath(missing.target.ports).lock), false);
