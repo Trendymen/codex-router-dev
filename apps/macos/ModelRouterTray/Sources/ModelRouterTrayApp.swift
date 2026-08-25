@@ -2120,26 +2120,6 @@ private struct StatusBeacon: View {
   }
 }
 
-enum CapabilityPresentationModel {
-  static func groupID(for capabilityID: String) -> String {
-    switch capabilityID {
-    case "lifecycle", "usage", "native-session-usage": return "core"
-    case "provider-credentials", "provider-model-state", "picker-catalog": return "providers"
-    case "doctor-update", "maintenance", "failover", "protocol-proof", "cc-switch", "tool-result-aging": return "maintenance"
-    default: return "advanced"
-    }
-  }
-
-  static func startsExpanded(_ capabilityID: String) -> Bool { false }
-}
-
-private struct CapabilityPresentationGroup: Identifiable {
-  let id: String
-  let title: String
-  let icon: String
-  let capabilities: [CapabilityDescription]
-}
-
 private struct OperationPulse: View {
   let active: Bool
   var body: some View {
@@ -2156,36 +2136,16 @@ private struct AccentButtonStyle: ButtonStyle {
 
 private struct CapabilityTrayView: View {
   @ObservedObject var store: RouterStore
-  @State private var expandedGroups: Set<String> = []
 
   var body: some View {
     VStack(alignment: .leading, spacing: 0) {
       header
       Divider()
       if store.capabilitySnapshot.isCompatible {
-        summary
         ScrollView {
           LazyVStack(alignment: .leading, spacing: 12) {
-            ForEach(groups) { group in
-              DisclosureGroup(
-                isExpanded: Binding(
-                  get: { expandedGroups.contains(group.id) },
-                  set: { isExpanded in
-                    if isExpanded { expandedGroups.insert(group.id) } else { expandedGroups.remove(group.id) }
-                  }
-                )
-              ) {
-                ForEach(group.capabilities) { capability in
-                  CapabilitySectionView(store: store, capability: capability)
-                }
-              } label: {
-                HStack(spacing: 8) {
-                  Image(systemName: group.icon).foregroundStyle(routerAccent)
-                  Text(routerLocalized(group.title)).font(.subheadline.weight(.semibold))
-                  Spacer()
-                  Text("\(group.capabilities.count)").font(.caption.monospaced()).foregroundStyle(routerMuted)
-                }
-              }
+            ForEach(store.capabilitySnapshot.capabilities) { capability in
+              CapabilitySectionView(store: store, capability: capability)
             }
             if store.commandResult != nil {
               CapabilityResultView(store: store)
@@ -2216,39 +2176,6 @@ private struct CapabilityTrayView: View {
     }
     .padding(14)
   }
-
-  private var groups: [CapabilityPresentationGroup] {
-    let grouped = Dictionary(grouping: store.capabilitySnapshot.capabilities) { CapabilityPresentationModel.groupID(for: $0.id) }
-    let definitions: [(String, String, String)] = [
-      ("core", "Router overview", "waveform.path.ecg"),
-      ("providers", "Providers", "shippingbox"),
-      ("advanced", "Vision Bridge", "eye"),
-      ("maintenance", "Maintenance", "wrench.and.screwdriver"),
-    ]
-    return definitions.compactMap { id, title, icon in
-      guard let capabilities = grouped[id], !capabilities.isEmpty else { return nil }
-      return CapabilityPresentationGroup(id: id, title: title, icon: icon, capabilities: capabilities)
-    }
-  }
-
-  private var summary: some View {
-    HStack(spacing: 10) {
-      ProviderIcon(providerID: store.selectedUsageProviderID, size: 28, showsHelp: false)
-      VStack(alignment: .leading, spacing: 2) {
-        Text(store.selectedUsageProvider.shortName).font(.subheadline.weight(.semibold))
-        Text(store.activeModel ?? store.activityState.label).font(.caption).foregroundStyle(routerMuted).lineLimit(1)
-      }
-      Spacer()
-      VStack(alignment: .trailing, spacing: 2) {
-        Text(store.activeRequestCount == 0 ? routerLocalized("No traffic") : "\(store.activeRequestCount) \(routerLocalized("Running chats"))")
-          .font(.caption.weight(.medium))
-        Text("\(store.selectedProviderUsage?.totalTokens ?? 0) \(routerLocalized("Tokens"))")
-          .font(.caption2.monospaced()).foregroundStyle(routerMuted)
-      }
-    }
-    .padding(.horizontal, 14)
-    .padding(.vertical, 10)
-  }
 }
 
 private struct IncompatibleCapabilityView: View {
@@ -2274,21 +2201,18 @@ private struct IncompatibleCapabilityView: View {
 private struct CapabilitySectionView: View {
   @ObservedObject var store: RouterStore
   let capability: CapabilityDescription
-  @State private var expanded = false
 
   var body: some View {
-    DisclosureGroup(isExpanded: $expanded) {
+    VStack(alignment: .leading, spacing: 7) {
+      HStack {
+        Text(routerLocalized(capability.localizationKey)).font(.subheadline.weight(.semibold))
+        Spacer()
+        Text("\(capability.nodeCommands.count)").font(.caption.monospaced()).foregroundStyle(routerMuted)
+      }
       ForEach(capability.nodeCommands.compactMap(store.capabilitySnapshot.command), id: \.id) { command in
         CapabilityCommandRow(store: store, command: command)
       }
-    } label: {
-      HStack {
-        Text(routerLocalized(capability.localizationKey)).font(.caption.weight(.medium))
-        Spacer()
-        Text("\(capability.nodeCommands.count)").font(.caption2.monospaced()).foregroundStyle(routerMuted)
-      }
     }
-    .padding(.vertical, 2)
   }
 }
 
@@ -2473,9 +2397,6 @@ enum MenuBarStatusItemConfiguration {
   static let fallbackTitle = "MR"
   static let overlayWidth: CGFloat = 32
   static let overlayHeight: CGFloat = 24
-  // Keep the fallback overlay to the left of macOS's battery/Wi-Fi/Control
-  // Center group, alongside ordinary third-party menu-bar applications.
-  static let overlayRightInset: CGFloat = 372
   static let fallbackImageName = "AppIcon"
   static let visibilityRecoveryDelay: TimeInterval = 1
 }
@@ -2525,7 +2446,7 @@ private final class MenuBarOverlayController: NSObject {
   func show() {
     guard let screen = NSScreen.main ?? NSScreen.screens.first else { return }
     let frame = screen.frame
-    let x = max(frame.minX, frame.maxX - MenuBarStatusItemConfiguration.overlayRightInset)
+    let x = max(frame.minX, frame.maxX - 270)
     let y = frame.maxY - MenuBarStatusItemConfiguration.overlayHeight
     panel.setFrame(NSRect(x: x, y: y, width: MenuBarStatusItemConfiguration.overlayWidth, height: MenuBarStatusItemConfiguration.overlayHeight), display: true)
     panel.orderFrontRegardless()
