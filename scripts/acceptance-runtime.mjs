@@ -1,6 +1,6 @@
 import { execFileSync, spawn } from "node:child_process";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
-import { chmodSync, closeSync, constants as fsConstants, copyFileSync, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, constants as fsConstants, copyFileSync, cpSync, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import net from "node:net";
 import http from "node:http";
 import path from "node:path";
@@ -285,12 +285,14 @@ export function preferredPushedRuntimeRemote({ git = (args, options = {}) => exe
 
 export function assertPushedRuntimeHarness(sourceCommit, { git = (args, options = {}) => execFileSync("git", args, { cwd: ROOT, ...options }), remoteProbe } = {}) {
   if (!/^[0-9a-f]{40}$/.test(String(sourceCommit || ""))) throw new Error("source commit must be a full Git commit");
-  const head = String(git(["rev-parse", "HEAD"], { encoding: "utf8" })).trim();
+  // A dirty or untracked harness is unsafe regardless of what commit callers
+  // supplied.  Reject it before opening a commit object or touching a remote.
+  for (const file of RUNTIME_PATHS) if (String(git(["status", "--porcelain", "--", file], { encoding: "utf8" })).trim()) throw new Error(`runtime harness path is dirty or untracked: ${file}`);
   for (const file of RUNTIME_PATHS) {
-    if (String(git(["status", "--porcelain", "--", file], { encoding: "utf8" })).trim()) throw new Error(`runtime harness path is dirty or untracked: ${file}`);
     const committed = Buffer.from(git(["show", `${sourceCommit}:${file}`], { encoding: "buffer" }));
     if (!committed.equals(readFileSync(path.join(ROOT, file)))) throw new Error(`runtime harness bytes differ from source commit: ${file}`);
   }
+  const head = String(git(["rev-parse", "HEAD"], { encoding: "utf8" })).trim();
   const remoteName = preferredPushedRuntimeRemote({ git });
   const remote = String((remoteProbe || ((name) => git(["ls-remote", name, "refs/heads/main"], { encoding: "utf8" })))(remoteName, sourceCommit)).trim().split(/\s+/)[0];
   if (remote !== sourceCommit || head !== sourceCommit) throw new Error(`runtime acceptance must run current ${remoteName}/main`);
@@ -299,7 +301,7 @@ export function assertPushedRuntimeHarness(sourceCommit, { git = (args, options 
 /** Every mutating/recording CLI command calls this gate.  It intentionally is
  * not used by injected unit seams, which exercise the pure helpers before the
  * two files are checked in. */
-function assertRuntimeCommandProvenance(sourceCommit) { return assertPushedRuntimeHarness(sourceCommit); }
+export function assertRuntimeCommandProvenance(sourceCommit, options) { return assertPushedRuntimeHarness(sourceCommit, options); }
 
 function exactKeys(value, keys, name) { if (!value || typeof value !== "object" || Array.isArray(value) || Object.keys(value).sort().join("\0") !== [...keys].sort().join("\0")) throw new Error(`runtime handle ${name} schema is invalid`); return value; }
 function sameIdentity(left, right) { return Number(left?.dev) === Number(right?.dev) && Number(left?.ino) === Number(right?.ino); }
@@ -577,6 +579,38 @@ export function verifiedSwiftBundle(bundle, sourceCommit, { manifestPath = path.
   if (actual !== expected || path.relative(buildRoot, actual).startsWith("..") || actual === "/Applications/Model Router.app") throw new Error("Swift bundle is not the Task1 isolated build artifact");
   return actual;
 }
+function task1ManifestForBuildRoot(buildRoot, sourceCommit) {
+  const requestedBuildRoot = path.resolve(buildRoot), manifestPath = path.join(path.dirname(requestedBuildRoot), "acceptance-build.json"), entry = privateIdentity(manifestPath, "Task1 build manifest"), manifest = JSON.parse(readPrivateNoFollow(manifestPath, identity(entry), "Task1 build manifest"));
+  if (manifest?.sourceCommit !== sourceCommit || manifest?.buildRoot !== requestedBuildRoot) throw new Error("Task1 build manifest does not bind the requested build root and source commit");
+  return { manifestPath, bundle: verifiedSwiftBundle(manifest.bundlePath, sourceCommit, { manifestPath }) };
+}
+function copyVerifiedSwiftBundle(env, bundle) {
+  const appPath = inside(env.root, env.target.appPath, "verified Swift bundle target");
+  if (existsSync(appPath)) throw new Error("verified Swift bundle target already exists");
+  mkdirSync(path.dirname(appPath), { recursive: true, mode: 0o700 });
+  const staging = inside(env.root, path.join(path.dirname(appPath), `.${path.basename(appPath)}.${process.pid}.${randomBytes(6).toString("hex")}.staging`), "verified Swift bundle staging");
+  try {
+    cpSync(bundle, staging, { recursive: true, preserveTimestamps: true, force: false, errorOnExist: true });
+    const staged = lstatSync(staging);
+    if (!staged.isDirectory() || staged.isSymbolicLink()) throw new Error("verified Swift bundle staging is invalid");
+    if (existsSync(appPath)) throw new Error("verified Swift bundle target appeared during copy");
+    renameSync(staging, appPath);
+    const copied = lstatSync(appPath);
+    if (!copied.isDirectory() || copied.isSymbolicLink() || !sameIdentity(copied, staged)) throw new Error("verified Swift bundle target identity changed during copy");
+    return { path: appPath, identity: identity(copied) };
+  } catch (error) {
+    try { if (existsSync(staging) && !lstatSync(staging).isSymbolicLink()) rmSync(staging, { recursive: true, force: true }); } catch {}
+    throw error;
+  }
+}
+function removeCopiedSwiftBundle(env, copied) {
+  if (!copied) return;
+  const appPath = inside(env.root, copied.path, "copied Swift bundle target");
+  if (appPath !== env.target.appPath || !existsSync(appPath)) return;
+  const entry = lstatSync(appPath);
+  if (!entry.isDirectory() || entry.isSymbolicLink() || !sameIdentity(entry, copied.identity)) throw new Error("refusing to remove a replaced Swift bundle target");
+  rmSync(appPath, { recursive: true, force: false });
+}
 
 export function validateVisualRecord({ kind, artifact, sourceCommit, runtimeId, captureStartedAt, verdict, viewport, appearance, reviewer, inspected, issues, sidecars }) {
   const expected = VISUALS[kind]; if (!expected || verdict !== "passed" || !/^[0-9a-f]{40}$/.test(String(sourceCommit || ""))) throw new Error("invalid visual record");
@@ -588,9 +622,14 @@ export function validateVisualRecord({ kind, artifact, sourceCommit, runtimeId, 
   return { ...expected, kind, screenshot: resolved, sourceCommit, ...(runtimeId ? { runtimeId } : {}), ...(captureStartedAt ? { captureStartedAt } : {}), ...(sidecars ? { sidecars } : {}), verdict, viewport, appearance: appearance || expected.appearance, reviewer, inspected: [...inspected], issues: [...issues] };
 }
 
-export async function startAcceptanceRuntime(env, { sourceCommit = env?.sourceCommit, runtimeFactory = createLocalRuntime, operations = {} } = {}) {
+export async function startAcceptanceRuntime(env, { sourceCommit = env?.sourceCommit, runtimeFactory = createLocalRuntime, operations = {}, task1ManifestPath, buildRoot } = {}) {
   assertIsolatedEnvironment(env); if (sourceCommit !== env.sourceCommit) throw new Error("runtime source commit mismatch");
   if (existsSync(env.sourceRoot)) throw new Error("runtime acceptance requires a fresh explicit root");
+  const suppliedTask1 = task1ManifestPath || buildRoot;
+  if (runtimeFactory === createLocalRuntime && (!task1ManifestPath || !buildRoot)) throw new Error("default runtime requires a Task1 build manifest and build root");
+  if (suppliedTask1 && (!task1ManifestPath || !buildRoot)) throw new Error("Task1 manifest and build root must be supplied together");
+  const task1 = suppliedTask1 ? task1ManifestForBuildRoot(buildRoot, sourceCommit) : undefined;
+  if (task1 && task1.manifestPath !== path.resolve(task1ManifestPath)) throw new Error("Task1 manifest path is not the canonical sibling of its build root");
   const operation = {
     acquireLease: acquireIsolationLease,
     captureRoot: runtimeCaptureRoot,
@@ -599,7 +638,7 @@ export async function startAcceptanceRuntime(env, { sourceCommit = env?.sourceCo
     unlink: unlinkSync,
     ...operations,
   };
-  let runtime, callbacks, release, control, handshakePath, captureRoots, cleaned = false;
+  let runtime, callbacks, release, control, handshakePath, captureRoots, copiedBundle, cleaned = false;
   const closeControl = async () => {
     if (!control) return;
     await new Promise((resolve, reject) => control.close((error) => error ? reject(error) : resolve()));
@@ -608,6 +647,7 @@ export async function startAcceptanceRuntime(env, { sourceCommit = env?.sourceCo
     if (cleaned) return; cleaned = true;
     const failures = [];
     try { await runtime?.dispose?.(); } catch (error) { failures.push(error); }
+    try { removeCopiedSwiftBundle(env, copiedBundle); } catch (error) { failures.push(error); }
     try { await closeControl(); } catch (error) { failures.push(error); }
     for (const file of [controlPath(env.root), handshakePath, handlePath(env.root)].filter(Boolean)) try { operation.unlink(file); } catch (error) { if (error?.code !== "ENOENT") failures.push(error); }
     try { if (captureRoots) operation.removeCaptureRoots(captureRoots); } catch (error) { failures.push(error); }
@@ -615,8 +655,9 @@ export async function startAcceptanceRuntime(env, { sourceCommit = env?.sourceCo
     if (failures.length) throw new AggregateError(failures, "direct runtime cleanup failed");
   };
   try {
-    runtime = await runtimeFactory(env, { sourceCommit });
+    runtime = await runtimeFactory(env, { sourceCommit, ...(runtimeFactory === createLocalRuntime ? { requireSwift: false } : {}) });
     callbacks = runtimeCallbacksFor(env) || runtime.callbacks;
+    if (task1) copiedBundle = copyVerifiedSwiftBundle(env, task1.bundle);
     await callbacks.prerequisites(env); await callbacks.install(env); const started = await callbacks.start(env); const health = await callbacks.health(env);
     if (!health?.ok) throw new Error("isolated Router health is not OK");
     release = operation.acquireLease(env.root, env.target.ports);
@@ -1033,7 +1074,7 @@ export async function finalNonLiveAcceptance({ root, buildRoot, browserProfile, 
         verifiedSwiftBundle(manifest.bundlePath, sourceCommit, { manifestPath });
         if (requestedProfile !== finalNonLiveBrowserProfile(preflight)) throw new Error("final non-live browser profile does not match the explicit worker plan");
         const env = createIsolatedEnvironment({ root: preflight, nonce: `final-${hash(preflight).slice(0, 16)}`, sourceCommit });
-        return startAcceptanceWorker(env, { browserProfile: requestedProfile, requireSwift });
+        return startAcceptanceWorker(env, { browserProfile: requestedProfile, requireSwift, task1ManifestPath: manifestPath });
       }))();
     }
     if (!handle || handle.sourceCommit !== sourceCommit || path.resolve(handle.root) !== absoluteRoot) throw new Error("final non-live runtime handle is not bound to this invocation");
@@ -1129,9 +1170,10 @@ async function createControlServer(env, runtimeId, token, callbacks, shutdown) {
   if (!lstatSync(env.root).isDirectory() || (statSync(env.root).mode & 0o077) !== 0) throw new Error("runtime control root is not private");
   return server;
 }
-async function startAcceptanceWorker(env, { browserProfile, requireSwift = true } = {}) {
+async function startAcceptanceWorker(env, { browserProfile, requireSwift = true, task1ManifestPath } = {}) {
   const runtimeId = `worker-${randomBytes(8).toString("hex")}`, token = randomBytes(32).toString("hex"), failurePath = path.join(env.root, "runtime-worker-failure.json");
-  const args = [fileURLToPath(import.meta.url), "--worker", "--root", env.root, "--source-commit", env.sourceCommit, "--runtime-id", runtimeId, "--token", token, ...(requireSwift ? [] : ["--no-swift"]), ...(browserProfile ? ["--browser-profile", browserProfile] : [])];
+  if (requireSwift && !task1ManifestPath) throw new Error("runtime worker requires a verified Task1 build manifest");
+  const args = [fileURLToPath(import.meta.url), "--worker", "--root", env.root, "--source-commit", env.sourceCommit, "--runtime-id", runtimeId, "--token", token, ...(requireSwift ? [] : ["--no-swift"]), ...(browserProfile ? ["--browser-profile", browserProfile] : []), ...(task1ManifestPath ? ["--task1-manifest", task1ManifestPath] : [])];
   const child = spawn(process.execPath, args, { detached: true, stdio: "ignore" }); child.unref();
   const deadline = Date.now() + 15_000;
   while (!existsSync(handlePath(env.root)) && !existsSync(failurePath) && child.exitCode === null && child.signalCode === null && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 50));
@@ -1158,7 +1200,7 @@ async function worker(args) {
   catch (error) { try { privateJsonReplace(failurePath, { owner: OWNER, sourceCommit, status: "failed", stage: "bootstrap", message: safeText(error?.message || "runtime worker bootstrap failed") }); } catch {}; throw error; }
   const fixtureState = { quotaModel: null, attempts: [] };
   let runtime, callbacks, server, started, stopping = false, captureRoots, profile;
-  const runtimeId = option(args, "--runtime-id", true) || `worker-${randomBytes(8).toString("hex")}`, token = option(args, "--token", true) || randomBytes(32).toString("hex"), handshakePath = path.join(env.root, "runtime-handshake"), plannedBrowserProfile = option(args, "--browser-profile", true);
+  const runtimeId = option(args, "--runtime-id", true) || `worker-${randomBytes(8).toString("hex")}`, token = option(args, "--token", true) || randomBytes(32).toString("hex"), handshakePath = path.join(env.root, "runtime-handshake"), plannedBrowserProfile = option(args, "--browser-profile", true), requireSwift = !args.includes("--no-swift"), task1ManifestPath = option(args, "--task1-manifest", true);
   if (!/^worker-[0-9a-f]{16}$/.test(runtimeId) || !/^[0-9a-f]{64}$/.test(token)) throw new Error("runtime worker bootstrap binding is invalid");
   const emergencyStop = () => {
     // The child object is created by this worker, so this fallback does not
@@ -1169,7 +1211,10 @@ async function worker(args) {
     if (stopping) return; stopping = true;
     const failures = [];
     try { await boundedCleanup("runtime", async () => runtime?.dispose()); } catch (error) { failures.push(error); emergencyStop(); }
-    try { await boundedCleanup("control socket", async () => new Promise((resolve) => server?.close(resolve))); } catch (error) { failures.push(error); server?.unref(); }
+    try { await boundedCleanup("control socket", async () => {
+      if (!server) return;
+      await new Promise((resolve) => server.close(resolve));
+    }); } catch (error) { failures.push(error); server?.unref(); }
     for (const file of [controlPath(env.root), handshakePath, handlePath(env.root)]) try { unlinkSync(file); } catch (error) { if (error?.code !== "ENOENT") failures.push(error); }
     try { removeCaptureRoots(captureRoots); } catch (error) { failures.push(error); }
     try { release(); } catch (error) { failures.push(error); }
@@ -1186,7 +1231,9 @@ async function worker(args) {
   process.on("SIGTERM", () => { void shutdown(); }); process.on("SIGINT", () => { void shutdown(); });
   process.once("uncaughtException", async () => { await shutdown(); }); process.once("unhandledRejection", async () => { await shutdown(); });
   try {
-    const runtimeOptions = { sourceCommit, requireSwift: !args.includes("--no-swift") };
+    const task1 = requireSwift ? task1ManifestPath ? task1ManifestForBuildRoot(path.join(path.dirname(task1ManifestPath), "build-root"), sourceCommit) : (() => { throw new Error("runtime worker requires a Task1 build manifest"); })() : undefined;
+    if (task1 && task1.manifestPath !== path.resolve(task1ManifestPath)) throw new Error("runtime worker Task1 manifest path is not canonical");
+    const runtimeOptions = { sourceCommit, requireSwift: false };
     if (!args.includes("--stable-fixture")) runtimeOptions.providerFixtureFactory = async ({ registerServer, signal }) => {
       // Do not proxy the checked-in fixture through an extra HTTP hop.  The
       // Router deliberately observes the upstream stream while relaying it;
@@ -1199,7 +1246,7 @@ async function worker(args) {
     };
     runtime = await createLocalRuntime(env, runtimeOptions);
     callbacks = runtime.callbacks;
-    await callbacks.prerequisites(env); await callbacks.install(env);
+    await callbacks.prerequisites(env); if (task1) copyVerifiedSwiftBundle(env, task1.bundle); await callbacks.install(env);
     // Keep the installer's checked Task2 catalog byte-identical for the first
     // protocol baseline.  Task3-specific routes are layered only after that
     // stable transport has proved its terminal lifecycle.
@@ -1324,7 +1371,7 @@ export async function runAcceptanceRuntimeCli(argv = process.argv.slice(2), { pr
   }
   const root = path.resolve(option(args, "--root")), evidence = path.resolve(option(args, "--evidence")), sourceCommit = option(args, "--source-commit", true) || currentCommit();
   provenance(sourceCommit);
-  if (command === "start") { if (existsSync(root)) throw new Error("runtime start requires a fresh root with no prior control artifacts"); const env = cliEnvironment(root, sourceCommit), browserProfile = defaultCliBrowserProfile(env.root); await assertPortsAvailable(env.target.ports); const handle = await startAcceptanceWorker(env, { browserProfile }); privateJson(path.join(env.evidenceRoot, "runtime-start.json"), runtimeAcceptanceReport(handle)); process.stdout.write(`${handle.handlePath}\n`); return; }
+  if (command === "start") { if (existsSync(root)) throw new Error("runtime start requires a fresh root with no prior control artifacts"); const task1 = task1ManifestForBuildRoot(path.resolve(option(args, "--build-root")), sourceCommit), env = cliEnvironment(root, sourceCommit), browserProfile = defaultCliBrowserProfile(env.root); await assertPortsAvailable(env.target.ports); const handle = await startAcceptanceWorker(env, { browserProfile, task1ManifestPath: task1.manifestPath }); privateJson(path.join(env.evidenceRoot, "runtime-start.json"), runtimeAcceptanceReport(handle)); process.stdout.write(`${handle.handlePath}\n`); return; }
   const handle = readHandle(handlePath(root)); if (handle.sourceCommit !== sourceCommit) throw new Error("runtime handle source commit mismatch");
   if (command === "stop") {
     const reports = completedTask3ReportsOrPending(handle);

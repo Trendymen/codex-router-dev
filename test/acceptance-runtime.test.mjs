@@ -11,6 +11,7 @@ import { createIsolatedEnvironment } from "../scripts/verify-isolated-install.mj
 import { prepareAcceptanceBuild } from "../scripts/prepare-acceptance-build.mjs";
 import {
   assertPushedRuntimeHarness,
+  assertRuntimeCommandProvenance,
   assertControlOwnership,
   assertRuntimeHandle,
   createRuntimeFixture,
@@ -56,9 +57,9 @@ function freshExactRuntimeRoot(name = "runtime") {
   }
   throw new Error("no unleased exact-runtime port bucket is available");
 }
-function freshIsolatedTestEnvironment(parent, stage) {
+function freshIsolatedTestEnvironment(parent, stage, sourceCommit = commit) {
   for (let attempt = 0; attempt < 64; attempt += 1) {
-    const nonce = `cleanup-${stage}-${randomBytes(12).toString("hex")}`, env = createIsolatedEnvironment({ root: path.join(parent, `runtime-${stage}-${attempt}`), nonce, sourceCommit: commit });
+    const nonce = `cleanup-${stage}-${randomBytes(12).toString("hex")}`, env = createIsolatedEnvironment({ root: path.join(parent, `runtime-${stage}-${attempt}`), nonce, sourceCommit });
     if (!existsSync(isolationLeasePath(env.target.ports).lock)) return env;
   }
   throw new Error("no unleased isolated acceptance port bucket is available");
@@ -153,7 +154,7 @@ test("CLI start worker consumes the default profile plan while retaining its run
   const fixture = currentTask1Fixture(), sourceCommit = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim(), runtimeRoot = freshExactRuntimeRoot(), evidence = path.join(runtimeRoot, "evidence.json"), browserRoot = path.join(path.dirname(runtimeRoot), "browser"), swiftRoot = path.join(path.dirname(runtimeRoot), "swift");
   const invoke = (args) => runAcceptanceRuntimeCli(args, { provenance: () => true }); let live;
   try {
-    await invoke(["start", "--root", runtimeRoot, "--evidence", evidence, "--source-commit", sourceCommit]);
+    await invoke(["start", "--root", runtimeRoot, "--evidence", evidence, "--source-commit", sourceCommit, "--build-root", fixture.manifest.buildRoot]);
     live = JSON.parse(readFileSync(path.join(runtimeRoot, "runtime-handle.json"), "utf8"));
     assert.equal(live.profile, defaultCliBrowserProfile(runtimeRoot));
     assert.equal(live.captureRoots.browser, browserRoot); assert.equal(live.captureRoots.swift, swiftRoot);
@@ -242,7 +243,7 @@ test("runtime recorder is private and names exactly eight rows", () => {
   assert.match(source, /if \(previous\) writeFileSync\(file, previous.*else rmSync\(file/s);
   assert.doesNotMatch(source, /127\.0\.0\.1:4200/);
   assert.match(source, /runtime-worker-failure\.json/);
-  assert.match(source, /assertRuntimeCommandProvenance\(sourceCommit\)/);
+  assert.match(source, /provenance\(sourceCommit\)/);
   assert.match(source, /readPrivateNoFollow\(handle\.handshake\.path/);
   assert.match(source, /runtimeId !== handle\.runtimeId/);
   assert.match(source, /waitForWorkerCleanup/);
@@ -262,6 +263,9 @@ test("post-push gate verifies both runtime harness files through an injected sea
   assert.equal(preferredPushedRuntimeRemote({ git: (args) => args[0] === "remote" ? "github\norigin\n" : git(args) }), "github");
   assert.doesNotThrow(() => assertPushedRuntimeHarness(commit, { git, remoteProbe: () => `${commit}\trefs/heads/main\n` }));
   assert.throws(() => assertPushedRuntimeHarness(commit, { git: (args, options) => args[0] === "status" ? " M scripts/acceptance-runtime.mjs\n" : git(args, options), remoteProbe: () => `${commit}\trefs/heads/main\n` }), /dirty/i);
+  const calls = [];
+  assert.throws(() => assertPushedRuntimeHarness(commit, { git: (args) => { calls.push(args); if (args[0] === "status") return "?? scripts/acceptance-runtime.mjs\n"; throw new Error(`unexpected ${args[0]}`); } }), /dirty|untracked/i);
+  assert.deepEqual(calls, [["status", "--porcelain", "--", "scripts/acceptance-runtime.mjs"]]);
 });
 
 test("validateVisualRecord requires a fresh artifact and inspection", () => {
@@ -367,6 +371,46 @@ test("start runtime settles every acquired resource after injected setup failure
   }
 });
 
+test("default start runtime consumes its explicit Task1 manifest before creating resources", { skip: process.platform !== "darwin", timeout: 40_000 }, async () => {
+  const fixture = currentTask1Fixture(), globalManifest = JSON.parse(readFileSync(path.resolve("generated", "acceptance", "task1-build", "acceptance-build.json"), "utf8"));
+  assert.notEqual(globalManifest.sourceCommit, fixture.sourceCommit, "test requires the global Task1 manifest to be stale");
+  const missingRoot = freshExactRuntimeRoot(), missing = createIsolatedEnvironment({ root: missingRoot, nonce: `runtime-${createHash("sha256").update(missingRoot).digest("hex").slice(0, 16)}`, sourceCommit: fixture.sourceCommit });
+  await assert.rejects(startAcceptanceRuntime(missing, { sourceCommit: fixture.sourceCommit }), /Task1 build manifest|build root/i);
+  assert.equal(existsSync(missing.sourceRoot), false); assert.equal(existsSync(isolationLeasePath(missing.target.ports).lock), false);
+  const runtimeRoot = freshExactRuntimeRoot(), env = createIsolatedEnvironment({ root: runtimeRoot, nonce: `runtime-${createHash("sha256").update(runtimeRoot).digest("hex").slice(0, 16)}`, sourceCommit: fixture.sourceCommit }); let live, captureRoots;
+  try {
+    live = await startAcceptanceRuntime(env, { sourceCommit: fixture.sourceCommit, task1ManifestPath: fixture.manifestPath, buildRoot: fixture.manifest.buildRoot });
+    assert.equal(runtimeAcceptanceReport(live.handlePath, { verifyIdentity: false }).status, "running");
+    captureRoots = live.captureRoots;
+  } finally { await live?.runtime.dispose(); }
+  assert.equal(existsSync(captureRoots.browser), false); assert.equal(existsSync(captureRoots.swift), false);
+});
+
+test("start runtime settles a verified bundle when its injected factory fails", { skip: process.platform !== "darwin" }, async () => {
+  const fixture = currentTask1Fixture(), runtimeRoot = freshExactRuntimeRoot(), env = createIsolatedEnvironment({ root: runtimeRoot, nonce: `runtime-${createHash("sha256").update(runtimeRoot).digest("hex").slice(0, 16)}`, sourceCommit: fixture.sourceCommit });
+  await assert.rejects(startAcceptanceRuntime(env, { sourceCommit: fixture.sourceCommit, task1ManifestPath: fixture.manifestPath, buildRoot: fixture.manifest.buildRoot, runtimeFactory: async () => { throw new Error("injected factory failure"); } }), /injected factory failure/);
+  assert.equal(existsSync(env.target.appPath), false); assert.equal(existsSync(path.join(env.root, "runtime-handle.json")), false); assert.equal(existsSync(path.join(env.root, "runtime-handshake")), false); assert.equal(existsSync(isolationLeasePath(env.target.ports).lock), false);
+});
+
+test("start runtime removes its copied bundle when post-copy prerequisites fail", { skip: process.platform !== "darwin" }, async () => {
+  const fixture = currentTask1Fixture(), runtimeRoot = freshExactRuntimeRoot(), env = createIsolatedEnvironment({ root: runtimeRoot, nonce: `runtime-${createHash("sha256").update(runtimeRoot).digest("hex").slice(0, 16)}`, sourceCommit: fixture.sourceCommit }); let disposed = false;
+  await assert.rejects(startAcceptanceRuntime(env, { sourceCommit: fixture.sourceCommit, task1ManifestPath: fixture.manifestPath, buildRoot: fixture.manifest.buildRoot, runtimeFactory: async () => ({ dispose: async () => { disposed = true; }, callbacks: { prerequisites: async () => { throw new Error("post-copy prerequisites failure"); } } }) }), /post-copy prerequisites failure/);
+  assert.equal(disposed, true); assert.equal(existsSync(env.target.appPath), false); assert.equal(existsSync(path.join(env.root, "runtime-handle.json")), false); assert.equal(existsSync(path.join(env.root, "runtime-handshake")), false); assert.equal(existsSync(isolationLeasePath(env.target.ports).lock), false);
+});
+
+test("pre-control worker failure preserves its original error and releases owned resources", { skip: process.platform !== "darwin", timeout: 40_000 }, async () => {
+  const sourceCommit = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim(), dir = freshExactRuntimeRoot(), invalidProfile = path.join(path.dirname(dir), "foreign", "profile"), child = spawn(process.execPath, [path.resolve("scripts/acceptance-runtime.mjs"), "--worker", "--root", dir, "--source-commit", sourceCommit, "--runtime-id", "worker-0123456789abcdef", "--token", "a".repeat(64), "--browser-profile", invalidProfile, "--no-swift"], { stdio: ["ignore", "ignore", "pipe"] });
+  let stderr = ""; child.stderr.on("data", (chunk) => { stderr += chunk; });
+  try {
+    const failurePath = path.join(dir, "runtime-worker-failure.json"); await waitFor(() => existsSync(failurePath), "pre-control worker did not report failure");
+    const failure = JSON.parse(readFileSync(failurePath, "utf8"));
+    assert.match(failure.message, /planned browser profile is not an owned runtime or final profile/i); assert.doesNotMatch(failure.message, /startup and cleanup|cleanup failed/i);
+    await new Promise((resolve) => child.once("exit", resolve));
+    assert.equal(existsSync(path.join(dir, "c")), false, stderr); assert.equal(existsSync(path.join(dir, "runtime-handle.json")), false, stderr);
+    assert.equal(existsSync(isolationLeasePath(isolatedPortsForNonce(`runtime-${createHash("sha256").update(dir).digest("hex").slice(0, 16)}`)).lock), false);
+  } finally { if (!child.killed) child.kill("SIGTERM"); }
+});
+
 test("Swift session accepts only the bound Task1 manifest and isolated bundle", { skip: process.platform !== "darwin" }, () => {
   const dir = root(), build = path.join(dir, "build"), bundle = path.join(build, "Model Router.app"), manifest = path.join(dir, "acceptance-build.json");
   mkdirSync(bundle, { recursive: true }); writeFileSync(manifest, JSON.stringify({ sourceCommit: commit, buildOnly: true, buildRoot: build, bundlePath: bundle }), { mode: 0o600 });
@@ -416,7 +460,7 @@ function finalSeam(finalRoot, { dispose } = {}) {
   return value;
 }
 
-test("five-parameter final API starts a real seam, runs protocol, and leaves an owned manual continuation", async () => {
+test("five-parameter final API starts a real seam, runs protocol, and leaves an owned manual continuation", { skip: process.platform !== "darwin" }, async () => {
   const dir = root(), finalRoot = path.join(dir, "fresh"), evidence = path.join(dir, "evidence.json"); let protocolCalls = 0, disposed = false;
   const live = finalSeam(finalRoot, { dispose: () => { disposed = true; } });
   const result = await finalNonLiveAcceptance({ root: finalRoot, buildRoot: dir, browserProfile: live.profile, evidence, sourceCommit: commit, provenance: () => true, run: { start: async () => live, protocol: async () => { protocolCalls += 1; } } });
@@ -442,7 +486,7 @@ test("five-parameter final API without run uses the CLI worker protocol and plan
 
 test("public browser session to visual to stop publishes exactly seventeen local Task3 rows", { skip: process.platform !== "darwin", timeout: 60_000 }, async () => {
   const fixture = currentTask1Fixture(), manifest = fixture.manifest, sourceCommit = fixture.sourceCommit;
-  const dir = acceptanceTemp("task3-public-matrix-"), evidence = path.join(dir, "evidence.json"), child = spawn(process.execPath, [path.resolve("scripts/acceptance-runtime.mjs"), "--worker", "--root", dir, "--source-commit", sourceCommit, "--no-swift"], { stdio: ["ignore", "ignore", "pipe"] });
+  const dir = freshExactRuntimeRoot("worker"), evidence = path.join(dir, "evidence.json"), child = spawn(process.execPath, [path.resolve("scripts/acceptance-runtime.mjs"), "--worker", "--root", dir, "--source-commit", sourceCommit, "--no-swift"], { stdio: ["ignore", "ignore", "pipe"] });
   const invoke = (args) => runAcceptanceRuntimeCli(args, { provenance: () => true }); let live;
   const writeCapture = (captureRoot, name, sidecars = false) => {
     const artifact = path.join(captureRoot, name); writeFileSync(artifact, "pixels", { mode: 0o600 });
@@ -481,10 +525,14 @@ test("public browser session to visual to stop publishes exactly seventeen local
   }
 });
 
-test("production final provenance rejects untracked runtime harness before it starts a worker", async () => {
-  const dir = temp("task3-final-provenance-"), finalRoot = path.join(dir, "r");
-  await assert.rejects(finalNonLiveAcceptance({ root: finalRoot, buildRoot: dir, browserProfile: finalNonLiveBrowserProfile(finalRoot), evidence: path.join(dir, "evidence.json"), sourceCommit: commit }), /dirty|untracked|github/i);
-  assert.equal(existsSync(finalRoot), false);
+test("production final provenance rejects an injected dirty harness before source reads, remotes, or workers", async () => {
+  const calls = [], git = (args) => { calls.push(args); if (args[0] === "status") return "?? scripts/acceptance-runtime.mjs\n"; throw new Error(`unexpected ${args[0]}`); };
+  assert.throws(() => assertRuntimeCommandProvenance(commit, { git }), /dirty|untracked/i);
+  assert.deepEqual(calls, [["status", "--porcelain", "--", "scripts/acceptance-runtime.mjs"]]);
+  const dir = temp("task3-final-provenance-"), finalRoot = path.join(dir, "r"); calls.length = 0;
+  await assert.rejects(finalNonLiveAcceptance({ root: finalRoot, buildRoot: dir, browserProfile: finalNonLiveBrowserProfile(finalRoot), evidence: path.join(dir, "evidence.json"), sourceCommit: commit, provenance: (sourceCommit) => assertRuntimeCommandProvenance(sourceCommit, { git }) }), /dirty|untracked/i);
+  assert.deepEqual(calls, [["status", "--porcelain", "--", "scripts/acceptance-runtime.mjs"]]); assert.equal(existsSync(finalRoot), false);
+  assert.throws(() => assertRuntimeCommandProvenance(commit, { git: (args) => { if (args[0] === "status") return ""; if (args[0] === "show") throw new Error("source commit path is unavailable"); throw new Error(`unexpected ${args[0]}`); } }), /source commit path is unavailable/i);
 });
 
 test("resumed active final restores evidence and disposes its runtime after a human callback failure", async () => {
@@ -495,7 +543,7 @@ test("resumed active final restores evidence and disposes its runtime after a hu
 });
 
 test("resumed disk final restores evidence and stops the owned worker after a human callback failure", { skip: process.platform !== "darwin", timeout: 40_000 }, async () => {
-  const fixture = currentTask1Fixture(), dir = acceptanceTemp("task3-final-disk-"), evidence = path.join(dir, "evidence.json"), prior = '{"schemaVersion":1,"finalGeneration":null,"entries":[]}\n'; writeFileSync(evidence, prior, { mode: 0o600 });
+  const fixture = currentTask1Fixture(), dir = freshExactRuntimeRoot("worker"), evidence = path.join(dir, "evidence.json"), prior = '{"schemaVersion":1,"finalGeneration":null,"entries":[]}\n'; mkdirSync(dir, { recursive: true, mode: 0o700 }); writeFileSync(evidence, prior, { mode: 0o600 });
   const child = spawn(process.execPath, [path.resolve("scripts/acceptance-runtime.mjs"), "--worker", "--root", dir, "--source-commit", fixture.sourceCommit, "--no-swift"], { stdio: ["ignore", "ignore", "pipe"] }); let live;
   try {
     await waitFor(() => existsSync(path.join(dir, "runtime-handle.json")) || existsSync(path.join(dir, "runtime-worker-failure.json")), "disk final worker did not start");
@@ -525,7 +573,7 @@ test("final API restores prior evidence when a visual callback fails", async () 
 
 test("real worker owns its lease/socket and IPC stop cleans every owned runtime handle", { skip: process.platform !== "darwin", timeout: 40_000 }, async () => {
   const sourceCommit = (await import("node:child_process")).execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim();
-  const dir = acceptanceTemp("task3-worker-test-");
+  const dir = freshExactRuntimeRoot("worker");
   const child = spawn(process.execPath, [path.resolve("scripts/acceptance-runtime.mjs"), "--worker", "--root", dir, "--source-commit", sourceCommit, "--no-swift"], { env: { ...process.env, DEEPSEEK_API_KEY: "parent-secret-must-not-reach-protocol-child", HTTPS_PROXY: "https://parent-proxy.invalid", NODE_OPTIONS: "" }, stdio: ["ignore", "ignore", "pipe"] });
   let stderr = ""; child.stderr.on("data", (chunk) => { stderr += chunk; });
   try {
@@ -544,7 +592,7 @@ test("real worker owns its lease/socket and IPC stop cleans every owned runtime 
 
 test("real worker rejects a replaced socket and a reused router identity", { skip: process.platform !== "darwin", timeout: 40_000 }, async () => {
   const sourceCommit = (await import("node:child_process")).execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim();
-  const dir = acceptanceTemp("task3-worker-owner-test-");
+  const dir = freshExactRuntimeRoot("worker");
   const child = spawn(process.execPath, [path.resolve("scripts/acceptance-runtime.mjs"), "--worker", "--root", dir, "--source-commit", sourceCommit, "--no-swift"], { stdio: ["ignore", "ignore", "pipe"] });
   let stderr = ""; child.stderr.on("data", (chunk) => { stderr += chunk; });
   try {
@@ -562,7 +610,7 @@ test("real worker rejects a replaced socket and a reused router identity", { ski
 
 test("router crash makes the worker release its owned control resources", { skip: process.platform !== "darwin", timeout: 40_000 }, async () => {
   const sourceCommit = (await import("node:child_process")).execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim();
-  const dir = acceptanceTemp("task3-worker-crash-test-");
+  const dir = freshExactRuntimeRoot("worker");
   const child = spawn(process.execPath, [path.resolve("scripts/acceptance-runtime.mjs"), "--worker", "--root", dir, "--source-commit", sourceCommit, "--no-swift"], { stdio: ["ignore", "ignore", "pipe"] });
   let stderr = ""; child.stderr.on("data", (chunk) => { stderr += chunk; });
   try {
