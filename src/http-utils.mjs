@@ -1,4 +1,4 @@
-import { Readable } from "node:stream";
+import { Readable, Writable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { isDeepStrictEqual } from "node:util";
 
@@ -550,8 +550,7 @@ function isExplicitCancellationError(error) {
     || error?.name === "AbortError";
 }
 
-function isClientPipelineCancellation(error, response, signal) {
-  if (!response.destroyed || response.writableFinished) return false;
+function isClientPipelineCancellation(error, response, signal, clientResponseClosed) {
   if (!isExplicitCancellationError(error)) return false;
   // Router requests have the incoming message on ServerResponse. Its aborted
   // bit is a peer-owned fact, unlike the response close event: pipeline also
@@ -559,12 +558,61 @@ function isClientPipelineCancellation(error, response, signal) {
   // signal whenever it is available. It still has to agree with pipeline's
   // explicit cancellation error: destroying a server response also marks its
   // request aborted, and must not hide an adapter's own failure.
-  if (typeof response.req?.aborted === "boolean") return response.req.aborted;
-  // The public helper is also used with bare writable test doubles. They lack
-  // the request object, so only an owned caller signal plus an explicit
-  // cancellation error may take this fallback. A generic premature-close on a
-  // target with no request object is not enough evidence by itself.
-  return signal?.aborted === true;
+  // `req.aborted === false` may simply be stale while the owned AbortSignal or
+  // response close already records the caller leaving; it must not veto either
+  // of those synchronous cancellation facts.
+  return clientResponseClosed
+    || response.req?.aborted === true
+    || (response.destroyed && signal?.aborted === true);
+}
+
+function prematureCloseError() {
+  const error = new Error("Response stream closed before the relay completed.");
+  error.code = "ERR_STREAM_PREMATURE_CLOSE";
+  return error;
+}
+
+function responseRelaySink(response) {
+  let cleanupPendingWrite = () => {};
+  return new Writable({
+    write(chunk, encoding, callback) {
+      if (response.destroyed || response.writableEnded) {
+        callback(prematureCloseError());
+        return;
+      }
+      try {
+        if (response.write(chunk, encoding)) {
+          callback();
+          return;
+        }
+      } catch (error) {
+        callback(error);
+        return;
+      }
+      const settle = (error) => {
+        cleanupPendingWrite();
+        callback(error);
+      };
+      const onDrain = () => settle();
+      const onClose = () => settle(prematureCloseError());
+      cleanupPendingWrite = () => {
+        response.removeListener("drain", onDrain);
+        response.removeListener("close", onClose);
+        cleanupPendingWrite = () => {};
+      };
+      response.once("drain", onDrain);
+      response.once("close", onClose);
+    },
+    // Completing the source only completes the relay. The caller owns the
+    // real ServerResponse and may append a terminal failure event instead.
+    final(callback) {
+      callback();
+    },
+    destroy(error, callback) {
+      cleanupPendingWrite();
+      callback(error);
+    },
+  });
 }
 
 export async function pipeResponse(
@@ -586,27 +634,54 @@ export async function pipeResponse(
     return;
   }
   const source = Readable.fromWeb(upstream.body);
+  const sink = responseRelaySink(response);
+  let clientResponseClosed = response.destroyed && !response.writableFinished;
+  let pipelineAborted = false;
   const abortPipeline = () => {
+    if (pipelineAborted) return;
+    pipelineAborted = true;
     source.destroy();
     for (const stage of transforms) stage?.destroy?.();
+    sink.destroy();
   };
+  const abortOnResponseClose = () => {
+    if (!response.writableFinished) {
+      clientResponseClosed = true;
+      abortPipeline();
+    }
+  };
+  const cleanupAbortListeners = () => {
+    signal?.removeEventListener("abort", abortPipeline);
+    response.removeListener("close", abortOnResponseClose);
+  };
+  response.once("close", abortOnResponseClose);
   signal?.addEventListener("abort", abortPipeline, { once: true });
+  // Register first, then check the already-set states. That closes the race
+  // where cancellation happened just before these one-shot listeners existed.
+  if (clientResponseClosed) {
+    abortPipeline();
+    cleanupAbortListeners();
+    return;
+  }
+  if (signal?.aborted) {
+    abortPipeline();
+    cleanupAbortListeners();
+    throw signal.reason || Object.assign(new Error("The request was aborted."), { name: "AbortError", code: "ABORT_ERR" });
+  }
   try {
-    // `pipeline` forwards errors and destroys every stream in the chain, which
-    // `.pipe()` does not: a mid-stream upstream failure used to leave the
-    // response half-written and open forever. `end: false` keeps the response
-    // itself out of that teardown so the caller can end the body cleanly (see
-    // `endStreamedResponse`) instead of resetting the socket.
-    await pipeline(source, ...transforms, response, { end: false });
+    // `pipeline` owns only a disposable relay sink. An adapter/source failure
+    // can tear that chain down without destroying the committed HTTP response,
+    // leaving the caller able to append a terminal SSE failure frame.
+    await pipeline(source, ...transforms, sink);
   } catch (error) {
     // A client that disconnects mid-stream destroys the response, which
     // pipeline reports as a premature close. That is not a router failure, and
     // pipeline has already torn the upstream read down, so the in-flight
     // counter releases without inventing an error.
-    if (isClientPipelineCancellation(error, response, signal)) return;
+    if (isClientPipelineCancellation(error, response, signal, clientResponseClosed)) return;
     throw error;
   } finally {
-    signal?.removeEventListener("abort", abortPipeline);
+    cleanupAbortListeners();
   }
   // `leaveOpen` lets the caller keep the response writable after the upstream
   // stream ends so an empty completion can be retried against the same
