@@ -308,36 +308,39 @@ export function scheduleStartupRebuildSelfHeal(handoff, {
  * process group on abort, so SIGTERM cannot leave an in-process catalog write
  * racing after the router has been stopped.
  */
+function productionGroupProbe(pgid) {
+  let output;
+  try {
+    output = execFileSync("/bin/ps", ["-axo", "pgid=,stat="], {
+      encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, LC_ALL: "C", LANG: "C" },
+    });
+  } catch (error) {
+    throw new Error(`Could not verify deferred startup rebuild process group: ${error?.code || error?.message || String(error)}`);
+  }
+  for (const line of String(output).split("\n")) {
+    if (!line.trim()) continue;
+    const match = /^\s*(\d+)\s+(\S+)\s*$/.exec(line);
+    if (!match) throw new Error("Could not parse deferred startup rebuild process group status.");
+    if (Number(match[1]) === pgid && !match[2].startsWith("Z")) return true;
+  }
+  return false;
+}
+
 export function spawnDeferredStartupRebuild({
   sourceRoot = SOURCE_ROOT,
   signal,
   spawnImpl = spawn,
+  platform = process.platform,
   childArgs = [path.join(sourceRoot, "src", "deferred-startup-rebuild-child.mjs")],
   termGraceMs = 2_000,
   groupWaitAttempts = 80,
   groupWaitMs = 25,
-  groupProbe = (pgid) => {
-    let output;
-    try {
-      output = execFileSync("/bin/ps", ["-axo", "pgid=,stat="], {
-        encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, LC_ALL: "C", LANG: "C" },
-      });
-    } catch (error) {
-      throw new Error(`Could not verify deferred startup rebuild process group: ${error?.code || error?.message || String(error)}`);
-    }
-    let matched = false;
-    for (const line of String(output).split("\n")) {
-      if (!line.trim()) continue;
-      const match = /^\s*(\d+)\s+(\S+)\s*$/.exec(line);
-      if (!match) throw new Error("Could not parse deferred startup rebuild process group status.");
-      if (Number(match[1]) !== pgid) continue;
-      matched = true;
-      if (!match[2].startsWith("Z")) return true;
-    }
-    return false;
-  },
+  groupProbe = productionGroupProbe,
 } = {}) {
-  if (process.platform === "win32") {
+  if (platform !== process.platform && (spawnImpl === spawn || groupProbe === productionGroupProbe)) {
+    throw new Error("Deferred startup rebuild platform overrides require fully injected process primitives.");
+  }
+  if (platform === "win32") {
     return Promise.reject(new Error("Deferred startup rebuild child cancellation is supported only on macOS/POSIX service targets."));
   }
   if (signal?.aborted) return Promise.reject(abortError());
@@ -345,7 +348,7 @@ export function spawnDeferredStartupRebuild({
     const child = spawnImpl(process.execPath, childArgs, {
       cwd: sourceRoot,
       stdio: ["ignore", "ignore", "pipe"],
-      detached: process.platform !== "win32",
+      detached: platform !== "win32",
       windowsHide: true,
       env: process.env,
     });

@@ -280,7 +280,7 @@ test("SIGTERM kills an in-flight deferred rebuild child and schedule resolves wi
   const promise = scheduleStartupRebuildSelfHeal({ token: "a".repeat(32), transactionToken: "b".repeat(32) }, {
     signal: controller.signal,
     waitForHandoff: async () => {},
-    rebuild: ({ signal }) => spawnDeferredStartupRebuild({ signal, spawnImpl: () => { spawned += 1; return child; } }),
+    rebuild: ({ signal }) => spawnDeferredStartupRebuild({ signal, platform: "darwin", groupProbe: () => false, spawnImpl: () => { spawned += 1; return child; } }),
     cleanup: () => {},
   });
   await new Promise((resolve) => setImmediate(resolve));
@@ -305,6 +305,7 @@ test("owned child escalates TERM to KILL after bounded grace when it ignores TER
     return true;
   };
   const running = spawnDeferredStartupRebuild({
+    platform: "darwin",
     signal: controller.signal,
     termGraceMs: 1,
     spawnImpl: () => child,
@@ -330,6 +331,7 @@ test("termination reports a bounded explicit error when its process group remain
     return true;
   };
   const running = spawnDeferredStartupRebuild({
+    platform: "darwin",
     signal: controller.signal,
     termGraceMs: 1,
     groupWaitAttempts: 1,
@@ -350,6 +352,7 @@ test("abort settles from independent group proof even when child never emits exi
   const signals = [];
   child.kill = (signal) => { signals.push(signal); return true; };
   const running = spawnDeferredStartupRebuild({
+    platform: "darwin",
     signal: controller.signal,
     termGraceMs: 1,
     groupWaitAttempts: 1,
@@ -369,6 +372,7 @@ test("group probe errors fail closed as termination verification errors", async 
   child.stderr = new EventEmitter();
   child.kill = () => true;
   const running = spawnDeferredStartupRebuild({
+    platform: "darwin",
     signal: controller.signal, spawnImpl: () => child,
     groupProbe: () => { throw Object.assign(new Error("permission denied"), { code: "EACCES" }); },
   });
@@ -383,6 +387,8 @@ test("production child seam is detached and targets only the checked-in rebuild 
   child.kill = () => true;
   let captured;
   const running = spawnDeferredStartupRebuild({
+    platform: "darwin",
+    groupProbe: () => false,
     spawnImpl: (command, args, options) => {
       captured = { command, args, options };
       queueMicrotask(() => { child.emit("exit", 0, null); child.emit("close", 0, null); });

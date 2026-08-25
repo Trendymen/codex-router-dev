@@ -404,8 +404,8 @@ test("Windows adapter restores a missing generation through normalized links, AC
     restoreOwnedRuntime(snapshot, { fs: {
       ...adapter,
       rename(source, destination) {
-        renameAttempts += 1;
-        if (renameAttempts === 1) {
+        if (destination === path.join(generations, "current")) renameAttempts += 1;
+        if (destination === path.join(generations, "current") && renameAttempts === 1) {
           const error = new Error("transient sharing violation");
           error.code = "EPERM";
           throw error;

@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import http from "node:http";
 import { createServer } from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -9,7 +11,7 @@ import { fileURLToPath } from "node:url";
 import { callerBaseUrl } from "../src/caller-auth.mjs";
 import { privateFileIsProtected, protectPrivateFile } from "../src/file-security.mjs";
 import { redactSensitive } from "../src/sensitive-redactor.mjs";
-import { acceptanceCatalogFixture, privateRegularFile, runtimeEnv, acquireIsolationLease, assertCliPreflight, assertPortsAvailable, assertPushedHarness, completeIsolatedInstaller, createIsolatedEnvironment, createLocalProviderFixture, guardIsolatedRuntimeCallback, isolationLeasePath, ownedProcessAlive, planIsolatedEnvironment, readInstalledCallerSecret, validDownstreamResponsesLifecycle, verifyCleanInstall, writeAcceptanceCatalog } from "../scripts/verify-isolated-install.mjs";
+import { acceptanceCatalogFixture, privateRegularFile, runtimeEnv, acquireIsolationLease, assertCliPreflight, assertPortsAvailable, assertPushedHarness, completeIsolatedInstaller, createIsolatedEnvironment, createLocalProviderFixture, createLocalRuntime, guardIsolatedRuntimeCallback, isolationLeasePath, ownedProcessAlive, planIsolatedEnvironment, readInstalledCallerSecret, validateAcceptanceProviderFixture, validDownstreamResponsesLifecycle, verifyCleanInstall, writeAcceptanceCatalog } from "../scripts/verify-isolated-install.mjs";
 
 const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -212,6 +214,207 @@ test("local provider fixture accepts only the exact Responses and Messages diale
     }
     assert.equal(fixture.attempts.filter((attempt) => !attempt.accepted).length, 6);
   } finally { await new Promise((resolve) => fixture.server.close(resolve)); }
+});
+
+test("acceptance runtime fixture seam admits only an owned loopback-safe observation schema", async () => {
+  const server = http.createServer((_request, response) => response.writeHead(204).end());
+  await new Promise((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", resolve); });
+  try {
+    const baseUrl = `http://127.0.0.1:${server.address().port}/v1`;
+    const attempts = [{ path: "/v1/responses", method: "POST", model: "deepseek-v4-flash", accepted: true, reason: "accepted", transport: "responses" }];
+    const safe = { server, baseUrl, attempts, requests: [attempts[0]] };
+    assert.equal(validateAcceptanceProviderFixture(safe), safe);
+    assert.throws(() => validateAcceptanceProviderFixture({ ...safe, baseUrl: "https://example.com/v1" }), /loopback/);
+    assert.throws(() => validateAcceptanceProviderFixture({ ...safe, baseUrl: `http://[::1]:${server.address().port}/v1` }), /owned loopback/i);
+    assert.throws(() => validateAcceptanceProviderFixture({ ...safe, attempts: [{ ...safe.attempts[0], payload: "must-not-escape" }] }), /closed|payload/i);
+    assert.throws(() => validateAcceptanceProviderFixture({ ...safe, server: { listening: true, close() {}, address: () => ({ address: "127.0.0.1", port: server.address().port }) } }), /owned|listening|server/i);
+    assert.throws(() => validateAcceptanceProviderFixture({ ...safe, attempts: [{ ...safe.attempts[0], path: "/v1/responses?secret=forbidden" }] }), /closed safe schema/i);
+    const mismatched = { ...attempts[0], transport: "messages" };
+    assert.throws(() => validateAcceptanceProviderFixture({ ...safe, attempts: [mismatched], requests: [mismatched] }), /closed safe schema/i);
+  } finally { await new Promise((resolve) => server.close(resolve)); }
+});
+
+test("an injected acceptance fixture is used once by real start and is closed after restart cleanup", async () => {
+  const acceptanceRoot = path.join(repositoryRoot, "generated", "acceptance");
+  mkdirSync(acceptanceRoot, { recursive: true, mode: 0o700 });
+  const root = mkdtempSync(path.join(acceptanceRoot, `task3-fixture-runtime-${process.pid}-`));
+  const sourceCommit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repositoryRoot, encoding: "utf8" }).trim();
+  let injectedFixture;
+  let factoryCalls = 0;
+  let runtime;
+  try {
+    const env = createIsolatedEnvironment({ root, nonce: `fixture-runtime-${process.pid}`, sourceCommit });
+    runtime = await createLocalRuntime(env, {
+      sourceCommit,
+      allowReleased: true,
+      requireSwift: false,
+      providerFixtureFactory: async ({ registerServer }) => {
+        factoryCalls += 1;
+        injectedFixture = await createLocalProviderFixture({ registerServer });
+        return injectedFixture;
+      },
+    });
+    await runtime.callbacks.install(env);
+    await Promise.all([runtime.callbacks.start(env), runtime.callbacks.start(env)]);
+    await runtime.callbacks.route(env, "responses");
+    await runtime.callbacks.route(env, "messages");
+    await runtime.callbacks.lifecycle(env, "restart");
+    assert.equal(factoryCalls, 1);
+    assert.deepEqual(injectedFixture.requests.map(({ path, transport }) => ({ path, transport })), [{ path: "/v1/responses", transport: "responses" }, { path: "/v1/messages", transport: "messages" }]);
+  } finally {
+    await runtime?.dispose();
+    assert.equal(injectedFixture?.server.listening || false, false);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a failing fixture factory closes every server it registered before router spawn", async () => {
+  const acceptanceRoot = path.join(repositoryRoot, "generated", "acceptance");
+  mkdirSync(acceptanceRoot, { recursive: true, mode: 0o700 });
+  const root = mkdtempSync(path.join(acceptanceRoot, `task3-fixture-failure-${process.pid}-`));
+  const sourceCommit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repositoryRoot, encoding: "utf8" }).trim();
+  let server;
+  let runtime;
+  try {
+    const env = createIsolatedEnvironment({ root, nonce: `fixture-failure-${process.pid}`, sourceCommit });
+    runtime = await createLocalRuntime(env, {
+      sourceCommit,
+      allowReleased: true,
+      requireSwift: false,
+      providerFixtureFactory: async ({ registerServer }) => {
+        server = http.createServer((_request, response) => response.writeHead(204).end());
+        await new Promise((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", resolve); });
+        registerServer(server);
+        throw new Error("planned fixture setup failure");
+      },
+    });
+    await assert.rejects(runtime.callbacks.start(env), /planned fixture setup failure/);
+    assert.equal(server.listening, false);
+  } finally {
+    await runtime?.dispose();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a custom fixture that skips registerServer is rejected and its returned Node server is closed", async () => {
+  const acceptanceRoot = path.join(repositoryRoot, "generated", "acceptance");
+  mkdirSync(acceptanceRoot, { recursive: true, mode: 0o700 });
+  const root = mkdtempSync(path.join(acceptanceRoot, `task3-fixture-unregistered-${process.pid}-`));
+  const sourceCommit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repositoryRoot, encoding: "utf8" }).trim();
+  let fixture;
+  let runtime;
+  try {
+    const env = createIsolatedEnvironment({ root, nonce: `fixture-unregistered-${process.pid}`, sourceCommit });
+    runtime = await createLocalRuntime(env, {
+      sourceCommit,
+      allowReleased: true,
+      requireSwift: false,
+      providerFixtureFactory: async () => {
+        fixture = await createLocalProviderFixture();
+        return fixture;
+      },
+    });
+    await assert.rejects(runtime.callbacks.start(env), /must register/);
+    assert.equal(fixture.server.listening, false);
+  } finally {
+    await runtime?.dispose();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("dispose during a deferred registered fixture closes it and prevents router spawn", async () => {
+  const acceptanceRoot = path.join(repositoryRoot, "generated", "acceptance");
+  mkdirSync(acceptanceRoot, { recursive: true, mode: 0o700 });
+  const root = mkdtempSync(path.join(acceptanceRoot, `task3-fixture-dispose-${process.pid}-`));
+  const sourceCommit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repositoryRoot, encoding: "utf8" }).trim();
+  let server;
+  let baseUrl;
+  let releaseFactory;
+  let factoryStarted;
+  let runtime;
+  let unhandled;
+  const onUnhandled = (reason) => { unhandled = reason; };
+  try {
+    const env = createIsolatedEnvironment({ root, nonce: `fixture-dispose-${process.pid}`, sourceCommit });
+    runtime = await createLocalRuntime(env, {
+      sourceCommit,
+      allowReleased: true,
+      requireSwift: false,
+      providerFixtureFactory: async ({ registerServer }) => {
+        server = http.createServer((_request, response) => response.writeHead(204).end());
+        await new Promise((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", resolve); });
+        registerServer(server);
+        baseUrl = `http://127.0.0.1:${server.address().port}/v1`;
+        factoryStarted();
+        await new Promise((resolve) => { releaseFactory = resolve; });
+        return { server, baseUrl, attempts: [], requests: [] };
+      },
+    });
+    const entered = new Promise((resolve) => { factoryStarted = resolve; });
+    const starting = runtime.callbacks.start(env);
+    await entered;
+    const disposing = runtime.dispose();
+    process.on("unhandledRejection", onUnhandled);
+    releaseFactory();
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    assert.equal(unhandled, undefined);
+    await assert.rejects(starting, /disposed/);
+    await disposing;
+    assert.equal(server.listening, false);
+    assert.equal(existsSync(env.logPath), false);
+  } finally {
+    process.off("unhandledRejection", onUnhandled);
+    releaseFactory?.();
+    await runtime?.dispose();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("dispose aborts a permanently pending fixture without waiting for its factory and rejects late registration", async () => {
+  const acceptanceRoot = path.join(repositoryRoot, "generated", "acceptance");
+  mkdirSync(acceptanceRoot, { recursive: true, mode: 0o700 });
+  const root = mkdtempSync(path.join(acceptanceRoot, `task3-fixture-pending-${process.pid}-`));
+  const sourceCommit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repositoryRoot, encoding: "utf8" }).trim();
+  let server;
+  let lateServer;
+  let signal;
+  let registerServer;
+  let factoryStarted;
+  let runtime;
+  try {
+    const env = createIsolatedEnvironment({ root, nonce: `fixture-pending-${process.pid}`, sourceCommit });
+    runtime = await createLocalRuntime(env, {
+      sourceCommit,
+      allowReleased: true,
+      requireSwift: false,
+      providerFixtureFactory: async (context) => {
+        ({ signal, registerServer } = context);
+        server = http.createServer((_request, response) => response.writeHead(204).end());
+        await new Promise((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", resolve); });
+        registerServer(server);
+        factoryStarted();
+        await new Promise(() => {});
+      },
+    });
+    const entered = new Promise((resolve) => { factoryStarted = resolve; });
+    void runtime.callbacks.start(env);
+    await entered;
+    assert.equal(signal.aborted, false);
+    const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error("dispose deadline")), 1_000));
+    await Promise.race([runtime.dispose(), timeout]);
+    assert.equal(signal.aborted, true);
+    assert.equal(server.listening, false);
+    await assertPortsAvailable(env.target.ports);
+    lateServer = http.createServer((_request, response) => response.writeHead(204).end());
+    await new Promise((resolve, reject) => { lateServer.once("error", reject); lateServer.listen(0, "127.0.0.1", resolve); });
+    assert.throws(() => registerServer(lateServer), /disposed|aborted/);
+    await new Promise((resolve) => lateServer.once("close", resolve));
+    assert.equal(lateServer.listening, false);
+  } finally {
+    server?.close();
+    lateServer?.close();
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("downstream client lifecycle requires Responses created and completed events", () => {
