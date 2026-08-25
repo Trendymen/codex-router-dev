@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import os from "node:os";
@@ -42,6 +42,15 @@ function root() { return mkdtempSync(path.join(os.tmpdir(), "acceptance-runtime-
 function temp(prefix) { return mkdtempSync(path.join(os.tmpdir(), prefix)); }
 function acceptanceTemp(prefix) { const parent = path.resolve("generated", "acceptance"); mkdirSync(parent, { recursive: true, mode: 0o700 }); return mkdtempSync(path.join(parent, prefix)); }
 function isolatedPortsForNonce(nonce) { const base = 46_000 + ([...nonce].reduce((sum, char) => sum + char.codePointAt(0), 0) % 600) * 20; return { oauth: base + 1, router: base + 2, api: base + 3, grokOauth: base + 8, devinCli: base + 10 }; }
+function assertTask3CodexFixture(root) {
+  const catalog = JSON.parse(readFileSync(path.join(root, "state", "native-models.json"), "utf8"));
+  assert.equal(catalog.captured_with, "codex-router-task3-fixture-1");
+  assert.deepEqual(catalog.models.map((model) => model.slug), ["gpt-5.5"]);
+  const codex = path.join(root, "codex-fixture");
+  assert.equal(statSync(codex).mode & 0o111, 0o100);
+  assert.match(spawnSync(codex, ["--version"], { encoding: "utf8" }).stdout, /codex-router-task3-fixture-1/);
+  assert.notEqual(spawnSync(codex, ["debug", "models"], { encoding: "utf8" }).status, 0);
+}
 function freshWorkerRoot(parent, prefix, nonceFor) {
   for (let attempt = 0; attempt < 64; attempt += 1) {
     const root = path.join(parent, `${prefix}${randomBytes(8).toString("hex")}`), nonce = nonceFor(root);
@@ -380,6 +389,7 @@ test("default start runtime consumes its explicit Task1 manifest before creating
   try {
     live = await startAcceptanceRuntime(env, { sourceCommit: fixture.sourceCommit, task1ManifestPath: fixture.manifestPath, buildRoot: fixture.manifest.buildRoot });
     assert.equal(runtimeAcceptanceReport(live.handlePath, { verifyIdentity: false }).status, "running");
+    assertTask3CodexFixture(env.root);
     captureRoots = live.captureRoots;
   } finally { await live?.runtime.dispose(); }
   assert.equal(existsSync(captureRoots.browser), false); assert.equal(existsSync(captureRoots.swift), false);
@@ -584,6 +594,7 @@ test("real worker uses the parent provenance seam and completes its local fixtur
     const handleFile = path.join(dir, "runtime-handle.json"); await waitFor(() => existsSync(handleFile) || existsSync(path.join(dir, "runtime-worker-failure.json")), "worker did not report startup");
     assert.equal(existsSync(path.join(dir, "runtime-worker-failure.json")), false, stderr);
     const live = JSON.parse(readFileSync(handleFile, "utf8")); assert.equal(live.router.workerPid, child.pid); assert.equal(await control(live, "status").then((value) => value.ok), true);
+    assertTask3CodexFixture(dir);
     const protocol = await control(live, "protocol");
     assert.deepEqual(protocol, { ok: true, stage: "complete" });
     const stage = JSON.parse(readFileSync(path.join(dir, "evidence", "runtime-stage.json"), "utf8"));

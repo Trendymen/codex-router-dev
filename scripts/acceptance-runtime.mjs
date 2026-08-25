@@ -37,6 +37,7 @@ const VISUALS = Object.freeze({
   "testing-evidence": { requirementId: "r61", themeId: "success-testing-evidence", appearance: "light" },
 });
 const RUNTIME_ROWS = Object.freeze({ r06: "reasoning-abort-nonstream", r19: "failover", r22: "catalog-lifecycle-atomicity", r29: "platform-removal", r41: "testing-runtime", r45: "success-node-router", r51: "success-catalog", r55: "success-platform" });
+const TASK3_CODEX_FIXTURE_VERSION = "codex-router-task3-fixture-1";
 const UI_ROWS = Object.freeze({ r24: "capability-command-ui", r35: "write-sessions", r47: "success-desktop-app", r59: "success-public-errors" });
 export function finalTask3RequirementIds() {
   return Object.freeze([...Object.keys(RUNTIME_ROWS), ...Object.keys(UI_ROWS), ...new Set(Object.values(VISUALS).map((value) => value.requirementId))]);
@@ -187,6 +188,14 @@ export function protocolAuthorizationPredicates({ providerAuthorization, nativeA
 }
 function privateJson(file, value) { mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 }); const temp = `${file}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`; writeFileSync(temp, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 }); chmodSync(temp, 0o600); renameSync(temp, file); }
 function privateJsonReplace(file, value) { if (existsSync(file) && lstatSync(file).isSymbolicLink()) throw new Error("refusing to replace a symbolic-link acceptance artifact"); privateJson(file, value); }
+function writeTask3CodexFixture(env) {
+  assertIsolatedEnvironment(env);
+  const nativeCatalog = { captured_with: TASK3_CODEX_FIXTURE_VERSION, models: [{ slug: "gpt-5.5", display_name: "GPT-5.5", visibility: "list", priority: 1, base_instructions: "", model_messages: { instructions_template: "" }, supports_parallel_tool_calls: false, input_modalities: ["text"] }] };
+  privateJson(path.join(env.stateRoot, "native-models.json"), nativeCatalog);
+  if (existsSync(env.codexBin) && lstatSync(env.codexBin).isSymbolicLink()) throw new Error("Task3 Codex fixture cannot replace a symbolic link");
+  writeFileSync(env.codexBin, `#!/bin/sh\nif [ "$#" -eq 1 ] && [ "$1" = "--version" ]; then\n  printf '%s\\n' '${TASK3_CODEX_FIXTURE_VERSION}'\n  exit 0\nfi\nexit 1\n`, { mode: 0o700 });
+  chmodSync(env.codexBin, 0o700);
+}
 function safeText(value) { const raw = String(value); if (/(?:Bearer\s+|Basic\s+|[?&](?:token|key|secret)=|caller[-_ ]?(?:key|secret)|capability|prompt|reasoning|tool[_ -]?(?:args|arguments)|request[_ -]?body)/i.test(raw)) throw new Error("unsafe acceptance text"); const text = redactSensitive(raw, { profile: "log" }); if (/(?:Bearer\s+|Basic\s+|[?&](?:token|key|secret)=|caller[-_ ]?(?:key|secret)|capability|prompt|reasoning|tool[_ -]?(?:args|arguments)|request[_ -]?body)/i.test(text)) throw new Error("unsafe acceptance text"); return text; }
 function localPath(root, value, name) { const resolved = inside(root, value, name); let entry; try { entry = lstatSync(resolved); } catch { throw new Error(`${name} must be a regular non-empty file`); } if (!entry.isFile() || entry.isSymbolicLink() || statSync(resolved).size < 1) throw new Error(`${name} must be a regular non-empty file`); return resolved; }
 function canonicalArtifact(root, value, name) {
@@ -658,7 +667,7 @@ export async function startAcceptanceRuntime(env, { sourceCommit = env?.sourceCo
     runtime = await runtimeFactory(env, { sourceCommit, ...(runtimeFactory === createLocalRuntime ? { requireSwift: false } : {}) });
     callbacks = runtimeCallbacksFor(env) || runtime.callbacks;
     if (task1) copiedBundle = copyVerifiedSwiftBundle(env, task1.bundle);
-    await callbacks.prerequisites(env); await callbacks.install(env); const started = await callbacks.start(env); const health = await callbacks.health(env);
+    await callbacks.prerequisites(env); if (runtimeFactory === createLocalRuntime) writeTask3CodexFixture(env); await callbacks.install(env); const started = await callbacks.start(env); const health = await callbacks.health(env);
     if (!health?.ok) throw new Error("isolated Router health is not OK");
     release = operation.acquireLease(env.root, env.target.ports);
     const runtimeId = `runtime-${randomBytes(8).toString("hex")}`, token = randomBytes(32).toString("hex"); handshakePath = path.join(env.root, "runtime-handshake"); captureRoots = { browser: operation.captureRoot(env.root, runtimeId, "browser"), swift: operation.captureRoot(env.root, runtimeId, "swift") }; const profile = inside(captureRoots.browser, path.join(captureRoots.browser, "profile"), "runtime browser profile");
@@ -1249,7 +1258,7 @@ async function worker(args) {
     };
     runtime = await createLocalRuntime(env, runtimeOptions);
     callbacks = runtime.callbacks;
-    await callbacks.prerequisites(env); if (task1) copyVerifiedSwiftBundle(env, task1.bundle); await callbacks.install(env);
+    await callbacks.prerequisites(env); writeTask3CodexFixture(env); if (task1) copyVerifiedSwiftBundle(env, task1.bundle); await callbacks.install(env);
     // Keep the installer's checked Task2 catalog byte-identical for the first
     // protocol baseline.  Task3-specific routes are layered only after that
     // stable transport has proved its terminal lifecycle.

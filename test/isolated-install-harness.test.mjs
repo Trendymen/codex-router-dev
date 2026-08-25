@@ -68,9 +68,10 @@ test("isolated environment owns every mutable target and rejects production coll
   try {
     const env = createIsolatedEnvironment({ root, sourceRoot, uid: 502, nonce: "unit" });
     assert.equal(env.root, realpathSync(root));
-    for (const value of [env.codexHome, env.stateRoot, env.supportRoot, env.launchAgentsDir, env.target.routerPlistPath, env.target.trayPlistPath, env.target.appPath, env.browserProfile, env.credentialsPath, env.logPath]) {
+    for (const value of [env.codexHome, env.codexBin, env.stateRoot, env.supportRoot, env.launchAgentsDir, env.target.routerPlistPath, env.target.trayPlistPath, env.target.appPath, env.browserProfile, env.credentialsPath, env.logPath]) {
       assert.ok(value.startsWith(`${env.root}${path.sep}`), value);
     }
+    assert.equal(runtimeEnv(env).CODEX_BIN, process.env.CODEX_BIN);
     assert.notEqual(env.target.routerLabel, "io.github.codex-router");
     assert.notEqual(env.target.trayLabel, "io.github.codex-router.tray");
     assert.notEqual(env.target.ports.router, 4202);
