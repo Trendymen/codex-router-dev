@@ -59,6 +59,17 @@ struct MenuBarSettingsTests {
     #expect(MenuBarLayoutMetrics.statusItemWidth(displayMode: .iconOnly) == 24)
   }
 
+  @Test("the AppKit status item uses its own autosave identity")
+  func appKitStatusItemDoesNotPersistManualRemoval() {
+    #expect(MenuBarStatusItemConfiguration.autosaveName == "ModelRouterTray")
+    #expect(MenuBarStatusItemConfiguration.defaultLength == 24)
+    #expect(MenuBarStatusItemConfiguration.fallbackTitle == "MR")
+    #expect(MenuBarStatusItemConfiguration.fallbackImageName == "AppIcon")
+    #expect(MenuBarStatusItemConfiguration.visibilityRecoveryDelay == 1)
+    #expect(MenuBarStatusItemConfiguration.overlayWidth == 32)
+    #expect(MenuBarStatusItemConfiguration.overlayHeight == 24)
+  }
+
   @Test("the activity badge is not a second dot on the indicator style")
   func indicatorHasNoSideBadge() {
     #expect(MenuBarLayoutMetrics.showsActivityBadge(iconStyle: .indicator, isIdle: false) == false)

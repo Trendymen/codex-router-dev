@@ -2389,19 +2389,80 @@ private struct CapabilitySettingsView: View {
   }
 }
 
+enum MenuBarStatusItemConfiguration {
+  // Give the AppKit item a private identity instead of inheriting the old
+  // SwiftUI Item-0 slot that the user removed from ControlCenter.
+  static let autosaveName: String? = "ModelRouterTray"
+  static let defaultLength: CGFloat = 24
+  static let fallbackTitle = "MR"
+  static let overlayWidth: CGFloat = 32
+  static let overlayHeight: CGFloat = 24
+  static let fallbackImageName = "AppIcon"
+  static let visibilityRecoveryDelay: TimeInterval = 1
+}
+
+@MainActor
+private final class MenuBarOverlayController: NSObject {
+  let panel: NSPanel
+  let button: NSButton
+  var onClick: (() -> Void)?
+
+  init(store: RouterStore) {
+    panel = NSPanel(
+      contentRect: NSRect(x: 0, y: 0, width: MenuBarStatusItemConfiguration.overlayWidth, height: MenuBarStatusItemConfiguration.overlayHeight),
+      styleMask: [.borderless, .nonactivatingPanel],
+      backing: .buffered,
+      defer: false
+    )
+    button = NSButton(frame: NSRect(x: 0, y: 0, width: MenuBarStatusItemConfiguration.overlayWidth, height: MenuBarStatusItemConfiguration.overlayHeight))
+    super.init()
+    panel.level = .screenSaver
+    panel.isOpaque = false
+    panel.backgroundColor = .clear
+    panel.hasShadow = false
+    panel.hidesOnDeactivate = false
+    panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
+    panel.ignoresMouseEvents = false
+    button.isBordered = false
+    button.imagePosition = .noImage
+    button.wantsLayer = true
+    button.layer?.backgroundColor = NSColor(calibratedRed: 0.03, green: 0.08, blue: 0.16, alpha: 0.96).cgColor
+    button.layer?.cornerRadius = 6
+    button.layer?.masksToBounds = true
+    button.image = nil
+    button.attributedTitle = NSAttributedString(
+      string: MenuBarStatusItemConfiguration.fallbackTitle,
+      attributes: [
+        .foregroundColor: NSColor.white,
+        .font: NSFont.systemFont(ofSize: 11, weight: .bold),
+      ]
+    )
+    button.toolTip = routerLocalized("Model Router")
+    button.target = self
+    button.action = #selector(clicked(_:))
+    panel.contentView = button
+  }
+
+  func show() {
+    guard let screen = NSScreen.main ?? NSScreen.screens.first else { return }
+    let frame = screen.frame
+    let x = max(frame.minX, frame.maxX - 270)
+    let y = frame.maxY - MenuBarStatusItemConfiguration.overlayHeight
+    panel.setFrame(NSRect(x: x, y: y, width: MenuBarStatusItemConfiguration.overlayWidth, height: MenuBarStatusItemConfiguration.overlayHeight), display: true)
+    panel.orderFrontRegardless()
+  }
+
+  @objc private func clicked(_ sender: Any?) {
+    onClick?()
+  }
+}
+
 @main
 struct ModelRouterTrayApp: App {
   @NSApplicationDelegateAdaptor private var appDelegate: AppDelegate
   @ObservedObject private var store = RouterStore.shared
 
   var body: some Scene {
-    MenuBarExtra(isInserted: Binding(get: { store.surfacesVisible }, set: { _ in })) {
-      CapabilityTrayView(store: store)
-    } label: {
-      StatusItemLabel(store: store)
-    }
-    .menuBarExtraStyle(.window)
-
     Settings {
       CapabilitySettingsView(store: store)
     }
@@ -2413,6 +2474,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
   let store = RouterStore.shared
   private var islandController: IslandWindowController?
   private var desktopPanelController: DesktopPanelWindowController?
+  private var statusItem: NSStatusItem?
+  private var statusPopover: NSPopover?
+  private var menuBarOverlay: MenuBarOverlayController?
+  private var statusButtonObservation: AnyCancellable?
   private var surfaceVisibility: AnyCancellable?
   private var terminationRestoreTask: Task<Void, Never>?
 
@@ -2446,10 +2511,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
       return
     }
     NSApp.setActivationPolicy(.accessory)
+    installStatusItem()
     islandController = IslandWindowController(store: store)
     desktopPanelController = DesktopPanelWindowController(store: store)
+    statusButtonObservation = store.objectWillChange.sink { [weak self] in
+      Task { @MainActor [weak self] in self?.refreshStatusItem() }
+    }
+    menuBarOverlay = MenuBarOverlayController(store: store)
+    menuBarOverlay?.onClick = { [weak self] in self?.toggleStatusPopover(nil) }
+    menuBarOverlay?.show()
     surfaceVisibility = store.$surfacesVisible.combineLatest(store.$islandMode).sink { [weak self] visible, mode in
       Task { @MainActor [weak self] in
+        self?.statusItem?.isVisible = visible
+        if visible {
+          self?.menuBarOverlay?.show()
+        } else {
+          self?.menuBarOverlay?.panel.orderOut(nil)
+        }
         self?.islandController?.setVisible(visible && mode == .notch)
         self?.desktopPanelController?.setVisible(visible && mode == .desktop)
       }
@@ -2460,6 +2538,87 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     Task { await store.startActivityPolling() }
     Task { await store.startAccountUsagePolling() }
     Task { await store.startProviderPolling() }
+  }
+
+  private func installStatusItem() {
+    let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+    // Do not reuse the system's Item-0 slot, which is exactly what the user
+    // had removed from ControlCenter.
+    item.autosaveName = MenuBarStatusItemConfiguration.autosaveName
+    item.isVisible = false
+    statusItem = item
+    let menu = NSMenu()
+    menu.autoenablesItems = false
+    let openItem = NSMenuItem(
+      title: routerLocalized("Open Model Router"),
+      action: #selector(toggleStatusPopover(_:)),
+      keyEquivalent: ""
+    )
+    openItem.target = self
+    menu.addItem(openItem)
+    menu.addItem(.separator())
+    let quitItem = NSMenuItem(
+      title: routerLocalized("Quit"),
+      action: #selector(terminateFromStatusMenu(_:)),
+      keyEquivalent: "q"
+    )
+    quitItem.target = self
+    menu.addItem(quitItem)
+    item.menu = menu
+    let popover = NSPopover()
+    popover.behavior = .transient
+    popover.animates = true
+    popover.contentSize = NSSize(width: 370, height: 590)
+    popover.contentViewController = NSHostingController(rootView: CapabilityTrayView(store: store))
+    statusPopover = popover
+    if let button = item.button {
+      button.target = self
+      button.action = #selector(toggleStatusPopover(_:))
+      button.imagePosition = .imageOnly
+      button.imageScaling = .scaleProportionallyDown
+      button.title = MenuBarStatusItemConfiguration.fallbackTitle
+      button.setAccessibilityLabel(routerLocalized("Model Router"))
+      button.toolTip = routerLocalized("Model Router")
+    }
+    refreshStatusItem()
+    NSLog("Model Router status item installed: visible=%@ button=%@", item.isVisible.description, String(describing: item.button))
+    DispatchQueue.main.asyncAfter(deadline: .now() + MenuBarStatusItemConfiguration.visibilityRecoveryDelay) { [weak self, weak item] in
+      guard let self, let item else { return }
+      item.isVisible = false
+      self.refreshStatusItem()
+    }
+  }
+
+  private func refreshStatusItem() {
+    guard let button = statusItem?.button else { return }
+    statusItem?.isVisible = false
+    let symbolName = store.menuBarPresetIcon.isEmpty ? "cpu" : store.menuBarPresetIcon
+    let image = NSImage(systemSymbolName: symbolName, accessibilityDescription: routerLocalized("Model Router"))
+      ?? NSImage(systemSymbolName: "cpu", accessibilityDescription: routerLocalized("Model Router"))
+      ?? NSImage(named: MenuBarStatusItemConfiguration.fallbackImageName)
+    image?.isTemplate = true
+    button.image = image
+    button.toolTip = RouterStore.menuBarTooltip(
+      provider: store.selectedUsageProvider.shortName,
+      state: store.activityState.label,
+      usage: nil
+    )
+  }
+
+  @objc private func toggleStatusPopover(_ sender: Any?) {
+    guard let popover = statusPopover else { return }
+    let button = menuBarOverlay?.button ?? statusItem?.button
+    guard let button else { return }
+    if popover.isShown {
+      popover.performClose(sender)
+    } else {
+      NSApp.activate(ignoringOtherApps: true)
+      popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+    }
+  }
+
+  @objc private func terminateFromStatusMenu(_ sender: Any?) {
+    NSApp.terminate(sender)
   }
 
   func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows: Bool) -> Bool {
@@ -2487,6 +2646,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
   func applicationWillTerminate(_ notification: Notification) {
     // AppKit has already received the termination reply. No asynchronous work
     // may be launched from this final callback.
+    if let statusItem { NSStatusBar.system.removeStatusItem(statusItem) }
+    statusItem = nil
+    statusPopover = nil
+    menuBarOverlay?.panel.orderOut(nil)
+    menuBarOverlay = nil
     store.prepareForTermination()
   }
 }
@@ -2495,7 +2659,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 // localization parity guard sees the complete native surface, including the
 // labels that are otherwise generated from the capability manifest at runtime.
 private let routerSurfaceCopy = [
-  routerLocalized("Model Router"), routerLocalized("Capability-driven controls"), routerLocalized("Read-only compatibility status"),
+  routerLocalized("Model Router"), routerLocalized("Open Model Router"), routerLocalized("Capability-driven controls"), routerLocalized("Read-only compatibility status"),
   routerLocalized("Router capability update required"), routerLocalized("Refresh after updating the Router."),
   routerLocalized("Quota warning"), routerLocalized("This operation may consume provider quota. Check the provider plan before continuing."),
   routerLocalized("Enter credential for this one-time operation"), routerLocalized("Confirm and run"), routerLocalized("Run"),
