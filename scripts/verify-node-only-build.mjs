@@ -52,7 +52,7 @@ const VARIABLE_SHELL_COMMAND_SOURCE_DIGESTS = Object.freeze({
   "bin/discover-models": "6f62bf629f0c47c4a44b0b0eca6e3f65cdb0c6d3cffdfac8b59d2e5bcc3a867b",
   "bin/doctor": "e0f91630f0d2b929ff5ab2f0ec38c9774cf1f403a0db1515e8a49612314bc193",
   "bin/enable": "4a0e832e5ab6c368738fb48644e4d7b02b918498d9882737cef6b4cd6cb63333",
-  "bin/install": "7229f40813dba1c6b4b8394d4fcacdd98a0932c59086184991ad0e14bc108d41",
+  "bin/install": "5efcc5016788b64ef4c1e58e1c0ff13e1343a253015ba819f6e92b7ec2bcef85",
   "bin/media": "cf5e65ee6571fcb085a61b10775d647017330662452e07ed1473b9afcdc4cd1c",
   "bin/migrate": "95866eafca903b9645be523169c8f3b631bd5693686efbad002ed67f9b848e33",
   "bin/model-router": "e858ea418520aec4d9c81df1fbb2191df3d3b702ee856827cccbf0e24e76a0fc",

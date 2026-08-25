@@ -285,21 +285,49 @@ test("public runtime migration binds explicit runtime roots to its snapshot", as
       restartOldService: async () => events.push("restart"),
     });
     assert.deepEqual(events, ["preflight", "install", "verify", "publish", "cleanup"]);
-    await assert.rejects(
-      runRuntimeMigration({
-        target,
-        runtimeRoots: { ...runtimeRoots, dshHome: path.join(root, "other-dsh") },
+    const reorderedRuntimeRoots = {
+      geminiHome: runtimeRoots.geminiHome,
+      dshHome: runtimeRoots.dshHome,
+      codexHome: runtimeRoots.codexHome,
+      userHome: runtimeRoots.userHome,
+    };
+    await runRuntimeMigration({
+      target,
+      runtimeRoots: reorderedRuntimeRoots,
+      snapshot,
+      preflight: async () => events.push("reordered-preflight"),
+      installReplacement: async () => events.push("reordered-install"),
+      verifyReplacement: async () => events.push("reordered-verify"),
+      publishReplacement: async () => events.push("reordered-publish"),
+      cleanupOld: async () => events.push("reordered-cleanup"),
+      restoreSnapshot: async () => events.push("reordered-restore"),
+      restartOldService: async () => events.push("reordered-restart"),
+    });
+    assert.deepEqual(events.slice(-5), ["reordered-preflight", "reordered-install", "reordered-verify", "reordered-publish", "reordered-cleanup"]);
+    for (const invalidRoots of [
+      { ...runtimeRoots, dshHome: path.join(root, "other-dsh") },
+      { ...runtimeRoots, extraRoot: path.join(root, "extra") },
+      { userHome: runtimeRoots.userHome, codexHome: runtimeRoots.codexHome, dshHome: runtimeRoots.dshHome },
+      Object.create(runtimeRoots),
+    ]) {
+      let preflightReached = false;
+      await assert.rejects(
+        runRuntimeMigration({
+          target,
+          runtimeRoots: invalidRoots,
         snapshot,
-        preflight: async () => {},
+        preflight: async () => { preflightReached = true; },
         installReplacement: async () => {},
         verifyReplacement: async () => {},
         publishReplacement: async () => {},
         cleanupOld: async () => {},
         restoreSnapshot: async () => {},
         restartOldService: async () => {},
-      }),
-      /different ServiceTarget|runtime roots|snapshot/i,
-    );
+        }),
+        /different ServiceTarget|runtime roots|snapshot/i,
+      );
+      assert.equal(preflightReached, false);
+    }
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

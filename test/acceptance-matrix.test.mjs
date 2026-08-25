@@ -559,6 +559,21 @@ test("合法变量命令放行绑定 exact source identity，任意同路径 dri
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+test("bin/install 的 production variable-command 授权接受当前精确来源且拒绝任何漂移", () => {
+  const root = expectedBuildRoot();
+  try {
+    const source = path.join(repoRoot, "bin", "install");
+    const target = path.join(root, "bin", "install");
+    mkdirSync(path.dirname(target), { recursive: true });
+    cpSync(source, target);
+    assert.equal(findingsFor(root).includes("runtime-command-unresolved:bin/install"), false, findingsFor(root).join(", "));
+    writeFileSync(target, readFileSync(target, "utf8").replace(/\r\n/g, "\n").replaceAll("\n", "\r\n"));
+    assert.equal(findingsFor(root).includes("runtime-command-unresolved:bin/install"), false, findingsFor(root).join(", "));
+    writeFileSync(target, `${readFileSync(target, "utf8")}\n# source identity drift\n`);
+    assert.ok(findingsFor(root).includes("runtime-command-unresolved:bin/install"), findingsFor(root).join(", "));
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test("已登记的 production variable-command source identity 集合不产生 unresolved", () => {
   const root = expectedBuildRoot();
   try {

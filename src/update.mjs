@@ -6,12 +6,6 @@ import { fileURLToPath } from "node:url";
 
 import { refuseUnsupportedPlatform } from "./platform-gate.mjs";
 import { CALLER_SECRET_PATH, currentServiceTarget, INSTALL_MANIFEST_PATH, SOURCE_ROOT, TARGET } from "./paths.mjs";
-import {
-  ownedRuntimePaths,
-  removeOwnedRuntime,
-  restoreOwnedRuntime,
-  snapshotOwnedRuntime,
-} from "./owned-runtime-paths.mjs";
 import { migrateRuntime } from "./runtime-migration.mjs";
 import { withCatalogPublicationLock } from "./catalog-publication-lock.mjs";
 import { withModelOverlayLock } from "./model-overlay-lock.mjs";
@@ -56,6 +50,40 @@ function requireNonProductionRuntimeCallbacks(target, runtime, operation, callba
       throw new Error(`Non-production ${operation} requires isolated ${name} callback.`);
     }
   }
+}
+
+// `owned-runtime-paths` now imports the catalog-generation topology, which in
+// turn reads the production registry at module evaluation time. An isolated
+// update must reject incomplete injected callbacks before that production-only
+// default can even be loaded.
+async function productionOwnedRuntimeOperations(target) {
+  if (target.mode !== "production") {
+    throw new Error("Non-production runtime migration requires isolated snapshot callback.");
+  }
+  return import("./owned-runtime-paths.mjs");
+}
+
+const RUNTIME_ROOT_FIELDS = Object.freeze(["userHome", "codexHome", "dshHome", "geminiHome"]);
+const RUNTIME_ROOT_OPTION_FIELDS = Object.freeze([...RUNTIME_ROOT_FIELDS, "shimPath"]);
+
+function normalizedRuntimeRootOptions(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const keys = Object.keys(value);
+  if (keys.some((key) => !RUNTIME_ROOT_OPTION_FIELDS.includes(key))) return undefined;
+  if (RUNTIME_ROOT_FIELDS.some((key) => !Object.hasOwn(value, key) || typeof value[key] !== "string" || value[key].length === 0)) return undefined;
+  if (Object.hasOwn(value, "shimPath") && (typeof value.shimPath !== "string" || value.shimPath.length === 0)) return undefined;
+  return Object.freeze(Object.fromEntries(
+    RUNTIME_ROOT_OPTION_FIELDS
+      .filter((key) => Object.hasOwn(value, key))
+      .map((key) => [key, value[key]]),
+  ));
+}
+
+function sameRuntimeRootOptions(left, right) {
+  const normalizedLeft = normalizedRuntimeRootOptions(left);
+  const normalizedRight = normalizedRuntimeRootOptions(right);
+  if (!normalizedLeft || !normalizedRight) return false;
+  return RUNTIME_ROOT_OPTION_FIELDS.every((key) => normalizedLeft[key] === normalizedRight[key]);
 }
 
 function errorMessage(error) {
@@ -368,6 +396,9 @@ export async function runRuntimeMigration(options = {}) {
     cleanupOld,
   } = options;
   requireNonProductionRuntimeCallbacks(target, options, "runtime migration", MIGRATION_RUNTIME_CALLBACKS);
+  if (target.mode !== "production" && snapshot === undefined) {
+    throw new Error("Non-production runtime migration requires isolated snapshot callback.");
+  }
   const catalogLock = options.catalogLock || withCatalogPublicationLock;
   const overlayLock = options.overlayLock || withModelOverlayLock;
   const signalCompletion = options.signalStartupRebuildCompletion || signalStartupRebuildCompletion;
@@ -377,11 +408,18 @@ export async function runRuntimeMigration(options = {}) {
   let committed = false;
   try {
     const result = await overlayLock(async (modelOverlayLockContext) => catalogLock(async (catalogLockContext) => {
-    const paths = ownedRuntimePaths(target, runtimeRoots || (typeof snapshot === "object" ? snapshot?.options : undefined) || {});
+    const operations = target.mode === "production"
+      ? await productionOwnedRuntimeOperations(target)
+      : undefined;
     const runtimeSnapshot = typeof snapshot === "function"
       ? await snapshot()
-      : snapshot || snapshotOwnedRuntime(paths);
-    if (runtimeSnapshot && (runtimeSnapshot.target !== target || JSON.stringify(runtimeSnapshot.options) !== JSON.stringify(paths.options))) {
+      : snapshot || operations?.snapshotOwnedRuntime(
+        operations.ownedRuntimePaths(target, runtimeRoots || {}),
+      );
+    const paths = target.mode === "production"
+      ? operations.ownedRuntimePaths(target, runtimeRoots || (typeof snapshot === "object" ? snapshot?.options : undefined) || {})
+      : { options: runtimeRoots || runtimeSnapshot?.options };
+    if (runtimeSnapshot && (runtimeSnapshot.target !== target || !sameRuntimeRootOptions(runtimeSnapshot.options, paths.options))) {
       throw new Error("Runtime migration snapshot is bound to a different ServiceTarget or runtime roots.");
     }
     const installReplacement = options.installReplacement || (() => installCurrentCheckout(target, { deferCatalogPublication: true }));
@@ -391,7 +429,7 @@ export async function runRuntimeMigration(options = {}) {
       modelOverlayLockContext,
       catalogLockContext,
     }));
-    const restoreSnapshot = options.restoreSnapshot || ((value) => restoreOwnedRuntime(value));
+    const restoreSnapshot = options.restoreSnapshot || ((value) => operations.restoreOwnedRuntime(value));
     const restartOldService = options.restartOldService || (() => restartOldRuntime(target, { deferStartupRebuild: true }));
     return migrateRuntime({
       snapshot: runtimeSnapshot,
@@ -405,7 +443,7 @@ export async function runRuntimeMigration(options = {}) {
         modelOverlayLockContext,
         catalogLockContext,
       }),
-      cleanupOld: cleanupOld || ((value) => removeOwnedRuntime(paths, { ids: OLD_RUNTIME_ARTIFACTS, snapshot: value })),
+      cleanupOld: cleanupOld || ((value) => operations.removeOwnedRuntime(paths, { ids: OLD_RUNTIME_ARTIFACTS, snapshot: value })),
       restoreSnapshot,
       restartOldService: async (value) => {
         const marker = await restartOldService(value);
@@ -520,13 +558,16 @@ export async function restoreRuntimeAndRevision(
   runtimeSnapshot,
   revision,
   {
-    restoreRuntime = restoreOwnedRuntime,
+    restoreRuntime,
     restoreRevision: restoreRevisionImpl = (value) => switchRevision(value),
+    operationsLoader = productionOwnedRuntimeOperations,
   } = {},
 ) {
+  const target = runtimeSnapshot?.target || currentServiceTarget();
   const failures = [];
   try {
-    await restoreRuntime(runtimeSnapshot);
+    const actualRestoreRuntime = restoreRuntime || (await operationsLoader(target)).restoreOwnedRuntime;
+    await actualRestoreRuntime(runtimeSnapshot);
   } catch (error) {
     failures.push(error);
   }
@@ -552,8 +593,8 @@ async function captureRuntimeSnapshot(target, runtime = {}) {
   if (runtime.snapshot !== undefined) {
     return typeof runtime.snapshot === "function" ? await runtime.snapshot() : runtime.snapshot;
   }
-  const paths = ownedRuntimePaths(target, runtime.runtimeRoots || {});
-  return snapshotOwnedRuntime(paths);
+  const { ownedRuntimePaths, snapshotOwnedRuntime } = await productionOwnedRuntimeOperations(target);
+  return snapshotOwnedRuntime(ownedRuntimePaths(target, runtime.runtimeRoots || {}));
 }
 
 export function checkForUpdate({ gitImpl, target = currentServiceTarget() } = {}) {

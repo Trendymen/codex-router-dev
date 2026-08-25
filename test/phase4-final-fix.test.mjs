@@ -189,7 +189,10 @@ test("non-production updateCheckout rejects every missing caller lifecycle callb
   const root = mkdtempSync(path.join(os.tmpdir(), "codex-router-update-callbacks-"));
   try {
     const target = resolveServiceTarget({ mode: "test", isolationRoot: root, sourceRoot: path.join(root, "checkout"), routerLabel: "io.github.codex-router.callback-test", trayLabel: "io.github.codex-router.callback-test.tray", ports: { oauth: 7511, router: 7512, api: 7513, grokOauth: 7518, devinCli: 7520 } });
-    const callbacks = Object.fromEntries(NON_PRODUCTION_RUNTIME_CALLBACKS.map((name) => [name, async () => {}]));
+    const callbacks = {
+      snapshot: { version: 1, target, options: {}, entries: {} },
+      ...Object.fromEntries(NON_PRODUCTION_RUNTIME_CALLBACKS.map((name) => [name, async () => {}])),
+    };
     for (const missing of NON_PRODUCTION_RUNTIME_CALLBACKS) {
       const runtime = { ...callbacks }; delete runtime[missing];
       await assert.rejects(() => updateCheckout({ target, runtime, gitImpl: () => { throw new Error("must not reach git"); } }), new RegExp(`isolated ${missing} callback`));
@@ -238,8 +241,7 @@ test("non-production updates never read, execute, or inspect production checkout
 
     const root = process.env.UPDATE_ACTUAL_ROOT;
     const { resolveServiceTarget } = await import(pathToFileURL(path.join(root, "src", "service-target.mjs")));
-    const { ownedRuntimePaths } = await import(pathToFileURL(path.join(root, "src", "owned-runtime-paths.mjs")));
-    const { rollbackCheckout, trayRefreshRequired, updateCheckout } = await import(pathToFileURL(path.join(root, "src", "update.mjs")));
+    const { rollbackCheckout, runRuntimeMigration, trayRefreshRequired, updateCheckout } = await import(pathToFileURL(path.join(root, "src", "update.mjs")));
     const rootDir = process.env.UPDATE_ISOLATION_ROOT;
     const target = resolveServiceTarget({
       mode: "test", isolationRoot: rootDir, sourceRoot: path.join(rootDir, "checkout"),
@@ -255,7 +257,7 @@ test("non-production updates never read, execute, or inspect production checkout
     };
     const callbacks = (events, verifyReplacement = async () => events.push("verify")) => ({
       runtimeRoots,
-      snapshot: { version: 1, target, options: ownedRuntimePaths(target, runtimeRoots).options, entries: {} },
+      snapshot: { version: 1, target, options: runtimeRoots, entries: {} },
       preflight: async () => events.push("preflight"),
       installReplacement: async () => events.push("merge"),
       verifyReplacement,
@@ -273,6 +275,16 @@ test("non-production updates never read, execute, or inspect production checkout
         events.push("refresh");
       },
     });
+    const missingPublish = callbacks([]);
+    delete missingPublish.publishReplacement;
+    await assert.rejects(
+      runRuntimeMigration({ target, ...missingPublish }),
+      /Non-production runtime migration requires isolated publishReplacement callback/,
+    );
+    await assert.rejects(
+      updateCheckout({ target, runtime: missingPublish, gitImpl: () => { throw new Error("must not reach git"); } }),
+      /Non-production updateCheckout requires isolated publishReplacement callback/,
+    );
     const sameCalls = [];
     const same = await updateCheckout({
       target,
@@ -384,6 +396,40 @@ test("update restore attempts runtime and revision independently and keeps prima
       assert.equal(error instanceof AggregateError, true);
       assert.equal(error.errors[0].message, "runtime restore failed");
       assert.equal(error.errors[1].message, "revision restore failed");
+      return true;
+    },
+  );
+});
+
+test("update restore records a default runtime-loader failure before attempting the revision", async () => {
+  const events = [];
+  const loaderFailure = new Error("runtime loader failed");
+  const revisionFailure = new Error("revision restore failed");
+  await assert.rejects(
+    () => import("../src/update.mjs").then(({ restoreRuntimeAndRevision }) =>
+      restoreRuntimeAndRevision({}, "old-revision", {
+        operationsLoader: async () => { throw loaderFailure; },
+        restoreRevision: async () => { events.push("revision"); },
+      }),
+    ),
+    (error) => {
+      assert.deepEqual(events, ["revision"]);
+      assert.equal(error instanceof AggregateError, true);
+      assert.equal(error.errors[0], loaderFailure);
+      return true;
+    },
+  );
+  await assert.rejects(
+    () => import("../src/update.mjs").then(({ restoreRuntimeAndRevision }) =>
+      restoreRuntimeAndRevision({}, "old-revision", {
+        operationsLoader: async () => { throw loaderFailure; },
+        restoreRevision: async () => { events.push("failed-revision"); throw revisionFailure; },
+      }),
+    ),
+    (error) => {
+      assert.deepEqual(events, ["revision", "failed-revision"]);
+      assert.equal(error instanceof AggregateError, true);
+      assert.deepEqual(error.errors, [loaderFailure, revisionFailure]);
       return true;
     },
   );
