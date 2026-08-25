@@ -11,7 +11,7 @@ import { fileURLToPath } from "node:url";
 import { callerBaseUrl } from "../src/caller-auth.mjs";
 import { privateFileIsProtected, protectPrivateFile } from "../src/file-security.mjs";
 import { redactSensitive } from "../src/sensitive-redactor.mjs";
-import { acceptanceCatalogFixture, privateRegularFile, runtimeEnv, acquireIsolationLease, assertCliPreflight, assertPortsAvailable, assertPushedHarness, completeIsolatedInstaller, createIsolatedEnvironment, createLocalProviderFixture, createLocalRuntime, guardIsolatedRuntimeCallback, isolationLeasePath, ownedProcessAlive, planIsolatedEnvironment, readInstalledCallerSecret, validateAcceptanceProviderFixture, validDownstreamResponsesLifecycle, verifyCleanInstall, writeAcceptanceCatalog } from "../scripts/verify-isolated-install.mjs";
+import { acceptanceCatalogFixture, privateRegularFile, runtimeEnv, acquireIsolationLease, assertCliPreflight, assertCurrentPushedCommit, assertPortsAvailable, assertPushedHarness, completeIsolatedInstaller, createIsolatedEnvironment, createLocalProviderFixture, createLocalRuntime, guardIsolatedRuntimeCallback, isolationLeasePath, ownedProcessAlive, planIsolatedEnvironment, readInstalledCallerSecret, resolvePushedRemote, validateAcceptanceProviderFixture, validDownstreamResponsesLifecycle, verifyCleanInstall, writeAcceptanceCatalog } from "../scripts/verify-isolated-install.mjs";
 
 const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -22,6 +22,20 @@ function fixture() {
 
 function assertPrivateFile(file) {
   assert.equal(privateFileIsProtected(file), true, `private file is not protected: ${file}`);
+}
+
+function committedHarnessGit(commit, { remotes = ["github"], upstream = "github/main" } = {}) {
+  return (args, options = {}) => {
+    if (args[0] === "status") return "";
+    if (args[0] === "remote") return `${remotes.join("\n")}\n`;
+    if (args[0] === "rev-parse") return `${upstream}\n`;
+    if (args[0] === "show") {
+      const file = args[1].slice(commit.length + 1);
+      const bytes = readFileSync(path.join(repositoryRoot, file));
+      return options.encoding === "buffer" ? bytes : bytes.toString("utf8");
+    }
+    throw new Error(`unexpected git command: ${args.join(" ")}`);
+  };
 }
 
 test("Windows private-file validation binds an ACL result to the opened file identity", () => {
@@ -479,6 +493,76 @@ test("clean install harness proves the full isolated service and command contrac
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+test("pushed harness resolves github then origin then upstream without probing before local provenance", () => {
+  const commit = "a".repeat(40);
+  const source = (argument) => readFileSync(path.join(repositoryRoot, argument.slice(commit.length + 1)));
+  const resolver = (remotes, upstream) => (args, options = {}) => {
+    if (args[0] === "remote") return `${remotes.join("\n")}\n`;
+    if (args[0] === "rev-parse") return `${upstream}\n`;
+    if (args[0] === "show") return options.encoding === "buffer" ? source(args[1]) : source(args[1]).toString("utf8");
+    throw new Error(`unexpected git command: ${args.join(" ")}`);
+  };
+
+  assert.deepEqual(resolvePushedRemote({ git: resolver(["github", "origin"], "origin/main") }), { remote: "github", ref: "refs/heads/main" });
+  assert.deepEqual(resolvePushedRemote({ git: resolver(["origin"], "origin/main") }), { remote: "origin", ref: "refs/heads/main" });
+  assert.deepEqual(resolvePushedRemote({ git: resolver(["fork"], "fork/release/candidate") }), { remote: "fork", ref: "refs/heads/release/candidate" });
+  assert.throws(() => resolvePushedRemote({ git: resolver([], "") }), /cannot resolve.*remote/i);
+
+  const dirtyCalls = [];
+  assert.throws(() => assertPushedHarness(commit, {
+    git(args) { dirtyCalls.push(args); if (args[0] === "status") return "?? scripts/verify-isolated-install.mjs\n"; throw new Error("network or source read must not run for dirty harness"); },
+    remoteProbe() { throw new Error("network must not run for dirty harness"); },
+  }), /dirty or untracked/i);
+  assert.deepEqual(dirtyCalls, [["status", "--porcelain", "--", "scripts/verify-isolated-install.mjs"]]);
+
+  const probes = [];
+  assert.equal(assertPushedHarness(commit, {
+    git(args, options = {}) {
+      if (args[0] === "status") return "";
+      if (args[0] === "show") return options.encoding === "buffer" ? source(args[1]) : source(args[1]).toString("utf8");
+      if (args[0] === "remote") return "origin\n";
+      throw new Error(`unexpected git command: ${args.join(" ")}`);
+    },
+    remoteProbe(remote, ref) { probes.push([remote, ref]); return `${commit}\t${ref}\n`; },
+  }), true);
+  assert.deepEqual(probes, [["origin", "refs/heads/main"]]);
+
+  assert.throws(() => assertPushedHarness(commit, {
+    git: committedHarnessGit(commit, { remotes: ["origin"], upstream: "origin/main" }),
+    remoteProbe: (_remote, ref) => `${"b".repeat(40)}\t${ref}\n`,
+  }), /source commit is not origin\/main/);
+});
+
+test("current pushed commit gate checks HEAD before its resolved remote", () => {
+  const commit = "c".repeat(40);
+  const calls = [];
+  assert.throws(() => assertCurrentPushedCommit(commit, {
+    git(args) { calls.push(args); if (args.join(" ") === "rev-parse HEAD") return `${"d".repeat(40)}\n`; throw new Error("remote resolution must not run after HEAD mismatch"); },
+    remoteProbe() { throw new Error("network must not run after HEAD mismatch"); },
+  }), /current source commit/);
+  assert.deepEqual(calls, [["rev-parse", "HEAD"]]);
+
+  const probes = [];
+  assert.equal(assertCurrentPushedCommit(commit, {
+    git(args) {
+      if (args.join(" ") === "rev-parse HEAD") return `${commit}\n`;
+      if (args[0] === "remote") return "origin\n";
+      throw new Error(`unexpected git command: ${args.join(" ")}`);
+    },
+    remoteProbe(remote, ref) { probes.push([remote, ref]); return `${commit}\t${ref}\n`; },
+  }), true);
+  assert.deepEqual(probes, [["origin", "refs/heads/main"]]);
+
+  assert.throws(() => assertCurrentPushedCommit(commit, {
+    git(args) {
+      if (args.join(" ") === "rev-parse HEAD") return `${commit}\n`;
+      if (args[0] === "remote") return "origin\n";
+      throw new Error(`unexpected git command: ${args.join(" ")}`);
+    },
+    remoteProbe: (_remote, ref) => `${"d".repeat(40)}\t${ref}\n`,
+  }), /source commit is not origin\/main/);
+});
+
 test("pre-push unit guards reject stale provenance and non-macOS roots without writing or passed evidence", () => {
   const { sourceRoot } = fixture();
   mkdirSync(path.join(sourceRoot, "generated", "acceptance"), { recursive: true });
@@ -487,7 +571,8 @@ test("pre-push unit guards reject stale provenance and non-macOS roots without w
     const before = existsSync(path.join(root, "checkout"));
     assert.throws(() => assertCliPreflight(root, { platform: "linux" }), /macOS-only/);
     assert.equal(existsSync(path.join(root, "checkout")), before);
-    assert.throws(() => assertPushedHarness("a".repeat(40), { remoteProbe: () => "b".repeat(40), git: () => "" }), /github\/main/);
+    const stale = "a".repeat(40);
+    assert.throws(() => assertPushedHarness(stale, { remoteProbe: (_remote, ref) => `${"b".repeat(40)}\t${ref}\n`, git: committedHarnessGit(stale) }), /github\/main/);
     assert.throws(() => assertPushedHarness("a".repeat(40), { remoteProbe: () => "a".repeat(40), git: (args) => args[0] === "status" ? "?? scripts/verify-isolated-install.mjs" : "" }), /dirty or untracked/);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });

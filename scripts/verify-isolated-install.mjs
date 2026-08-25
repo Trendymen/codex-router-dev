@@ -96,18 +96,44 @@ export function guardIsolatedRuntimeCallback(isDisposed, callback) {
 }
 
 function gitText(args, { encoding = "utf8" } = {}) { return execFileSync("git", args, { cwd: ROOT, encoding }); }
+function remoteDisplay({ remote, ref }) { return `${remote}/${ref.slice("refs/heads/".length)}`; }
+
+/** Resolves the authoritative pushed branch without assuming a checkout remote name. */
+export function resolvePushedRemote({ git = gitText } = {}) {
+  if (typeof git !== "function") throw new Error("Git resolver is required");
+  const remotes = String(git(["remote"])).split(/\r?\n/).map((value) => value.trim()).filter(Boolean);
+  for (const remote of ["github", "origin"]) if (remotes.includes(remote)) return { remote, ref: "refs/heads/main" };
+  let upstream;
+  try { upstream = String(git(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"])).trim(); } catch { throw new Error("cannot resolve a pushed Git remote"); }
+  const remote = [...remotes].sort((left, right) => right.length - left.length).find((value) => upstream.startsWith(`${value}/`));
+  const branch = remote && upstream.slice(remote.length + 1);
+  if (!remote || !branch || !/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(branch) || branch.includes("..") || branch.endsWith(".") || branch.endsWith("/")) throw new Error("cannot resolve a pushed Git remote");
+  return { remote, ref: `refs/heads/${branch}` };
+}
+
+function assertRemoteTip(sourceCommit, target, { git = gitText, remoteProbe } = {}) {
+  const output = String((remoteProbe || ((remote, ref) => git(["ls-remote", remote, ref])))(target.remote, target.ref)).trim();
+  const [remoteCommit, remoteRef] = output.split(/\s+/);
+  if (remoteCommit !== sourceCommit || remoteRef !== target.ref) throw new Error(`source commit is not ${remoteDisplay(target)}`);
+  return true;
+}
+
+/** Requires the checked-out commit and its selected remote tip to match. */
+export function assertCurrentPushedCommit(sourceCommit, { git = gitText, remoteProbe } = {}) {
+  if (!/^[0-9a-f]{40}$/.test(String(sourceCommit || ""))) throw new Error("source commit must be a full Git commit");
+  if (String(git(["rev-parse", "HEAD"])).trim() !== sourceCommit) throw new Error("isolated runtime must materialize the current source commit");
+  return assertRemoteTip(sourceCommit, resolvePushedRemote({ git }), { git, remoteProbe });
+}
+
 /** Proves that a post-push CLI is executing the same four checked-in harness bytes. */
 export function assertPushedHarness(sourceCommit, { git = gitText, remoteProbe } = {}) {
   if (!/^[0-9a-f]{40}$/.test(String(sourceCommit || ""))) throw new Error("source commit must be a full Git commit");
-  const probe = remoteProbe || ((commit) => git(["ls-remote", "github", "refs/heads/main"]));
-  const remote = String(probe(sourceCommit)).trim().split(/\s+/)[0];
-  if (remote !== sourceCommit) throw new Error("source commit is not github/main");
   for (const file of HARNESS_PATHS) {
     if (String(git(["status", "--porcelain", "--", file])).trim()) throw new Error(`harness path is dirty or untracked: ${file}`);
     const committed = Buffer.from(git(["show", `${sourceCommit}:${file}`], { encoding: "buffer" }));
     if (!existsSync(path.join(ROOT, file)) || !committed.equals(readFileSync(path.join(ROOT, file)))) throw new Error(`harness bytes differ from source commit: ${file}`);
   }
-  return true;
+  return assertRemoteTip(sourceCommit, resolvePushedRemote({ git }), { git, remoteProbe });
 }
 
 /** No CLI root, lock, or launch operation is allowed before this gate succeeds. */
@@ -224,7 +250,7 @@ export function ownedProcessAlive(state, child) { return Boolean(state && state.
 async function ready(url, state, logPath) { const reason = () => existsSync(logPath) ? readFileSync(logPath, "utf8").slice(-4_000) : "no router stderr captured"; const deadline = Date.now() + 10_000; while (Date.now() < deadline) { if (!ownedProcessAlive(state, state?.child)) throw new Error(`isolated router exited before readiness: ${reason()}`); try { const response = await fetch(url); if (response.ok) return; } catch {} await new Promise((resolve) => setTimeout(resolve, 50)); } throw new Error(`isolated router did not become ready: ${reason()}`); }
 async function materialize(env, commit, { allowReleased = false } = {}) {
   if (!/^[0-9a-f]{40}$/.test(String(commit || ""))) throw new Error("source commit must be a full Git commit");
-  if (!allowReleased && (execFileSync("git", ["rev-parse", "HEAD"], { cwd: ROOT, encoding: "utf8" }).trim() !== commit || execFileSync("git", ["rev-parse", "github/main"], { cwd: ROOT, encoding: "utf8" }).trim() !== commit)) throw new Error("isolated runtime must materialize the current pushed source commit");
+  if (!allowReleased) assertCurrentPushedCommit(commit);
   execFileSync("git", ["cat-file", "-e", `${commit}^{commit}`], { cwd: ROOT, stdio: "ignore" });
   if (existsSync(env.sourceRoot)) throw new Error("isolated checkout already exists; use a fresh acceptance root");
   mkdirSync(env.sourceRoot, { recursive: true, mode: 0o700 }); const archive = execFileSync("git", ["archive", "--format=tar", commit], { cwd: ROOT, maxBuffer: 256 * 1024 * 1024 }); const tar = spawn(process.platform === "win32" ? "tar.exe" : "tar", ["-x", "-C", env.sourceRoot], { stdio: ["pipe", "ignore", "pipe"] }); tar.stdin.end(archive);

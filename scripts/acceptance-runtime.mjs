@@ -1233,7 +1233,10 @@ async function worker(args) {
   try {
     const task1 = requireSwift ? task1ManifestPath ? task1ManifestForBuildRoot(path.join(path.dirname(task1ManifestPath), "build-root"), sourceCommit) : (() => { throw new Error("runtime worker requires a Task1 build manifest"); })() : undefined;
     if (task1 && task1.manifestPath !== path.resolve(task1ManifestPath)) throw new Error("runtime worker Task1 manifest path is not canonical");
-    const runtimeOptions = { sourceCommit, requireSwift: false };
+    // The public CLI proves provenance before it spawns this local worker.
+    // Materialization still verifies the commit object, while avoiding a
+    // second remote probe from the isolated fixture process.
+    const runtimeOptions = { sourceCommit, requireSwift: false, allowReleased: true };
     if (!args.includes("--stable-fixture")) runtimeOptions.providerFixtureFactory = async ({ registerServer, signal }) => {
       // Do not proxy the checked-in fixture through an extra HTTP hop.  The
       // Router deliberately observes the upstream stream while relaying it;

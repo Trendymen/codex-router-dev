@@ -524,7 +524,7 @@ test("public browser session to visual to stop publishes exactly seventeen local
   }
 });
 
-test("production final provenance rejects an injected dirty harness before source reads, remotes, or workers", async () => {
+test("production CLI and final provenance reject missing or dirty harnesses before source reads, remotes, or workers", async () => {
   const calls = [], git = (args) => { calls.push(args); if (args[0] === "status") return "?? scripts/acceptance-runtime.mjs\n"; throw new Error(`unexpected ${args[0]}`); };
   assert.throws(() => assertRuntimeCommandProvenance(commit, { git }), /dirty|untracked/i);
   assert.deepEqual(calls, [["status", "--porcelain", "--", "scripts/acceptance-runtime.mjs"]]);
@@ -532,6 +532,11 @@ test("production final provenance rejects an injected dirty harness before sourc
   await assert.rejects(finalNonLiveAcceptance({ root: finalRoot, buildRoot: dir, browserProfile: finalNonLiveBrowserProfile(finalRoot), evidence: path.join(dir, "evidence.json"), sourceCommit: commit, provenance: (sourceCommit) => assertRuntimeCommandProvenance(sourceCommit, { git }) }), /dirty|untracked/i);
   assert.deepEqual(calls, [["status", "--porcelain", "--", "scripts/acceptance-runtime.mjs"]]); assert.equal(existsSync(finalRoot), false);
   assert.throws(() => assertRuntimeCommandProvenance(commit, { git: (args) => { if (args[0] === "status") return ""; if (args[0] === "show") throw new Error("source commit path is unavailable"); throw new Error(`unexpected ${args[0]}`); } }), /source commit path is unavailable/i);
+  const cliRoot = path.join(dir, "cli-root");
+  await assert.rejects(runAcceptanceRuntimeCli(["start", "--root", cliRoot, "--evidence", path.join(dir, "evidence.json"), "--source-commit", commit, "--build-root", dir], {
+    provenance: (sourceCommit) => assertRuntimeCommandProvenance(sourceCommit, { git }),
+  }), /dirty|untracked/i);
+  assert.equal(existsSync(cliRoot), false);
 });
 
 test("resumed active final restores evidence and disposes its runtime after a human callback failure", async () => {
@@ -570,7 +575,7 @@ test("final API restores prior evidence when a visual callback fails", async () 
   assert.equal(disposed, true); assert.equal(readFileSync(evidence, "utf8"), prior);
 });
 
-test("real worker owns its lease/socket and IPC stop cleans every owned runtime handle", { skip: process.platform !== "darwin", timeout: 40_000 }, async () => {
+test("real worker uses the parent provenance seam and completes its local fixture with an unreachable parent proxy", { skip: process.platform !== "darwin", timeout: 40_000 }, async () => {
   const sourceCommit = (await import("node:child_process")).execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim();
   const dir = freshExactRuntimeRoot("worker");
   const child = spawn(process.execPath, [path.resolve("scripts/acceptance-runtime.mjs"), "--worker", "--root", dir, "--source-commit", sourceCommit, "--no-swift"], { env: { ...process.env, DEEPSEEK_API_KEY: "parent-secret-must-not-reach-protocol-child", HTTPS_PROXY: "https://parent-proxy.invalid", NODE_OPTIONS: "" }, stdio: ["ignore", "ignore", "pipe"] });
