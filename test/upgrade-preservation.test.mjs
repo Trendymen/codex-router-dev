@@ -88,6 +88,10 @@ function fixture() {
   return { root, target, runtimeRoots, paths: ownedRuntimePaths(target, runtimeRoots) };
 }
 
+function windowsTestAdapter(overrides = {}) {
+  return { platform: "win32", protect: () => {}, verifyProtected: () => true, ...overrides };
+}
+
 test("Appendix G upgrade consumer dispatches every checked-in upgrade/platform oracle row", () => {
   const { root, paths } = fixture();
   try {
@@ -450,15 +454,14 @@ test("Windows catalog pointer replacement retains recoverable state across every
     const { root, target, runtimeRoots } = fixture();
     try {
       const topology = installManagedCatalogTopology(target, `windows-${scenario.id}`);
-      const snapshot = snapshotOwnedRuntime(ownedRuntimePaths(target, runtimeRoots));
+      const snapshot = snapshotOwnedRuntime(ownedRuntimePaths(target, runtimeRoots), { fs: windowsTestAdapter() });
       rmSync(topology.generationDir, { recursive: true, force: true });
       const generations = path.join(target.stateRoot, "catalog-generations");
       const current = path.join(generations, "current");
       const foreign = "foreign-current";
       const transient = (message, code = "EBUSY") => Object.assign(new Error(message), { code });
       let failure;
-      try { restoreOwnedRuntime(snapshot, { fs: {
-        platform: "win32",
+      try { restoreOwnedRuntime(snapshot, { fs: windowsTestAdapter({
         rename(source, destination) {
           const sourceName = path.basename(source);
           const destinationName = path.basename(destination);
@@ -489,7 +492,7 @@ test("Windows catalog pointer replacement retains recoverable state across every
           if (scenario.id === "retains-tombstone" && path.basename(value).includes("catalog-pointer-remove")) throw new Error("unsafe final tombstone unlink");
           return unlinkSync(value);
         },
-      } }); } catch (error) { failure = error; }
+      }) }); } catch (error) { failure = error; }
       if (scenario.shouldFail !== false) assert.match(String(failure?.message || ""), /Windows catalog pointer|injected|restore/i, scenario.id);
       const names = readdirSync(generations);
       const targetOf = (value) => { try { return readlinkSync(value); } catch { return null; } };
@@ -517,13 +520,12 @@ test("Windows catalog pointer identity compares exact BigInt inode values beyond
   const { root, target, runtimeRoots } = fixture();
   try {
     const topology = installManagedCatalogTopology(target, "windows-bigint");
-    const snapshot = snapshotOwnedRuntime(ownedRuntimePaths(target, runtimeRoots));
+    const snapshot = snapshotOwnedRuntime(ownedRuntimePaths(target, runtimeRoots), { fs: windowsTestAdapter() });
     rmSync(topology.generationDir, { recursive: true, force: true });
     const generations = path.join(target.stateRoot, "catalog-generations");
     const current = path.join(generations, "current");
     let bigintPointerStats = 0;
-    assert.throws(() => restoreOwnedRuntime(snapshot, { fs: {
-      platform: "win32",
+    assert.throws(() => restoreOwnedRuntime(snapshot, { fs: windowsTestAdapter({
       lstat(value, options) {
         const entry = lstatSync(value, options);
         if (options?.bigint && (value === current || path.basename(value).startsWith("current.catalog-current-displaced"))) {
@@ -533,7 +535,7 @@ test("Windows catalog pointer identity compares exact BigInt inode values beyond
         }
         return entry;
       },
-    } }), /identity|pointer|restore/i);
+    }) }), /identity|pointer|restore/i);
     assert.ok(bigintPointerStats >= 2, "pointer lstat must request exact bigint identities before and after displacement");
     assert.equal(readdirSync(generations).some((name) => name.startsWith("restore-")), true, "a pointer identity ambiguity must preserve the created generation for recovery");
   } finally {
@@ -545,7 +547,7 @@ test("Windows outer rollback preserves both old and new recovery pointers when a
   const { root, target, runtimeRoots } = fixture();
   try {
     const topology = installManagedCatalogTopology(target, "windows-outer-rollback");
-    const snapshot = snapshotOwnedRuntime(ownedRuntimePaths(target, runtimeRoots));
+    const snapshot = snapshotOwnedRuntime(ownedRuntimePaths(target, runtimeRoots), { fs: windowsTestAdapter() });
     rmSync(topology.generationDir, { recursive: true, force: true });
     const generations = path.join(target.stateRoot, "catalog-generations");
     const current = path.join(generations, "current");
@@ -553,8 +555,7 @@ test("Windows outer rollback preserves both old and new recovery pointers when a
     let initialSwitch = false;
     let primary;
     let failure;
-    try { restoreOwnedRuntime(snapshot, { fs: {
-      platform: "win32",
+    try { restoreOwnedRuntime(snapshot, { fs: windowsTestAdapter({
       rename(source, destination) {
         const sourceName = path.basename(source);
         const destinationName = path.basename(destination);
@@ -577,7 +578,7 @@ test("Windows outer rollback preserves both old and new recovery pointers when a
         }
         return readlinkSync(value);
       },
-    } }); } catch (error) { failure = error; }
+    }) }); } catch (error) { failure = error; }
     assert.ok(failure instanceof Error);
     const messages = [failure.message, ...(failure.errors || []).map((entry) => entry.message)].join("\n");
     assert.match(messages, /injected validation after initial pointer switch/);
@@ -601,13 +602,12 @@ test("Windows outer rollback retains a secondary tombstone that still binds the 
   const { root, target, runtimeRoots } = fixture();
   try {
     const topology = installManagedCatalogTopology(target, "windows-secondary-residue");
-    const snapshot = snapshotOwnedRuntime(ownedRuntimePaths(target, runtimeRoots));
+    const snapshot = snapshotOwnedRuntime(ownedRuntimePaths(target, runtimeRoots), { fs: windowsTestAdapter() });
     rmSync(topology.generationDir, { recursive: true, force: true });
     const generations = path.join(target.stateRoot, "catalog-generations");
     const current = path.join(generations, "current");
     let initialSwitch = false;
-    assert.throws(() => restoreOwnedRuntime(snapshot, { fs: {
-      platform: "win32",
+    assert.throws(() => restoreOwnedRuntime(snapshot, { fs: windowsTestAdapter({
       rename(source, destination) {
         if (path.basename(source).startsWith("current.catalog-current-restore") && destination === current) initialSwitch = true;
         return renameSync(source, destination);
@@ -616,7 +616,7 @@ test("Windows outer rollback retains a secondary tombstone that still binds the 
         if (initialSwitch && value === path.join(target.stateRoot, "merged-models.json")) throw new Error("injected validation for secondary tombstone");
         return readlinkSync(value);
       },
-    } }), /Managed catalog current restore failed/);
+    }) }), /Managed catalog current restore failed/);
     const names = readdirSync(generations);
     const targetOf = (value) => { try { return readlinkSync(value); } catch { return null; } };
     assert.equal(targetOf(current), topology.generation, "outer rollback restores the prior current pointer");
@@ -632,7 +632,7 @@ test("Windows tombstone ceiling is global, rejects lookalikes, and preserves the
   const { root, target, runtimeRoots } = fixture();
   try {
     const topology = installManagedCatalogTopology(target, "windows-tombstone-ceiling");
-    const snapshot = snapshotOwnedRuntime(ownedRuntimePaths(target, runtimeRoots));
+    const snapshot = snapshotOwnedRuntime(ownedRuntimePaths(target, runtimeRoots), { fs: windowsTestAdapter() });
     const generations = path.join(target.stateRoot, "catalog-generations");
     const current = path.join(generations, "current");
     const before = lstatSync(current, { bigint: true });
@@ -642,7 +642,7 @@ test("Windows tombstone ceiling is global, rejects lookalikes, and preserves the
     symlinkSync(topology.generation, path.join(generations, "unknown.catalog-pointer-remove.1.not-managed"), "dir");
     rmSync(topology.generationDir, { recursive: true, force: true });
     let failure;
-    try { restoreOwnedRuntime(snapshot, { fs: { platform: "win32" } }); } catch (error) { failure = error; }
+    try { restoreOwnedRuntime(snapshot, { fs: windowsTestAdapter() }); } catch (error) { failure = error; }
     assert.ok(failure instanceof Error);
     assert.match([failure.message, ...(failure.errors || []).map((entry) => entry.message)].join("\n"), /tombstone limit|maintenance/i);
     const after = lstatSync(current, { bigint: true });
