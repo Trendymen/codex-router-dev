@@ -58,6 +58,9 @@ jobs:
           }
 
   homebrew-formula:
+    # This fork is not currently distributed through Homebrew. Keep the job
+    # definition available for a future tap/release, but do not run it in CI.
+    if: ${{ false }}
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7
