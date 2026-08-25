@@ -543,6 +543,30 @@ export function writeStreamErrorEvent(response, { code, message }) {
   }
 }
 
+function isExplicitCancellationError(error) {
+  return error?.code === "ERR_STREAM_PREMATURE_CLOSE"
+    || error?.code === "ABORT_ERR"
+    || error?.code === "request_aborted"
+    || error?.name === "AbortError";
+}
+
+function isClientPipelineCancellation(error, response, signal) {
+  if (!response.destroyed || response.writableFinished) return false;
+  if (!isExplicitCancellationError(error)) return false;
+  // Router requests have the incoming message on ServerResponse. Its aborted
+  // bit is a peer-owned fact, unlike the response close event: pipeline also
+  // closes the response when an adapter/source fails. Prefer that ownership
+  // signal whenever it is available. It still has to agree with pipeline's
+  // explicit cancellation error: destroying a server response also marks its
+  // request aborted, and must not hide an adapter's own failure.
+  if (typeof response.req?.aborted === "boolean") return response.req.aborted;
+  // The public helper is also used with bare writable test doubles. They lack
+  // the request object, so only an owned caller signal plus an explicit
+  // cancellation error may take this fallback. A generic premature-close on a
+  // target with no request object is not enough evidence by itself.
+  return signal?.aborted === true;
+}
+
 export async function pipeResponse(
   upstream,
   response,
@@ -579,7 +603,7 @@ export async function pipeResponse(
     // pipeline reports as a premature close. That is not a router failure, and
     // pipeline has already torn the upstream read down, so the in-flight
     // counter releases without inventing an error.
-    if (response.destroyed && !response.writableFinished) return;
+    if (isClientPipelineCancellation(error, response, signal)) return;
     throw error;
   } finally {
     signal?.removeEventListener("abort", abortPipeline);

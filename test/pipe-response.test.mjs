@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import http from "node:http";
-import { Transform } from "node:stream";
+import { Transform, Writable } from "node:stream";
 import test from "node:test";
 
 import { endStreamedResponse, pipeResponse } from "../src/http-utils.mjs";
@@ -15,12 +15,35 @@ function close(server) {
   return new Promise((resolve) => server.close(resolve));
 }
 
+function controlledResponse(request) {
+  let markedDestroyed = false;
+  const response = new Writable({
+    write(_chunk, _encoding, callback) {
+      callback();
+    },
+  });
+  Object.defineProperty(response, "destroyed", {
+    configurable: true,
+    get: () => markedDestroyed,
+  });
+  response.req = request;
+  response.setHeader = () => {};
+  response.getHeader = () => undefined;
+  return {
+    response,
+    markDestroyed: () => {
+      markedDestroyed = true;
+    },
+  };
+}
+
 // A client that hangs up mid-stream makes the response emit "close" without
 // ever emitting "finish" or "error". pipeResponse must still settle, otherwise
 // the router's in-flight counter never releases the request.
 test("pipeResponse settles when the client disconnects mid-stream", async () => {
   let settled = false;
   let pipeError;
+  let callerAborted = false;
 
   const server = http.createServer(async (request, response) => {
     const upstream = {
@@ -38,6 +61,7 @@ test("pipeResponse settles when the client disconnects mid-stream", async () => 
     } catch (error) {
       pipeError = error;
     }
+    callerAborted = request.aborted;
     settled = true;
   });
 
@@ -62,6 +86,7 @@ test("pipeResponse settles when the client disconnects mid-stream", async () => 
   await close(server);
   assert.equal(settled, true, "pipeResponse never settled after client disconnect");
   assert.equal(pipeError, undefined);
+  assert.equal(callerAborted, true, "the server request did not record the peer abort");
 });
 
 test("pipeResponse resolves after a complete response", async () => {
@@ -196,6 +221,74 @@ test("an upstream body that fails mid-stream ends the chunked body instead of re
 
   // `pipeline` tears the whole chain down; `.pipe()` left the transform alive.
   assert.equal(transform.destroyed, true, "the failure did not destroy the chain");
+});
+
+// A local ServerResponse destroy also marks its IncomingMessage as aborted.
+// That is indistinguishable from a peer cancellation if pipeResponse ignores
+// the pipeline error's ownership. Reproduce that HTTP state, then control the
+// writable teardown ordering so the delayed adapter failure is observable.
+test("an adapter truncation rejects after local response destroy marks the request aborted", async () => {
+  let pipeError;
+  let serverSettled = false;
+  const server = http.createServer(async (request, response) => {
+    response.write("data: first\n\n");
+    const aborted = new Promise((resolve) => request.once("aborted", resolve));
+    response.destroy();
+    await aborted;
+    const controlled = controlledResponse(request);
+    const adapter = new Transform({
+      transform(chunk, _encoding, callback) {
+        if (this.seenFirst) {
+          const error = new Error("adapter detected truncated stream");
+          error.code = "upstream_stream_truncated";
+          // Pipeline must attach the writable while it is healthy. This is the
+          // post-first-frame state the adapter sees when its own failure then
+          // tears the destination down.
+          controlled.markDestroyed();
+          setImmediate(() => callback(error));
+          return;
+        }
+        this.seenFirst = true;
+        callback(null, chunk);
+      },
+    });
+    const upstream = {
+      status: 200,
+      headers: new Map([["content-type", "text/event-stream"]]),
+      body: new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode("data: relayed\n\n"));
+          controller.enqueue(new TextEncoder().encode("data: truncated\n\n"));
+          controller.close();
+        },
+      }),
+    };
+    try {
+      await pipeResponse(upstream, controlled.response, new Set(), [adapter]);
+    } catch (error) {
+      pipeError = error;
+    }
+    serverSettled = true;
+  });
+
+  const port = await listen(server);
+  await new Promise((resolve) => {
+    const request = http.request({ host: "127.0.0.1", port, path: "/" }, (response) => {
+      response.resume();
+      response.once("close", resolve);
+    });
+    request.once("error", resolve);
+    request.end();
+  });
+  const deadline = Date.now() + 2_000;
+  while (!serverSettled && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  await close(server);
+
+  assert.equal(serverSettled, true, "server did not observe the local response teardown");
+  assert.equal(pipeError?.code, "upstream_stream_truncated");
+  assert.equal(pipeError?.message, "adapter detected truncated stream");
 });
 
 // The case above fails between two complete events, which is the lucky one. A
