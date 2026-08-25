@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
+import { createHash, randomBytes } from "node:crypto";
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { isolationLeasePath } from "../scripts/verify-isolated-install.mjs";
+import { acquireIsolationLease, isolationLeasePath } from "../scripts/verify-isolated-install.mjs";
 import { createIsolatedEnvironment } from "../scripts/verify-isolated-install.mjs";
 import { prepareAcceptanceBuild } from "../scripts/prepare-acceptance-build.mjs";
 import {
@@ -15,11 +16,13 @@ import {
   createRuntimeFixture,
   completedSessionArtifact,
   completedTask3ReportsOrPending,
+  defaultCliBrowserProfile,
   finalNonLiveAcceptance,
   finalNonLiveBrowserProfile,
   finalTask3RequirementIds,
   protocolAuthorizationPredicates,
   protocolLabEnvironment,
+  preferredPushedRuntimeRemote,
   noOwnedLiteLlmOr4200,
   removeCaptureRoots,
   runtimeCaptureRoot,
@@ -35,10 +38,35 @@ import {
 
 const commit = "a".repeat(40);
 function root() { return mkdtempSync(path.join(os.tmpdir(), "acceptance-runtime-")); }
+function temp(prefix) { return mkdtempSync(path.join(os.tmpdir(), prefix)); }
+function acceptanceTemp(prefix) { const parent = path.resolve("generated", "acceptance"); mkdirSync(parent, { recursive: true, mode: 0o700 }); return mkdtempSync(path.join(parent, prefix)); }
+function isolatedPortsForNonce(nonce) { const base = 46_000 + ([...nonce].reduce((sum, char) => sum + char.codePointAt(0), 0) % 600) * 20; return { oauth: base + 1, router: base + 2, api: base + 3, grokOauth: base + 8, devinCli: base + 10 }; }
+function freshWorkerRoot(parent, prefix, nonceFor) {
+  for (let attempt = 0; attempt < 64; attempt += 1) {
+    const root = path.join(parent, `${prefix}${randomBytes(8).toString("hex")}`), nonce = nonceFor(root);
+    if (!existsSync(isolationLeasePath(isolatedPortsForNonce(nonce)).lock)) return root;
+  }
+  throw new Error("no unleased worker port bucket is available");
+}
+function freshExactRuntimeRoot(name = "runtime") {
+  const boundary = path.resolve("generated", "acceptance");
+  for (let attempt = 0; attempt < 64; attempt += 1) {
+    const parent = path.join(boundary, `t-${randomBytes(4).toString("hex")}`), root = path.join(parent, name), nonce = `runtime-${createHash("sha256").update(root).digest("hex").slice(0, 16)}`;
+    if (!existsSync(isolationLeasePath(isolatedPortsForNonce(nonce)).lock)) { mkdirSync(parent, { recursive: true, mode: 0o700 }); return root; }
+  }
+  throw new Error("no unleased exact-runtime port bucket is available");
+}
+function freshIsolatedTestEnvironment(parent, stage) {
+  for (let attempt = 0; attempt < 64; attempt += 1) {
+    const nonce = `cleanup-${stage}-${randomBytes(12).toString("hex")}`, env = createIsolatedEnvironment({ root: path.join(parent, `runtime-${stage}-${attempt}`), nonce, sourceCommit: commit });
+    if (!existsSync(isolationLeasePath(env.target.ports).lock)) return env;
+  }
+  throw new Error("no unleased isolated acceptance port bucket is available");
+}
 let task1Fixture;
 function currentTask1Fixture() {
   if (task1Fixture) return task1Fixture;
-  const sourceCommit = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim(), isolationRoot = mkdtempSync(path.resolve("generated/acceptance/task3-test-task1-"));
+  const sourceCommit = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim(), isolationRoot = acceptanceTemp("task3-test-task1-");
   const manifest = prepareAcceptanceBuild({ isolationRoot, sourceCommit, dryRun: true });
   mkdirSync(manifest.bundlePath, { recursive: true, mode: 0o700 });
   return task1Fixture = Object.freeze({ manifestPath: path.join(isolationRoot, "acceptance-build.json"), manifest, sourceCommit });
@@ -103,14 +131,59 @@ test("nested protocol Router receives a closed lab environment, not its parent's
   assert.doesNotMatch(JSON.stringify(env), /parent-(?:deepseek-secret|proxy)|real-(?:home|codex|auth|hook)/);
 });
 
-test("runtime capture root is a private canonical sibling bound to the runtime id", () => {
-  const dir = mkdtempSync(path.resolve("generated/acceptance/task3-capture-test-"));
+test("runtime capture root is a private canonical sibling bound to the runtime id", { skip: process.platform !== "darwin" }, () => {
+  const dir = acceptanceTemp("task3-capture-test-");
   const capture = runtimeCaptureRoot(dir, "worker-0123456789abcdef");
   assert.equal(path.dirname(capture), path.dirname(dir));
   assert.match(path.basename(capture), /^task3-browser-task3-capture-test-[A-Za-z0-9-]+-worker-0123456789abcdef$/);
   assert.equal(realpathSync(capture), capture);
   assert.equal(statSync(capture).mode & 0o077, 0);
   assert.throws(() => runtimeCaptureRoot(dir, "runtime-test"), /runtime id/i);
+});
+
+test("CLI start plans a stable sibling browser profile from its runtime root", () => {
+  const parent = temp("task3-profile-plan-");
+  for (const [runtimeName, browserName] of [["runtime", "browser"], ["final-runtime", "final-browser"], ["runtime-98a5624", "browser-98a5624"]]) {
+    assert.equal(defaultCliBrowserProfile(path.join(parent, runtimeName)), path.join(parent, browserName, "profile"));
+  }
+  assert.throws(() => defaultCliBrowserProfile(path.join(parent, "unrelated")), /runtime root basename/i);
+});
+
+test("CLI start worker consumes the default profile plan while retaining its runtime-id capture root", { skip: process.platform !== "darwin", timeout: 60_000 }, async () => {
+  const fixture = currentTask1Fixture(), sourceCommit = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim(), runtimeRoot = freshExactRuntimeRoot(), evidence = path.join(runtimeRoot, "evidence.json"), browserRoot = path.join(path.dirname(runtimeRoot), "browser"), swiftRoot = path.join(path.dirname(runtimeRoot), "swift");
+  const invoke = (args) => runAcceptanceRuntimeCli(args, { provenance: () => true }); let live;
+  try {
+    await invoke(["start", "--root", runtimeRoot, "--evidence", evidence, "--source-commit", sourceCommit]);
+    live = JSON.parse(readFileSync(path.join(runtimeRoot, "runtime-handle.json"), "utf8"));
+    assert.equal(live.profile, defaultCliBrowserProfile(runtimeRoot));
+    assert.equal(live.captureRoots.browser, browserRoot); assert.equal(live.captureRoots.swift, swiftRoot);
+    await invoke(["browser-session", "--root", runtimeRoot, "--evidence", evidence, "--source-commit", sourceCommit, "--profile", defaultCliBrowserProfile(runtimeRoot)]);
+    assert.equal(existsSync(live.profile), true);
+    const writeCapture = (captureRoot, name, sidecars = false) => {
+      const artifact = path.join(captureRoot, name); writeFileSync(artifact, "pixels", { mode: 0o600 });
+      if (sidecars) for (const kind of ["console", "network", "storage"]) writeFileSync(`${artifact}.${kind}.json`, JSON.stringify({ version: 1, kind, observations: [{ status: "clean", code: `${kind}-checked` }] }), { mode: 0o600 });
+      return artifact;
+    };
+    const command = (name, extra = []) => [name, "--root", runtimeRoot, "--evidence", evidence, "--source-commit", sourceCommit, ...extra];
+    for (const kind of ["browser-desktop", "browser-narrow", "testing-evidence"]) {
+      const artifact = writeCapture(live.captureRoots.browser, `${kind}.png`, true);
+      await invoke(command("record-visual", ["--kind", kind, "--artifact", artifact, "--verdict", "passed", "--reviewer", "reviewer", "--inspected", '["visible"]']));
+    }
+    await invoke(command("swift-session", ["--bundle", fixture.manifest.bundlePath, "--task1-manifest", fixture.manifestPath]));
+    for (const kind of ["swift-light", "swift-dark", "vision-allow"]) {
+      const artifact = writeCapture(live.captureRoots.swift, `${kind}.png`);
+      await invoke(command("record-visual", ["--kind", kind, "--artifact", artifact, "--verdict", "passed", "--reviewer", "reviewer", "--inspected", '["visible"]']));
+    }
+    await invoke(["protocol", "--root", runtimeRoot, "--evidence", evidence, "--source-commit", sourceCommit]);
+    await invoke(["stop", "--root", runtimeRoot, "--evidence", evidence, "--source-commit", sourceCommit]);
+    assert.equal(existsSync(live.socket), false);
+    assert.equal(existsSync(live.captureRoots.browser), false);
+    assert.equal(existsSync(live.captureRoots.swift), false);
+    assert.equal(existsSync(live.profile), false);
+    assert.equal(JSON.parse(readFileSync(evidence, "utf8")).entries.length, 17);
+  } finally {
+    if (live && existsSync(live.socket)) { try { await control(live, "stop"); } catch {} }
+  }
 });
 
 test("4200 probe excludes a foreign owner but rejects any Task3-owned listener or LiteLLM command", () => {
@@ -140,7 +213,7 @@ test("sanitizeRuntimeHandle reconstructs a closed handle without capabilities", 
   assert.throws(() => assertRuntimeHandle({ ...safe, root: path.join(dir, "..") }), /isolated root|handle path/i);
 });
 
-test("runtime report refuses symlinked and production-labelled handle files", () => {
+test("runtime report refuses symlinked and production-labelled handle files", { skip: process.platform !== "darwin" }, () => {
   const dir = root(), value = sanitizeRuntimeHandle(handle(dir));
   mkdirSync(path.dirname(value.handlePath), { recursive: true }); writeFileSync(value.handlePath, JSON.stringify(value), { mode: 0o600 });
   assert.equal(runtimeAcceptanceReport(value.handlePath, { verifyIdentity: false }).status, "running");
@@ -150,7 +223,7 @@ test("runtime report refuses symlinked and production-labelled handle files", ()
   assert.throws(() => runtimeAcceptanceReport(value.handlePath), /production label/i);
 });
 
-test("control ownership rejects a replaced lease, socket, and reused process identity", () => {
+test("control ownership rejects a replaced lease, socket, and reused process identity", { skip: process.platform !== "darwin" }, () => {
   const dir = root(), value = handle(dir);
   const identity = (pid) => ({ pid, digest: pid === value.router.pid ? "d".repeat(64) : "e".repeat(64) });
   assert.throws(() => assertControlOwnership(value, { inspect: identity }), /ENOENT|lease/i);
@@ -178,11 +251,15 @@ test("runtime recorder is private and names exactly eight rows", () => {
 test("post-push gate verifies both runtime harness files through an injected seam", () => {
   const script = readFileSync(new URL("../scripts/acceptance-runtime.mjs", import.meta.url)), suite = readFileSync(new URL("../test/acceptance-runtime.test.mjs", import.meta.url));
   const git = (args, options = {}) => {
+    if (args[0] === "remote") return "github\n";
     if (args[0] === "rev-parse") return `${commit}\n`;
     if (args[0] === "status") return "";
     if (args[0] === "show") return options.encoding === "buffer" ? (args[1].endsWith(".test.mjs") ? suite : script) : "";
     throw new Error(`unexpected git ${args.join(" ")}`);
   };
+  assert.equal(preferredPushedRuntimeRemote({ git: (args) => args[0] === "remote" ? "origin\nupstream\n" : git(args) }), "origin");
+  assert.equal(preferredPushedRuntimeRemote({ git: (args) => args[0] === "remote" ? "upstream\n" : git(args) }), "upstream");
+  assert.equal(preferredPushedRuntimeRemote({ git: (args) => args[0] === "remote" ? "github\norigin\n" : git(args) }), "github");
   assert.doesNotThrow(() => assertPushedRuntimeHarness(commit, { git, remoteProbe: () => `${commit}\trefs/heads/main\n` }));
   assert.throws(() => assertPushedRuntimeHarness(commit, { git: (args, options) => args[0] === "status" ? " M scripts/acceptance-runtime.mjs\n" : git(args, options), remoteProbe: () => `${commit}\trefs/heads/main\n` }), /dirty/i);
 });
@@ -201,8 +278,8 @@ test("validateVisualRecord requires a fresh artifact and inspection", () => {
   assert.equal(validateVisualRecord({ kind: "swift-light", artifact, sourceCommit: commit, ...binding, verdict: "passed", viewport: "1440x900", appearance: "light", reviewer: "acceptance reviewer", inspected: ["vision"], issues: [] }).requirementId, "r57");
 });
 
-test("completed session rejects stale source capture but reads its owned archive after source cleanup", () => {
-  const dir = mkdtempSync(path.resolve("generated/acceptance/task3-archive-test-")), capture = path.join(dir, "capture"), source = path.join(capture, "desktop.png"), started = new Date().toISOString(), runtimeId = "worker-0123456789abcdef";
+test("completed session rejects stale source capture but reads its owned archive after source cleanup", { skip: process.platform !== "darwin" }, () => {
+  const dir = acceptanceTemp("task3-archive-test-"), capture = path.join(dir, "capture"), source = path.join(capture, "desktop.png"), started = new Date().toISOString(), runtimeId = "worker-0123456789abcdef";
   mkdirSync(capture, { recursive: true, mode: 0o700 }); writeFileSync(path.join(dir, "browser-session.json"), JSON.stringify({ owner: "codex-router-phase5-runtime-v1", sourceCommit: commit, runtimeId, captureStartedAt: started, status: "pending_manual_session", profile: "profile", url: "http://127.0.0.1:1" }), { mode: 0o600 });
   writeFileSync(source, "pixels", { mode: 0o600 }); utimesSync(source, new Date(Date.now() - 60_000), new Date(Date.now() - 60_000));
   assert.throws(() => completedSessionArtifact(dir, capture, "browser", commit, runtimeId, Date.now() - 120_000, source, "reviewer", ["toolbar"]), /predates/i);
@@ -232,8 +309,8 @@ test("capture cleanup aggregates removal failures so final evidence is withheld"
   assert.deepEqual(calls, ["/safe/browser", "/safe/swift"]);
 });
 
-test("stop treats only absent reports as pending and propagates malformed staged reports", () => {
-  const dir = mkdtempSync(path.resolve("generated/acceptance/task3-report-state-")), value = handle(dir, { runtimeId: "worker-0123456789abcdef" });
+test("stop treats only absent reports as pending and propagates malformed staged reports", { skip: process.platform !== "darwin" }, () => {
+  const dir = temp("task3-report-state-"), value = handle(dir, { runtimeId: "worker-0123456789abcdef" });
   assert.equal(completedTask3ReportsOrPending(value), null);
   mkdirSync(path.join(dir, "evidence"), { recursive: true, mode: 0o700 }); writeFileSync(path.join(dir, "evidence", "browser-session-report.json"), "not-json", { mode: 0o600 });
   // Once any report exists, the set is staged evidence, not a benign pending
@@ -243,8 +320,8 @@ test("stop treats only absent reports as pending and propagates malformed staged
   assert.throws(() => completedTask3ReportsOrPending(value));
 });
 
-test("browser session archives closed non-secret sidecars bound to its worker", () => {
-  const dir = mkdtempSync(path.resolve("generated/acceptance/task3-sidecar-")), capture = path.join(path.dirname(dir), `${path.basename(dir)}-capture`), artifact = path.join(capture, "desktop.png"), runtimeId = "worker-0123456789abcdef", started = Date.now() - 1_000;
+test("browser session archives closed non-secret sidecars bound to its worker", { skip: process.platform !== "darwin" }, () => {
+  const dir = acceptanceTemp("task3-sidecar-"), capture = path.join(path.dirname(dir), `${path.basename(dir)}-capture`), artifact = path.join(capture, "desktop.png"), runtimeId = "worker-0123456789abcdef", started = Date.now() - 1_000;
   mkdirSync(capture, { recursive: true, mode: 0o700 }); writeFileSync(path.join(dir, "browser-session.json"), JSON.stringify({ owner: "codex-router-phase5-runtime-v1", sourceCommit: commit, runtimeId, captureStartedAt: new Date().toISOString(), status: "pending_manual_session", profile: "profile", url: "http://127.0.0.1:1" }), { mode: 0o600 });
   writeFileSync(artifact, "pixels", { mode: 0o600 });
   for (const kind of ["console", "network", "storage"]) writeFileSync(`${artifact}.${kind}.json`, JSON.stringify({ version: 1, kind, observations: [{ status: "clean", code: `${kind}-checked` }] }), { mode: 0o600 });
@@ -258,20 +335,20 @@ test("browser session archives closed non-secret sidecars bound to its worker", 
   assert.doesNotThrow(() => readCompletedSessionArtifact(dir, "browser", commit, { runtimeId, router: { startedAt: started }, captureRoots: { browser: capture } }));
 });
 
-test("browser sidecars reject secret-bearing content before evidence is written", () => {
+test("browser sidecars reject secret-bearing content before evidence is written", { skip: process.platform !== "darwin" }, () => {
   const unsafe = ["Bearer caller-secret", "Authorization", "Cookie", "http://127.0.0.1/capability/token", "storage credential", "requestBody", "response_body", "prompt", "reasoning", "tool_args", "access_token=abc", "refresh-token=abc", "API KEY", "password", "session_id", "auth token", "secret_value"];
   for (const text of unsafe) {
-    const dir = mkdtempSync(path.resolve("generated/acceptance/task3-sidecar-secret-")), capture = path.join(path.dirname(dir), `${path.basename(dir)}-capture`), artifact = path.join(capture, "desktop.png"), runtimeId = "worker-0123456789abcdef";
-    mkdirSync(capture, { recursive: true, mode: 0o700 }); writeFileSync(path.join(dir, "browser-session.json"), JSON.stringify({ owner: "codex-router-phase5-runtime-v1", sourceCommit: commit, runtimeId, captureStartedAt: new Date().toISOString(), status: "pending_manual_session", profile: "profile", url: "http://127.0.0.1:1" }), { mode: 0o600 }); writeFileSync(artifact, "pixels", { mode: 0o600 });
+    const dir = acceptanceTemp("task3-sidecar-secret-"), capture = path.join(path.dirname(dir), `${path.basename(dir)}-capture`), artifact = path.join(capture, "desktop.png"), runtimeId = "worker-0123456789abcdef", started = new Date(Date.now() - 2_000).toISOString();
+    mkdirSync(capture, { recursive: true, mode: 0o700 }); writeFileSync(path.join(dir, "browser-session.json"), JSON.stringify({ owner: "codex-router-phase5-runtime-v1", sourceCommit: commit, runtimeId, captureStartedAt: started, status: "pending_manual_session", profile: "profile", url: "http://127.0.0.1:1" }), { mode: 0o600 }); writeFileSync(artifact, "pixels", { mode: 0o600 });
     for (const kind of ["console", "network", "storage"]) writeFileSync(`${artifact}.${kind}.json`, JSON.stringify({ version: 1, kind, observations: [{ status: "clean", code: kind === "network" ? text : "checked" }] }), { mode: 0o600 });
-    assert.throws(() => completedSessionArtifact(dir, capture, "browser", commit, runtimeId, Date.now() - 1_000, artifact, "reviewer", ["toolbar"]), /sidecar|unsafe|secret/i, text);
+    assert.throws(() => completedSessionArtifact(dir, capture, "browser", commit, runtimeId, Date.now() - 1_000, artifact, "reviewer", ["toolbar"]), /browser .*sidecar contains unsafe content/i, text);
     assert.equal(existsSync(path.join(dir, "evidence", "browser-session-report.json")), false);
   }
 });
 
-test("start runtime settles every acquired resource after injected setup failures", async () => {
+test("start runtime settles every acquired resource after injected setup failures", { skip: process.platform !== "darwin" }, async () => {
   for (const stage of ["runtimeFactory", "prerequisites", "install", "start", "health", "control"]) {
-    const parent = root(), env = createIsolatedEnvironment({ root: path.join(parent, `runtime-${stage}`), nonce: `cleanup-${stage}-${Math.random().toString(16).slice(2, 10)}`, sourceCommit: commit }), disposed = [];
+    const parent = root(), env = freshIsolatedTestEnvironment(parent, stage), lease = isolationLeasePath(env.target.ports), disposed = []; let released = false;
     const callbacks = {
       prerequisites: async () => { if (stage === "prerequisites") throw new Error(stage); },
       install: async () => { if (stage === "install") throw new Error(stage); },
@@ -280,14 +357,17 @@ test("start runtime settles every acquired resource after injected setup failure
     };
     await assert.rejects(startAcceptanceRuntime(env, {
       runtimeFactory: async () => { if (stage === "runtimeFactory") throw new Error(stage); return { callbacks, dispose: async () => { disposed.push(stage); } }; },
-      operations: { createControlServer: async () => { if (stage === "control") throw new Error(stage); throw new Error("unexpected control creation"); } },
+      operations: {
+        acquireLease: (leaseRoot, ports) => { const release = acquireIsolationLease(leaseRoot, ports); return () => { release(); released = true; }; },
+        createControlServer: async () => { if (stage === "control") throw new Error(stage); throw new Error("unexpected control creation"); },
+      },
     }), new RegExp(stage));
     assert.deepEqual(disposed, stage === "runtimeFactory" ? [] : [stage]); assert.equal(existsSync(path.join(env.root, "c")), false); assert.equal(existsSync(path.join(env.root, "runtime-handshake")), false); assert.equal(existsSync(path.join(env.root, "runtime-handle.json")), false);
-    assert.equal(existsSync(isolationLeasePath(env.target.ports).lock), false);
+    assert.equal(released, stage === "control"); assert.equal(existsSync(lease.lock), false);
   }
 });
 
-test("Swift session accepts only the bound Task1 manifest and isolated bundle", () => {
+test("Swift session accepts only the bound Task1 manifest and isolated bundle", { skip: process.platform !== "darwin" }, () => {
   const dir = root(), build = path.join(dir, "build"), bundle = path.join(build, "Model Router.app"), manifest = path.join(dir, "acceptance-build.json");
   mkdirSync(bundle, { recursive: true }); writeFileSync(manifest, JSON.stringify({ sourceCommit: commit, buildOnly: true, buildRoot: build, bundlePath: bundle }), { mode: 0o600 });
   assert.equal(verifiedSwiftBundle(bundle, commit, { manifestPath: manifest }), realpathSync(bundle));
@@ -298,7 +378,7 @@ test("Swift session accepts only the bound Task1 manifest and isolated bundle", 
 });
 
 test("Plan sibling capture layout resolves exactly one active runtime", () => {
-  const parent = mkdtempSync(path.resolve("generated/acceptance/task3-sibling-test-")), runtime = path.join(parent, "runtime"), browser = path.join(parent, "browser"), artifact = path.join(browser, "desktop.png");
+  const parent = acceptanceTemp("task3-sibling-test-"), runtime = path.join(parent, "runtime"), browser = path.join(parent, "browser"), artifact = path.join(browser, "desktop.png");
   mkdirSync(runtime, { recursive: true }); mkdirSync(browser, { recursive: true }); writeFileSync(path.join(runtime, "runtime-handle.json"), "{}", { mode: 0o600 }); writeFileSync(artifact, "pixels", { mode: 0o600 });
   assert.equal(runtimeRootForArtifact(artifact), runtime);
   const other = path.join(parent, "other"); mkdirSync(other); writeFileSync(path.join(other, "runtime-handle.json"), "{}", { mode: 0o600 });
@@ -346,23 +426,23 @@ test("five-parameter final API starts a real seam, runs protocol, and leaves an 
   assert.equal(resumed.status, "pending_manual_capture"); assert.equal(protocolCalls, 2); await live.runtime.dispose();
 });
 
-test("five-parameter final API without run uses the CLI worker protocol and planned bindings", { timeout: 60_000 }, async () => {
-  const fixture = currentTask1Fixture(), parent = mkdtempSync(path.resolve("generated/acceptance/task3-f-"));
-  const finalRoot = path.join(parent, "r"), evidence = path.join(finalRoot, "evidence.json"), browserProfile = finalNonLiveBrowserProfile(finalRoot);
+test("five-parameter final API without run uses the CLI worker protocol and planned bindings", { skip: process.platform !== "darwin", timeout: 60_000 }, async () => {
+  const fixture = currentTask1Fixture(), finalRoot = freshExactRuntimeRoot("final-runtime"), evidence = path.join(finalRoot, "evidence.json"), browserProfile = finalNonLiveBrowserProfile(finalRoot);
   let live;
   try {
     const result = await finalNonLiveAcceptance({ root: finalRoot, buildRoot: fixture.manifest.buildRoot, browserProfile, evidence, sourceCommit: fixture.sourceCommit, task1ManifestPath: fixture.manifestPath, requireSwift: false, provenance: () => true });
     live = result.runtimeHandle;
     assert.equal(result.status, "pending_manual_capture"); assert.equal(result.browserProfile, browserProfile); assert.match(live.runtimeId, /^worker-/);
+    assert.equal(live.captureRoots.browser, path.join(path.dirname(finalRoot), "final-browser")); assert.equal(live.captureRoots.swift, path.join(finalRoot, "swift"));
     assert.equal(JSON.parse(readFileSync(path.join(finalRoot, "evidence", "runtime-stage.json"), "utf8")).status, "completed");
   } finally {
     if (live) { await control(live, "stop"); await waitFor(() => !existsSync(live.socket), "default final worker did not stop"); }
   }
 });
 
-test("public browser session to visual to stop publishes exactly seventeen local Task3 rows", { timeout: 60_000 }, async () => {
+test("public browser session to visual to stop publishes exactly seventeen local Task3 rows", { skip: process.platform !== "darwin", timeout: 60_000 }, async () => {
   const fixture = currentTask1Fixture(), manifest = fixture.manifest, sourceCommit = fixture.sourceCommit;
-  const dir = mkdtempSync(path.resolve("generated/acceptance/task3-public-matrix-")), evidence = path.join(dir, "evidence.json"), child = spawn(process.execPath, [path.resolve("scripts/acceptance-runtime.mjs"), "--worker", "--root", dir, "--source-commit", sourceCommit, "--no-swift"], { stdio: ["ignore", "ignore", "pipe"] });
+  const dir = acceptanceTemp("task3-public-matrix-"), evidence = path.join(dir, "evidence.json"), child = spawn(process.execPath, [path.resolve("scripts/acceptance-runtime.mjs"), "--worker", "--root", dir, "--source-commit", sourceCommit, "--no-swift"], { stdio: ["ignore", "ignore", "pipe"] });
   const invoke = (args) => runAcceptanceRuntimeCli(args, { provenance: () => true }); let live;
   const writeCapture = (captureRoot, name, sidecars = false) => {
     const artifact = path.join(captureRoot, name); writeFileSync(artifact, "pixels", { mode: 0o600 });
@@ -402,7 +482,7 @@ test("public browser session to visual to stop publishes exactly seventeen local
 });
 
 test("production final provenance rejects untracked runtime harness before it starts a worker", async () => {
-  const dir = mkdtempSync(path.resolve("generated/acceptance/task3-final-provenance-")), finalRoot = path.join(dir, "r");
+  const dir = temp("task3-final-provenance-"), finalRoot = path.join(dir, "r");
   await assert.rejects(finalNonLiveAcceptance({ root: finalRoot, buildRoot: dir, browserProfile: finalNonLiveBrowserProfile(finalRoot), evidence: path.join(dir, "evidence.json"), sourceCommit: commit }), /dirty|untracked|github/i);
   assert.equal(existsSync(finalRoot), false);
 });
@@ -414,8 +494,8 @@ test("resumed active final restores evidence and disposes its runtime after a hu
   assert.equal(disposed, true); assert.equal(existsSync(live.captureRoots.browser), false); assert.equal(existsSync(live.captureRoots.swift), false); assert.equal(readFileSync(evidence, "utf8"), prior);
 });
 
-test("resumed disk final restores evidence and stops the owned worker after a human callback failure", { timeout: 40_000 }, async () => {
-  const fixture = currentTask1Fixture(), dir = mkdtempSync(path.resolve("generated/acceptance/task3-final-disk-")), evidence = path.join(dir, "evidence.json"), prior = '{"schemaVersion":1,"finalGeneration":null,"entries":[]}\n'; writeFileSync(evidence, prior, { mode: 0o600 });
+test("resumed disk final restores evidence and stops the owned worker after a human callback failure", { skip: process.platform !== "darwin", timeout: 40_000 }, async () => {
+  const fixture = currentTask1Fixture(), dir = acceptanceTemp("task3-final-disk-"), evidence = path.join(dir, "evidence.json"), prior = '{"schemaVersion":1,"finalGeneration":null,"entries":[]}\n'; writeFileSync(evidence, prior, { mode: 0o600 });
   const child = spawn(process.execPath, [path.resolve("scripts/acceptance-runtime.mjs"), "--worker", "--root", dir, "--source-commit", fixture.sourceCommit, "--no-swift"], { stdio: ["ignore", "ignore", "pipe"] }); let live;
   try {
     await waitFor(() => existsSync(path.join(dir, "runtime-handle.json")) || existsSync(path.join(dir, "runtime-worker-failure.json")), "disk final worker did not start");
@@ -443,9 +523,9 @@ test("final API restores prior evidence when a visual callback fails", async () 
   assert.equal(disposed, true); assert.equal(readFileSync(evidence, "utf8"), prior);
 });
 
-test("real worker owns its lease/socket and IPC stop cleans every owned runtime handle", { timeout: 40_000 }, async () => {
+test("real worker owns its lease/socket and IPC stop cleans every owned runtime handle", { skip: process.platform !== "darwin", timeout: 40_000 }, async () => {
   const sourceCommit = (await import("node:child_process")).execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim();
-  const dir = mkdtempSync(path.resolve("generated/acceptance/task3-worker-test-"));
+  const dir = acceptanceTemp("task3-worker-test-");
   const child = spawn(process.execPath, [path.resolve("scripts/acceptance-runtime.mjs"), "--worker", "--root", dir, "--source-commit", sourceCommit, "--no-swift"], { env: { ...process.env, DEEPSEEK_API_KEY: "parent-secret-must-not-reach-protocol-child", HTTPS_PROXY: "https://parent-proxy.invalid", NODE_OPTIONS: "" }, stdio: ["ignore", "ignore", "pipe"] });
   let stderr = ""; child.stderr.on("data", (chunk) => { stderr += chunk; });
   try {
@@ -462,9 +542,9 @@ test("real worker owns its lease/socket and IPC stop cleans every owned runtime 
   } finally { if (!child.killed) child.kill("SIGTERM"); }
 });
 
-test("real worker rejects a replaced socket and a reused router identity", { timeout: 40_000 }, async () => {
+test("real worker rejects a replaced socket and a reused router identity", { skip: process.platform !== "darwin", timeout: 40_000 }, async () => {
   const sourceCommit = (await import("node:child_process")).execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim();
-  const dir = mkdtempSync(path.resolve("generated/acceptance/task3-worker-owner-test-"));
+  const dir = acceptanceTemp("task3-worker-owner-test-");
   const child = spawn(process.execPath, [path.resolve("scripts/acceptance-runtime.mjs"), "--worker", "--root", dir, "--source-commit", sourceCommit, "--no-swift"], { stdio: ["ignore", "ignore", "pipe"] });
   let stderr = ""; child.stderr.on("data", (chunk) => { stderr += chunk; });
   try {
@@ -480,9 +560,9 @@ test("real worker rejects a replaced socket and a reused router identity", { tim
   }
 });
 
-test("router crash makes the worker release its owned control resources", { timeout: 40_000 }, async () => {
+test("router crash makes the worker release its owned control resources", { skip: process.platform !== "darwin", timeout: 40_000 }, async () => {
   const sourceCommit = (await import("node:child_process")).execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim();
-  const dir = mkdtempSync(path.resolve("generated/acceptance/task3-worker-crash-test-"));
+  const dir = acceptanceTemp("task3-worker-crash-test-");
   const child = spawn(process.execPath, [path.resolve("scripts/acceptance-runtime.mjs"), "--worker", "--root", dir, "--source-commit", sourceCommit, "--no-swift"], { stdio: ["ignore", "ignore", "pipe"] });
   let stderr = ""; child.stderr.on("data", (chunk) => { stderr += chunk; });
   try {

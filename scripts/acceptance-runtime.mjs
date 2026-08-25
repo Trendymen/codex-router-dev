@@ -98,12 +98,26 @@ export function runtimeCaptureRoot(root, runtimeId, kind = "browser") {
   if (!/^(?:worker|runtime)-[0-9a-f]{16}$/.test(String(runtimeId || ""))) throw new Error("runtime id is invalid for capture root");
   if (!["browser", "swift"].includes(kind)) throw new Error("runtime capture kind is invalid");
   const runtimeRoot = path.resolve(root), parent = path.dirname(runtimeRoot), name = path.basename(runtimeRoot).replace(/[^a-z0-9-]/gi, "-");
-  const capture = name === "runtime" ? path.join(parent, kind) : path.join(parent, `task3-${kind}-${name}-${runtimeId}`);
+  const capture = path.join(parent, `task3-${kind}-${name}-${runtimeId}`);
   if (existsSync(capture)) throw new Error("runtime capture root already exists");
   mkdirSync(capture, { recursive: true, mode: 0o700 }); chmodSync(capture, 0o700);
   const entry = lstatSync(capture);
   if (!entry.isDirectory() || entry.isSymbolicLink() || (statSync(capture).mode & 0o077) !== 0 || realpathSync(capture) !== capture) throw new Error("runtime capture root is not a private canonical directory");
   return capture;
+}
+/** CLI starts bind browser state to the supplied runtime-root name before the
+ * worker receives its random runtime id.  This keeps the public continuation
+ * path deterministic without widening it to an arbitrary sibling. */
+export function defaultCliBrowserProfile(root) {
+  const runtimeRoot = path.resolve(root), name = path.basename(runtimeRoot);
+  let browserName;
+  if (name === "final-runtime") browserName = "final-browser";
+  else {
+    const match = /^runtime(?:-([a-z0-9][a-z0-9-]*))?$/i.exec(name);
+    if (!match) throw new Error("CLI runtime root basename cannot plan a browser profile");
+    browserName = match[1] ? `browser-${match[1]}` : "browser";
+  }
+  return acceptanceSiblingPath(runtimeRoot, path.join(path.dirname(runtimeRoot), browserName, "profile"), "CLI browser profile");
 }
 /** The five-argument final API plans its browser profile before it spawns the
  * same worker used by the CLI.  Keeping this deterministic binds the caller's
@@ -111,16 +125,35 @@ export function runtimeCaptureRoot(root, runtimeId, kind = "browser") {
  * during worker shutdown. */
 export function finalNonLiveBrowserProfile(root) {
   const runtimeRoot = path.resolve(root), name = path.basename(runtimeRoot).replace(/[^a-z0-9-]/gi, "-");
-  return acceptanceSiblingPath(runtimeRoot, path.join(path.dirname(runtimeRoot), `task3-browser-${name}-final`, "profile"), "final non-live browser profile");
+  const browserName = name === "final-runtime" ? "final-browser" : `task3-browser-${name}-final`;
+  return acceptanceSiblingPath(runtimeRoot, path.join(path.dirname(runtimeRoot), browserName, "profile"), "final non-live browser profile");
 }
-function finalNonLiveBrowserCaptureRoot(root, profile) {
-  const expected = finalNonLiveBrowserProfile(root);
-  if (path.resolve(profile) !== expected) throw new Error("final non-live browser profile does not match the explicit worker plan");
-  const captureRoot = path.dirname(expected);
-  if (existsSync(captureRoot)) throw new Error("final non-live browser capture root already exists");
-  mkdirSync(captureRoot, { recursive: true, mode: 0o700 }); chmodSync(captureRoot, 0o700);
-  if (!lstatSync(captureRoot).isDirectory() || lstatSync(captureRoot).isSymbolicLink() || (statSync(captureRoot).mode & 0o077) !== 0 || realpathSync(captureRoot) !== captureRoot) throw new Error("final non-live browser capture root is not private");
-  return captureRoot;
+function createPlannedCaptureRoot(root, captureRoot, name, { sibling = true } = {}) {
+  const resolved = sibling ? acceptanceSiblingPath(root, captureRoot, name) : inside(root, captureRoot, name);
+  if (existsSync(resolved)) throw new Error(`${name} already exists`);
+  mkdirSync(resolved, { recursive: false, mode: 0o700 }); chmodSync(resolved, 0o700);
+  const entry = lstatSync(resolved);
+  if (!entry.isDirectory() || entry.isSymbolicLink() || (statSync(resolved).mode & 0o077) !== 0 || realpathSync(resolved) !== resolved) throw new Error(`${name} is not a private canonical directory`);
+  return resolved;
+}
+function plannedBrowserCapture(root, runtimeId, profile) {
+  const requested = path.resolve(profile), runtimeRoot = path.resolve(root), finalProfile = finalNonLiveBrowserProfile(runtimeRoot);
+  if (requested === finalProfile) return { captureRoot: createPlannedCaptureRoot(runtimeRoot, path.dirname(requested), "final non-live browser capture root"), profile: requested };
+  const defaultProfile = defaultCliBrowserProfile(runtimeRoot);
+  if (requested === defaultProfile) {
+    return { captureRoot: createPlannedCaptureRoot(runtimeRoot, path.dirname(defaultProfile), "planned browser capture root"), profile: defaultProfile };
+  }
+  throw new Error("planned browser profile is not an owned runtime or final profile");
+}
+function plannedSwiftCaptureRoot(root, runtimeId) {
+  const runtimeRoot = path.resolve(root), name = path.basename(runtimeRoot);
+  if (name === "final-runtime") return createPlannedCaptureRoot(runtimeRoot, path.join(runtimeRoot, "swift"), "final runtime Swift capture root", { sibling: false });
+  const match = /^runtime(?:-([a-z0-9][a-z0-9-]*))?$/i.exec(name);
+  if (match) {
+    const swiftName = match[1] ? `swift-${match[1]}` : "swift";
+    return createPlannedCaptureRoot(runtimeRoot, path.join(path.dirname(runtimeRoot), swiftName), "planned Swift capture root");
+  }
+  return runtimeCaptureRoot(runtimeRoot, runtimeId, "swift");
 }
 /** A nested protocol router gets a newly constructed environment.  In
  * particular it never inherits credentials, proxies, NODE_OPTIONS, or the
@@ -244,16 +277,23 @@ export function runtimeRootForArtifact(artifact) {
 }
 function sourceBytes(sourceCommit, file) { return execFileSync("git", ["show", `${sourceCommit}:${file}`], { cwd: ROOT, encoding: "buffer" }); }
 
+export function preferredPushedRuntimeRemote({ git = (args, options = {}) => execFileSync("git", args, { cwd: ROOT, ...options }) } = {}) {
+  const remotes = new Set(String(git(["remote"], { encoding: "utf8" })).trim().split(/\s+/).filter(Boolean));
+  for (const name of ["github", "origin", "upstream"]) if (remotes.has(name)) return name;
+  throw new Error("runtime acceptance requires a github, origin, or upstream remote");
+}
+
 export function assertPushedRuntimeHarness(sourceCommit, { git = (args, options = {}) => execFileSync("git", args, { cwd: ROOT, ...options }), remoteProbe } = {}) {
   if (!/^[0-9a-f]{40}$/.test(String(sourceCommit || ""))) throw new Error("source commit must be a full Git commit");
-  const remote = String((remoteProbe || (() => git(["ls-remote", "github", "refs/heads/main"], { encoding: "utf8" })))(sourceCommit)).trim().split(/\s+/)[0];
   const head = String(git(["rev-parse", "HEAD"], { encoding: "utf8" })).trim();
-  if (remote !== sourceCommit || head !== sourceCommit) throw new Error("runtime acceptance must run current github/main");
   for (const file of RUNTIME_PATHS) {
     if (String(git(["status", "--porcelain", "--", file], { encoding: "utf8" })).trim()) throw new Error(`runtime harness path is dirty or untracked: ${file}`);
     const committed = Buffer.from(git(["show", `${sourceCommit}:${file}`], { encoding: "buffer" }));
     if (!committed.equals(readFileSync(path.join(ROOT, file)))) throw new Error(`runtime harness bytes differ from source commit: ${file}`);
   }
+  const remoteName = preferredPushedRuntimeRemote({ git });
+  const remote = String((remoteProbe || ((name) => git(["ls-remote", name, "refs/heads/main"], { encoding: "utf8" })))(remoteName, sourceCommit)).trim().split(/\s+/)[0];
+  if (remote !== sourceCommit || head !== sourceCommit) throw new Error(`runtime acceptance must run current ${remoteName}/main`);
   return true;
 }
 /** Every mutating/recording CLI command calls this gate.  It intentionally is
@@ -1045,7 +1085,7 @@ export async function finalNonLiveAcceptance({ root, buildRoot, browserProfile, 
 }
 
 function option(args, name, optional = false) { const index = args.indexOf(name); if (index < 0) { if (optional) return undefined; throw new Error(`missing ${name}`); } const value = args[index + 1]; if (!value || value.startsWith("--")) throw new Error(`missing ${name}`); return value; }
-function cliEnvironment(root, sourceCommit) { const canonical = assertCliPreflight(root); return createIsolatedEnvironment({ root: canonical, nonce: `runtime-${path.basename(canonical).replace(/[^a-z0-9-]/gi, "-")}`, sourceCommit }); }
+function cliEnvironment(root, sourceCommit) { const canonical = assertCliPreflight(root); return createIsolatedEnvironment({ root: canonical, nonce: `runtime-${hash(canonical).slice(0, 16)}`, sourceCommit }); }
 export function assertControlOwnership(handle, { inspect = psIdentity } = {}) {
   const lease = lstatSync(handle.lease.path);
   if (!sameIdentity(lease, handle.lease.identity)) throw new Error("refusing to contact runtime with replaced lease owner");
@@ -1117,7 +1157,7 @@ async function worker(args) {
   try { env = cliEnvironment(root, sourceCommit); release = acquireIsolationLease(env.root, env.target.ports); }
   catch (error) { try { privateJsonReplace(failurePath, { owner: OWNER, sourceCommit, status: "failed", stage: "bootstrap", message: safeText(error?.message || "runtime worker bootstrap failed") }); } catch {}; throw error; }
   const fixtureState = { quotaModel: null, attempts: [] };
-  let runtime, callbacks, server, started, stopping = false, captureRoots;
+  let runtime, callbacks, server, started, stopping = false, captureRoots, profile;
   const runtimeId = option(args, "--runtime-id", true) || `worker-${randomBytes(8).toString("hex")}`, token = option(args, "--token", true) || randomBytes(32).toString("hex"), handshakePath = path.join(env.root, "runtime-handshake"), plannedBrowserProfile = option(args, "--browser-profile", true);
   if (!/^worker-[0-9a-f]{16}$/.test(runtimeId) || !/^[0-9a-f]{64}$/.test(token)) throw new Error("runtime worker bootstrap binding is invalid");
   const emergencyStop = () => {
@@ -1166,7 +1206,8 @@ async function worker(args) {
     writeTask3Catalog(env); writeFixtureCredential(env, "qwen-plan"); assertTask3Catalog(env); privateJson(path.join(env.stateRoot, "failover.json"), { version: 1, enabled: true, chain: ["qwen-plan/deepseek-v4-flash-0731"] });
     started = await callbacks.start(env); const health = await callbacks.health(env); if (!health?.ok) throw new Error("runtime worker health failed");
     nodeOnlyIdentity({ pid: started.pid }, env.sourceRoot);
-    captureRoots = { browser: plannedBrowserProfile ? finalNonLiveBrowserCaptureRoot(env.root, plannedBrowserProfile) : runtimeCaptureRoot(env.root, runtimeId, "browser"), swift: runtimeCaptureRoot(env.root, runtimeId, "swift") }; const profile = plannedBrowserProfile || inside(captureRoots.browser, path.join(captureRoots.browser, "profile"), "runtime browser profile");
+    const browser = plannedBrowserProfile ? plannedBrowserCapture(env.root, runtimeId, plannedBrowserProfile) : (() => { const captureRoot = runtimeCaptureRoot(env.root, runtimeId, "browser"); return { captureRoot, profile: inside(captureRoot, path.join(captureRoot, "profile"), "runtime browser profile") }; })();
+    captureRoots = { browser: browser.captureRoot, swift: plannedBrowserProfile ? plannedSwiftCaptureRoot(env.root, runtimeId) : runtimeCaptureRoot(env.root, runtimeId, "swift") }; profile = browser.profile;
     for (const [kind, captureRoot] of Object.entries(captureRoots)) privateJson(path.join(captureRoot, "runtime-capture.json"), { owner: OWNER, kind, runtimeId, root: env.root, sourceCommit });
     privateJson(handshakePath, { version: 1, runtimeId, token }); const handshake = privateIdentity(handshakePath, "runtime handshake");
     server = await createControlServer(env, runtimeId, token, { protocol: () => stageWorkerProtocol({ env, callbacks, fixtureState, sourceCommit }) }, shutdown);
@@ -1283,7 +1324,7 @@ export async function runAcceptanceRuntimeCli(argv = process.argv.slice(2), { pr
   }
   const root = path.resolve(option(args, "--root")), evidence = path.resolve(option(args, "--evidence")), sourceCommit = option(args, "--source-commit", true) || currentCommit();
   provenance(sourceCommit);
-  if (command === "start") { if (existsSync(root)) throw new Error("runtime start requires a fresh root with no prior control artifacts"); const env = cliEnvironment(root, sourceCommit); await assertPortsAvailable(env.target.ports); const handle = await startAcceptanceWorker(env); privateJson(path.join(env.evidenceRoot, "runtime-start.json"), runtimeAcceptanceReport(handle)); process.stdout.write(`${handle.handlePath}\n`); return; }
+  if (command === "start") { if (existsSync(root)) throw new Error("runtime start requires a fresh root with no prior control artifacts"); const env = cliEnvironment(root, sourceCommit), browserProfile = defaultCliBrowserProfile(env.root); await assertPortsAvailable(env.target.ports); const handle = await startAcceptanceWorker(env, { browserProfile }); privateJson(path.join(env.evidenceRoot, "runtime-start.json"), runtimeAcceptanceReport(handle)); process.stdout.write(`${handle.handlePath}\n`); return; }
   const handle = readHandle(handlePath(root)); if (handle.sourceCommit !== sourceCommit) throw new Error("runtime handle source commit mismatch");
   if (command === "stop") {
     const reports = completedTask3ReportsOrPending(handle);
