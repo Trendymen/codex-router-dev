@@ -1157,6 +1157,12 @@ async function controlRequest(handle, command) {
     client.once("connect", () => client.end(`${JSON.stringify({ version: 1, command, runtimeId: handle.runtimeId, token: handshake.token })}\n`));
   });
 }
+function panelBootstrapUrlForHandle(handle, value) {
+  const port = Number(handle?.router?.port);
+  const pattern = new RegExp(`^http://127\\.0\\.0\\.1:${port}/panel-bootstrap/[A-Za-z0-9_-]{43}$`);
+  if (typeof value !== "string" || !pattern.test(value)) throw new Error("runtime control returned an invalid browser bootstrap URL");
+  return value;
+}
 async function createControlServer(env, runtimeId, token, callbacks, shutdown) {
   const socket = controlPath(env.root); if (existsSync(socket)) throw new Error("runtime control socket already exists");
   // Protocol work can outlive the peer's request half-close.  Keep the write
@@ -1165,8 +1171,9 @@ async function createControlServer(env, runtimeId, token, callbacks, shutdown) {
     let text = ""; client.setEncoding("utf8"); client.on("data", (chunk) => { text += chunk; }); client.once("end", async () => {
       try {
         const request = JSON.parse(text); exactKeys(request, ["version", "command", "runtimeId", "token"], "control request");
-        if (request.version !== 1 || request.runtimeId !== runtimeId || !["status", "stop", "protocol"].includes(request.command) || typeof request.token !== "string" || request.token.length !== token.length || !timingSafeEqual(Buffer.from(request.token), Buffer.from(token))) throw new Error("runtime control request is not authorized");
+        if (request.version !== 1 || request.runtimeId !== runtimeId || !["status", "stop", "protocol", "browser-session"].includes(request.command) || typeof request.token !== "string" || request.token.length !== token.length || !timingSafeEqual(Buffer.from(request.token), Buffer.from(token))) throw new Error("runtime control request is not authorized");
         if (request.command === "protocol") { await callbacks.protocol(); client.end(JSON.stringify({ ok: true, stage: "complete" })); return; }
+        if (request.command === "browser-session") { const url = await callbacks.browserSession(); client.end(JSON.stringify({ ok: true, url })); return; }
         client.end(`${JSON.stringify({ ok: true, status: request.command === "status" ? "running" : "stopping" })}`); if (request.command === "stop") setImmediate(shutdown);
       } catch (error) { let detail = "rejected"; try { detail = safeText(error?.message || detail); } catch {} client.end(JSON.stringify({ ok: false, error: detail })); }
     });
@@ -1269,7 +1276,7 @@ async function worker(args) {
     captureRoots = { browser: browser.captureRoot, swift: plannedBrowserProfile ? plannedSwiftCaptureRoot(env.root, runtimeId) : runtimeCaptureRoot(env.root, runtimeId, "swift") }; profile = browser.profile;
     for (const [kind, captureRoot] of Object.entries(captureRoots)) privateJson(path.join(captureRoot, "runtime-capture.json"), { owner: OWNER, kind, runtimeId, root: env.root, sourceCommit });
     privateJson(handshakePath, { version: 1, runtimeId, token }); const handshake = privateIdentity(handshakePath, "runtime handshake");
-    server = await createControlServer(env, runtimeId, token, { protocol: () => stageWorkerProtocol({ env, callbacks, fixtureState, sourceCommit }) }, shutdown);
+    server = await createControlServer(env, runtimeId, token, { protocol: () => stageWorkerProtocol({ env, callbacks, fixtureState, sourceCommit }), browserSession: () => callbacks.browserSession() }, shutdown);
     const leaseInfo = isolationLeasePath(env.target.ports), lease = lstatSync(leaseInfo.lock), socket = lstatSync(controlPath(env.root));
     if (!socket.isSocket()) throw new Error("runtime control endpoint is not a Unix socket");
     writeHandle({ owner: OWNER, sourceCommit, root: env.root, handlePath: handlePath(env.root), runtimeId, socket: controlPath(env.root), socketIdentity: identity(socket), handshake: { path: handshakePath, identity: handshake }, router: { pid: started.pid, workerPid: process.pid, startedAt: Date.now(), port: env.target.ports.router, label: env.target.routerLabel, routerIdentity: psIdentity(started.pid), workerIdentity: psIdentity(process.pid) }, lease: { path: leaseInfo.lock, normalized: leaseInfo.normalized, identity: identity(lease), ports: Object.values(env.target.ports) }, captureRoots, profile, artifacts: { report: path.join(env.evidenceRoot, "runtime.json") } });
@@ -1396,9 +1403,9 @@ export async function runAcceptanceRuntimeCli(argv = process.argv.slice(2), { pr
   }
   if (command === "protocol") return protocol(handle);
   if (command === "browser-session") {
-    const profile = path.resolve(option(args, "--profile")); if (profile !== handle.profile) throw new Error("browser profile must be the worker-owned canonical capture profile"); mkdirSync(profile, { recursive: true, mode: 0o700 });
+    const profile = path.resolve(option(args, "--profile")); if (profile !== handle.profile) throw new Error("browser profile must be the worker-owned canonical capture profile");
     const artifact = inside(root, path.join(root, "browser-session.json"), "browser session artifact"), completed = option(args, "--completed-artifact", true);
-    if (!completed) { privateJsonReplace(artifact, { owner: OWNER, sourceCommit, runtimeId: handle.runtimeId, captureStartedAt: new Date().toISOString(), status: "pending_manual_session", profile: path.relative(handle.captureRoots.browser, profile), url: `http://127.0.0.1:${handle.router.port}` }); process.stdout.write(`http://127.0.0.1:${handle.router.port}\n${profile}\n`); return; }
+    if (!completed) { const response = await controlRequest(handle, "browser-session"); if (response?.ok !== true) throw new Error("runtime browser session IPC was rejected"); const url = panelBootstrapUrlForHandle(handle, response.url); mkdirSync(profile, { recursive: true, mode: 0o700 }); privateJsonReplace(artifact, { owner: OWNER, sourceCommit, runtimeId: handle.runtimeId, captureStartedAt: new Date().toISOString(), status: "pending_manual_session", profile: path.relative(handle.captureRoots.browser, profile), url }); process.stdout.write(`${url}\n${profile}\n`); return; }
     completedSessionArtifact(root, handle.captureRoots.browser, "browser", sourceCommit, handle.runtimeId, handle.router.startedAt, path.resolve(completed), option(args, "--reviewer"), JSON.parse(option(args, "--inspected")));
     return;
   }

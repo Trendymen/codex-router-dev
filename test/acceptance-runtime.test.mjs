@@ -169,6 +169,13 @@ test("CLI start worker consumes the default profile plan while retaining its run
     assert.equal(live.captureRoots.browser, browserRoot); assert.equal(live.captureRoots.swift, swiftRoot);
     await invoke(["browser-session", "--root", runtimeRoot, "--evidence", evidence, "--source-commit", sourceCommit, "--profile", defaultCliBrowserProfile(runtimeRoot)]);
     assert.equal(existsSync(live.profile), true);
+    const browserSession = JSON.parse(readFileSync(path.join(runtimeRoot, "browser-session.json"), "utf8"));
+    assert.match(browserSession.url, new RegExp(`^http://127\\.0\\.0\\.1:${live.router.port}/panel-bootstrap/[A-Za-z0-9_-]{43}$`));
+    const bootstrap = await fetch(browserSession.url, { redirect: "manual" });
+    assert.equal(bootstrap.status, 303); assert.equal(bootstrap.headers.get("location"), "/panel/");
+    const cookie = bootstrap.headers.get("set-cookie"); assert.match(cookie || "", /^panel_session=/);
+    const panel = await fetch(`http://127.0.0.1:${live.router.port}/panel/`, { headers: { cookie } });
+    assert.equal(panel.status, 200); assert.equal(panel.url.includes("_codex-router"), false);
     const writeCapture = (captureRoot, name, sidecars = false) => {
       const artifact = path.join(captureRoot, name); writeFileSync(artifact, "pixels", { mode: 0o600 });
       if (sidecars) for (const kind of ["console", "network", "storage"]) writeFileSync(`${artifact}.${kind}.json`, JSON.stringify({ version: 1, kind, observations: [{ status: "clean", code: `${kind}-checked` }] }), { mode: 0o600 });
@@ -595,6 +602,14 @@ test("real worker uses the parent provenance seam and completes its local fixtur
     assert.equal(existsSync(path.join(dir, "runtime-worker-failure.json")), false, stderr);
     const live = JSON.parse(readFileSync(handleFile, "utf8")); assert.equal(live.router.workerPid, child.pid); assert.equal(await control(live, "status").then((value) => value.ok), true);
     assertTask3CodexFixture(dir);
+    const browser = await control(live, "browser-session");
+    assert.equal(browser.ok, true); assert.match(browser.url, new RegExp(`^http://127\\.0\\.0\\.1:${live.router.port}/panel-bootstrap/[A-Za-z0-9_-]{43}$`));
+    const bootstrap = await fetch(browser.url, { redirect: "manual" });
+    assert.equal(bootstrap.status, 303); assert.equal(bootstrap.headers.get("location"), "/panel/");
+    const cookie = bootstrap.headers.get("set-cookie"); assert.match(cookie || "", /^panel_session=/);
+    const panel = await fetch(`http://127.0.0.1:${live.router.port}/panel/`, { headers: { cookie } });
+    assert.equal(panel.status, 200); assert.equal(panel.url, `http://127.0.0.1:${live.router.port}/panel/`);
+    assert.notEqual((await fetch(browser.url, { redirect: "manual" })).status, 303);
     const protocol = await control(live, "protocol");
     assert.deepEqual(protocol, { ok: true, stage: "complete" });
     const stage = JSON.parse(readFileSync(path.join(dir, "evidence", "runtime-stage.json"), "utf8"));

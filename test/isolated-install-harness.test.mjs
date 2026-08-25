@@ -281,6 +281,12 @@ test("an injected acceptance fixture is used once by real materialized start and
     });
     await runtime.callbacks.install(env);
     await Promise.all([runtime.callbacks.start(env), runtime.callbacks.start(env)]);
+    const bootstrapUrl = await runtime.callbacks.browserSession(env);
+    assert.match(bootstrapUrl, new RegExp(`^http://127\\.0\\.0\\.1:${env.target.ports.router}/panel-bootstrap/[A-Za-z0-9_-]{43}$`));
+    const bootstrap = await fetch(bootstrapUrl, { redirect: "manual" });
+    assert.equal(bootstrap.status, 303); assert.match(bootstrap.headers.get("set-cookie") || "", /^panel_session=/);
+    const panel = await fetch(`http://127.0.0.1:${env.target.ports.router}/panel/`, { headers: { cookie: bootstrap.headers.get("set-cookie") } });
+    assert.equal(panel.status, 200);
     await runtime.callbacks.route(env, "responses");
     await runtime.callbacks.route(env, "messages");
     await runtime.callbacks.lifecycle(env, "restart");
