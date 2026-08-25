@@ -68,6 +68,7 @@ struct MenuBarSettingsTests {
     #expect(MenuBarStatusItemConfiguration.visibilityRecoveryDelay == 1)
     #expect(MenuBarStatusItemConfiguration.overlayWidth == 32)
     #expect(MenuBarStatusItemConfiguration.overlayHeight == 24)
+    #expect(MenuBarStatusItemConfiguration.overlayRightInset == 372)
   }
 
   @Test("the activity badge is not a second dot on the indicator style")
@@ -75,6 +76,15 @@ struct MenuBarSettingsTests {
     #expect(MenuBarLayoutMetrics.showsActivityBadge(iconStyle: .indicator, isIdle: false) == false)
     #expect(MenuBarLayoutMetrics.showsActivityBadge(iconStyle: .provider, isIdle: false) == true)
     #expect(MenuBarLayoutMetrics.showsActivityBadge(iconStyle: .provider, isIdle: true) == false)
+  }
+
+  @Test("capability sections use compact grouped presentation")
+  func capabilitySectionsUseCompactGroupedPresentation() {
+    #expect(CapabilityPresentationModel.groupID(for: "lifecycle") == "core")
+    #expect(CapabilityPresentationModel.groupID(for: "usage") == "core")
+    #expect(CapabilityPresentationModel.groupID(for: "vision") == "advanced")
+    #expect(CapabilityPresentationModel.groupID(for: "provider-credentials") == "providers")
+    #expect(CapabilityPresentationModel.startsExpanded("lifecycle") == false)
   }
 
   @Test("choosing a custom image copies it into Application Support")
