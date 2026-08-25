@@ -539,13 +539,14 @@ export function adaptOpenAIResponses({ model, upstream, requestContext = {} } = 
     signal: requestContext.signal,
   });
   const reasoningDuplex = Duplex.fromWeb(reasoning);
-  // Node 22's Web-stream adapter has a writev rejection bug: when a preceding
-  // forced buffer releases several held frames and this stage rejects one,
+  // Node 22's Web-stream adapter has a writev rejection bug: any tool request
+  // can send several frames through this stage (forced release is only one
+  // known source), and when one then rejects,
   // its internal callback treats the single Error as an array (`error.filter`)
   // and loses the trusted protocol error in an unhandled rejection. Disable
   // only that batching hook; ordinary `_write` preserves the same ordered
   // Web TransformStream contract and lets pipeline reach the safe boundary.
-  if (toolBuild?.forcedRequirement) reasoningDuplex._writev = null;
+  if (toolBuild?.forcedRequirement || Array.isArray(toolBuild?.tools) && toolBuild.tools.length > 0) reasoningDuplex._writev = null;
   return Object.freeze({
     upstream,
     relayContext,

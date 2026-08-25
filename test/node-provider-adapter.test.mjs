@@ -10,6 +10,8 @@ import { pipeline } from "node:stream/promises";
 import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
+import { ReasoningProtocolError } from "../src/reasoning-summary-compat.mjs";
+
 import {
   adaptOpenAIResponses,
   buildOpenAIResponsesRequest,
@@ -743,6 +745,60 @@ test("multiline data frames parse as one event while unchanged bytes remain exac
     upstream: new Response("", { headers: { "content-type": "text/event-stream" } }),
   });
   assert.equal(await through(adapter.transforms, [Buffer.from(raw)]), raw);
+});
+
+test("Node 22 Web stream batching is disabled for every tool build, while no-tool streams retain byte-equivalent batching", () => {
+  const tool = [{ type: "function", name: "run", parameters: { type: "object", properties: {} } }];
+  const adapterFor = (payload) => {
+    const built = buildOpenAIResponsesRequest({ model: deepseek, payload });
+    return adaptOpenAIResponses({
+      model: deepseek,
+      upstream: new Response("", { headers: { "content-type": "text/event-stream" } }),
+      requestContext: { toolBuild: built.toolBuild },
+    });
+  };
+  const ordinary = adapterFor({ input, tools: tool, tool_choice: "auto" });
+  const forced = adapterFor({ input, tools: tool, tool_choice: "required" });
+  const emptyForced = adapterFor({ input, tools: [], tool_choice: "required" });
+  const undefinedToolsContinuation = adapterFor({ input, tool_choice: "required" });
+  const withoutTools = adapterFor({ input });
+  // This is the precise Node 22 guard: a rejected batched Web Transform write
+  // calls `error.filter` and converts a controlled public tool error into an
+  // ECONNRESET.  Ordinary tool calls need the same guard as forced calls.
+  assert.equal(ordinary.transforms[1]._writev, null);
+  assert.equal(forced.transforms[1]._writev, null);
+  assert.equal(emptyForced.transforms[1]._writev, null);
+  assert.equal(typeof undefinedToolsContinuation.transforms[1]._writev, "function");
+  assert.equal(typeof withoutTools.transforms[1]._writev, "function");
+});
+
+test("ordinary tools preserve the original reasoning failure across a corked Node 22 write batch", async () => {
+  const built = buildOpenAIResponsesRequest({
+    model: deepseek,
+    payload: { input, tools: [{ type: "function", name: "run", parameters: { type: "object", properties: {} } }], tool_choice: "auto" },
+  });
+  const adapter = adaptOpenAIResponses({
+    model: deepseek,
+    upstream: new Response("", { headers: { "content-type": "text/event-stream" } }),
+    requestContext: { toolBuild: built.toolBuild },
+  });
+  const reasoning = adapter.transforms[1], unhandled = [];
+  const onUnhandled = (reason) => { unhandled.push(reason); };
+  process.on("unhandledRejection", onUnhandled);
+  try {
+    const failed = new Promise((resolve) => reasoning.once("error", resolve));
+    const sink = new Writable({ write(_chunk, _encoding, callback) { callback(); } });
+    reasoning.pipe(sink);
+    reasoning.cork();
+    reasoning.write(Buffer.from(`data: ${JSON.stringify({ type: "response.created", response: { id: "resp_batch", model: deepseek.slug, output: [] } })}\n\n`));
+    reasoning.write(Buffer.from(`data: ${JSON.stringify({ type: "response.reasoning_summary_text.delta", output_index: 0, item_id: "missing", summary_index: 0, delta: "local" })}\n\n`));
+    reasoning.uncork();
+    const error = await Promise.race([failed, new Promise((_, reject) => setTimeout(() => reject(new Error("corked reasoning batch did not fail")), 1_000))]);
+    assert.ok(error instanceof ReasoningProtocolError);
+    assert.equal(error.code, "reasoning_delta_without_item");
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(unhandled.length, 0, `unexpected unhandled rejection: ${unhandled.map((value) => value?.message || value).join(", ")}`);
+  } finally { process.off("unhandledRejection", onUnhandled); reasoning.destroy(); }
 });
 
 test("real ToolBuild preserves semantically unchanged multiline and unknown frames byte-for-byte", async () => {
